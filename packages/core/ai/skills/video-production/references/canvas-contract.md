@@ -1,6 +1,8 @@
 # Canvas contract
 
-Write `CANVAS.md` as the first durable, reviewable production artifact. Use the user's content language. Give it a version and keep stable IDs across later assets and edits. Treat an attached or pasted script as the source of truth: preserve its scene order, exact spoken text, character names, and ending. If a visual beat is inferred rather than scripted, mark that inference. A brief-only request may use a labeled working script.
+This Canvas contract applies only to caller-authorized `production_mode=adapt` or `production_mode=generate`. Write `CANVAS.md` as the first durable, reviewable production artifact. Use the user's content language. Give it a version and keep stable IDs across later assets and edits. Treat an attached or pasted script as the source of truth: preserve its scene order, exact spoken text, character names, and ending. If a visual beat is inferred rather than scripted, mark that inference. A brief-only request may use a labeled working script.
+
+For `production_mode=reuse`, do not manufacture a canvas, edit decision list, subtitle project, or replacement media. Keep a concise review record instead: caller authorization; source `Document` ID and SHA-256 (or an authorized attachment path when no Document exists); measured `0..duration` range; timestamped frame/text and audio observations; rights/fact/destination checks; independent-review and approval state; and only review artifact paths. The original source identity remains separate from those output paths.
 
 ## Header and chapters
 
@@ -39,7 +41,7 @@ Give the canvas a navigable opening with a section list and a compact visual ove
 Add a dedicated **How Manor generates this video** section that a different agent could execute without reconstructing decisions from prose. Include:
 
 1. An asset inventory separating supplied reference-only media, accepted reusable takes, missing footage, narration, music, ambience, captions, and editable graphics. Give each one a stable shot or track ID, actual Knowledge path/document ID when available, and status.
-2. The ordered Manor tool route and gates: `generate_file(kind="search")` for required audio models, `plan_video_segments` for each new motion shot, `generate_video`/`generate_image`/audio creation with supported reference controls, `wait_media_jobs`, `probe_media`, and `render_frame_samples`. Show the selected Account model and provider duration only after the tool returns them; label preflight values as pending beforehand.
+2. The ordered Manor tool route and gates: `generate_file(kind="search")` for required image/video/audio models, `plan_video_segments` for each new motion shot, `generate_file(kind="image"|"video"|"audio")` with model-specific controls in `params`, `wait_media_jobs`, `probe_media`, and `render_frame_samples`. Show the selected Account model and provider duration only after the tool returns them; label preflight values as pending beforehand.
 3. For each generated shot, a paste-ready generation brief containing subject identity, first state, visible action and camera path, last state, negative constraints, aspect ratio, requested provider duration, reference asset roles, and expected audio policy. Keep exact prompts/parameters or a linked prompt record after submission, plus returned job ID and accepted take. Explain how to reject a failed take and reuse completed jobs without resubmitting blindly.
 4. A long-form chapter plan when runtime exceeds a short clip: which shots are provider segments, how chapters are staged, and where narration/music continuity crosses chapter boundaries.
 

@@ -34,6 +34,16 @@ Append requirements to an existing Task using update_task_runtime. Do not store
 them only in chat, change Workspace policy or start a duplicate Task. Rules must
 constrain the downstream action they concern, rather than an unrelated task-create gate.
 
+To start a pending Task (one drafted earlier without starting), call start_task
+with its task_id. It runs with its own Agents and delivers its own output: do not
+redo its work in Chat or create a second Task for it.
+
+When the user asks that some kind of action wait for their review in this
+conversation ("writes to Knowledge need my approval", "stop at the approval
+card"), call hold_for_approval with those categories (files covers Knowledge)
+before doing the work. The held action then stops at a card; the user's words
+alone stop nothing. A lasting Workspace requirement is a rule (add_rule).
+
 If the user's reply answers an open blocker, call answer_task_blocker with its
 request_id and the actual answer. A bare retry request is not a blocker answer;
 login blockers use their dedicated controls. If recovery is unavailable, report

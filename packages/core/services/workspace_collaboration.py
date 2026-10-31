@@ -1,6 +1,6 @@
 """Bounded external portal. Guests never acquire a customer company actor."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Literal
 
 from fastapi import HTTPException
@@ -8,10 +8,23 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import or_, select
 
 from packages.core.models.client_delivery import ClientWorkspaceDelivery
-from packages.core.models.user import Entity, User
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.chat_room import ChatRoom, ChatRoomMember
-from packages.core.models.workspace import WorkspaceActivity, WorkspaceStaff
+from packages.core.models.workspace import Workspace, WorkspaceActivity, WorkspaceStaff
 from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+from packages.core.services.external_collaboration_access import (
+    COLLABORATOR_MEMBERSHIP_ROLE,
+    MAINTAINER_ROLE,
+    PROVIDER_TRIAL_ROLE,
+    REMOVED_PROVIDER,
+    TRIAL_PHASES,
+    WORKSPACE_ACCESS_ROLES,
+    grant_expired,
+    grant_is_live,
+    grantee_manages_source,
+    now,
+    sync_external_access,
+)
 from packages.core.services.workspace_access import (
     lock_workspace_access_boundary,
     lock_workspace_recipient_authorization,
@@ -23,7 +36,8 @@ class InviteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     email: str = Field(min_length=3, max_length=255, pattern="^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")
     role: Literal["tester", "maintainer"] = "tester"
-    days: int = Field(default=14, ge=1, le=90)
+    # None keeps a grant that has no expiry (a kept maintainer) without one; only on update.
+    days: int | None = Field(default=14, ge=1, le=90)
     share_configuration: bool = False
 
 
@@ -90,10 +104,6 @@ async def link_group(db, user, workspace_id, req):
     return {"linked": room is not None, "group": group_view(room) if room else None}
 
 
-def now():
-    return datetime.now(timezone.utc)
-
-
 def public_grant(row):
     return {
         k: getattr(row, k)
@@ -109,9 +119,41 @@ def public_grant(row):
             "share_configuration",
         )
     } | {
-        "status": "expired" if row.status != "revoked" and row.expires_at <= now() else row.status,
+        "status": "expired" if row.status != "revoked" and grant_expired(row) else row.status,
         "path": f"/workspace-collaboration/{row.id}",
+        # One of the provider team's grants: the customer decides on the team as a whole.
+        "team": bool(row.delivery_id) and row.role in WORKSPACE_ACCESS_ROLES,
     }
+
+
+def team_grants(delivery_id, ws, *roles):
+    """The delivery's active access grants in this Workspace, oldest first, locked."""
+    return (
+        select(WorkspaceCollaboration)
+        .where(
+            WorkspaceCollaboration.delivery_id == delivery_id,
+            WorkspaceCollaboration.workspace_id == ws.id,
+            WorkspaceCollaboration.entity_id == ws.entity_id,
+            WorkspaceCollaboration.role.in_(roles or WORKSPACE_ACCESS_ROLES),
+            WorkspaceCollaboration.status == "active",
+        )
+        .order_by(WorkspaceCollaboration.created_at, WorkspaceCollaboration.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+async def target_delivery(db, ws, *, delivery_id=None, lock=False):
+    """The delivery that installed this Workspace; locked after the Workspace."""
+    query = select(ClientWorkspaceDelivery).where(
+        ClientWorkspaceDelivery.target_workspace_id == ws.id,
+        ClientWorkspaceDelivery.target_entity_id == ws.entity_id,
+    )
+    if delivery_id is not None:
+        query = query.where(ClientWorkspaceDelivery.id == delivery_id)
+    if lock:
+        query = query.with_for_update()
+    return await db.scalar(query.execution_options(populate_existing=True))
 
 
 def audit(db, ws, user, event, details):
@@ -133,29 +175,49 @@ async def managed_workspace(db, user, workspace_id):
         raise HTTPException(404, "Workspace not found")
     await lock_workspace_recipient_authorization(db, workspace_id=ws.id, entity_id=ws.entity_id, user_id=user.id)
     await fresh_actor(db, user)
+    # Read the membership itself: a derived owner seat must never let a
+    # collaborator decide who else works in the customer's Workspace.
+    role = await db.scalar(
+        select(UserMembership.role).where(
+            UserMembership.user_id == user.id,
+            UserMembership.entity_id == ws.entity_id,
+            UserMembership.status == "active",
+            UserMembership.deleted_at.is_(None),
+        )
+    )
+    if role == COLLABORATOR_MEMBERSHIP_ROLE:
+        raise HTTPException(403, "External collaborators cannot change this Workspace's collaboration")
     if not await user_can_manage_workspace(db, workspace_id=ws.id, user_id=user.id, entity_role=user.role):
         raise HTTPException(403, "A customer Workspace manager must approve this action")
     return ws
 
 
-async def live_boundary(db, row):
-    ws = await lock_workspace_access_boundary(db, workspace_id=row.workspace_id, entity_id=row.entity_id)
+async def live_boundary(db, row, *, lock=True):
+    # lock=False runs the same checks with plain reads, for per-request lookups
+    # that must not serialize against Workspace lifecycle writes.
+    if lock:
+        ws = await lock_workspace_access_boundary(db, workspace_id=row.workspace_id, entity_id=row.entity_id)
+    else:
+        ws = await db.scalar(
+            select(Workspace)
+            .where(Workspace.id == row.workspace_id, Workspace.entity_id == row.entity_id)
+            .execution_options(populate_existing=True)
+        )
     entity = await db.scalar(select(Entity.id).where(Entity.id == row.entity_id, Entity.deleted_at.is_(None)))
     if ws is None or ws.deleted_at is not None or entity is None:
         raise HTTPException(410, "Workspace is no longer available")
-    if row.status == "revoked" or row.expires_at <= now():
+    if row.status == "revoked" or grant_expired(row):
         raise HTTPException(410, "Collaboration expired or revoked")
     if row.authorized_by:
-        await lock_workspace_recipient_authorization(
-            db, workspace_id=ws.id, entity_id=ws.entity_id, user_id=row.authorized_by
-        )
+        if lock:
+            await lock_workspace_recipient_authorization(
+                db, workspace_id=ws.id, entity_id=ws.entity_id, user_id=row.authorized_by
+            )
         # Resolve the issuing identity in the customer company; never use the guest's company role.
         # Ordinary same-company authorization below also fences revoked/deleted issuers.
         issuer = await db.scalar(
             select(User).where(User.id == row.authorized_by, User.status == "active", User.deleted_at.is_(None))
         )
-        from packages.core.models.user import UserMembership
-
         role = await db.scalar(
             select(UserMembership.role).where(
                 UserMembership.user_id == row.authorized_by,
@@ -175,15 +237,16 @@ async def live_boundary(db, row):
     return ws
 
 
-async def guest_grant(db, user, grant_id, *, active=True):
+async def guest_grant(db, user, grant_id, *, active=True, for_update=False):
     # Workspace-first lock order is shared by invite, revoke and portal access.
+    # for_update: the caller writes the guest's derived access (User FOR UPDATE).
     stub = await db.get(WorkspaceCollaboration, grant_id)
     if stub is None or user.email.casefold() != stub.email:
         raise HTTPException(404, "Collaboration not found")
     ws = await live_boundary(db, stub)
     # Freeze the guest identity before the child grant, matching user deletion's
     # User -> grant order. This prevents a stale proof and a revoke/read deadlock.
-    current = await fresh_actor(db, user, verified=True)
+    current = await fresh_actor(db, user, verified=True, for_update=for_update)
     row = await db.scalar(
         select(WorkspaceCollaboration)
         .where(WorkspaceCollaboration.id == grant_id)
@@ -192,7 +255,7 @@ async def guest_grant(db, user, grant_id, *, active=True):
     )
     if row.email != current.email.casefold():
         raise HTTPException(404, "Collaboration not found")
-    if row.status == "revoked" or row.expires_at <= now():
+    if row.status == "revoked" or grant_expired(row):
         raise HTTPException(410, "Collaboration expired or revoked")
     if row.user_id and row.user_id != user.id:
         raise HTTPException(404, "Collaboration not found")
@@ -234,13 +297,15 @@ async def invite(db, user, workspace_id, req):
     ws = await managed_workspace(db, user, workspace_id)
     if req.email.casefold() == user.email.casefold():
         raise HTTPException(422, "Invite an external collaborator rather than yourself")
+    if req.days is None:
+        raise HTTPException(422, "Choose how long the invitation lasts")
     duplicate = await db.scalar(
         select(WorkspaceCollaboration.id)
         .where(
             WorkspaceCollaboration.workspace_id == ws.id,
             WorkspaceCollaboration.email == req.email.casefold(),
             WorkspaceCollaboration.status.in_(["requested", "invited", "active"]),
-            WorkspaceCollaboration.expires_at > now(),
+            or_(WorkspaceCollaboration.expires_at.is_(None), WorkspaceCollaboration.expires_at > now()),
         )
         .limit(1)
     )
@@ -281,17 +346,24 @@ async def request_maintenance(db, user, client_id, delivery_id):
         raise HTTPException(404, "Accepted delivery not found")
     if not await can_manage_delivery(db, user, row):
         raise HTTPException(403, "Only a source Workspace manager may request maintenance")
-    await fresh_actor(db, user, verified=True)
+    # The target Workspace before the requester's User row, as in open_client_trial and guest_grant.
     ws = await lock_workspace_access_boundary(db, workspace_id=row.target_workspace_id, entity_id=row.target_entity_id)
     if ws is None or ws.deleted_at is not None:
         raise HTTPException(410, "Customer Workspace is no longer available")
+    await fresh_actor(db, user, verified=True)
+    # The phase moves only under the Workspace lock held above.
+    await db.refresh(row)
+    if row.phase in TRIAL_PHASES:
+        raise HTTPException(
+            409, "During the trial every manager of the Workspace opens it from Customer trials; no request is needed"
+        )
     existing = await db.scalar(
         select(WorkspaceCollaboration)
         .where(
             WorkspaceCollaboration.delivery_id == row.id,
             WorkspaceCollaboration.email == user.email.casefold(),
             WorkspaceCollaboration.status.in_(["requested", "invited", "active"]),
-            WorkspaceCollaboration.expires_at > now(),
+            or_(WorkspaceCollaboration.expires_at.is_(None), WorkspaceCollaboration.expires_at > now()),
         )
         .order_by(WorkspaceCollaboration.created_at.desc())
         .limit(1)
@@ -324,12 +396,7 @@ async def management(db, user, workspace_id):
             .order_by(WorkspaceCollaboration.created_at.desc())
         )
     ).all()
-    delivery = await db.scalar(
-        select(ClientWorkspaceDelivery).where(
-            ClientWorkspaceDelivery.target_workspace_id == ws.id,
-            ClientWorkspaceDelivery.target_entity_id == ws.entity_id,
-        )
-    )
+    delivery = await target_delivery(db, ws)
     return {
         "workspace_id": ws.id,
         "title": ws.name,
@@ -346,7 +413,47 @@ async def management(db, user, workspace_id):
         ],
         "phase": delivery.phase if delivery else None,
         "acceptance": delivery.acceptance if delivery else {},
+        "provider_team": await provider_team(db, delivery, grants),
     }
+
+
+async def provider_team(db, delivery, grants):
+    """Who of the provider company works in the Workspace now, decided on as one team.
+
+    Only live members: a teammate who no longer manages the source Workspace
+    is not in the team, though their derived seat may briefly remain.
+    """
+    if delivery is None:
+        return None
+    source_side = {}
+    members = [
+        g for g in reversed(grants)
+        if g.delivery_id == delivery.id
+        and g.role in WORKSPACE_ACCESS_ROLES
+        and await grant_is_live(db, g, source_side=source_side)
+    ]
+    roles = {g.role for g in members}
+    return {
+        "delivery_id": delivery.id,
+        "access": "trial" if PROVIDER_TRIAL_ROLE in roles else "maintainer" if roles else "none",
+        "members": [
+            {"grant_id": g.id, "email": g.email, "user_id": g.user_id, "role": g.role, "accepted_at": g.accepted_at}
+            for g in members
+        ],
+    }
+
+
+async def reauthorize_provider(db, ws, row):
+    """The customer authorizes the provider again after removing the team.
+
+    Clears the removal marker so the authorized grant can be accepted; a
+    grant authorized before the removal was revoked with the team and can
+    never be accepted.
+    """
+    delivery = await target_delivery(db, ws, delivery_id=row.delivery_id, lock=True)
+    acceptance = (delivery.acceptance or {}) if delivery else {}
+    if acceptance.get("provider") in REMOVED_PROVIDER:
+        delivery.acceptance = {**acceptance, "provider": "reauthorized", "reauthorized_at": now().isoformat()}
 
 
 async def change_grant(db, user, workspace_id, grant_id, action, req=None):
@@ -362,25 +469,58 @@ async def change_grant(db, user, workspace_id, grant_id, action, req=None):
     )
     if row is None:
         raise HTTPException(404, "Collaboration not found")
+    # Workspace, grant, then the delivery: the same order as phase() and accept().
+    delivery = (
+        await target_delivery(db, ws, delivery_id=row.delivery_id, lock=True)
+        if row.delivery_id and row.role in WORKSPACE_ACCESS_ROLES
+        else None
+    )
+    if row.role == PROVIDER_TRIAL_ROLE or (delivery is not None and delivery.phase in TRIAL_PHASES):
+        # Every grant of the delivery is the provider team's until acceptance decides on it.
+        raise HTTPException(
+            409, "The provider stays during the trial; choose keep or remove when accepting the delivery"
+        )
+    if delivery is not None and row.status != "active":
+        delivery = None
+    # A live maintainer grant of a delivery is one member of the provider team:
+    # the customer removes or re-scopes the whole team at once.
+    team = (await db.scalars(team_grants(delivery.id, ws, MAINTAINER_ROLE))).all() if delivery else [row]
+    if action == "revoke" and delivery is not None:
+        from packages.core.services.client_trial_access import revoke_provider_team
+
+        await revoke_provider_team(db, ws, delivery, user)
+        audit(db, ws, user, "External collaboration revoke", {"collaboration_id": row.id})
+        return public_grant(row)
     if action == "revoke":
         row.status = "revoked"
         row.snapshot = {}
     elif (
         action in {"authorize", "update"}
         and row.status in ({"requested"} if action == "authorize" else {"invited", "active"})
-        and row.expires_at > now()
+        and not grant_expired(row)
     ):
         if req.email.casefold() != row.email or req.role != row.role:
             raise HTTPException(422, "Approve the exact requested identity and role")
+        if req.days is None and row.expires_at is not None:
+            raise HTTPException(422, "Only an authorization without an expiry can stay without one")
         if action == "authorize":
             row.status = "invited"
-        row.authorized_by = user.id
-        row.authority_fingerprint = await issuer_fingerprint(db, ws, user.id)
-        row.share_configuration = req.share_configuration
-        row.snapshot = await share_snapshot(db, ws) if req.share_configuration else {}
-        row.expires_at = now() + timedelta(days=req.days)
+            if row.delivery_id:
+                await reauthorize_provider(db, ws, row)
+        fingerprint = await issuer_fingerprint(db, ws, user.id)
+        snapshot = await share_snapshot(db, ws) if req.share_configuration else {}
+        expires_at = None if req.days is None else now() + timedelta(days=req.days)
+        for grant in team if action == "update" else [row]:
+            grant.authorized_by = user.id
+            grant.authority_fingerprint = fingerprint
+            grant.share_configuration = req.share_configuration
+            grant.snapshot = snapshot
+            grant.expires_at = expires_at
     else:
         raise HTTPException(409, "This authorization can no longer be changed; issue a new invitation")
+    # Status and expiry both shape the derived seat.
+    for grant in team if action == "update" else [row]:
+        await sync_external_access(db, grant)
     audit(db, ws, user, f"External collaboration {action}", {"collaboration_id": row.id})
     return public_grant(row)
 
@@ -398,51 +538,104 @@ async def portal(db, user, grant_id):
 
 
 async def accept(db, user, grant_id):
-    ws, row = await guest_grant(db, user, grant_id, active=False)
+    # Lock the guest exclusively from the start: holding SHARE and upgrading in
+    # sync_external_access deadlocks two concurrent accepts by the same person.
+    ws, row = await guest_grant(db, user, grant_id, active=False, for_update=True)
     if row.status == "requested":
         raise HTTPException(403, "Wait for the customer to authorize this request")
     if row.status == "invited":
+        if row.delivery_id and await db.scalar(
+            select(WorkspaceCollaboration.id).where(
+                WorkspaceCollaboration.delivery_id == row.delivery_id,
+                WorkspaceCollaboration.user_id == user.id,
+                WorkspaceCollaboration.status == "active",
+                WorkspaceCollaboration.role.in_(WORKSPACE_ACCESS_ROLES),
+            )
+        ):
+            # One live access grant per person and delivery (a database invariant).
+            raise HTTPException(409, "You already work in this customer Workspace")
+        delivery = (
+            await target_delivery(db, ws, delivery_id=row.delivery_id, lock=True)
+            if row.delivery_id and row.role == MAINTAINER_ROLE
+            else None
+        )
+        if delivery is not None and delivery.phase in TRIAL_PHASES:
+            # During the trial the provider team opens the Workspace from its own company.
+            raise HTTPException(409, "The provider team already works in this Workspace during the trial")
+        if delivery is not None and (delivery.acceptance or {}).get("provider") in REMOVED_PROVIDER:
+            # Only an authorization the customer gives after removing the team counts.
+            raise HTTPException(409, "The customer removed the provider team; ask them to authorize you again")
         row.status = "active"
         row.user_id = user.id
         row.accepted_at = now()
+        await sync_external_access(db, row)
+        if delivery is not None and delivery.phase == "delivered":
+            # The customer re-authorized the provider: the whole team may open it again.
+            delivery.acceptance = {**(delivery.acceptance or {}), "provider": "keep", "restored_at": now().isoformat()}
         audit(db, ws, user, "External collaborator accepted", {"collaboration_id": row.id})
     return public_grant(row)
 
 
-async def phase(db, user, workspace_id, action, note):
+async def phase(db, user, workspace_id, action, note, provider=None):
     ws = await managed_workspace(db, user, workspace_id)
-    delivery = await db.scalar(
-        select(ClientWorkspaceDelivery)
-        .where(
-            ClientWorkspaceDelivery.target_workspace_id == ws.id,
-            ClientWorkspaceDelivery.target_entity_id == ws.entity_id,
-        )
-        .with_for_update()
-    )
+    delivery = await target_delivery(db, ws, lock=True)
     if delivery is None:
         raise HTTPException(404, "Delivery not found")
     if action == "request_acceptance" and delivery.phase == "trial":
         delivery.phase = "awaiting_acceptance"
-    elif action == "accept" and delivery.phase in {"trial", "awaiting_acceptance"}:
+    elif action == "accept" and delivery.phase in TRIAL_PHASES:
+        # Workspace, then delivery, then every grant of the team, then the
+        # derived rows in sync_external_access. The decision is the team's.
+        team = (await db.scalars(team_grants(delivery.id, ws))).all()
+        if not team:
+            # A delivery from before trial access has no provider to decide on.
+            provider = None
+        elif provider not in {"keep", "remove"}:
+            raise HTTPException(422, "Choose whether to keep the provider as maintainer or remove them")
+        elif provider == "keep":
+            # Every live grant of the team becomes a maintainer, checked against
+            # the accepting manager's authority.
+            fingerprint = await issuer_fingerprint(db, ws, user.id)
+            for grant in team:
+                if not await grantee_manages_source(db, grant):
+                    # A teammate who no longer manages the source Workspace is not kept.
+                    grant.status = "revoked"
+                    grant.snapshot = {}
+                    await sync_external_access(db, grant)
+                    continue
+                grant.role = MAINTAINER_ROLE
+                grant.authorized_by = user.id
+                grant.authority_fingerprint = fingerprint
+                grant.expires_at = None
+                await sync_external_access(db, grant)
+        else:
+            from packages.core.services.client_trial_access import revoke_provider_team
+
+            # Every grant of the team, pending ones included, so none can restore it later.
+            await revoke_provider_team(db, ws, delivery, user)
         delivery.phase = "delivered"
         delivery.acceptance = {
             "confirmed_by": user.id,
             "confirmed_at": now().isoformat(),
             "note": note,
             "operation_revision": ws.operation_revision,
+            "provider": provider,
+            **({"removed_at": now().isoformat(), "removed_by": user.id} if provider == "remove" else {}),
         }
     elif action == "accept" and delivery.phase == "delivered":
         return {"phase": delivery.phase, "acceptance": delivery.acceptance}
     else:
         raise HTTPException(409, "Delivery is not in a reviewable phase")
-    audit(db, ws, user, "Customer delivery phase changed", {"phase": delivery.phase, "note": note})
+    details = {"phase": delivery.phase, "note": note}
+    if action == "accept":
+        details["provider"] = provider
+    audit(db, ws, user, "Customer delivery phase changed", details)
     return {"phase": delivery.phase, "acceptance": delivery.acceptance}
 
 
 async def issuer_fingerprint(db, ws, user_id):
     import hashlib
     import json
-    from packages.core.models.user import UserMembership
 
     membership = (
         await db.execute(
@@ -474,9 +667,7 @@ async def issuer_fingerprint(db, ws, user_id):
     ).hexdigest()
 
 
-async def fresh_actor(db, user, *, verified=False):
-    from packages.core.models.user import UserMembership
-
+async def fresh_actor(db, user, *, verified=False, for_update=False):
     current = (
         await db.execute(
             select(
@@ -488,7 +679,7 @@ async def fresh_actor(db, user, *, verified=False):
                 User.token_version,
             )
             .where(User.id == user.id)
-            .with_for_update(read=True)
+            .with_for_update(read=not for_update)
         )
     ).one_or_none()
     membership = await db.scalar(

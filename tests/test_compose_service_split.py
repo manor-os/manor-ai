@@ -24,16 +24,14 @@ def test_compose_keeps_worker_split_small_and_beat_filesystem_free() -> None:
     services = compose["services"]
 
     assert {
-        "manor-worker", "manor-worker-heavy", "manor-worker-control", "manor-worker-ops", "manor-beat",
+        "manor-worker", "manor-worker-heavy", "manor-worker-control", "manor-beat",
     }.issubset(services)
     assert "manor-worker-embedding" not in services
 
     worker_command = " ".join(str(part) for part in services["manor-worker"]["command"].split())
     worker_heavy_command = " ".join(str(part) for part in services["manor-worker-heavy"]["command"].split())
     worker_control_command = " ".join(str(part) for part in services["manor-worker-control"]["command"].split())
-    worker_ops_command = " ".join(str(part) for part in services["manor-worker-ops"]["command"].split())
     beat = services["manor-beat"]
-    ops = services["manor-worker-ops"]
 
     # The control plane (queue ``celery``) has its own pool: two concurrent
     # chat turns must never starve the sandbox scheduler / outbox ticks.
@@ -45,25 +43,25 @@ def test_compose_keeps_worker_split_small_and_beat_filesystem_free() -> None:
     assert "--hostname manor-worker-heavy@%h" in worker_heavy_command
     assert "--hostname manor-worker-control@%h" in worker_control_command
     assert services["manor-worker-control"]["environment"]["MANOR_SERVICE_ROLE"] == "worker"
-    # Monitoring walks Docker for seconds per tick; on the control pool that
-    # discarded scheduler/outbox ticks. Its own pool, Docker socket kept
-    # (inherited volumes), no JuiceFS.
-    assert "-Q ops " in worker_ops_command
-    assert "--hostname manor-worker-ops@%h" in worker_ops_command
-    assert "ops" not in worker_control_command.split("-Q ")[1].split()[0].split(",")
-    assert ops["environment"]["MANOR_SERVICE_ROLE"] == "worker"
-    assert ops["environment"]["MANOR_FS_ENABLED"] == "false"
-    assert ops.get("devices") == []
-    assert ops.get("privileged") is False
-    assert any("docker.sock" in str(volume) for volume in ops.get("volumes", [])), (
-        "the ops worker needs the Docker socket to walk peer containers"
-    )
     assert beat["environment"]["MANOR_SERVICE_ROLE"] == "beat"
     assert beat["environment"]["MANOR_FS_ENABLED"] == "false"
     assert beat.get("devices") == []
     assert beat.get("volumes") == []
     assert beat.get("privileged") is False
     assert "juicefs-init" not in beat.get("depends_on", {})
+
+
+def test_compose_consumes_every_declared_queue() -> None:
+    from packages.core.queues import CeleryQueue
+
+    consumed: set[str] = set()
+    for service in yaml.safe_load(COMPOSE.read_text())["services"].values():
+        parts = str(service.get("command", "")).split()
+        if parts[:4] == ["celery", "-A", "packages.core.celery_app", "worker"] and "-Q" in parts:
+            consumed.update(parts[parts.index("-Q") + 1].split(","))
+    assert {queue.value for queue in CeleryQueue} <= consumed
+
+
 
 
 def test_compose_keeps_local_state_single_machine_with_redis_db_split() -> None:
@@ -101,7 +99,7 @@ def test_compose_keeps_local_state_single_machine_with_redis_db_split() -> None:
 
 
 
-def test_compose_pins_ollama_to_the_doks_runtime_version() -> None:
+def test_compose_pins_ollama_to_the_cloud_runtime_version() -> None:
     compose = yaml.safe_load(COMPOSE.read_text())
     services = compose["services"]
 

@@ -5,6 +5,7 @@ import { api, type GovernancePresetKey } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import type { Workspace, WorkspaceStaff } from "../lib/types";
 import { useAuthStore } from "../stores/auth";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 import { canManageWorkspace } from "../lib/permissions";
 import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
 import BlueprintAgentSelection, { blueprintAgentSubscriptions } from "../components/blueprints/BlueprintAgentSelection";
@@ -49,7 +50,10 @@ import {
   formatBlueprintVariableValue,
   parseBlueprintVariableValue,
 } from "../lib/blueprintVariables.mjs";
+import { isBlueprintPackageName, readBlueprintPackagePayload } from "../lib/blueprintPackage";
 import { resolveBlueprintChannelSelections } from "../lib/blueprintSetup.mjs";
+import { userAvatarImage } from "../lib/userAvatar";
+import { workspaceChatActionCount } from "../lib/workspaceActionCount";
 
 interface WorkspaceForm {
   name: string;
@@ -74,29 +78,6 @@ function currentWorkspaceIntroMotionUrl() {
   return document.documentElement.dataset.theme === "dark"
     ? WORKSPACE_INTRO_DARK_MOTION_URL
     : WORKSPACE_INTRO_MOTION_URL;
-}
-function positiveStat(value: unknown) {
-  const count = Number(value || 0);
-  return Number.isFinite(count) && count > 0 ? count : 0;
-}
-
-function workspaceChatActionCount(ws: Pick<Workspace, "stats">) {
-  const stats = ws.stats || {};
-  const hasChatActionStats = [
-    stats.chat_pending_actions,
-    stats.proposal_actions,
-    stats.failed_actions,
-  ].some((value) => value !== undefined && value !== null);
-
-  if (!hasChatActionStats) {
-    return positiveStat(stats.pending_actions ?? stats.hitl_tasks ?? 0);
-  }
-
-  return (
-    positiveStat(stats.chat_pending_actions) +
-    positiveStat(stats.proposal_actions) +
-    positiveStat(stats.failed_actions)
-  );
 }
 
 function WorkspaceIntroPanel() {
@@ -206,9 +187,9 @@ function WorkspaceCreatorSummary({ workspace }: { workspace: Workspace }) {
           fontWeight: 850,
         }}
       >
-        {workspace.created_by_avatar_url ? (
+        {userAvatarImage(workspace.created_by_avatar_url) ? (
           <img
-            src={workspace.created_by_avatar_url}
+            src={userAvatarImage(workspace.created_by_avatar_url)}
             alt=""
             style={{ width: "100%", height: "100%", objectFit: "cover" }}
           />
@@ -366,6 +347,8 @@ function ImportWorkspaceDialog({
   const toast = useToastStore();
   const [fileName, setFileName] = useState("");
   const [payload, setPayload] = useState<Record<string, any> | null>(null);
+  // A .manor package installs as the file itself, so its carried files come along.
+  const [packageFile, setPackageFile] = useState<File | null>(null);
   const [workspaceName, setWorkspaceName] = useState("");
   const [mode, setMode] = useState<"live" | "simulate">("live");
   const [preset, setPreset] = useState<GovernancePresetKey>("automatic");
@@ -385,6 +368,7 @@ function ImportWorkspaceDialog({
     if (!open) return;
     setFileName("");
     setPayload(null);
+    setPackageFile(null);
     setWorkspaceName("");
     setMode("live");
     setPreset("automatic");
@@ -399,19 +383,22 @@ function ImportWorkspaceDialog({
   const onFileChange = async (file?: File | null) => {
     setError("");
     setPayload(null);
+    setPackageFile(null);
     setSelectedAgentIds({});
     setVariableValues({});
     setChannelConfigIds({});
     setFileName(file?.name || "");
     if (!file) return;
     try {
-      const parsed = JSON.parse(await readTextFile(file));
+      const isPackage = isBlueprintPackageName(file.name);
+      const parsed = isPackage ? await readBlueprintPackagePayload(file) : JSON.parse(await readTextFile(file));
       const nextPayload = blueprintPayloadFromJson(parsed);
       if (!nextPayload) {
         setError(t("page.workspaces.import_invalid_blueprint"));
         return;
       }
       setPayload(nextPayload);
+      if (isPackage) setPackageFile(file);
       const manifest = isRecord(nextPayload.manifest) ? nextPayload.manifest : {};
       const title = typeof manifest.title === "string" ? manifest.title : "";
       if (title && !workspaceName) setWorkspaceName(title);
@@ -463,8 +450,7 @@ function ImportWorkspaceDialog({
     setImporting(true);
     setError("");
     try {
-      const result = await api.blueprints.installPayload({
-        payload,
+      const options = {
         mode,
         workspace_name: workspaceName.trim() || undefined,
         create_missing_agents: createMissingAgents,
@@ -472,7 +458,10 @@ function ImportWorkspaceDialog({
         governance_preset: preset,
         variable_values: variableOverrides,
         channel_config_ids: resolvedChannelConfigIds,
-      });
+      };
+      const result = packageFile
+        ? await api.blueprints.installPackage(packageFile, options)
+        : await api.blueprints.installPayload({ payload, ...options });
       toast.success(t("page.workspaces.imported_workspace"));
       onImported(result.workspace_id);
       onClose();
@@ -513,7 +502,7 @@ function ImportWorkspaceDialog({
         }}>
           <input
             type="file"
-            accept="application/json,.json"
+            accept="application/json,.json,.manor"
             onChange={(e) => onFileChange(e.target.files?.[0])}
             style={{ display: "none" }}
           />
@@ -611,6 +600,9 @@ export default function Workspaces() {
   const [showImportModal, setShowImportModal] = useState(false);
   const [editing, setEditing] = useState<Workspace | null>(null);
   const currentUser = useAuthStore((s) => s.user);
+  // An external collaborator sees only their granted Workspaces: no drafts,
+  // creation, marketplace or trash, all of which the server refuses them.
+  const collaborator = useIsCollaborator();
   // Workspace membership for the row being edited — powers the access summary
   // in the edit modal. Only fetched while that modal is open so the list page
   // doesn't issue a staff query per workspace.
@@ -651,6 +643,7 @@ export default function Workspaces() {
         (y.updated_at || y.created_at || "").localeCompare(x.updated_at || x.created_at || ""),
       );
     },
+    enabled: !collaborator,
   });
 
   const allWs = workspaces || [];
@@ -696,6 +689,7 @@ export default function Workspaces() {
   const { data: graceDaysResp } = useQuery({
     queryKey: ["workspaces-grace-days"],
     queryFn: () => api.workspaces.graceDays(),
+    enabled: !collaborator,
     staleTime: 60 * 60 * 1000,
   });
   const graceDays = graceDaysResp?.grace_days ?? 30;
@@ -811,7 +805,7 @@ export default function Workspaces() {
             className="w-full sm:w-64"
           />
         ) : undefined}
-        actions={!isMarketplace ? (
+        actions={!isMarketplace && !collaborator ? (
           <Dropdown
             align="right"
             trigger={<PageHeaderAddButton label={t("page.workspaces.add_workspace")} caret />}
@@ -1213,7 +1207,7 @@ export default function Workspaces() {
         </div>
 
         {/* Trash — soft-deleted workspaces in the grace window */}
-        <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
+        {!collaborator && <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
             <button
               onClick={() => setShowTrash((v) => !v)}
               style={{
@@ -1269,7 +1263,7 @@ export default function Workspaces() {
                 </div>
               )
             )}
-        </div>
+        </div>}
       </div>
       </>
       )}

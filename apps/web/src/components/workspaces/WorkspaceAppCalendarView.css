@@ -1,0 +1,319 @@
+/* Keep the overview mounted for return navigation; only the open calendar is shown. */
+.workspace-app-view[data-calendar-focused="true"] > .workspace-app-view__scroll > :not(.workspace-app-zone--records:has(> .workspace-app-calendar.is-context-open)),
+.workspace-app-view[data-calendar-focused="true"] .workspace-app-zone--records > :not(.workspace-app-calendar.is-context-open) { display: none; }
+.workspace-app-view[data-calendar-focused="true"] :is(.workspace-app-zone--records, .workspace-app-zone--records > .workspace-app-calendar) { margin-top: 0; border-top: 0; }
+
+.workspace-app-calendar {
+  --calendar-line: var(--app-hairline);
+  --calendar-attention: #89600c;
+  --calendar-active: #4b5d71;
+  --calendar-success: #287757;
+  container: campaign-calendar / inline-size;
+  min-width: 0; margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--calendar-line);
+  color: var(--text-default); font-variant-numeric: tabular-nums;
+}
+html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62; --calendar-active: #b0bdce; --calendar-success: #87c9a7; }
+.workspace-app-calendar__brand-defs { position: absolute; pointer-events: none; }
+.workspace-app-calendar svg.integration-logo[data-integration-brand="instagram"], .workspace-app-calendar__date-dots svg[data-integration-brand="instagram"] { fill: var(--calendar-instagram-fill); }
+.workspace-app-calendar.is-context-open { margin-top: 0; padding-top: 0; border-top: 0; }
+.workspace-app-calendar > [data-testid] { display: grid; gap: 24px; min-width: 0; }
+.workspace-app-calendar :is(button, a) { -webkit-tap-highlight-color: transparent; }
+.workspace-app-calendar :is(button, a, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.workspace-app-calendar button { font-family: inherit; }
+.workspace-app-calendar__back, .workspace-app-calendar__month button, .workspace-app-calendar__day-close, .workspace-app-calendar__more, .workspace-app-calendar__load-more { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; cursor: pointer; }
+.workspace-app-calendar__back { justify-self: start; min-height: 34px; padding: 0 14px 0 10px; border-radius: 999px; background: var(--app-card-fill); color: var(--text-default); font-size: 13px; font-weight: 550; }
+.workspace-app-calendar__back:hover { background: var(--app-card-fill-hover); }
+.workspace-app-calendar__back:hover, .workspace-app-calendar__more:hover, .workspace-app-calendar__load-more:hover { color: var(--text-strong); }
+.workspace-app-calendar__collection-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+.workspace-app-calendar__collection-heading h3 { margin: 0; color: var(--text-strong); font-size: 17px; font-weight: 650; line-height: 1.35; }
+.workspace-app-calendar__collection-heading h3 small { margin-left: 6px; color: var(--text-muted); font-size: 13px; font-weight: 500; }
+.workspace-app-calendar__timezone { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+/* A campaign is a cover card like the App's songs and videos: a cover in the
+   campaign's own colours with its progress in large type and only what went
+   wrong on top, then the name and one quiet line of detail under it. */
+.workspace-app-calendar__contexts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); gap: 26px 18px; }
+.workspace-app-calendar__context { display: flex; flex-direction: column; gap: 12px; width: 100%; min-width: 0; padding: 0; border: 0; background: none; color: inherit; text-align: start; cursor: pointer; }
+.workspace-app-calendar__cover {
+  position: relative; isolation: isolate; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 12px;
+  aspect-ratio: 5 / 4; padding: 16px; border-radius: calc(18px * var(--app-radius-scale, 1)); color: white;
+  background:
+    radial-gradient(90% 80% at 85% 10%, hsl(var(--campaign-accent) 80% 66% / 85%), transparent 62%),
+    radial-gradient(110% 100% at 0% 100%, hsl(var(--campaign-hue) 70% 30%), transparent 75%),
+    linear-gradient(150deg, hsl(var(--campaign-hue) 55% 46%), hsl(var(--campaign-accent) 45% 18%));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 12px 28px -18px rgb(0 0 0 / 55%);
+}
+/* Slow light lines across the cover, echoing the hero's wave. */
+.workspace-app-calendar__cover::before {
+  content: ""; position: absolute; z-index: -1; inset: -40% -10%;
+  background: repeating-radial-gradient(ellipse 120% 60% at 30% 120%, transparent 0 14px, rgb(255 255 255 / 9%) 14px 15px);
+  transition: transform .8s cubic-bezier(.2, .8, .2, 1);
+}
+.workspace-app-calendar__cover::after { content: ""; position: absolute; z-index: -1; inset: 0; background: linear-gradient(180deg, transparent 35%, rgb(0 0 0 / 38%)); }
+.workspace-app-calendar__context:is(:hover, :focus-visible) .workspace-app-calendar__cover::before { transform: translateY(-6%) scale(1.04); }
+.workspace-app-calendar__cover-figure { display: grid; gap: 2px; }
+.workspace-app-calendar__cover-figure small { color: rgb(255 255 255 / 80%); font-size: 12px; font-weight: 500; }
+.workspace-app-calendar__cover-figure strong { font-size: clamp(30px, 9cqi, 40px); font-weight: 700; letter-spacing: -.04em; line-height: 1; }
+.workspace-app-calendar__cover progress { appearance: none; width: 100%; height: 4px; overflow: hidden; border: 0; border-radius: 999px; background: rgb(255 255 255 / 28%); }
+.workspace-app-calendar__cover progress::-webkit-progress-bar { border-radius: 999px; background: rgb(255 255 255 / 28%); }
+.workspace-app-calendar__cover progress::-webkit-progress-value { border-radius: 999px; background: white; }
+.workspace-app-calendar__cover progress::-moz-progress-bar { border-radius: 999px; background: white; }
+.workspace-app-calendar__cover-flags { position: absolute; top: 14px; left: 14px; right: 56px; display: flex; flex-wrap: wrap; gap: 6px; }
+.workspace-app-calendar__cover-open { position: absolute; top: 12px; right: 12px; box-sizing: content-box; padding: 9px; border-radius: 50%; background: rgb(255 255 255 / 92%); color: #1d1d1f; transition: transform .2s ease; }
+.workspace-app-calendar__context:hover .workspace-app-calendar__cover-open { transform: translateX(2px); }
+.workspace-app-calendar__cover > :is(.workspace-app-calendar__loading, .workspace-app-calendar__empty) { padding: 0; color: rgb(255 255 255 / 85%); }
+.workspace-app-calendar__context-copy { display: grid; gap: 3px; min-width: 0; padding: 0 2px; }
+.workspace-app-calendar__context-copy > strong { overflow: hidden; color: var(--text-strong); font-size: 15px; font-weight: 650; letter-spacing: -.015em; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-calendar__context-fields { display: flex; flex-wrap: wrap; gap: 6px 20px; min-width: 0; color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+.workspace-app-calendar__context-copy > .workspace-app-calendar__context-fields { gap: 0 12px; font-size: 12px; line-height: 1.5; }
+.workspace-app-calendar__context-fields > span { display: inline-flex; flex-wrap: wrap; gap: 0 5px; }
+.workspace-app-calendar__context-fields small { font-size: inherit; }
+.workspace-app-calendar__context-fields time { color: var(--text-default); }
+.workspace-app-calendar__context-status { display: flex; flex-wrap: wrap; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.workspace-app-calendar__context-status > span { white-space: nowrap; }
+.workspace-app-calendar__context-status > span:not(:last-child)::after { content: "·"; margin: 0 6px; }
+.workspace-app-calendar__completion { display: grid; gap: 8px; min-width: 115px; color: var(--text-default); font-size: 13px; }
+.workspace-app-calendar__completion > span { display: flex; align-items: center; gap: 5px; }
+.workspace-app-calendar__completion strong { font-weight: 650; white-space: nowrap; }
+/* Stage counts read as quiet pills, like the App's scheduled-action chips. */
+.workspace-app-calendar__stage-counts { display: contents; color: var(--text-muted); font-size: 12px; }
+.workspace-app-calendar :is(.workspace-app-calendar__stage-counts > *, .workspace-app-calendar__cover-flags > *, .workspace-app-calendar__attention) { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 0 10px 0 8px; border-radius: 999px; background: var(--surface-panel); font-size: 12px; white-space: nowrap; }
+.workspace-app-calendar :is(.workspace-app-calendar__stage-counts > *, .workspace-app-calendar__cover-flags > *, .workspace-app-calendar__attention).is-jump { border: 0; font-family: inherit; line-height: inherit; cursor: pointer; }
+.workspace-app-calendar :is(.workspace-app-calendar__stage-counts > *, .workspace-app-calendar__attention).is-jump:hover { background: var(--surface-panel); box-shadow: 0 1px 3px rgb(0 0 0 / 18%); }
+/* The white chips on the dark cover and banner keep light-theme ink in either theme. */
+.workspace-app-calendar :is(.workspace-app-calendar__cover-flags > *, .workspace-app-calendar__heading .workspace-app-calendar__stage-counts > *, .workspace-app-calendar__heading .workspace-app-calendar__attention) {
+  --text-muted: #6e6e73; --calendar-attention: #89600c; --calendar-active: #4b5d71; --calendar-success: #287757; --chip-danger-fg: #b42318; --surface-panel: #fff;
+  background: rgb(255 255 255 / 92%); color: var(--text-muted);
+}
+.workspace-app-calendar :is(.workspace-app-calendar__cover-flags, .workspace-app-calendar__heading) .workspace-app-calendar__attention { color: var(--calendar-attention); }
+.workspace-app-calendar :is(.workspace-app-calendar__stage-counts, .workspace-app-calendar__cover-flags) > .is-error { color: var(--chip-danger-fg); font-weight: 600; }
+.workspace-app-calendar__attention { color: var(--calendar-attention); font-weight: 600; }
+.workspace-app-calendar__cover-flags > * { min-height: 24px; font-size: 11.5px; }
+.workspace-app-calendar__cover-flags > .workspace-app-calendar__attention { color: #89600c; }
+.workspace-app-calendar__next { display: flex; flex-wrap: nowrap; align-items: baseline; gap: 0 5px; min-width: 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.workspace-app-calendar__next > :not(small) { flex: none; }
+.workspace-app-calendar__next time { color: var(--text-default); }
+.workspace-app-calendar__next small { min-width: 0; overflow: hidden; color: var(--text-default); font-size: inherit; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-calendar__next small::before { content: "· "; color: var(--text-muted); }
+
+.workspace-app-calendar__heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 18px 24px; }
+/* The open campaign's banner: the Featured hero's dark stage, lit in the campaign's own colours. */
+.workspace-app-calendar__heading {
+  position: relative; isolation: isolate; overflow: hidden; padding: clamp(22px, 3.4cqi, 36px); border-radius: calc(22px * var(--app-radius-scale, 1)); color: white;
+  background:
+    radial-gradient(70% 120% at 100% 0%, hsl(var(--campaign-accent) 75% 55% / 55%), transparent 60%),
+    radial-gradient(60% 110% at 70% 120%, hsl(var(--campaign-hue) 70% 45% / 45%), transparent 65%),
+    #0b0b0d;
+}
+.workspace-app-calendar__heading::before {
+  content: ""; position: absolute; z-index: -1; inset: -30% -10% -30% 30%;
+  background: repeating-radial-gradient(ellipse 130% 55% at 20% 130%, transparent 0 16px, rgb(255 255 255 / 7%) 16px 17px);
+}
+.workspace-app-calendar__heading :is(.workspace-app-calendar__context-fields, .workspace-app-calendar__timezone) { color: rgb(255 255 255 / 66%); }
+.workspace-app-calendar__heading .workspace-app-calendar__context-fields time { color: white; }
+.workspace-app-calendar__heading .workspace-app-calendar__completion { color: white; }
+.workspace-app-calendar__heading .workspace-app-calendar__status-icon.is-neutral { color: rgb(255 255 255 / 70%); }
+.workspace-app-calendar__heading-copy { display: grid; gap: 12px; min-width: 0; }
+.workspace-app-calendar__heading h3 { margin: 0; color: white; font-size: clamp(27px, 3.2cqi, 38px); font-weight: 650; letter-spacing: -.035em; line-height: 1.16; overflow-wrap: anywhere; }
+.workspace-app-calendar__metadata { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 18px; }
+.workspace-app-calendar__plan-links { grid-column: 2; grid-row: 1 / 3; min-width: 140px; max-width: 230px; }
+.workspace-app-calendar__plan-links .workspace-app-data__block, .workspace-app-calendar__plan-links .workspace-app-data__record { padding: 0; border: 0; }
+.workspace-app-calendar__plan-links .workspace-app-data__item { min-height: 36px; gap: 8px; padding: 0 16px; border-radius: 999px; background: white; color: #1d1d1f; }
+.workspace-app-calendar__plan-links .workspace-app-data__item :is(strong, svg) { color: inherit; }
+.workspace-app-calendar__plan-links .workspace-app-data__item strong { font-weight: 500; }
+.workspace-app-calendar__context-details { color: var(--text-muted); font-size: 13px; }
+.workspace-app-calendar__context-details:empty { display: none; }
+.workspace-app-calendar__summary { grid-column: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 6px; padding-bottom: 4px; }
+.workspace-app-calendar__summary > .workspace-app-calendar__completion { margin-right: 8px; }
+.workspace-app-calendar__summary .workspace-app-calendar__completion { font-size: 14px; }
+.workspace-app-calendar__summary .workspace-app-calendar__completion { min-width: 0; }
+.workspace-app-calendar__summary progress { display: none; }
+.workspace-app-calendar__summary .workspace-app-calendar__attention { font-weight: 600; }
+.workspace-app-calendar__layout { display: grid; min-width: 0; gap: 28px; align-items: start; }
+.workspace-app-calendar__month-area { min-width: 0; padding: 14px 16px 16px; border-radius: calc(22px * var(--app-radius-scale, 1)); background: var(--app-card-fill); }
+.workspace-app-calendar__month { display: grid; grid-template-columns: minmax(0, 1fr) 32px 32px; align-items: center; gap: 6px; min-height: 44px; margin-bottom: 10px; }
+.workspace-app-calendar__month h4 { grid-row: 1; grid-column: 1; padding-left: 4px; }
+.workspace-app-calendar__month button:last-child { grid-column: 3; }
+.workspace-app-calendar__month h4 { margin: 0; color: var(--text-strong); font-size: 19px; font-weight: 650; letter-spacing: -.025em; line-height: 1.3; }
+.workspace-app-calendar__month button { justify-content: center; width: 32px; min-height: 32px; border-radius: 50%; background: var(--surface-panel); color: var(--text-strong); }
+.workspace-app-calendar__month button:hover { background: var(--text-strong); color: var(--surface-panel); }
+.workspace-app-calendar__weekdays, .workspace-app-calendar__grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); min-width: 0; }
+.workspace-app-calendar__weekdays span { padding: 0 6px 8px; color: var(--text-muted); font-size: 12px; text-align: center; }
+/* A week without posts stays short, so the campaign's own weeks are in view. */
+.workspace-app-calendar__grid { grid-auto-rows: minmax(52px, auto); gap: 4px; }
+.workspace-app-calendar__cell.has-items { min-height: 96px; }
+.workspace-app-calendar__cell { position: relative; display: flex; flex-direction: column; min-width: 0; padding: 6px 5px; border-radius: calc(12px * var(--app-radius-scale, 1)); container: calendar-cell / inline-size; }
+/* Only a day with posts is a tile; empty days stay quiet on the month card. */
+.workspace-app-calendar__cell.has-items { background: var(--surface-panel); box-shadow: 0 1px 2px rgb(0 0 0 / 5%); }
+html[data-theme="dark"] .workspace-app-calendar__cell.has-items { background: var(--app-card-fill-hover); }
+.workspace-app-calendar__cell:not(.has-items) .workspace-app-calendar__date { color: var(--text-muted); }
+.workspace-app-calendar__cell.is-selected { z-index: 1; outline: 2px solid var(--text-strong); outline-offset: -2px; }
+.workspace-app-calendar__date { display: flex; flex-direction: column; flex: none; align-items: flex-start; justify-content: center; gap: 4px; width: 100%; min-width: 0; min-height: 32px; padding: 2px 3px; border: 0; background: transparent; color: var(--text-default); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-calendar__date-number { display: inline-grid; place-items: center; min-width: 22px; height: 22px; border-radius: 999px; font-weight: 550; }
+.workspace-app-calendar__cell.is-selected .workspace-app-calendar__date-number { background: var(--text-strong); color: var(--surface-panel); }
+.workspace-app-calendar__date-dots { display: none; flex-wrap: wrap; gap: 3px; max-width: 100%; }
+.workspace-app-calendar__date-dots svg { flex: none; width: 5px; height: 5px; fill: currentColor; }
+html[data-theme="dark"] .workspace-app-calendar__date-dots svg:not([data-integration-brand="instagram"]) { fill: color-mix(in srgb, currentColor 65%, var(--text-strong)); }
+.workspace-app-calendar__cell.is-outside .workspace-app-calendar__date { color: var(--text-faint); }
+.workspace-app-calendar__previews { display: grid; align-content: start; min-width: 0; margin-top: 2px; }
+.workspace-app-calendar__event { display: grid; grid-template-columns: 12px max-content minmax(0, 1fr); align-items: center; gap: 3px; min-width: 0; min-height: 19px; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; font-size: 10.5px; line-height: 17px; text-align: start; cursor: pointer; }
+.workspace-app-calendar__event time { font-size: 10px; white-space: nowrap; }
+.workspace-app-calendar__event > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-calendar__event .workspace-app-calendar__status-icon { width: 11px; height: 11px; }
+/* A narrow day cell keeps the time and status; the full label stays in the button's title and accessible name. */
+@container calendar-cell (max-width: 119px) {
+  .workspace-app-calendar__event > span:last-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+.workspace-app-calendar__event { min-height: 22px; margin-top: 2px; padding: 0 6px 0 4px; border-radius: calc(7px * var(--app-radius-scale, 1)); background: var(--app-card-fill); color: var(--text-default); font-size: 11.5px; line-height: 22px; }
+.workspace-app-calendar__event time { font-size: 11px; font-weight: 600; }
+.workspace-app-calendar__event:hover { background: var(--app-card-fill-hover); color: var(--text-strong); }
+.workspace-app-calendar__event.is-attention { color: var(--calendar-attention); }
+.workspace-app-calendar__event.is-error { color: var(--chip-danger-fg); }
+.workspace-app-calendar__event.is-attention { background: color-mix(in srgb, var(--calendar-attention) 11%, var(--surface-panel)); }
+.workspace-app-calendar__event.is-error { background: color-mix(in srgb, var(--chip-danger-fg) 10%, var(--surface-panel)); }
+.workspace-app-calendar__more { justify-self: start; min-height: 18px; font-size: 11px; line-height: 18px; }
+.workspace-app-calendar__day-issue { display: flex; align-items: center; gap: 5px; color: var(--calendar-attention); font-size: 10px; line-height: 16px; white-space: nowrap; }
+.workspace-app-calendar__mobile-day-preview { display: none; }
+
+.workspace-app-calendar__day-panel { min-width: 0; padding: 18px 18px 6px; border-radius: calc(22px * var(--app-radius-scale, 1)); background: var(--app-card-fill); }
+.workspace-app-calendar__day-panel:focus { outline: none; }
+.workspace-app-calendar__day-panel > header { display: grid; grid-template-columns: minmax(0, 1fr) 32px; align-items: start; gap: 10px; padding: 0 0 14px; border-bottom: 1px solid var(--calendar-line); }
+.workspace-app-calendar__day-panel h4 { margin: 0; color: var(--text-strong); font-size: 20px; font-weight: 650; letter-spacing: -.025em; line-height: 1.35; }
+.workspace-app-calendar__day-panel header p { margin: 7px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.workspace-app-calendar__day-close { justify-content: center; width: 32px; min-height: 32px; border-radius: 50%; background: var(--surface-panel); }
+.workspace-app-calendar__day-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.workspace-app-calendar__day-item { position: relative; min-width: 0; border-bottom: 1px solid var(--calendar-line); }
+.workspace-app-calendar__day-item:last-child { border-bottom: 0; }
+.workspace-app-calendar__day-item.is-error::before { content: ""; position: absolute; top: 18px; bottom: 18px; left: -10px; width: 2px; border-radius: calc(1px * var(--app-radius-scale, 1)); background: var(--chip-danger-fg); }
+.workspace-app-calendar__item-heading { display: grid; grid-template-columns: 44px 22px minmax(0, 1fr) 16px; align-items: start; gap: 12px; width: 100%; min-width: 0; min-height: 83px; padding: 18px 0; border: 0; background: transparent; color: var(--text-default); font: inherit; text-align: start; cursor: pointer; }
+.workspace-app-calendar__item-heading:hover { color: var(--text-strong); }
+.workspace-app-calendar__item-heading > time { padding-top: 1px; color: var(--text-default); font-size: 13px; line-height: 1.5; white-space: nowrap; }
+.workspace-app-calendar__brand { display: inline-flex; align-items: center; justify-content: center; padding-top: 1px; color: var(--text-default); }
+.workspace-app-calendar__item-copy { display: grid; gap: 4px; min-width: 0; }
+.workspace-app-calendar__item-copy strong { color: var(--text-strong); font-size: 15px; font-weight: 500; line-height: 1.4; overflow-wrap: anywhere; }
+.workspace-app-calendar__provider { color: var(--text-muted); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.workspace-app-calendar__status { display: inline-flex; align-items: center; justify-self: start; gap: 7px; max-width: 100%; min-height: 22px; color: var(--text-muted); font-size: 12px; font-weight: 500; line-height: 1.5; }
+.workspace-app-calendar__status.is-error { font-weight: 650; }
+.workspace-app-calendar__status > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.workspace-app-calendar__status-icon { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 14px; height: 14px; color: var(--text-muted); }
+.workspace-app-calendar__status-icon svg { width: 100%; height: 100%; stroke-width: 1.8; }
+.workspace-app-calendar__status .workspace-app-calendar__status-icon { width: 15px; height: 15px; }
+.workspace-app-calendar :is(.workspace-app-calendar__status, .workspace-app-calendar__status-icon).is-published { color: var(--calendar-success); }
+.workspace-app-calendar :is(.workspace-app-calendar__status, .workspace-app-calendar__status-icon):is(.is-processing, .is-ready) { color: var(--calendar-active); }
+.workspace-app-calendar :is(.workspace-app-calendar__status, .workspace-app-calendar__status-icon).is-attention { color: var(--calendar-attention); }
+.workspace-app-calendar :is(.workspace-app-calendar__status, .workspace-app-calendar__status-icon).is-error { color: var(--chip-danger-fg); }
+.workspace-app-calendar .workspace-app-calendar__status-icon:is(.is-published, .is-error) { border-radius: 50%; background: var(--calendar-success); color: var(--surface-panel); }
+.workspace-app-calendar .workspace-app-calendar__status-icon.is-error { background: var(--chip-danger-fg); }
+.workspace-app-calendar__status-icon:is(.is-published, .is-error) svg { width: 72%; height: 72%; stroke-width: 2.4; }
+.workspace-app-calendar__spinner { width: 100%; height: 100%; box-sizing: border-box; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; }
+.workspace-app-calendar__item-chevron { margin-top: 3px; color: var(--text-faint); }
+/* A post waiting on the person carries its answer on the row, under its title. */
+.workspace-app-calendar__item-response { display: flex; margin: -6px 0 16px 90px; }
+.workspace-app-calendar__item-response:empty { display: none; }
+.workspace-app-calendar__day-item.is-expanded { margin-inline: -10px; padding-inline: 10px; border-radius: calc(14px * var(--app-radius-scale, 1)); background: var(--surface-panel); }
+.workspace-app-calendar__day-item.is-expanded .workspace-app-calendar__item-chevron { transform: rotate(180deg); color: var(--text-default); }
+.workspace-app-calendar__item-details { display: grid; gap: 14px; min-width: 0; margin: 0 0 18px 78px; padding: 16px 8px 0 0; border-top: 1px solid var(--calendar-line); }
+.workspace-app-calendar__item-details .workspace-app-data__progress-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; font-size: 12px; }
+.workspace-app-calendar__item-details .workspace-app-data__progress-fields > span { display: block; min-width: 0; overflow-wrap: anywhere; }
+.workspace-app-calendar__item-details .workspace-app-data__progress-fields b { display: block; margin-bottom: 4px; color: var(--text-muted); font-weight: 400; }
+.workspace-app-calendar__item-details .workspace-app-data__execution, .workspace-app-calendar__item-details .workspace-app-data__execution-disclosure { font-size: 12px; }
+.workspace-app-calendar__item-metrics { display: grid; gap: 8px; margin: -8px 16px 16px 78px; }
+.workspace-app-calendar__item-metrics .workspace-app-data__metrics { display: flex; flex-wrap: wrap; gap: 4px 8px; }
+.workspace-app-calendar__item-metrics .workspace-app-data__metric { display: block; }
+.workspace-app-calendar__item-metrics .workspace-app-data__metric-copy { display: flex; flex-direction: row-reverse; align-items: baseline; gap: 5px; }
+.workspace-app-calendar__item-metrics .workspace-app-data__metric-copy > strong { font-size: 13px; font-weight: 600; line-height: 1.5; }
+.workspace-app-calendar__item-metrics .workspace-app-data__metric-copy > small { font-size: 11px; }
+.workspace-app-calendar__publication-details { display: grid; gap: 12px; min-width: 0; }
+.workspace-app-calendar__publication-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; color: var(--text-muted); font-size: 11px; }
+.workspace-app-calendar__publication-link.workspace-app-data__item { display: inline-flex; gap: 6px; padding: 0; font-size: 12px; }
+.workspace-app-calendar__publication-details .workspace-app-data__statistics { gap: 8px; }
+.workspace-app-calendar__publication-details .workspace-app-data__metrics { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.workspace-app-calendar__publication-details .workspace-app-data__metrics:empty { display: none; }
+.workspace-app-calendar__publication-details .workspace-app-data__metric-copy { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.workspace-app-calendar__publication-details .workspace-app-data__metric-copy > small { font-size: 11px; }
+.workspace-app-calendar__publication-details .workspace-app-data__stale { padding: 0; background: none; font-size: inherit; }
+.workspace-app-calendar__schedule-notes { margin-top: 16px; }
+.workspace-app-calendar__schedule-notes .workspace-app-calendar__context-fields { font-size: 12px; }
+.workspace-app-calendar__schedule-notes time { color: inherit; }
+
+.workspace-app-calendar__supplementary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 10px; }
+.workspace-app-calendar__group { min-width: 0; padding: 0 18px; border-radius: calc(18px * var(--app-radius-scale, 1)); background: var(--app-card-fill); }
+.workspace-app-calendar__group:not([open]):hover { background: var(--app-card-fill-hover); }
+.workspace-app-calendar__group > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; color: var(--text-default); font-size: 14px; font-weight: 550; cursor: pointer; list-style: none; }
+.workspace-app-calendar__group > summary::-webkit-details-marker { display: none; }
+.workspace-app-calendar__group[open] { grid-column: 1 / -1; }
+.workspace-app-calendar__group[open] > summary > svg { transform: rotate(180deg); }
+.workspace-app-calendar__group-body { display: grid; gap: 16px; padding: 0 0 18px; }
+.workspace-app-calendar__group .workspace-app-data__block { padding: 0; border: 0; }
+.workspace-app-calendar__group .workspace-app-data__record { gap: 12px; padding: 14px 0; }
+.workspace-app-calendar__group .workspace-app-data__record:has(.workspace-app-data__record-media) { grid-template-columns: minmax(0, 96px) minmax(0, 1fr); column-gap: 14px; }
+.workspace-app-calendar__group .workspace-app-data__record-media { grid-template-columns: minmax(0, 96px); }
+.workspace-app-calendar__group .workspace-app-data__record-media-item { max-width: 96px; }
+.workspace-app-calendar__empty, .workspace-app-calendar__error, .workspace-app-calendar__loading, .workspace-app-calendar__undated { margin: 0; color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+.workspace-app-calendar__error { color: var(--chip-danger-fg); }
+.workspace-app-calendar__empty { padding: 16px 0; }
+.workspace-app-calendar__load-more { font-size: 13px; }
+
+@container campaign-calendar (min-width: 960px) {
+  .workspace-app-calendar.is-day-open .workspace-app-calendar__layout { grid-template-columns: minmax(0, 1.7fr) minmax(340px, 1fr); }
+}
+@container campaign-calendar (min-width: 640px) and (max-width: 959px) {
+  .workspace-app-calendar__day-panel .workspace-app-calendar__item-copy strong { font-size: 16px; }
+}
+@container campaign-calendar (max-width: 639px) {
+  .workspace-app-calendar__cover { aspect-ratio: 16 / 9; }
+  .workspace-app-calendar > [data-testid] { gap: 20px; }
+  .workspace-app-calendar :is(.workspace-app-calendar__stage-counts > *, .workspace-app-calendar__attention) { gap: 4px; min-height: 24px; padding: 0 8px 0 6px; font-size: 11px; }
+  .workspace-app-calendar__heading { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .workspace-app-calendar__heading h3 { font-size: 27px; line-height: 1.2; }
+  .workspace-app-calendar__metadata { gap: 8px; }
+  .workspace-app-calendar__metadata .workspace-app-calendar__context-fields { gap: 4px 14px; font-size: 12px; }
+  .workspace-app-calendar__plan-links { grid-column: 1; grid-row: 3; justify-self: start; max-width: none; min-width: 0; }
+  .workspace-app-calendar__plan-links .workspace-app-data__item { min-height: 28px; }
+  .workspace-app-calendar__summary { grid-row: 2; gap: 8px 12px; padding-bottom: 0; }
+  .workspace-app-calendar__summary .workspace-app-calendar__completion { order: 0; }
+  .workspace-app-calendar__summary .workspace-app-calendar__attention { order: 1; }
+  .workspace-app-calendar__month-area { padding: 12px 10px 14px; }
+  .workspace-app-calendar__month { margin-bottom: 8px; }
+  .workspace-app-calendar__month h4 { font-size: 17px; }
+  .workspace-app-calendar__weekdays span { padding: 0 0 10px; font-size: 11px; }
+  .workspace-app-calendar__grid { grid-auto-rows: minmax(54px, auto); gap: 0; }
+  .workspace-app-calendar__cell, .workspace-app-calendar__cell.has-items { min-height: 0; padding: 0; background: transparent; box-shadow: none; }
+  .workspace-app-calendar__cell.is-selected { outline: none; background: transparent; }
+  .workspace-app-calendar__date { align-items: center; justify-content: flex-start; gap: 4px; width: 100%; min-height: 54px; padding: 0 0 6px; font-size: 15px; text-align: center; }
+  .workspace-app-calendar__date-number { width: 32px; height: 32px; border-radius: 50%; }
+  .workspace-app-calendar__cell.is-selected .workspace-app-calendar__date-number { background: var(--text-strong); color: var(--surface-panel); font-weight: 600; }
+  .workspace-app-calendar__date-dots { display: flex; justify-content: center; gap: 1px; max-width: 32px; }
+  .workspace-app-calendar__date-dots svg { width: 4px; height: 4px; }
+  .workspace-app-calendar__previews { display: none; }
+  .workspace-app-calendar__mobile-day-preview { display: block; margin-top: 20px; }
+  .workspace-app-calendar__mobile-day-preview > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .workspace-app-calendar__mobile-day-preview h4 { margin: 0; color: var(--text-strong); font-size: 20px; font-weight: 650; letter-spacing: -.025em; }
+  .workspace-app-calendar__mobile-day-preview header button { display: inline-flex; align-items: center; gap: 3px; min-height: 44px; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; font-size: 12px; cursor: pointer; }
+  .workspace-app-calendar__mobile-day-preview header button[aria-expanded="true"] svg { transform: rotate(180deg); }
+  .workspace-app-calendar__mobile-day-preview > p { margin: 2px 0 12px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+  .workspace-app-calendar__mobile-day-preview .workspace-app-calendar__day-list { padding: 0 12px; border-radius: calc(16px * var(--app-radius-scale, 1)); background: var(--surface-panel); }
+  .workspace-app-calendar__mobile-day-preview .workspace-app-calendar__more { width: 100%; min-height: 44px; margin-top: 6px; font-size: 13px; }
+  .workspace-app-calendar__item-heading { grid-template-columns: 40px 20px minmax(0, 1fr) 12px; gap: 9px; padding: 16px 0; min-height: 80px; }
+  .workspace-app-calendar__item-copy strong { font-size: 14px; }
+  .workspace-app-calendar__provider { font-size: 10px; }
+  .workspace-app-calendar__brand svg { width: 20px; height: 20px; }
+  .workspace-app-calendar__item-chevron { width: 12px; }
+  .workspace-app-calendar__item-details { margin-left: 0; padding: 14px 10px 0; }
+  .workspace-app-calendar__item-response { margin-left: 78px; }
+  .workspace-app-calendar__item-metrics { margin-left: 78px; margin-right: 0; }
+  .workspace-app-calendar__day-panel h4 { font-size: 25px; }
+  .workspace-app-calendar__day-panel > header { min-height: 78px; }
+  .workspace-app-calendar__schedule-notes { margin-top: 20px; }
+  .workspace-app-calendar__schedule-notes .workspace-app-calendar__context-fields { font-size: 11px; }
+  .workspace-app-calendar__supplementary { grid-template-columns: minmax(0, 1fr); }
+  .workspace-app-calendar__group > summary { min-height: 56px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .workspace-app-calendar :is(button, a) { transition: color .15s ease, background-color .15s ease; }
+  .workspace-app-calendar__spinner { animation: workspace-app-calendar-spin .85s linear infinite; }
+}
+@keyframes workspace-app-calendar-spin { to { transform: rotate(360deg); } }
+
+/* One being prepared, before it exists: a campaign card whose cover shows how far it is. */
+.workspace-app-calendar__context[data-making] .workspace-app-calendar__cover { align-items: center; justify-content: center; }
+.workspace-app-calendar__context[data-making]:disabled { cursor: default; }

@@ -13,7 +13,7 @@ import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Textarea from "../ui/Textarea";
 import Checkbox from "../ui/Checkbox";
-import { api, type BlueprintDetail } from "../../lib/api";
+import { api, type BlueprintDetail, type ExportBlueprintPayloadRequest } from "../../lib/api";
 import {
   formatBlueprintVariableValue,
   parseBlueprintVariableValue,
@@ -234,7 +234,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
 
   useEffect(() => {
     if (!open || existingBlueprintInitialized || !existingBlueprintQuery.isSuccess) return;
-    const existing = existingBlueprintQuery.data;
+    let existing = existingBlueprintQuery.data;
     if (existing) {
       setTitle(existing.title);
       setSlug(existing.slug);
@@ -264,34 +264,42 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
     open,
   ]);
 
+  const exportOptions = (): ExportBlueprintPayloadRequest => {
+    const includeKnowledgeBodies = (
+      !!includes.include_memory_files
+      && selectedKnowledgeDocumentIds.length > 0
+    );
+    return {
+      ...includes,
+      title,
+      summary: summary || undefined,
+      description: description || undefined,
+      usage_guide: usageGuide.trim(),
+      tags: tagsInput.split(",").map((t) => t.trim()).filter(Boolean),
+      author_handle: authorHandle || undefined,
+      install_variables: personalizationFields.map(serializePersonalizationField),
+      include_memory_files: includeKnowledgeBodies,
+      knowledge_pack_mode: includeKnowledgeBodies ? "inline_text" : "skeleton",
+      knowledge_document_ids: includeKnowledgeBodies
+        ? selectedKnowledgeDocumentIds
+        : [],
+    };
+  };
+
   const exportMutation = useMutation({
-    mutationFn: () => {
-      const includeKnowledgeBodies = (
-        !!includes.include_memory_files
-        && selectedKnowledgeDocumentIds.length > 0
-      );
-      return api.workspaces.exportBlueprint(workspaceId, {
-        ...includes,
-        slug,
-        title,
-        summary: summary || undefined,
-        description: description || undefined,
-        usage_guide: usageGuide.trim(),
-        tags: tagsInput.split(",").map((t) => t.trim()).filter(Boolean),
-        author_handle: authorHandle || undefined,
-        marketplace_blueprint_id: existingBlueprintQuery.data?.id,
-        install_variables: personalizationFields.map(serializePersonalizationField),
-        include_memory_files: includeKnowledgeBodies,
-        knowledge_pack_mode: includeKnowledgeBodies ? "inline_text" : "skeleton",
-        knowledge_document_ids: includeKnowledgeBodies
-          ? selectedKnowledgeDocumentIds
-          : [],
-        replace_existing: replaceExisting,
-      });
-    },
+    mutationFn: () => api.workspaces.exportBlueprint(workspaceId, {
+      ...exportOptions(),
+      slug,
+      title,
+      marketplace_blueprint_id: existingBlueprintQuery.data?.id,
+      replace_existing: replaceExisting,
+    }),
     onSuccess: (bp) => {
       queryClient.invalidateQueries({ queryKey: ["blueprints"] });
-      toast.success(t("component.export_blueprint_modal.blueprint_draft_created"));
+      queryClient.invalidateQueries({ queryKey: ["blueprint", bp.id] });
+      toast.success(updatesLiveBlueprint
+        ? t("component.export_blueprint_modal.new_version_saved")
+        : t("component.export_blueprint_modal.blueprint_draft_created"));
       onClose();
       handleExportedBlueprint(bp);
     },
@@ -300,6 +308,25 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
     },
   });
 
+  // A file to install elsewhere, carrying the pictures and Skill files the App uses.
+  const packageMutation = useMutation({
+    mutationFn: () => api.workspaces.exportBlueprintPackage(workspaceId, exportOptions()),
+    onSuccess: ({ blob, filename }) => {
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(href);
+    },
+    onError: (e: Error) => {
+      toast.error(`Export failed: ${e.message}`);
+    },
+  });
+
+  // Re-exporting a live Blueprint saves its next version for review; the
+  // published release keeps serving installs until the update is approved.
+  const updatesLiveBlueprint = existingBlueprintQuery.data?.status === "published";
   const slugValid = /^[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]$/.test(slug);
   const personalizationKeys = personalizationFields.map((field) => field.key.trim());
   const personalizationValid = personalizationFields.every((field) => (
@@ -341,18 +368,34 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
         <>
           <Button variant="outline" onClick={onClose}>{t("action.cancel")}</Button>
           <Button
+            variant="outline"
+            disabled={title.trim().length === 0 || knowledgeSelectionUnavailable || packageMutation.isPending}
+            loading={packageMutation.isPending}
+            onClick={() => packageMutation.mutate()}
+          >{t("component.export_blueprint_modal.download_package")}</Button>
+          <Button
             variant="primary"
             disabled={!canSubmit}
             loading={exportMutation.isPending}
             onClick={() => exportMutation.mutate()}
           >
-            {t("component.export_blueprint_modal.create_draft")}</Button>
+            {updatesLiveBlueprint
+              ? t("component.export_blueprint_modal.save_new_version")
+              : t("component.export_blueprint_modal.create_draft")}</Button>
         </>
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ background: "var(--surface-muted)", padding: 12, borderRadius: "var(--radius-control)", fontSize: 12, color: "var(--text-default)" }}>
           {t("component.export_blueprint_modal.a_blueprint_is_a_portable_json_document_secrets_runtim")}</div>
+
+        {updatesLiveBlueprint && (
+          <div role="note" style={{ padding: 12, borderRadius: "var(--radius-control)", background: "var(--surface-muted)", color: "var(--text-default)", fontSize: 12 }}>
+            {t("component.export_blueprint_modal.updates_live_blueprint", {
+              version: existingBlueprintQuery.data?.content_version ?? "",
+            })}
+          </div>
+        )}
 
         {existingBlueprintQuery.isError && (
           <div role="alert" style={{ padding: 10, borderRadius: "var(--radius-control)", background: "var(--surface-muted)", color: "var(--text-default)", fontSize: 12 }}>
@@ -380,6 +423,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
             label={t("component.export_blueprint_modal.slug_used_in_urls_when_sharing")}
             value={slug}
             onChange={(e) => setSlug(e.target.value)}
+            disabled={updatesLiveBlueprint}
             placeholder="x-growth-v1"
           />
           {!slugValid && slug.length > 0 && (

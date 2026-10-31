@@ -288,6 +288,8 @@ async def list_documents(
     file_size_min: int | None = None,
     file_size_max: int | None = None,
     include_generated_assets: bool = True,
+    media_kinds: Sequence[str] | None = None,
+    exclude_work_artifacts: bool = False,
     limit: int | None = 100, offset: int = 0,
     count_total: bool = True,
     sort_by: str = "date",
@@ -310,6 +312,8 @@ async def list_documents(
         file_size_min=file_size_min,
         file_size_max=file_size_max,
         include_generated_assets=include_generated_assets,
+        media_kinds=media_kinds,
+        exclude_work_artifacts=exclude_work_artifacts,
     )
     q = select(Document).where(*conditions)
     count_q = select(func.count()).select_from(Document).where(*conditions) if count_total else None
@@ -411,6 +415,28 @@ async def list_documents(
     return list(result.scalars().all()), count_result.scalar_one()
 
 
+#: Media kinds a listing can be narrowed to, by MIME type or file extension.
+MEDIA_KIND_EXTENSIONS = {
+    "audio": ("mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "opus", "wma", "aiff", "aif"),
+    "video": ("mp4", "mov", "webm", "mkv", "avi", "m4v"),
+    "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "heic", "avif"),
+}
+MEDIA_KINDS = (*MEDIA_KIND_EXTENSIONS, "document")
+
+
+def _media_kind_clause(kind: str):
+    """Documents of one media kind; "document" is everything that is not audio, video or an image."""
+    def of(media: str):
+        return or_(
+            Document.mime_type.ilike(f"{media}/%"),
+            func.lower(Document.file_type).in_(MEDIA_KIND_EXTENSIONS[media]),
+        )
+
+    if kind in MEDIA_KIND_EXTENSIONS:
+        return of(kind)
+    return not_(or_(*(of(media) for media in MEDIA_KIND_EXTENSIONS)))
+
+
 def _document_scope_conditions(
     entity_id: str, *,
     name_search: str | None = None,
@@ -426,6 +452,8 @@ def _document_scope_conditions(
     file_size_min: int | None = None,
     file_size_max: int | None = None,
     include_generated_assets: bool = True,
+    media_kinds: Sequence[str] | None = None,
+    exclude_work_artifacts: bool = False,
 ) -> list:
     """Shared WHERE clauses for the visible-document scope.
 
@@ -457,6 +485,15 @@ def _document_scope_conditions(
             ),
         )
         conditions.append(not_(generated_media))
+    kinds = {str(kind).strip().lower() for kind in (media_kinds or ()) if str(kind).strip()}
+    if kinds:
+        conditions.append(or_(*(_media_kind_clause(kind) for kind in sorted(kinds))))
+    if exclude_work_artifacts:
+        from packages.core.services.generated_artifact_service import WORK_ARTIFACT_ROLES
+
+        # Files made on the way to a result (QA frames, recipes, timelines); a file with no role stays.
+        role = func.lower(Document.metadata_["artifact"]["role"].astext)
+        conditions.append(or_(role.is_(None), role.not_in(sorted(WORK_ARTIFACT_ROLES))))
     if name_search:
         search = f"%{name_search}%"
         conditions.append(or_(

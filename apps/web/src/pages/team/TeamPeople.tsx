@@ -35,6 +35,7 @@ import {
   IconWrench,
 } from "../../components/icons";
 import { usePermission } from "../../lib/permissions";
+import { userAvatarImage } from "../../lib/userAvatar";
 import {
   Kind,
   KindFilter,
@@ -48,6 +49,7 @@ import {
   staffStatusLabel,
   summarizePermissions,
 } from "./shared";
+import { getPreferredTimeZone } from "../../lib/format";
 
 export default function TeamPeople() {
   const queryClient = useQueryClient();
@@ -114,8 +116,13 @@ export default function TeamPeople() {
   }, [teamUsage]);
 
   const updateStaffMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: StaffForm }) =>
-      api.staff.update(id, formToPayload(data)),
+    mutationFn: ({ id, data, initialRole }: { id: string; data: StaffForm; initialRole: string }) => {
+      const payload = formToPayload(data);
+      // The role is an authority change: only send it when it was changed here,
+      // never as a side effect of editing a phone number.
+      if (data.role === initialRole) delete payload.role;
+      return api.staff.update(id, payload);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["staff"] });
       queryClient.invalidateQueries({ queryKey: ["team-usage"] });
@@ -645,7 +652,11 @@ export default function TeamPeople() {
         }}
         onSave={() => {
           if (editStaff)
-            updateStaffMutation.mutate({ id: editStaff.id, data: editForm });
+            updateStaffMutation.mutate({
+              id: editStaff.id,
+              data: editForm,
+              initialRole: toForm(editStaff).role,
+            });
           else createVendorMutation.mutate(editForm);
         }}
         isSaving={
@@ -1517,7 +1528,7 @@ function StaffAvatar({
   size: number;
   iconSize: number;
 }) {
-  const src = (avatarUrl || "").trim();
+  const src = userAvatarImage(avatarUrl);
   const [brokenSrc, setBrokenSrc] = useState<string | null>(() =>
     src && brokenStaffAvatarUrls.has(src) ? src : null,
   );
@@ -1745,6 +1756,7 @@ function formatDateTime(value?: string | null): string {
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    timeZone: getPreferredTimeZone(),
   });
 }
 
@@ -1755,6 +1767,7 @@ function formatShortDate(value?: string | null): string {
   return date.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
+    timeZone: getPreferredTimeZone(),
   });
 }
 

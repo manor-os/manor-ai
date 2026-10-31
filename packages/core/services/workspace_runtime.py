@@ -909,11 +909,15 @@ async def ensure_workspace_task_conversation(
     db: AsyncSession,
     *,
     entity_id: str,
-    workspace_id: str,
+    workspace_id: str | None,
     task_id: str,
     title: str | None = None,
 ) -> Conversation:
-    """Create/reuse the workspace thread that represents a task."""
+    """Create/reuse the thread that represents a task.
+
+    A Task assigned directly to an Agent (``workspace_id`` None) gets a
+    thread outside any Workspace.
+    """
     from packages.core.workspace_chat.service import spawn_thread
     from packages.core.services.task_comment_approval_origin import lock_task_comment_turn_boundary
 
@@ -1215,9 +1219,13 @@ async def sync_workspace_runtime_schedules(
         # Keep automation definitions visible and restorable while making the
         # paused state explicit in the Automations UI. This also covers the
         # built-in Strategist/evolution jobs instead of deleting them.
-        from packages.core.services.scheduler_service import pause_workspace_automations
+        from packages.core.services.scheduler_service import (
+            pause_workspace_autonomy_jobs,
+        )
 
-        await pause_workspace_automations(db, workspace.id, workspace.entity_id)
+        await pause_workspace_autonomy_jobs(
+            db, workspace.id, workspace.entity_id,
+        )
         return
     if autonomy_state is WorkspaceAutonomyState.RUNNING:
         await install_workspace_runtime_schedules(db, workspace, user_id=user_id)

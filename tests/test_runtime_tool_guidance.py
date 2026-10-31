@@ -663,3 +663,84 @@ async def test_validation_feedback_is_observed_and_model_authors_correction(monk
         {"files": {"project.html": "wrong entry"}},
         {"files": {"index.html": "model-authored timed clips"}},
     ]
+
+
+def test_a_guide_requested_before_a_park_is_loaded_after_the_resume():
+    """Staging 2026-10-19: a run that parked on a sandbox ticket after every
+    round got tool_guidance_required for video_edit forever -- the request
+    lived only in the loop that parked, so the resumed loop never loaded it."""
+
+    messages = _messages()
+    state = RuntimeToolGuidance()
+    state.prepare(messages, set())  # a deferred tool: not in the round's schemas
+    state.mark_observed()
+    call = _call()
+    error = state.preflight(GUIDED_TOOL)
+    assert json.loads(error)["error"] == "tool_guidance_required"
+    messages += [_assistant(call), {"role": "tool", "tool_call_id": call["id"], "content": str(error)}]
+
+    resumed = RuntimeToolGuidance(checkpoint_messages=copy.deepcopy(messages))
+    resumed.prepare(messages, set())
+    assert GUIDE.instructions in messages[0]["content"]
+    assert resumed.preflight(GUIDED_TOOL) is not None  # read in the next model round first
+    resumed.mark_observed()
+    assert resumed.preflight(GUIDED_TOOL) is None
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_only_a_tool_result_can_carry_a_guide_request_across_a_resume(role):
+    messages = _messages()
+    error = RuntimeToolGuidance().preflight(GUIDED_TOOL)
+    messages.append({"role": role, "content": str(error)})
+
+    RuntimeToolGuidance(checkpoint_messages=messages).prepare(messages, set())
+    assert GUIDE.instructions not in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded", ["current", "older", "none"])
+async def test_a_pending_call_resumes_on_the_hosts_record_of_the_read_guide(monkeypatch, recorded):
+    """Staging 2026-10-19: video_edit passed the guide check, parked for its
+    sandbox, and every resume rejected it again -- the long conversation's
+    system message no longer held the guide text the check looked for."""
+
+    pending = _call(file="index.html")
+    checkpoint_observed = {
+        "current": {GUIDED_TOOL: GUIDE.source_sha256},
+        "older": {GUIDED_TOOL: NEW_GUIDE.source_sha256},
+        "none": {},
+    }[recorded]
+    executions = []
+
+    async def model(messages, tools, **_kwargs):
+        if not executions:
+            assert recorded != "current"
+            assert any("tool_guidance_required" in str(item.get("content")) for item in messages)
+            return "", [_call(file="index.html")], {}
+        return "done", [], {}
+
+    async def execute(name, arguments):
+        executions.append(name)
+        return json.dumps({"status": "completed"})
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", model)
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="Edit composition.",
+        tools=[_schema(GUIDED_TOOL)], tool_executor=execute, max_rounds=4,
+        resume_checkpoint=RuntimeAgentCheckpoint(
+            # The guide text is gone from the checkpoint's system message.
+            messages=[*_messages(), _assistant(pending)],
+            usage={}, rounds=1, tool_calls_made=[GUIDED_TOOL], pending_tool_call=pending,
+            remaining_tool_calls=[], tool_guidance=checkpoint_observed,
+        ).to_dict(),
+    )
+    assert result.error is None and result.content == "done"
+    assert executions == [GUIDED_TOOL]
+
+
+def test_checkpoint_state_records_only_what_a_model_round_read():
+    state = RuntimeToolGuidance()
+    state.prepare(_messages(), {GUIDED_TOOL})
+    assert state.checkpoint_state() == {}
+    state.mark_observed()
+    assert state.checkpoint_state() == {GUIDED_TOOL: GUIDE.source_sha256}

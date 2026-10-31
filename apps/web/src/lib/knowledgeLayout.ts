@@ -20,6 +20,8 @@ export type KnowledgeFileTypeFilter =
   | "sql"
   | "yaml";
 export type KnowledgeSortKey = "name" | "date" | "size";
+export type KnowledgeContentMatch = { document: Document; score: number; snippet: string };
+export type KnowledgeContentSearchResponse = { items: KnowledgeContentMatch[]; scanned: number; partial: boolean };
 
 type KnowledgeListParamsInput = {
   currentFolderId: string | null;
@@ -107,4 +109,35 @@ function matchesFileTypeFilter(doc: Document, fileTypeFilter: KnowledgeFileTypeF
     return ["mp3", "wav", "ogg", "aac", "flac", "m4a", "wma"].includes(ext);
   }
   return ext === fileTypeFilter;
+}
+
+/**
+ * Search results for the Knowledge page: name/metadata matches first, then
+ * documents found only by what they say (text, or an uploaded image/video/
+ * audio file's description and transcript), best match first. Content
+ * matches honour the file-type filter like the name matches do; the snippet
+ * shows why a file matched.
+ */
+export function mergeKnowledgeSearchResults(
+  nameMatches: Document[],
+  contentMatches: KnowledgeContentMatch[],
+  fileTypeFilter: KnowledgeFileTypeFilter,
+): { documents: Document[]; snippets: Map<string, string> } {
+  const snippets = new Map<string, string>();
+  const seen = new Set(nameMatches.map((doc) => doc.id));
+  const documents = [...nameMatches];
+  for (const match of contentMatches) {
+    const doc = match.document;
+    if (!doc?.id || !matchesFileTypeFilter(doc, fileTypeFilter)) continue;
+    if (match.snippet) snippets.set(doc.id, match.snippet);
+    if (seen.has(doc.id)) continue;
+    seen.add(doc.id);
+    documents.push(doc);
+  }
+  return { documents, snippets };
+}
+
+/** The label a folder is shown with; Task/Workflow run archives are named by ID. */
+export function folderDisplayName(folder: { name: string; display_name?: string | null }): string {
+  return folder.display_name || folder.name;
 }

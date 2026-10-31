@@ -26,19 +26,19 @@ def _load_sandbox_main_module():
 def test_sandbox_runner_api_token_protects_api_routes_but_not_health(monkeypatch) -> None:
     sandbox_main = _load_sandbox_main_module()
     monkeypatch.setattr(sandbox_main.config, "API_TOKEN", "runner-secret", raising=False)
-    monkeypatch.setattr(sandbox_main, "BUILD_VERSION", "k8s-test-fixture")
+    monkeypatch.setattr(sandbox_main, "BUILD_VERSION", "release-test-fixture")
     monkeypatch.setattr(
         sandbox_main.runner,
         "runtime_status",
-        lambda: {"sandbox_image": "ghcr.io/manor-os/sandbox-skill:k8s-test-fixture"},
+        lambda: {"sandbox_image": "ghcr.io/manor-os/sandbox-skill:release-test-fixture"},
     )
 
     client = TestClient(sandbox_main.app, raise_server_exceptions=False)
 
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["build_version"] == "k8s-test-fixture"
-    assert health.json()["sandbox_image"].endswith(":k8s-test-fixture")
+    assert health.json()["build_version"] == "release-test-fixture"
+    assert health.json()["sandbox_image"].endswith(":release-test-fixture")
     assert client.get("/api/v1/sandbox").status_code == 401
     assert client.get(
         "/api/v1/sandbox",
@@ -61,4 +61,5 @@ def test_sandbox_runner_api_fails_closed_when_token_is_unconfigured(monkeypatch)
     assert response.status_code == 503
     assert response.json() == {
         "detail": "Sandbox API token is not configured",
+        "code": "token_not_configured",
     }

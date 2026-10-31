@@ -72,7 +72,6 @@ from packages.core.strategist.proposal import (
     ProposedGoalChange,
     ProposedWorkflowChange,
 )
-from packages.core.tasks import ai_tasks
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 FLAG_KEY = "strategist_review_v2"
@@ -998,7 +997,6 @@ async def _run_v2_review(db, monkeypatch, workspace: Workspace, *, payload: dict
         return None
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop_post)
     monkeypatch.setattr(strategist_service, "_post_human_request_chat", _noop_post)
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
     return await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
 
 

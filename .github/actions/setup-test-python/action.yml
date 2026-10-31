@@ -3,6 +3,7 @@ description: Use the same Python and dependency lock for every deterministic tes
 runs:
   using: composite
   steps:
+    - uses: ./.github/actions/setup-apt
     - uses: actions/setup-python@v7
       with:
         python-version: "3.12"

@@ -40,8 +40,13 @@ export default function ResetPassword() {
       await api.auth.resetPassword(token, newPassword);
       setSuccess(true);
     } catch (err) {
-      if (err instanceof ApiError && err.status === 400) {
+      if (err instanceof ApiError && err.status === 400 && (
+        err.code === "auth.password_reset.invalid_token"
+        || (!err.code && err.message === "Invalid or expired reset token")
+      )) {
         setTokenInvalid(true);
+      } else if (err instanceof ApiError && err.status === 400) {
+        setError(err.message);
       } else {
         setError(t("page.forgot_password.server_error"));
       }

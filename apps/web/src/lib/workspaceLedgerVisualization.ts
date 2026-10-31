@@ -7,6 +7,7 @@ import type {
 } from "./api";
 import { getLocale, t } from "./i18n";
 import { formatUserFacingLabel } from "./taskDisplay";
+import { getPreferredTimeZone } from "./format";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -436,6 +437,7 @@ function updatedAtLabel(value: string | null): string {
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: getPreferredTimeZone(),
   }).format(date);
 }
 
@@ -1134,13 +1136,13 @@ function projectedPeriods(
   const timestamps = points.map((point) => workspaceLedgerTimelineTimestamp(point.key));
   const last = timestamps[timestamps.length - 1];
   const previous = timestamps[timestamps.length - 2];
-  const formatterOptions: Intl.DateTimeFormatOptions = {
+  const formatter = new Intl.DateTimeFormat(getLocale(), {
     month: "short",
     day: granularity === "month" ? undefined : "numeric",
     year: granularity === "month" ? "numeric" : undefined,
-  };
-  if (granularity) formatterOptions.timeZone = "UTC";
-  const formatter = new Intl.DateTimeFormat(getLocale(), formatterOptions);
+    // Bucketed periods are UTC calendar keys; raw instants follow the account zone.
+    timeZone: granularity ? "UTC" : getPreferredTimeZone(),
+  });
   return Array.from({ length: periods }, (_value, index) => {
     let timestamp: number | null = null;
     if (last !== null && granularity) {

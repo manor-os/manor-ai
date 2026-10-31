@@ -50,11 +50,15 @@ async def list_composer_skills(db, user, *, workspace_id=None, agent_id=None):
     including reusable Skills whose home is a different Workspace.
     """
     from packages.core.ai.runtime.skills import (
+        _runtime_skills_need_installed_ledger_contracts,
+        _runtime_workspace_ledger_contract_ids,
         runtime_master_uses_owner_chat_skill_scope,
         runtime_skill_is_eligible,
     )
     from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.models.permission import ResourceType
     from packages.core.services.builtin_plugin_service import load_user_builtin_plugin_preferences
+    from packages.core.services.resource_access import ResourceDescriptor, readable_resource_ids
     from packages.core.services.skill_service import (
         builtin_skill_copy_sources, list_skills, list_skills_for_agent,
     )
@@ -76,6 +80,21 @@ async def list_composer_skills(db, user, *, workspace_id=None, agent_id=None):
     )
     preferences = await load_user_builtin_plugin_preferences(db, user.id)
     legacy_copies = builtin_skill_copy_sources(skills)
+    # Reuse the runtime's batched authorization inputs. Per-Skill role/grant
+    # queries hold one transaction for the entire catalog during foreground
+    # refreshes, starving unrelated chat reads of admission permits.
+    entity_skills = [skill for skill in skills if skill.entity_id is not None]
+    readable_skill_ids = await readable_resource_ids(
+        db,
+        descriptors=[ResourceDescriptor.from_row(skill, ResourceType.SKILL) for skill in entity_skills],
+        entity_id=user.entity_id,
+        user_id=user.id,
+    ) if entity_skills else set()
+    installed_ledger_contract_ids = (
+        await _runtime_workspace_ledger_contract_ids(db, entity_id=user.entity_id, workspace_id=workspace_id)
+        if _runtime_skills_need_installed_ledger_contracts(skills)
+        else set()
+    )
     visible = []
     seen = set()
     for skill in skills:
@@ -97,6 +116,8 @@ async def list_composer_skills(db, user, *, workspace_id=None, agent_id=None):
             workspace_id=workspace_id,
             user_id=user.id,
             enforce_user_access=True,
+            readable_skill_ids=readable_skill_ids,
+            installed_ledger_contract_ids=installed_ledger_contract_ids,
             builtin_plugin_preferences=preferences,
         )
         if eligible:

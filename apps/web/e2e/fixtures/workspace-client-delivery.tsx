@@ -36,7 +36,13 @@ let knowledgeFailed = false;
 api.workspaces.blueprintExportKnowledgeDocuments = async (workspaceId, limit = 50, offset = 0) => {
   if (params.get("fault") === "knowledge" && !knowledgeFailed) { knowledgeFailed = true; throw new Error("Fixture: starter files unavailable"); }
   const count = params.has("no_starters") ? 0 : params.has("many_starters") ? 70 : 3;
-  return Array.from({ length: count }, (_, index) => ({ id: `${workspaceId}-starter-${index + 1}`, name: `template-${index + 1}.csv`, path: `templates/template-${index + 1}.csv`, file_size: 20, groups: [] })).slice(offset, offset + limit);
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${workspaceId}-starter-${index + 1}`, name: `template-${index + 1}.csv`,
+    path: `templates/template-${index + 1}.csv`, file_size: 20, groups: [],
+    ...(params.has("initial_template") && index === 1
+      ? { content_source: "initial_template" as const, required_by_workflows: ["Review support queue"] }
+      : {}),
+  })).slice(offset, offset + limit);
 };
 api.clients.prepareDelivery = async (clientId, data) => {
   calls += 1;

@@ -535,6 +535,7 @@ async def decide_gateway_live_turn(
         source="chat_voice",
         model=None,
         metadata=None,
+        workspace_id=scope.workspace_id,
     )
     async with runtime_llm_billing_context(
         **scope.usage_fields(),
@@ -593,6 +594,7 @@ async def render_gateway_live_result(
         source="chat_voice",
         model=None,
         metadata=None,
+        workspace_id=scope.workspace_id,
     )
     result_data = json.dumps(
         {
@@ -895,12 +897,15 @@ async def prepare_gateway_call(scope: ChatAudioScope):
     managed = False
     models: dict[str, str] = {}
     for role, label in (("stt", "Speech-to-text"), ("voice", "Text-to-speech")):
-        metadata = await resolve_llm_metadata_for_user(role, entity_id=scope.entity_id, user_id=scope.user_id)
+        metadata = await resolve_llm_metadata_for_user(
+            role, entity_id=scope.entity_id, user_id=scope.user_id, workspace_id=scope.workspace_id,
+        )
         if (metadata or {}).get("llm_api_key"):
             models[role] = await resolve_model_for_user(
                 role,
                 entity_id=scope.entity_id,
                 user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
             )
             continue
         managed = True
@@ -910,6 +915,7 @@ async def prepare_gateway_call(scope: ChatAudioScope):
                 role,
                 entity_id=scope.entity_id,
                 user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
             )
             models[role] = model
             route = await resolve_official_model_route(
@@ -928,7 +934,9 @@ async def prepare_gateway_call(scope: ChatAudioScope):
                 f"{label} is not configured. Configure Vercel AI Gateway / OpenRouter, or save an official provider BYOK for {label} in Account → Models.",
             )
     if managed:
-        await runtime_assert_credit_available(scope.entity_id, source="chat_voice")
+        await runtime_assert_credit_available(
+            scope.entity_id, source="chat_voice", workspace_id=scope.workspace_id,
+        )
     return models
 
 
@@ -986,6 +994,7 @@ async def run_voice_session(
     route = await resolve_realtime_route(
         scope.entity_id,
         user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
         required=False,
         allow_managed=os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud",
         # A Live Call is a Realtime surface. Saved STT/TTS roles configure

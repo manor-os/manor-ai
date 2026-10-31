@@ -48,6 +48,7 @@ def test_youtube_tool_schemas_do_not_expose_paths_or_arbitrary_metric_urls() -> 
         "expected_title",
         "expected_video_id",
         "expected_channel_name",
+        "expected_channel_id",
         "source_kind",
     }
     assert schemas["read_youtube_public_metrics"]["properties"] == {}

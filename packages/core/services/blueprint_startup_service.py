@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.blueprints import installed_blueprint_job_id
@@ -174,8 +174,14 @@ async def reconcile_blueprint_startup(
     *,
     workspace_id: str,
     trigger: str,
+    requested_by: str | None = None,
 ) -> BlueprintStartupResult:
-    """Dispatch only the startup work declared by one Blueprint Workspace."""
+    """Dispatch only the startup work declared by one Blueprint Workspace.
+
+    ``requested_by`` is the person who installed the Workspace or pressed
+    Start setup. A fresh install starts with its Strategist paused, so its
+    setup runs as that person's request, like any user-directed work.
+    """
 
     workspace = (await db.execute(
         select(Workspace).where(
@@ -185,7 +191,15 @@ async def reconcile_blueprint_startup(
     )).scalar_one_or_none()
     if workspace is None:
         return BlueprintStartupResult(state="workspace_missing")
-    if workspace.status != "active":
+    from packages.core.services.workspace_autonomy import workspace_allows_configured_work
+
+    # Setup is configured work and runs while only the Strategist is paused;
+    # the on-ready start below is autonomy and still needs an active Workspace.
+    declared = (workspace.settings or {}).get("blocking_setup") if isinstance(workspace.settings, dict) else None
+    has_setup_checks = isinstance(declared, dict) and bool(declared.get("checks"))
+    # Paused autonomy still runs what a person asked for: setup they started.
+    on_behalf = workspace.status != "active" and bool(requested_by) and has_setup_checks
+    if not workspace_allows_configured_work(workspace) or (workspace.status != "active" and not on_behalf):
         return BlueprintStartupResult(state=f"workspace_{workspace.status}")
 
     settings = workspace.settings if isinstance(workspace.settings, dict) else {}
@@ -243,6 +257,8 @@ async def reconcile_blueprint_startup(
         occurrence_key = BLUEPRINT_SETUP_OCCURRENCE_KEY
         state = "setup_dispatched" if base_job_ids else "blocked"
     else:
+        if workspace.status != "active":
+            return BlueprintStartupResult(state=f"workspace_{workspace.status}")
         ready_job_id = str(startup.get("on_ready_job_id") or "").strip()
         base_job_ids = [ready_job_id] if ready_job_id else []
         occurrence_key = BLUEPRINT_READY_OCCURRENCE_KEY
@@ -299,8 +315,9 @@ async def reconcile_blueprint_startup(
                 select(ScheduledJobRun)
                 .where(
                     ScheduledJobRun.job_id == scoped_job_id,
-                    ScheduledJobRun.idempotency_key.startswith(
-                        BLUEPRINT_SETUP_OCCURRENCE_KEY
+                    or_(
+                        ScheduledJobRun.idempotency_key.startswith(BLUEPRINT_SETUP_OCCURRENCE_KEY),
+                        ScheduledJobRun.idempotency_key.startswith(f"manual:{BLUEPRINT_SETUP_OCCURRENCE_KEY}"),
                     ),
                 )
                 .order_by(
@@ -310,20 +327,34 @@ async def reconcile_blueprint_startup(
                 .limit(1)
             )).scalar_one_or_none()
             if latest is not None:
-                if latest.status == ScheduledRunStatus.ERROR.value:
+                # A failed or cancelled attempt is over; setup asked for again
+                # is a new attempt, not the old one replayed.
+                if latest.status in (
+                    ScheduledRunStatus.ERROR.value,
+                    ScheduledRunStatus.CANCELLED.value,
+                ):
                     job_occurrence_key = (
                         f"{BLUEPRINT_SETUP_OCCURRENCE_KEY}:retry:{latest.id}"
                     )
                 else:
                     job_occurrence_key = str(
                         latest.idempotency_key or BLUEPRINT_SETUP_OCCURRENCE_KEY
-                    )
-        occurrence = await dispatch_job_occurrence(
-            job_db_id=job.id,
-            occurrence_key=job_occurrence_key,
-            trigger_type="blueprint_startup",
-            trigger_detail=trigger,
-        )
+                    ).removeprefix("manual:")
+        if on_behalf:
+            occurrence = await dispatch_job_occurrence(
+                job_db_id=job.id,
+                occurrence_key=f"manual:{job_occurrence_key}",
+                trigger_type="manual",
+                trigger_detail=trigger,
+                requesting_user_id=requested_by,
+            )
+        else:
+            occurrence = await dispatch_job_occurrence(
+                job_db_id=job.id,
+                occurrence_key=job_occurrence_key,
+                trigger_type="blueprint_startup",
+                trigger_detail=trigger,
+            )
         if occurrence is not None and occurrence.published:
             dispatched.append(job.job_id)
 

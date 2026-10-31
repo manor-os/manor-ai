@@ -1,7 +1,7 @@
 """Read-only access to metrics embedded in a public YouTube watch page."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import re
@@ -39,6 +39,9 @@ class YouTubePublicVideoMetrics:
     comments: int | None
     unavailable_fields: tuple[str, ...]
     collected_at: str
+    # Public page counters are normally exact; abbreviated channel subscriber
+    # text is only an estimate and must not be presented as an exact delta.
+    metric_precision: dict[str, str] = field(default_factory=dict)
 
 
 class YouTubePublicVideoError(ValueError):
@@ -64,6 +67,9 @@ def canonicalize_youtube_public_url(url: str) -> tuple[str, str]:
         video_id = parsed.path.strip("/")
     elif parsed.path.rstrip("/") == "/watch":
         video_id = parse_qs(parsed.query).get("v", [""])[0]
+    elif parsed.path.startswith("/shorts/"):
+        parts = parsed.path.strip("/").split("/")
+        video_id = parts[1] if len(parts) == 2 else ""
     else:
         video_id = ""
 
@@ -330,9 +336,8 @@ def parse_youtube_public_page(
         _find_first_key(initial, "likeCountIfIndifferentNumber")
     )
     comments = _non_negative_integer(_find_first_key(initial, "commentCount"))
-    subscribers = _compact_public_count(
-        _find_first_key(initial, "subscriberCountText")
-    )
+    subscriber_text = _renderer_text(_find_first_key(initial, "subscriberCountText"))
+    subscribers = _compact_public_count(subscriber_text)
     metrics = {
         "views": views,
         "likes": likes,
@@ -368,6 +373,16 @@ def parse_youtube_public_page(
         comments=comments,
         unavailable_fields=unavailable_fields,
         collected_at=collected_at or datetime.now(timezone.utc).isoformat(),
+        metric_precision={
+            "views": "exact",
+            "likes": "exact",
+            "comments": "exact",
+            "subscribers": (
+                "rounded"
+                if re.search(r"\d(?:\.\d+)?\s*[kmb]\b", subscriber_text, re.I)
+                else "exact"
+            ),
+        },
     )
 
 

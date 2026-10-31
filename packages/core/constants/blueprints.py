@@ -128,3 +128,23 @@ def is_runtime_derived_scheduled_job(
         normalized_id.startswith(DERIVED_WORKSPACE_SCHEDULE_PREFIXES)
         or normalized_type in DERIVED_ONLY_SCHEDULE_EXECUTION_TYPES
     )
+
+
+def is_runtime_derived_stat(collector_config: object) -> bool:
+    """Classify instance-owned definitions without inspecting business names.
+
+    A fixed public monitoring target may be portable. A definition attached to
+    an actual execution object must be recreated by its producer Workflow.
+    Unknown subject contracts cannot safely cross the Blueprint boundary.
+    """
+    if not isinstance(collector_config, dict):
+        raise ValueError("Stat collector_config must be an object")
+    subject = collector_config.get("subject")
+    if subject is None:
+        return False
+    if (not isinstance(subject, dict) or set(subject) != {"kind", "id"}
+            or not isinstance(subject.get("id"), str) or not subject["id"].strip()):
+        raise ValueError("Stat subject must declare its kind and instance id")
+    if subject.get("kind") in {"workflow_project", "workflow_run", "task", "document"}:
+        return True
+    raise ValueError(f"Stat subject kind {subject.get('kind')!r} has no portable contract")

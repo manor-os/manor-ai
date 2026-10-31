@@ -261,3 +261,72 @@ def test_a_node_output_file_must_exist_in_the_account_storage(tmp_path, monkeypa
         assert failure and failure["code"] == "output_file_missing", value
     # Nodes without the setting are unaffected.
     assert _missing_output_file_failure(None, {"video_url": "https://example.com"}, entity_id="ent") is None
+
+
+def test_revision_feedback_is_the_note_not_an_edit_of_read_only_material():
+    from packages.core.services.workflow_message_actions import split_revision_feedback
+
+    # Cards send change requests as review.revision_request; read-only reviews must accept them.
+    assert split_revision_feedback({"revision_request": " Brighter cover "}, None) == (None, "Brighter cover")
+    assert split_revision_feedback({"revision_request": "From card"}, "Typed note") == (None, "Typed note")
+    # A real edit of the material still goes through the editable-review path.
+    edited = {"revision_request": "x", "scenes": []}
+    assert split_revision_feedback(edited, None) == (edited, None)
+    assert split_revision_feedback(None, "note") == (None, "note")
+
+
+@pytest.mark.asyncio
+async def test_reviewed_files_reported_by_path_open_their_document(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.user import Entity
+    from packages.core.services.workflow_review_files import attach_review_document_ids
+
+    entity = Entity(id=generate_ulid(), name="Review files", plan_id="plan_enterprise")
+    db_session.add(entity)
+    await db_session.flush()
+    canvas = Document(entity_id=entity.id, name="CANVAS.md", fs_path="Workspaces/one/workflow/run/CANVAS.md")
+    db_session.add_all([canvas, Document(entity_id=entity.id, name="old.md", fs_path="Workspaces/one/old.md",
+                                         is_trashed=True)])
+    await db_session.flush()
+    review = {"artifacts": [{"name": "CANVAS.md", "fs_path": "Workspaces/one/workflow/run/CANVAS.md"},
+                            {"name": "old.md", "fs_path": "Workspaces/one/old.md"},
+                            {"name": "linked", "document_id": "kept", "fs_path": "x"}]}
+    await attach_review_document_ids(db_session, entity_id=entity.id, reviews=[review, None])
+    assert [item.get("document_id") for item in review["artifacts"]] == [canvas.id, None, "kept"]
+    # Another entity's Document with the same path is never linked.
+    other = {"artifacts": [{"fs_path": "Workspaces/one/workflow/run/CANVAS.md"}]}
+    await attach_review_document_ids(db_session, entity_id=generate_ulid(), reviews=[other])
+    assert "document_id" not in other["artifacts"][0]
+    # A Flow citing a file by its bare id ("{{x.document_id}}") gets the file itself, so it plays.
+    video = Document(entity_id=entity.id, name="test-music-video.mp4", fs_path="Workspaces/one/videos/test-music-video.mp4")
+    db_session.add(video)
+    await db_session.flush()
+    cited = {"artifacts": [video.id, "not-a-file"], "files": video.id}
+    await attach_review_document_ids(db_session, entity_id=entity.id, reviews=[cited])
+    linked = {"document_id": video.id, "name": "test-music-video.mp4", "fs_path": video.fs_path}
+    assert cited["artifacts"] == [linked, "not-a-file"]
+    assert cited["files"] == [linked]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_file_review_shows_the_cited_documents_in_order(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.user import Entity
+    from packages.core.services.workflow_review_files import review_files_from_refs
+
+    entity = Entity(id=generate_ulid(), name="Agent review", plan_id="plan_enterprise")
+    db_session.add(entity)
+    await db_session.flush()
+    cover = Document(entity_id=entity.id, name="page-01.png", fs_path="Workspaces/one/artifacts/v1/page-01.png")
+    captions = Document(entity_id=entity.id, name="captions.md", fs_path="Workspaces/one/artifacts/v1/captions.md")
+    gone = Document(entity_id=entity.id, name="old.png", fs_path="Workspaces/one/old.png", is_trashed=True)
+    db_session.add_all([cover, captions, gone])
+    await db_session.flush()
+    refs = [f"/api/v1/fs/{entity.id}/Workspaces/one/artifacts/v1/captions.md", f"/viewer/{cover.id}", cover.id, gone.id, "missing", ""]
+    files = await review_files_from_refs(db_session, entity_id=entity.id, refs=refs)
+    assert [item["document_id"] for item in files] == [captions.id, cover.id]
+    assert files[1] == {"document_id": cover.id, "name": "page-01.png", "fs_path": cover.fs_path}
+    # Another account's Documents are never shown.
+    assert await review_files_from_refs(db_session, entity_id=generate_ulid(), refs=[cover.id]) == []

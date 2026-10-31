@@ -15,6 +15,7 @@ Durability beyond ``FastAPI.BackgroundTasks``:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -931,12 +932,21 @@ def dispatch_due_notifications_task() -> Dict[str, int]:
     creating another parent Notification row.
     """
     from packages.core.database import async_session
+    from packages.core.services.chat_email_notifications import queue_due_chat_emails
     from packages.core.services.notification_scheduler import (
         dispatch_due_notifications,
     )
 
     async def _run() -> Dict[str, int]:
         async with async_session() as db:
+            # Bound discovery so a large chat backlog cannot starve the shared
+            # outbox or exceed this task's 60-second soft limit.
+            try:
+                async with asyncio.timeout(5):
+                    await queue_due_chat_emails(db)
+            except Exception:
+                await db.rollback()
+                logger.warning("Chat email discovery failed; continuing outbox delivery", exc_info=True)
             return await dispatch_due_notifications(db)
 
     return _run_async(_run())
@@ -976,6 +986,29 @@ def health_check_task(
     except Exception as exc:
         logger.warning("Health check task failed: %s", exc)
         return {"ok": False, "detail": str(exc)}
+
+
+@celery_app.task(name="integrations.deliver_incident_notices")
+def deliver_incident_notices() -> int:
+    """Notify each open connected-account incident once (every few minutes).
+
+    Covers both shared Integrations and personal OAuth accounts; a failure in
+    one kind does not hold back the other.
+    """
+    from packages.core.services.account_incident_delivery import (
+        deliver_account_incidents, deliver_oauth_account_incidents,
+    )
+
+    async def _deliver_all() -> int:
+        sent = 0
+        for deliver in (deliver_account_incidents, deliver_oauth_account_incidents):
+            try:
+                sent += await deliver()
+            except Exception:
+                logger.exception("account incident delivery failed in %s", deliver.__name__)
+        return sent
+
+    return _run_async(_deliver_all())
 
 
 @celery_app.task(name="integrations.health_tick")

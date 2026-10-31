@@ -245,6 +245,19 @@ async def broadcast_job_update(entity_id: str, job: dict):
     await _broadcast(entity_id, "job_update", job)
 
 
+async def broadcast_media_job_update(
+    entity_id: str,
+    job: dict,
+    *,
+    workspace_id: Optional[str] = None,
+):
+    """A media generation job changed phase; completion still sends ``video_ready``."""
+    if workspace_id:
+        await _broadcast_workspace(entity_id, workspace_id, "media_job_update", job)
+        return
+    await _broadcast(entity_id, "media_job_update", job)
+
+
 # ── Multi-target convenience ───────────────────────────────────────────────
 
 async def push_task_update_multi(

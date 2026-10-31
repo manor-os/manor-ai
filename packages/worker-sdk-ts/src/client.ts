@@ -1,5 +1,5 @@
 // HTTP client for the Manor worker protocol.
-// Wraps undici fetch with auth headers + transient-error backoff.
+// Wraps native or injected fetch with auth headers + transient-error backoff.
 
 import {
   HeartbeatRequest,

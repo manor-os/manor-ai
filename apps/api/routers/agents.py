@@ -38,7 +38,16 @@ from apps.api.errors import CodedError
 from apps.api.catalog import CatalogResponse, catalog_response
 from packages.core.services.agent_prompt_preview import preview_agent_prompt
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
+from apps.api.collaborator_boundary import collaborator_scope
 from apps.api.deps import get_current_user
+from packages.core.services.collaborator_scope import (
+    CollaboratorScopeError,
+    agent_workspace_ids,
+    agent_workspace_ids_batch,
+    payload_references,
+    references_outside,
+    require_collaborator_references,
+)
 from apps.api.routers.workspaces import (
     LearningCandidateResponse,
     RuntimeEvidenceResponse,
@@ -603,6 +612,11 @@ async def agent_catalog(
     db: AsyncSession = Depends(get_db),
 ):
     items = await _agent_list_response(db, user)
+    collaborator_ids = collaborator_scope(user)
+    if collaborator_ids is not None:
+        # An external collaborator sees only Agents of the Workspaces they were granted.
+        workspaces = await agent_workspace_ids_batch(db, [item.id for item in items], entity_id=user.entity_id)
+        items = [item for item in items if collaborator_ids & workspaces.get(item.id, set())]
     return catalog_response(
         items, catalog="agents", user=user, filters={}, known_version=known_version,
     )
@@ -622,6 +636,14 @@ async def create_new_agent(
         role=getattr(user, "role", None),
     ):
         raise HTTPException(403, "Cannot create an agent in this workspace")
+    if collaborator_scope(user) is not None and req.capability_ids:
+        # Capabilities resolve against the company's integrations and MCP
+        # servers; what a collaborator's Agent may reach is the runtime's call.
+        raise HTTPException(403, "External collaborators cannot attach company capabilities to an Agent")
+    await require_collaborator_references(
+        db, user_id=user.id, entity_id=user.entity_id, workspace_id=req.workspace_id,
+        refs=payload_references(req.config), user=user,
+    )
     capability_plan = None
     if req.capability_ids:
         from packages.core.services.agent_capability_catalog import (
@@ -943,6 +965,16 @@ async def update_one_agent(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_agent(db, user, agent_id, Capability.EDIT)
+    scope = collaborator_scope(user)
+    if scope is not None and req.config is not None:
+        # The new configuration may name only resources of a Workspace this Agent serves.
+        refs = payload_references(req.config)
+        workspaces = scope & await agent_workspace_ids(db, agent_id=agent_id, entity_id=user.entity_id)
+        if not any([
+            not await references_outside(db, entity_id=user.entity_id, workspace_id=workspace_id, refs=refs)
+            for workspace_id in sorted(workspaces)
+        ]):
+            raise CollaboratorScopeError()
     agent = await update_agent(db, agent_id, user.entity_id, **req.model_dump(exclude_none=True))
     if not agent:
         raise HTTPException(404, "Agent not found")

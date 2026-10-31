@@ -14,6 +14,7 @@ import type { EmailAccount } from "../../lib/emailAccounts";
 import Textarea from "../ui/Textarea";
 import SignatureFieldEditor from "./SignatureFieldEditor";
 import "./signature.css";
+import { getPreferredTimeZone } from "../../lib/format";
 
 interface SignatureRequestDialogProps {
   open: boolean;
@@ -27,6 +28,7 @@ function formatDate(value?: string) {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
+    timeZone: getPreferredTimeZone(),
   }).format(new Date(value));
 }
 

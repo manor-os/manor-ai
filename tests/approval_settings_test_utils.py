@@ -4,7 +4,13 @@ from packages.core.governance.approval_policy_service import (
     account_defaults, initialize_personal_approval, initialize_workspace_approval,
     read_approval_settings, update_approval_policy,
 )
+from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.user import Entity, User
+
+#: Tables a committed policy write touches besides its owner rows (the
+#: re-evaluation of pending approvals is staged in the runtime outbox).
+#: Fixtures that create a hand-picked table subset include these.
+POLICY_WRITE_SIDE_EFFECT_MODELS = (RuntimeOutboxEvent,)
 
 
 async def initialize_test_approval_owners(db, workspace, *, user_id):

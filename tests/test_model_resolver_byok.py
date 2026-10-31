@@ -55,3 +55,26 @@ def test_account_primary_byok_does_not_bind_to_mismatched_selected_model() -> No
         )
         is None
     )
+
+
+def test_declared_model_limits_follow_the_credential_and_its_bound_model() -> None:
+    limits = {"model": "acme/unknown-chat", "context_window_tokens": 1_000_000, "max_output_tokens": 100_000}
+    settings = {
+        "models": {"primary": "acme/unknown-chat"},
+        "llm_api_keys": {"primary": "sk-test-account-primary-1234567890"},
+        "llm_api_key_models": {"primary": "acme/unknown-chat"},
+        "llm_model_limits": {"primary": limits},
+    }
+
+    # A role inheriting the Primary credential inherits its declared limits.
+    worker = resolve_llm_metadata_from_settings(
+        settings, role="worker", source="entity", selected_model="acme/unknown-chat",
+    )
+    assert worker == {"llm_api_key": "sk-test-account-primary-1234567890", "llm_model_limits": limits}
+
+    # Limits saved for a model the credential is no longer bound to are stale.
+    rebound = {**settings, "models": {"primary": "acme/next-chat"}, "llm_api_key_models": {"primary": "acme/next-chat"}}
+    metadata = resolve_llm_metadata_from_settings(
+        rebound, role="primary", source="entity", selected_model="acme/next-chat",
+    )
+    assert metadata == {"llm_api_key": "sk-test-account-primary-1234567890"}

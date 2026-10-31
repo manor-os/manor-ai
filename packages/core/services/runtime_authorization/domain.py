@@ -33,6 +33,9 @@ class AuthorizationRule(str, Enum):
     WORKSPACE_READ = "permission.workspace.read"
     WORKSPACE_MANAGE = "permission.workspace.manage"
     WORKSPACE_WRITE = "permission.workspace.write"
+    COLLABORATOR_WORKSPACE = "permission.collaborator.workspace"
+    COLLABORATOR_SUBJECT = "permission.collaborator.subject"
+    COLLABORATOR_STEERING_ENDED = "permission.collaborator.steering_ended"
     AGENT_IDENTITY = "permission.agent.identity"
     AGENT_TOOL_BINDING = "permission.agent_tool_binding"
     EXTERNAL_TOOL_BINDING = "permission.external_tool_binding"
@@ -141,6 +144,9 @@ class PermissionDecision:
     outcome: AuthorizationOutcome
     reason: str | None = None
     matched_rule: str | None = None
+    # The acting collaborator's live-granted Workspaces when the collaborator
+    # gate admitted the call; callers check the call's arguments against it.
+    collaborator_workspace_ids: frozenset[str] | None = None
 
     @property
     def allowed(self) -> bool:
@@ -196,6 +202,13 @@ class RuntimeAuthorizationRequest:
     task_id: str | None = None
     runtime_surface: str | None = None
     agent_subscription_id: str | None = None
+    # Set only by the service after the collaborator gate admitted the call:
+    # the acting human's live-granted Workspaces. Never a caller argument.
+    collaborator_workspace_ids: frozenset[str] | None = None
+    # Set only by the service: ``user_id``'s role as the collaborator gate
+    # resolved it, so the strategies do not resolve it again.
+    user_role_resolved: bool = False
+    resolved_user_role: str | None = None
 
     @classmethod
     def create(
@@ -314,3 +327,5 @@ class AuthorizationActor:
     id: str
     entity_id: str
     role: str
+    # The raw UserMembership role, which decides collaborator status.
+    membership_role: str | None = None

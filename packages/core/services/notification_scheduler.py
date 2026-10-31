@@ -280,9 +280,22 @@ async def _lock_authorized_workspace_for_delivery(
             idempotency_key=notification.idempotency_key, meta=notification.meta,
             require_manual_run=True,
         )
+    workflow_delivery_allowed = False
+    if workspace is not None and workspace.status == "paused":
+        from packages.core.models.workflow import WorkflowRun
+
+        origin = (notification.meta or {}).get("workflow_origin")
+        if isinstance(origin, dict) and origin.get("run_id") and origin.get("actor_user_id"):
+            workflow_delivery_allowed = bool(await db.scalar(select(WorkflowRun.id).where(
+                WorkflowRun.id == origin["run_id"],
+                WorkflowRun.entity_id == entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+                WorkflowRun.started_by == origin["actor_user_id"],
+                WorkflowRun.status.in_(("running", "paused", "completed", "failed")),
+            )))
     if (
         workspace is None or workspace.deleted_at is not None
-        or workspace.status != "active" and not manual_initiative_allowed
+        or workspace.status != "active" and not (manual_initiative_allowed or workflow_delivery_allowed)
     ):
         await _cancel_inaccessible(
             db,
@@ -524,6 +537,22 @@ async def _process_claimed_event_in_session(
     notification_idempotency_key = notification.idempotency_key
     await db.commit()
 
+    if notification_type == "chat_unread_email":
+        from packages.core.services.chat_email_notifications import deliver_chat_email
+
+        try:
+            return await deliver_chat_email(
+                db, event_id=event_id, notification_id=notification_id,
+                claim_token=claim_token, now=when,
+            )
+        except Exception as exc:
+            await db.rollback()
+            return await _record_failure(
+                db, event_id=event_id, attempt_count=attempt_count,
+                claim_token=claim_token, when=when, exc=exc,
+            )
+
+
     from packages.core.services.notify import (
         _DELIVERED_TARGET_KEYS,
         dispatch_persisted_notification,
@@ -740,7 +769,7 @@ async def _dispatch_outbox(
             outcome = await _process_claimed_event(
                 db, event_id=event_id, claim_token=claim_token, when=when,
             )
-            counts[outcome] += 1
+            counts[outcome] = counts.get(outcome, 0) + 1
         finally:
             try:
                 if db.in_transaction():

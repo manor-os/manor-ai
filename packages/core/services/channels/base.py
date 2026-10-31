@@ -260,10 +260,11 @@ class ChannelAdapter(abc.ABC):
         body: bytes,
     ) -> bool:
         """Validate the request really came from the provider (signature
-        / bearer / IP). Default: trust caller; per-channel subclasses
-        should override (Slack signs, Discord signs, WeChat signs, …).
+        / bearer / IP). Default: reject. The generic callback route has no
+        auth of its own, so a channel accepts inbound posts there only by
+        overriding this with a real check (Discord signs, WeChat signs, …).
         """
-        return True
+        return False
 
     @abc.abstractmethod
     async def parse_inbound(

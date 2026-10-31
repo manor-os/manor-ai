@@ -46,13 +46,19 @@ Hard constraints:
     pay, sign, send, or inventing facts only the user can supply.
     Forbidding another copy of the same artifact is not forbidding
     in-place repair of the current one.
-  * If the Work batch reconciliation section lists stalled work, prioritize
-    repair, retry, unblock, or explicit operator close-out tasks before
-    proposing unrelated new work. Do not duplicate the stalled task unless the
-    new task is clearly a recovery attempt.
-    Exception: waiting_configuration is a recovery request on the original
-    Task. Do not create another Task requiring the same missing capability;
-    resolve its configuration review and continue that Task instead.
+  * If the Work batch reconciliation section lists stalled work, deal with it
+    on the original Task before proposing unrelated new work. Repair, retry
+    and unblock are actions on that Task, never a new Task: never propose a
+    task or human_request that recovers, retries, repairs, unblocks, resumes,
+    chases or verifies an open Task; such items are discarded.
+    For a blocked Task worth another attempt, put its task_id in
+    `retry_task_ids`; Manor retries that Task itself. A technical failure is
+    the platform's to recover: never ask the operator to fix or retry it.
+    waiting_configuration is a recovery request on the original Task: resolve
+    its configuration review and continue that Task; do not create another
+    Task requiring the same missing capability.
+    A Task marked waiting_on=person is not stalled agent work. Its request
+    card is already open for the operator; leave it there.
   * Do not wait for the user to send a workspace chat message.
     Chat is not the collection surface. If core facts only the user
     has are missing, emit `human_requests`. Otherwise propose
@@ -106,14 +112,16 @@ Hard constraints:
   * Make every structured `expected_output` a precise JSON Schema, not a prose
     hint: list all mandatory fields in `required`; when the task asks for
     exactly N records, set both `minItems` and `maxItems` to N on the relevant
-    array. The runtime hard-validates this contract before the terminal step
-    can complete, so do not omit constraints stated in the task description.
+    array. The Task agent works to this contract and checks its result against
+    it before completing, so do not omit constraints stated in the task
+    description.
   * For files with a project-specific Knowledge destination, set each file
     deliverable's `document_id_path` (JSON Pointer into the Task result),
     `workspace_folder` (exact relative logical folder, no storage root), and
     `require_readback=true`. Require that Document ID in `expected_output`.
-    The runtime verifies the actual Document, folder, file write and subsequent
-    readback; a path or saved=true claim alone cannot satisfy this contract.
+    The Task agent must report the saved Document as its deliverable; the host
+    accepts a reported file only if it exists and the agent read it back, so a
+    path or saved=true claim alone cannot satisfy this contract.
 
 Time horizon — pick the right owner for the timeline:
   * Agent-driven services (AI handles the work) typically complete
@@ -304,15 +312,17 @@ Treat the briefing's Workflow runs as execution evidence:
     or paused run. It is work already in flight, even when it needs input.
   * Never duplicate a completed scheduled Flow from the current review window
     unless the evidence explicitly calls for an intentional rerun.
-  * For a failed, blocked, or needs_input run, address the recorded blocker
-    with a human request, configuration change, or recovery task; do not hide
-    the failure by launching an indistinguishable fresh run.
+  * For a failed or blocked run, address the recorded blocker with a human
+    request, configuration change, or recovery task; do not hide the failure
+    by launching an indistinguishable fresh run.
+  * A needs_input run is already asking a person. Do not re-ask its question
+    or propose recovery work for it; mention the open request in notes.
 Omit the field or return [] when no installed Flow matches."""
 
 
 RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
     "review_id": "<provided in user prompt — copy verbatim>",
-    "summary": "One paragraph: this cycle's framing.",
+    "summary": "One or two short sentences from Manor AI to the owner, in plain words.",
     "tasks": [
         {
             "task_key": "stable_snake_case_key_unique_in_this_review",
@@ -327,6 +337,7 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
             "owner_service_key": "<service from allowed list>",
             "delegate_service_keys": ["<other allowed service>"],
             "depends_on_task_keys": ["task_key_that_must_finish_first"],
+            "existing_task_id": "<task_id of the existing Task this builds on, or null>",
             "required_capabilities": ["workspace.search", "web.safe_search"],
             "external_action": None,
             "priority": 3,
@@ -359,7 +370,8 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
             ],
         }
     ],
-    "notes": "Optional observations not actioned this cycle.",
+    "notes": "Optional private reasoning for the review record; never shown to the owner.",
+    "retry_task_ids": ["<task_id of a blocked Task Manor should retry; usually []>"],
 }
 
 
@@ -560,7 +572,7 @@ def runtime_strategist_system_prompt(
     if briefing_mode:
         parts.append(
             "If a task must run a bound Skill, list its exact owner-service slug in "
-            "`required_skills`; execution and completion will require a real invocation. "
+            "`required_skills`; the Task agent is told to run it with invoke_skill. "
             "Do not name a Skill unavailable to that owner service. "
             "Check its required inputs before proposing execution. Cite existing canonical "
             "inputs, or propose the missing upstream deliverable and declare depends_on_task_keys. "
@@ -582,8 +594,31 @@ def runtime_strategist_system_prompt(
         "of missing access. unavailable means unknown. A business capability ID is not a setting "
         "or credential, and access on another Agent is not inherited. "
         "Keep summary/notes about your proposed strategy; do not rewrite execution status or "
-        "diagnose blockers in free prose. The server renders referenced execution facts separately. "
+        "diagnose blockers in free prose. The server records referenced execution facts separately. "
         "These observations do not dispatch, retry, repair, approve or close Tasks."
+    )
+    parts.append(
+        "A Task with waiting_on_human=true or waiting_on=person is waiting on a person, and its "
+        "request card is already open for them. Only their answer unblocks it; no agent can. "
+        "Never propose a task or human_request that recovers, chases, relays, re-asks, verifies "
+        "or follows up that Task. "
+        "Leave it. Repair, retry and unblock of any open Task (in progress, blocked, on hold or "
+        "waiting) happen on that Task, never as a new Task: a task or human_request that "
+        "recovers, retries, repairs, unblocks, resumes or verifies an open Task is discarded. "
+        "To retry a blocked Task, list its exact task_id in retry_task_ids; Manor retries that "
+        "Task itself. Never ask the owner to fix, retry or work around a technical failure. "
+        "Set existing_task_id when a proposed task builds on an "
+        "existing Task."
+    )
+    parts.append(
+        "`summary` is the only text the workspace owner reads. Write it as Manor AI talking to "
+        "the owner (\"I\" and \"you\"), in one or two short sentences of plain language, in the "
+        "owner's language. Say what you propose and how it helps. When you propose nothing, say "
+        "so in one short friendly line. Never use internal terms such as review cycle, briefing, "
+        "execution evidence, Task acceptance, measurement gap or recovery pass, and do not explain "
+        "what you chose not to do. Requests already waiting on the owner have their own cards; do "
+        "not repeat them. `notes` is private reasoning for the review record and is never shown "
+        "to the owner."
     )
     if briefing_mode:
         parts.append(RUNTIME_STRATEGIST_EMPTY_OK)
@@ -1238,8 +1273,13 @@ def _format_work_batch_reconciliation(ctx: Any) -> str:
             task_status = task.get("status") or "unknown"
             age = task.get("age_hours")
             owner = task.get("owner_service_key") or "unassigned"
+            waiting = (
+                " waiting_on=person (request card already open; not agent work)"
+                if task.get("waiting_on_human") else ""
+            )
             lines.append(
-                f"  - [{task_status}] {title} owner={owner} age_hours={age}"
+                f"  - [{task_status}] {title} task_id={task.get('task_id')} "
+                f"owner={owner} age_hours={age}{waiting}"
             )
         missing = item.get("missing_task_ids") or []
         if missing:

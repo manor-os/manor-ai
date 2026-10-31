@@ -114,12 +114,35 @@ def list_templates() -> list[dict[str, Any]]:
     ]
 
 
+# Recipes an external Workspace collaborator may apply: they write only into
+# the Workspace. Every other recipe provisions company-level Agents, imports
+# marketplace Skills into the company, or measures a Goal through a company
+# integration (twitter_growth, email_triage, solo_*, product_video_studio).
+COLLABORATOR_TEMPLATES = frozenset({"daily_briefing"})
+
+
+async def _refuse_collaborator_template(db: AsyncSession, key: str, inp: TemplateInput) -> None:
+    from packages.core.services.collaborator_scope import actor_workspace_scope
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    scope = await actor_workspace_scope(db, user_id=inp.user_id, entity_id=inp.entity_id)
+    if scope is None and not collaborators_acting_now(inp.entity_id):
+        return
+    if key not in COLLABORATOR_TEMPLATES or (scope is not None and inp.workspace_id not in scope):
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            403, f"Template {key!r} creates company-level resources and is not available to external collaborators",
+        )
+
+
 async def apply_template(
     db: AsyncSession, key: str, inp: TemplateInput,
 ) -> TemplateResult:
     """Validate params + run the template. Caller commits."""
     tmpl = get_template(key)
     _validate_params(tmpl, inp.params)
+    await _refuse_collaborator_template(db, key, inp)
     logger.info(
         "applying template key=%s entity=%s workspace=%s",
         key, inp.entity_id, inp.workspace_id,

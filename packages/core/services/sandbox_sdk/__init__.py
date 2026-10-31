@@ -16,8 +16,11 @@ from .exceptions import (
     SandboxConnectionError,
     SandboxError,
     SandboxNotFoundError,
+    SandboxRequestError,
+    SandboxRunnerOutdatedError,
     SandboxRuntimeError,
     SandboxSecurityError,
+    SandboxTimeoutError,
 )
 from .models import (
     CancelExecutionResult,
@@ -36,6 +39,7 @@ from .models import (
     SkillManifest,
     SkillRunResult,
     SkillRunStepResult,
+    TailFileResult,
 )
 
 __all__ = [
@@ -46,8 +50,11 @@ __all__ = [
     "SandboxNotFoundError",
     "SandboxSecurityError",
     "SandboxCapacityError",
+    "SandboxRequestError",
     "SandboxRuntimeError",
+    "SandboxTimeoutError",
     "SandboxConnectionError",
+    "SandboxRunnerOutdatedError",
     # Models
     "ContainerConfig",
     "CancelExecutionResult",
@@ -65,4 +72,5 @@ __all__ = [
     "SkillManifest",
     "SkillRunResult",
     "SkillRunStepResult",
+    "TailFileResult",
 ]

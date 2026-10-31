@@ -1,5 +1,6 @@
 """Real OAuth service/ASGI/SQLite PKCE tests; no configured application DB."""
 import json
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -59,11 +60,21 @@ async def issued(http):
 @pytest.mark.parametrize("form", [False, True])
 async def test_actual_consent_persists_s256_and_requires_verifier_at_real_token_route(pkce_http, form):
     http, sessions = pkce_http
-    code = await issued(http)
+    state = "synthetic-relay:" + "a" * 1024 + "&next=one+two%2F?=end"
+    response = await http.post(
+        "/api/v1/oauth/authorize", **{"data" if form else "json": authorization(state=state)}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    code = body["code"]
+    assert body["state"] == state
+    assert parse_qs(urlsplit(body["redirect_to"]).query) == {"code": [code], "state": [state]}
     async with sessions() as db:
         row = await db.scalar(select(OAuthAuthorizationCode).where(OAuthAuthorizationCode.code == code))
         assert (row.code_challenge, row.code_challenge_method) == (CHALLENGE, "S256")
         assert row.entity_id == SELECTED_ENTITY and row.user_id == USER_ID
+        # SQLite does not enforce VARCHAR(255); require no relay state at rest.
+        assert row.state is None
     args = {"data" if form else "json": exchange(code)}
     response = await http.post("/api/v1/oauth/token", **args)
     assert response.status_code == 200, response.text

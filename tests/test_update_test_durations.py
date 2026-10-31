@@ -169,6 +169,35 @@ def test_allows_lane_specific_deployment_modes_with_the_same_runtime(duration_mo
     assert len(duration_module.validate_reports([regression, cloud])) == 2
 
 
+def test_shards_on_different_kernel_releases_share_one_runtime(duration_module, tmp_path):
+    runtime = {"lock": "same", "platform": "Linux-x86_64-glibc-2.39"}
+    first = _write_report(
+        tmp_path / "first",
+        group=1,
+        splits=2,
+        environment={**runtime, "kernel": "6.17.0-1022-azure"},
+        node_durations={"tests/test_kernel.py::test_first": 0.2},
+    )
+    second = _write_report(
+        tmp_path / "second",
+        group=2,
+        splits=2,
+        environment={**runtime, "kernel": "7.0.0-1017-azure"},
+        node_durations={"tests/test_kernel.py::test_second": 0.2},
+    )
+    assert len(duration_module.validate_reports([first, second])) == 2
+
+    other_libc = _write_report(
+        tmp_path / "other-libc",
+        group=2,
+        splits=2,
+        environment={"lock": "same", "platform": "Linux-x86_64-glibc-2.41", "kernel": "7.0.0-1017-azure"},
+        node_durations={"tests/test_kernel.py::test_second": 0.2},
+    )
+    with pytest.raises(ValueError, match="same runtime"):
+        duration_module.validate_reports([first, other_libc])
+
+
 def test_rejects_mismatched_ci_run_identity(duration_module, tmp_path):
     first = _write_report(
         tmp_path / "first",

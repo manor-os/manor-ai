@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
 import type { Document } from "../../lib/types";
-import { linkWorkflowDocuments, prepareWorkflowDocuments, workflowRunInputs, type WorkflowDocumentRef, type WorkflowUpload } from "../../lib/workflowRunInputs";
+import { linkWorkflowDocuments, prepareWorkflowDocuments, workflowRunInputChosen, workflowRunInputs, workflowUploadFolderId, type WorkflowDocumentRef, type WorkflowUpload } from "../../lib/workflowRunInputs";
 import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Textarea from "../ui/Textarea";
 import Select from "../ui/Select";
 import Modal from "../ui/Modal";
 import HitlKnowledgePicker from "../ui/HitlKnowledgePicker";
+import WorkflowRecordSelect from "./WorkflowRecordSelect";
+import WorkflowUploadProgress, { type WorkflowUploadStatus } from "./WorkflowUploadProgress";
 
 type RunInputFlow = Parameters<typeof workflowRunInputs>[0] & { id?: string; name: string };
 
@@ -36,6 +38,7 @@ export default function WorkflowRunInputModal({
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
   const [progress, setProgress] = useState("");
+  const [uploadStatuses, setUploadStatuses] = useState<Record<string, WorkflowUploadStatus>>({});
   const [submitError, setSubmitError] = useState("");
   const fileInputs = useRef<Record<string, HTMLInputElement | null>>({});
   const pickerButtons = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -56,6 +59,7 @@ export default function WorkflowRunInputModal({
     setPickerKey(null);
     setSubmitError("");
     setProgress("");
+    setUploadStatuses({});
   }, [runInputFlow?.id, runInputFlow?.name, initialValues]);
   const submitWorkflowRun = async () => {
     if (!runInputFlow || busy || submittingRef.current) return;
@@ -70,8 +74,9 @@ export default function WorkflowRunInputModal({
         continue;
       }
       const value = runInputValues[input.key] ?? "";
-      if (!value.trim()) {
-        if (input.required) errors[input.key] = "Provide a value before running this workflow.";
+      const picksMany = Boolean(input.choices || input.records?.multiple);
+      if (!value.trim() || (picksMany && !workflowRunInputChosen(value).length)) {
+        if (input.required) errors[input.key] = picksMany ? "Choose at least one option." : "Provide a value before running this workflow.";
         continue;
       }
       if (input.type === "number") {
@@ -95,21 +100,34 @@ export default function WorkflowRunInputModal({
     submittingRef.current = true;
     setSubmitting(true);
     setSubmitError("");
+    setUploadStatuses(Object.fromEntries(Object.values(uploads).flat().map((item) => [item.uploadKey, {
+      phase: item.document ? "uploaded" : "queued",
+    }])));
     try {
       const allDocuments: WorkflowDocumentRef[] = [];
       for (const input of inputs.filter((item) => item.documents)) {
+        const uploadFolderId = (uploads[input.key] || []).some((item) => !item.document)
+          ? await workflowUploadFolderId(workspaceId, api.workspaces.get)
+          : null;
         const documents = await prepareWorkflowDocuments(selected[input.key] || [], uploads[input.key] || [], async (item) => {
-          setProgress(`Uploading ${item.file.name}…`);
-          const document = await api.documents.upload(item.file, null, {
-            visibility: "private", classification: "internal", client_visible: false,
-          }, {
-            idempotencyKey: item.uploadKey,
-            onProgress: (status) => setProgress(status.phase === "uploading"
-              ? `Uploading ${item.file.name} (${status.percent ?? 0}%)…`
-              : `Processing ${item.file.name}…`),
-          });
-          void queryClient.invalidateQueries({ queryKey: ["documents"] });
-          return documentRef(document);
+          setUploadStatuses((current) => ({ ...current, [item.uploadKey]: { phase: "uploading", percent: 0 } }));
+          try {
+            const document = await api.documents.upload(item.file, uploadFolderId, {
+              visibility: "private", classification: "internal", client_visible: false,
+            }, {
+              idempotencyKey: item.uploadKey,
+              onProgress: (status) => setUploadStatuses((current) => ({ ...current, [item.uploadKey]: status })),
+            });
+            setUploadStatuses((current) => ({ ...current, [item.uploadKey]: { phase: "uploaded" } }));
+            void queryClient.invalidateQueries({ queryKey: ["documents"] });
+            return documentRef(document);
+          } catch (cause) {
+            setUploadStatuses((current) => ({ ...current, [item.uploadKey]: {
+              phase: "failed",
+              error: translateApiError(cause, "Upload failed."),
+            } }));
+            throw cause;
+          }
         });
         triggerData[input.key] = documents;
         allDocuments.push(...documents);
@@ -159,7 +177,7 @@ export default function WorkflowRunInputModal({
               <label htmlFor={`workflow-run-input-${index}`} style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text-strong)" }}>
                 {input.label}{input.required ? " *" : ""}
               </label>
-              {!input.documents && <span style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 10.5, color: "var(--text-faint)" }}>{input.type}</span>}
+              {!input.documents && !input.choices && !input.records && <span style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 10.5, color: "var(--text-faint)" }}>{input.type}</span>}
             </div>
             {input.documents ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -195,12 +213,66 @@ export default function WorkflowRunInputModal({
                   </div>
                 ))}
                 {(uploads[input.key] || []).map((item) => (
-                  <div key={item.uploadKey} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                    <span style={{ overflowWrap: "anywhere" }}>{item.file.name} · {item.document ? "Uploaded" : "Ready to upload"}</span>
+                  <WorkflowUploadProgress key={item.uploadKey} file={item.file}
+                    status={uploadStatuses[item.uploadKey] || { phase: item.document ? "uploaded" : "queued" }}>
                     <Button variant="ghost" size="sm" ariaLabel={`Remove ${item.file.name}`}
                       onClick={() => setUploads((current) => ({ ...current, [input.key]: current[input.key].filter((other) => other !== item) }))}>Remove</Button>
-                  </div>
+                  </WorkflowUploadProgress>
                 ))}
+                {runInputErrors[input.key] && <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>{runInputErrors[input.key]}</p>}
+              </div>
+            ) : input.records ? (
+              <div role="group" aria-label={input.label} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <WorkflowRecordSelect
+                  id={`workflow-run-input-${index}`}
+                  multiple={input.records.multiple}
+                  inputKey={input.key}
+                  value={input.records.multiple
+                    ? workflowRunInputChosen(runInputValues[input.key] ?? "")
+                    : runInputValues[input.key] ?? ""}
+                  workflowId={runInputFlow?.id}
+                  workspaceId={workspaceId || undefined}
+                  disabled={busy}
+                  required={input.required}
+                  invalid={Boolean(runInputErrors[input.key])}
+                  label={`${input.label}${input.required ? " *" : ""}`}
+                  onChange={(next) => {
+                    const multiple = input.records?.multiple;
+                    setRunInputValues((current) => ({
+                      ...current,
+                      [input.key]: multiple ? JSON.stringify(next.split("\n").filter(Boolean)) : next,
+                    }));
+                    setRunInputErrors((current) => ({ ...current, [input.key]: "" }));
+                  }}
+                />
+                {runInputErrors[input.key] && <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>{runInputErrors[input.key]}</p>}
+              </div>
+            ) : input.choices ? (
+              <div role="group" aria-label={input.label} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 14px" }}>
+                  {input.choices.map((option, optionIndex) => {
+                    const chosen = workflowRunInputChosen(runInputValues[input.key] ?? "");
+                    return (
+                      <label key={option.value} style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                        <input
+                          id={optionIndex === 0 ? `workflow-run-input-${index}` : undefined}
+                          type="checkbox"
+                          checked={chosen.includes(option.value)}
+                          onChange={(event) => {
+                            const next = new Set(chosen);
+                            if (event.target.checked) next.add(option.value);
+                            else next.delete(option.value);
+                            const ordered = input.choices!.map((choice) => choice.value).filter((choice) => next.has(choice));
+                            setRunInputValues((current) => ({ ...current, [input.key]: JSON.stringify(ordered) }));
+                            setRunInputErrors((current) => ({ ...current, [input.key]: "" }));
+                          }}
+                          className="workflow-starter-input-checkbox"
+                        />
+                        <span>{option.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
                 {runInputErrors[input.key] && <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>{runInputErrors[input.key]}</p>}
               </div>
             ) : input.type === "json" ? (
@@ -282,6 +354,7 @@ export default function WorkflowRunInputModal({
       })}
       onClose={() => setPickerKey(null)}
       restoreFocus={() => pickerButtons.current[pickerKey]?.focus()}
+      workspaceId={workspaceId || undefined}
     />}
     </>
   );

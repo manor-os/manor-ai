@@ -1,7 +1,7 @@
 import EmojiPicker, { EmojiStyle, Theme, type EmojiClickData } from "emoji-picker-react";
 import { getLocale } from "../../lib/i18n";
 
-export default function RoomEmojiPicker({ onSelect }: { onSelect: (emoji: string) => void }) {
+export default function RoomEmojiPicker({ onSelect, reactions = true }: { onSelect: (emoji: string) => void; reactions?: boolean }) {
   const pick = (selection: EmojiClickData) => onSelect(selection.emoji);
   return <EmojiPicker
     className="room-emoji-picker"
@@ -9,7 +9,7 @@ export default function RoomEmojiPicker({ onSelect }: { onSelect: (emoji: string
     height={340}
     emojiStyle={EmojiStyle.NATIVE}
     theme={document.documentElement.dataset.theme === "dark" ? Theme.DARK : Theme.LIGHT}
-    reactionsDefaultOpen
+    reactionsDefaultOpen={reactions}
     allowExpandReactions
     previewConfig={{ showPreview: false }}
     searchPlaceholder={getLocale() === "zh" ? "搜索表情" : "Search emoji"}

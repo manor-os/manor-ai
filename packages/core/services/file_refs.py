@@ -55,6 +55,24 @@ def is_chat_upload_storage_path(path: Any) -> bool:
     return bool(_CHAT_UPLOAD_RE.fullmatch(str(path or "").strip().lstrip("/")))
 
 
+def signed_file_url_capability(value: Any) -> str | None:
+    """Extract an opaque signed-file token for redaction only, never authorization.
+
+    The token is not decoded or verified; matching this URL shape grants no
+    file access and does not make it an openable ``FileRef``.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        path = urlsplit(value).path
+    except ValueError:
+        return None
+    prefix = "/api/v1/fs/public/"
+    if not path.startswith(prefix):
+        return None
+    return path[len(prefix):].partition("/")[0] or None
+
+
 def parse_file_reference(
     value: Any, *, entity_id: Any = None, allow_relative: bool = False,
 ) -> ParsedFileRef | None:
@@ -238,6 +256,52 @@ async def rewrite_reply_file_links(text: str, resolve: FileRefResolve) -> ReplyF
         cursor = code.end()
     pieces.append(await rewrite_prose(text[cursor:]))
     return ReplyFileLinks("".join(pieces), tuple(dict.fromkeys(unresolved)))
+
+
+def reply_file_references(text: str, *, entity_id: Any = None) -> list[ParsedFileRef]:
+    """The files a reply links, in reading order, each once.
+
+    Finds links the way :func:`rewrite_reply_file_links` does (markdown links
+    and bare file addresses outside code) and decodes each with
+    :func:`parse_file_reference`. A delivered reply links only files its
+    reader can open, so these are what it handed over.
+    """
+    found: list[ParsedFileRef] = []
+
+    def add(target: str) -> None:
+        ref = parse_file_reference(target, entity_id=entity_id)
+        if ref is not None and ref not in found:
+            found.append(ref)
+
+    for prose in _FENCE_RE.split(text or ""):
+        for match in _MARKDOWN_LINK_RE.finditer(prose):
+            add(_LINK_TITLE_RE.sub("", match[3]).strip().strip("<>").strip())
+        for match in _BARE_FILE_TARGET_RE.finditer(_MARKDOWN_LINK_RE.sub(" ", prose)):
+            add(match[0].rstrip(".,;:!?。，；：！？"))
+    return found
+
+
+def reply_file_links(text: str, *, entity_id: Any = None) -> list[tuple[str, ParsedFileRef]]:
+    """Like :func:`reply_file_references`, with each markdown link's label.
+
+    Bare addresses have no label and are named by their last path segment.
+    """
+    found: list[tuple[str, ParsedFileRef]] = []
+    seen: set[ParsedFileRef] = set()
+
+    def add(label: str, target: str) -> None:
+        ref = parse_file_reference(target, entity_id=entity_id)
+        if ref is not None and ref not in seen:
+            seen.add(ref)
+            found.append((label.strip() or _basename(target), ref))
+
+    for prose in _FENCE_RE.split(text or ""):
+        for match in _MARKDOWN_LINK_RE.finditer(prose):
+            add(match[2], _LINK_TITLE_RE.sub("", match[3]).strip().strip("<>").strip())
+        for match in _BARE_FILE_TARGET_RE.finditer(_MARKDOWN_LINK_RE.sub(" ", prose)):
+            target = match[0].rstrip(".,;:!?。，；：！？")
+            add(_basename(target), target)
+    return found
 
 
 def strip_internal_file_links(text: str) -> str:
@@ -443,6 +507,8 @@ __all__ = [
     "is_open_address",
     "openable_file_resolver",
     "parse_file_reference",
+    "reply_file_links",
+    "reply_file_references",
     "resolve_openable_file",
     "rewrite_reply_file_links",
     "strip_internal_file_links",

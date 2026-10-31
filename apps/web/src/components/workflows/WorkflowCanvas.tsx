@@ -17,6 +17,7 @@ import {
   useReactFlow,
   useStore,
   useNodesInitialized,
+  useUpdateNodeInternals,
   type Node,
   type Edge,
   type Connection,
@@ -90,7 +91,7 @@ const NODE_CATEGORY: Record<string, keyof typeof CAT_COLOR> = {
   transform: "data", split: "data", sort: "data", aggregate: "data", filter: "data",
   dedupe: "data", limit: "data", datetime: "data", extractfromfile: "data", code: "data",
   http: "io", connector: "io", respond: "io", notify: "io", subworkflow: "io", tool: "io",
-  publication_receipt: "io",
+  publication_receipt: "io", workflow_effect_deadline: "io",
   image: "media", video: "media", audio: "media", media: "media",
   end: "term", stop: "term", unsupported: "term",
   note: "note",
@@ -104,7 +105,7 @@ const TYPE_LABEL: Record<string, string> = {
   limit: "LIMIT", respond: "RESPOND", sort: "SORT", dedupe: "DEDUPE", stop: "STOP",
   extractfromfile: "EXTRACT FILE", transform: "SET", classifier: "CLASSIFY", wait: "WAIT",
   notify: "NOTIFY", end: "END", media: "MEDIA", image: "IMAGE", video: "VIDEO", audio: "AUDIO",
-  unsupported: "UNSUPPORTED", note: "NOTE", stage: "STAGE", publication_receipt: "RECEIPT",
+  unsupported: "UNSUPPORTED", note: "NOTE", stage: "STAGE", publication_receipt: "RECEIPT", workflow_effect_deadline: "DEADLINE",
 };
 
 // canonical node type -> accent colour (from its category) + short label
@@ -173,6 +174,7 @@ const ICON_CATEGORY: Record<string, string> = {
   tool: "tool",
   connector: "connector",
   publication_receipt: "publication_receipt",
+  workflow_effect_deadline: "wait",
   condition: "branch",
   switch: "switch",
   image: "image",
@@ -1018,6 +1020,28 @@ function withRoute(step: CanvasStep, handle: string | null | undefined, kind: st
   ));
 }
 
+// React Flow draws an edge only once both of its nodes know where their
+// handles are. A node measured before its handles mounted (the run view
+// rebuilds nodes as the run loads) keeps a size but no handle bounds, and
+// since its size never changes again it is never re-measured: every edge on
+// it stays undrawn, which left the run canvas with no lines at all.
+function RemeasureUnplacedHandles() {
+  const updateNodeInternals = useUpdateNodeInternals();
+  const unplaced = useStore((state) => {
+    const ids: string[] = [];
+    state.nodeLookup.forEach((node) => {
+      if (node.measured?.width && !node.internals.handleBounds) ids.push(node.id);
+    });
+    return ids.join("\n");
+  });
+  useEffect(() => {
+    if (!unplaced) return;
+    const frame = requestAnimationFrame(() => updateNodeInternals(unplaced.split("\n")));
+    return () => cancelAnimationFrame(frame);
+  }, [unplaced, updateNodeInternals]);
+  return null;
+}
+
 function FitRunCanvasOnResize() {
   const { fitView } = useReactFlow();
   const width = useStore((state) => state.width);
@@ -1259,6 +1283,7 @@ export default function WorkflowCanvas({
         proOptions={{ hideAttribution: true }}
         style={{ background: "var(--surface-app)" }}
       >
+        <RemeasureUnplacedHandles />
         {fitOnResize && <FitRunCanvasOnResize />}
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="rgba(28,25,23,0.12)" />
         <Controls showInteractive={false} />

@@ -71,14 +71,27 @@ _snapshot_budget = _SnapshotBudget(
     max_files=_MAX_SNAPSHOT_FILES,
     max_bytes=_MAX_SNAPSHOT_TOTAL_BYTES,
 )
+room_file_snapshot_budget = _SnapshotBudget(max_files=8, max_bytes=12 * 1024 * 1024 * 1024)
 
 
 class PinnedFileStreamingResponse(StreamingResponse):
     """Own already-verified private bytes, including pre-body disconnects."""
 
-    def __init__(self, handle, **kwargs):
+    def __init__(self, handle, *, on_close=None, **kwargs):
         self._handle = handle
+        self._on_close = on_close
+        self._closed = False
         super().__init__(self._chunks(), **kwargs)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._handle.close()
+        finally:
+            if self._on_close is not None:
+                self._on_close()
 
     def _chunks(self):
         while chunk := self._handle.read(1024 * 1024):
@@ -88,7 +101,7 @@ class PinnedFileStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._handle.close()
+            self.close()
 
 
 def _copy_file_snapshot(path: str) -> str:

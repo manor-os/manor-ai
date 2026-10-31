@@ -34,6 +34,7 @@ def hard_block_rules_for(
     action_key: str | None = None,
     capability_id: str | None = None,
     matched_rule: str | None = None,
+    category: str | None = None,
 ) -> list[dict[str, Any]]:
     """Name source rules using the same compiled selectors as the policy gate.
 
@@ -44,7 +45,11 @@ def hard_block_rules_for(
     from packages.core.governance.approval_facts import action_facts
     from packages.core.governance.approval_projection import compile_workspace_rules, selector_label
 
-    facts = action_facts(action_key=action_key, capability_id=capability_id)
+    # ``category`` comes from the caller's factory for dynamic (MCP) actions;
+    # declared keys read it from the declaration table.
+    if category is None:
+        category = action_facts(action_key=action_key, capability_id=capability_id).category
+    action_key = str(action_key or "").strip() or "unclassified.action"
     matched = str(matched_rule or "").strip()
     found: list[dict[str, Any]] = []
     for raw in rules if isinstance(rules, list) else []:
@@ -60,9 +65,9 @@ def hard_block_rules_for(
             selector = rule.selector
             hit = rule.id == matched
             if selector.kind == "action":
-                hit = hit or selector.action_key == facts.action_key
+                hit = hit or selector.action_key == action_key
             elif selector.kind == "category":
-                hit = hit or selector.category == facts.category
+                hit = hit or selector.category == category
             if not hit:
                 continue
             found.append({
@@ -133,10 +138,12 @@ def hard_block_denial_context(
     action_key: str | None,
     capability_id: str | None,
     matched_rule: str | None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     """Pure: everything a denial should carry, from the workspace's rules."""
     blocking = hard_block_rules_for(
         rules, action_key=action_key, capability_id=capability_id, matched_rule=matched_rule,
+        category=category,
     )
     fix = hard_block_fix(workspace_id, blocking)
     return {
@@ -154,6 +161,7 @@ async def governance_denial_step_error(
     capability_id: str | None,
     matched_rule: str | None,
     reason: str | None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     """The ``step.error`` a governance hard block writes, wherever it is decided.
 
@@ -168,6 +176,7 @@ async def governance_denial_step_error(
             action_key=action_key,
             capability_id=capability_id,
             matched_rule=matched_rule,
+            category=category,
         )
     except Exception:  # noqa: BLE001 — provenance is advisory
         import logging
@@ -206,6 +215,7 @@ async def load_hard_block_denial_context(
     action_key: str | None,
     capability_id: str | None,
     matched_rule: str | None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     """Load the workspace's rules and build the denial context; ``{}`` without a workspace."""
     ws = str(workspace_id or "").strip()
@@ -223,4 +233,5 @@ async def load_hard_block_denial_context(
         action_key=action_key,
         capability_id=capability_id,
         matched_rule=matched_rule,
+        category=category,
     )

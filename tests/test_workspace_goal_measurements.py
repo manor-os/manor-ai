@@ -220,6 +220,10 @@ async def test_creation_binds_manual_stat_without_inventing_a_baseline_or_score(
 @pytest.mark.parametrize("autonomous", [False, True])
 async def test_library_collector_follows_workspace_runtime_switch(db_session, autonomous):
     from packages.core.services.workspace_runtime import sync_workspace_runtime_schedules
+    from packages.core.services.scheduler_service import (
+        list_scheduled_jobs,
+        summarize_scheduled_jobs,
+    )
 
     workspace = await _create(db_session, fields=_fields(
         heartbeat_enabled=autonomous,
@@ -242,6 +246,19 @@ async def test_library_collector_follows_workspace_runtime_switch(db_session, au
     workspace.status = "paused"
     await sync_workspace_runtime_schedules(db_session, workspace)
     assert all(not job.enabled for job in await collector_jobs())
+    enabled_jobs, enabled_total = await list_scheduled_jobs(
+        db_session,
+        workspace.entity_id,
+        workspace_id=workspace.id,
+        status="enabled",
+    )
+    assert enabled_jobs == []
+    assert enabled_total == 0
+    assert (await summarize_scheduled_jobs(
+        db_session,
+        workspace.entity_id,
+        workspace_id=workspace.id,
+    ))["enabled"] == 0
     workspace.status = "active"
     await sync_workspace_runtime_schedules(db_session, workspace)
     assert len(await collector_jobs()) == 1

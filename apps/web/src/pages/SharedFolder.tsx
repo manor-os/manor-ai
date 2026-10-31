@@ -19,6 +19,7 @@ import ShareOtpGate from "../components/permissions/ShareOtpGate";
 import ReadOnlyFilePreview from "../components/file-preview/ReadOnlyFilePreview";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
+import { getPreferredTimeZone } from "../lib/format";
 
 interface PublicDoc {
   id: string;
@@ -190,7 +191,7 @@ export default function SharedFolder() {
               </span>
               {state.data.expires_at && (
                 <span style={{ fontSize: 12, color: "#a8a29e" }}>
-                  · {t("page.shared_folder.expires_on", { date: new Date(state.data.expires_at).toLocaleDateString() })}
+                  · {t("page.shared_folder.expires_on", { date: new Date(state.data.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) })}
                 </span>
               )}
             </div>

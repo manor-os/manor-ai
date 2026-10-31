@@ -372,7 +372,7 @@ export async function resolveChatMessageReferenceDocument(
   const inflight = referenceDocumentInflight.get(cacheKey);
   if (inflight) return inflight;
 
-  const lookup = api.documents.get(documentId).catch(() => null);
+  const lookup = api.documents.getForPreview(documentId).catch(() => null);
 
   referenceDocumentInflight.set(cacheKey, lookup);
   try {

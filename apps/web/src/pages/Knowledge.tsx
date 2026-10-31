@@ -13,7 +13,7 @@ import { useToastStore } from "../stores/toast";
 import { useDocumentDownload } from "../lib/useDocumentDownload";
 import { useUpgradeStore } from "../stores/upgrade";
 import { useWorkspaceFilter } from "../stores/workspace";
-import { relativeTime, formatFileSize, VectorStatus } from "../lib/format";
+import { relativeTime, formatFileSize, VectorStatus, getPreferredTimeZone } from "../lib/format";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
@@ -38,7 +38,9 @@ import type { NewExternalShareConfig } from "../components/permissions";
 import type { Document, DocumentFolderInfo, DocumentGrant, DocumentShare, UserSummary } from "../lib/types";
 import type { UploadOptionsValue } from "../components/permissions";
 import {
+  folderDisplayName,
   getKnowledgeBrowseParams,
+  mergeKnowledgeSearchResults,
   type KnowledgeFileTypeFilter,
   type KnowledgeLibrarySection,
   type KnowledgeSortKey,
@@ -316,6 +318,16 @@ const STYLES = `
 }
 .kb-doc-name-link:hover {
   color: #4f7d75;
+}
+
+/* Why a search result matched: two lines of the matching text. */
+.kb-search-snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 .kb-delete-btn {
@@ -1399,7 +1411,7 @@ function buildFolderPath(folder: any, allFolders: any[]): FolderPathEntry[] {
   let current = folder;
   while (current && !seen.has(current.id)) {
     seen.add(current.id);
-    path.unshift({ id: current.id, name: current.name });
+    path.unshift({ id: current.id, name: folderDisplayName(current) });
     current = allFolders.find((p: any) => p.id === current.parent_id);
   }
   return path;
@@ -1538,7 +1550,7 @@ function FolderTreeNode({
           <span style={{ width: 16 }} />
         )}
         <IconFolder size={14} className={isActive ? "text-manor-600" : "text-amber-500"} />
-        <span className="truncate text-[13px]">{folder.name}</span>
+        <span className="truncate text-[13px]">{folderDisplayName(folder)}</span>
         {folder.document_count > 0 && (
           <span className="text-[10px] text-stone-400 ml-auto">{folder.document_count}</span>
         )}
@@ -1940,6 +1952,24 @@ export default function Knowledge() {
   const contextMenu = useContextMenu();
   const searchTerm = search.trim();
   const isSearching = searchTerm.length > 0;
+  // Content search reads document text (and media descriptions) at query
+  // time, so it waits for typing to settle instead of running per keystroke.
+  const [contentSearchTerm, setContentSearchTerm] = useState(searchTerm);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setContentSearchTerm(searchTerm), 400);
+    return () => window.clearTimeout(timer);
+  }, [searchTerm]);
+  const contentSearchEnabled = isSearching && librarySection === "all" && contentSearchTerm === searchTerm;
+  const { data: contentSearch } = useQuery({
+    queryKey: ["documents-content-search", currentUser?.entity_id, currentUser?.id, contentSearchTerm, selectedWorkspaceId],
+    queryFn: ({ signal }) => api.documents.contentSearch({
+      q: contentSearchTerm,
+      workspace_id: selectedWorkspaceId || undefined,
+      limit: 20,
+    }, signal),
+    enabled: contentSearchEnabled,
+    staleTime: 60_000,
+  });
 
   const documentBrowseCacheKey = useMemo(
     () => ["documents-browse", currentUser?.entity_id, currentUser?.id, searchTerm, currentFolderId, selectedWorkspaceId, librarySection, fileTypeFilter, sortKey],
@@ -2071,6 +2101,10 @@ export default function Knowledge() {
     const folder = (folders as any[]).find((f: any) => f.id === folderId);
     return canManageFolderItem(folder);
   }, [canManageFolderItem, folders]);
+  // Workspace folders are removed with their Workspace, not from Knowledge.
+  const canDeleteFolderItem = useCallback((folder: Pick<DocumentFolderInfo, "owner_id" | "current_user_capabilities" | "delete_blocked_by_workspace"> | null | undefined) => (
+    !!folder && !folder.delete_blocked_by_workspace && canManageFolderItem(folder)
+  ), [canManageFolderItem]);
 
   useEffect(() => {
     const nextSearch = searchParams.get("q") || "";
@@ -2941,8 +2975,16 @@ export default function Knowledge() {
     return buildFolderPath(folder, folders as any[]).map((entry) => entry.name).join(" / ");
   }, [folders]);
 
-  // Derived: documents
-  const allDocuments = data?.items || [];
+  // Derived: documents. While searching, files found only by their content
+  // follow the name matches, each with the snippet that matched.
+  const { documents: allDocuments, snippets: contentSnippets } = useMemo(
+    () => mergeKnowledgeSearchResults(
+      (data?.items || []) as Document[],
+      contentSearchEnabled ? contentSearch?.items || [] : [],
+      fileTypeFilter,
+    ),
+    [contentSearch?.items, contentSearchEnabled, data?.items, fileTypeFilter],
+  );
 
   // Counts
   const folderCount = foldersAtLevel.length;
@@ -3091,6 +3133,7 @@ export default function Knowledge() {
 
   const buildFolderContextMenu = (folder: any): MenuItem[] => {
     const canManage = canManageFolderItem(folder);
+    const canDeleteFolder = canDeleteFolderItem(folder);
     const canShare = canShareFolderItem(folder);
     const canAddToWorkspace = canManageFolderMetadataItem(folder);
     const items: MenuItem[] = [
@@ -3133,7 +3176,7 @@ export default function Knowledge() {
         onClick: () => setFolderShareTarget(folder),
       });
     }
-    if (canManage) {
+    if (canDeleteFolder) {
       managedItems.push(
         { label: "", divider: true },
         {
@@ -3215,7 +3258,7 @@ export default function Knowledge() {
   const handleBatchTrash = useCallback(async () => {
     const selected = Array.from(selectedIds);
     const docIds = selected.filter((id) => allDocuments.some((d: any) => d.id === id && canDeleteDoc(d)));
-    const folderIds = selected.filter((id) => foldersAtLevel.some((f: any) => f.id === id && canManageFolderItem(f)));
+    const folderIds = selected.filter((id) => foldersAtLevel.some((f: any) => f.id === id && canDeleteFolderItem(f)));
     if (docIds.length === 0 && folderIds.length === 0) {
       setSelectedIds(new Set());
       setSelectMode(false);
@@ -3234,7 +3277,7 @@ export default function Knowledge() {
 
     setSelectedIds(new Set());
     setSelectMode(false);
-  }, [canDeleteDoc, canManageFolderItem, selectedIds, allDocuments, foldersAtLevel, trashMutation, deleteFolderMutation, toast]);
+  }, [canDeleteDoc, canDeleteFolderItem, selectedIds, allDocuments, foldersAtLevel, trashMutation, deleteFolderMutation, toast]);
 
   const handleBatchMove = useCallback(async (targetFolderId: string | null) => {
     const selected = Array.from(selectedIds);
@@ -3279,7 +3322,7 @@ export default function Knowledge() {
           { value: "__root__", label: t("page.knowledge.root_no_folder") },
           ...(foldersAtLevel as any[])
             .filter((f: any) => !selectedIds.has(f.id) && canManageFolderItem(f))
-            .map((f: any) => ({ value: f.id, label: f.name })),
+            .map((f: any) => ({ value: f.id, label: folderDisplayName(f) })),
         ]}
         placeholder={t("page.knowledge.move_to_folder")}
         style={{ minWidth: 160 }}
@@ -3930,7 +3973,7 @@ export default function Knowledge() {
                             className={`kb-folder-card${draggingItem?.id === folder.id ? " dragging" : ""}${dragOverTarget === folder.id ? " drag-over" : ""}${selectMode && selectedIds.has(folder.id) ? " !border-manor-500" : ""}`}
                             style={{ position: "relative" }}
                             draggable={!selectMode && folderManage}
-                            onDragStart={(e) => { if (!selectMode && folderManage) handleDragStartItem(e, { id: folder.id, type: "folder", name: folder.name }); }}
+                            onDragStart={(e) => { if (!selectMode && folderManage) handleDragStartItem(e, { id: folder.id, type: "folder", name: folderDisplayName(folder) }); }}
                             onDragEnd={handleDragEndItem}
                             onDragOver={(e) => {
                               if (draggingItem && draggingItem.id !== folder.id) {
@@ -3965,7 +4008,7 @@ export default function Knowledge() {
                               <IconFolder size={20} className="text-amber-600" />
                             </div>
                             <div className="flex-1 min-w-0">
-                              <p className="text-[14px] font-semibold text-stone-800 truncate">{folder.name}</p>
+                              <p className="text-[14px] font-semibold text-stone-800 truncate">{folderDisplayName(folder)}</p>
                               <p className="text-xs text-stone-400 mt-0.5">
                                 {folder.document_count == null ? "" : `${folder.document_count} ${t("page.knowledge.item")}${folder.document_count !== 1 ? "s" : ""}`}
                               </p>
@@ -4137,6 +4180,11 @@ export default function Knowledge() {
                                 {folderPathLabel}
                               </p>
                             )}
+                            {isSearching && contentSnippets.get(doc.id) && (
+                              <p className="kb-search-snippet m-0 mb-1 text-[11px] text-stone-500" title={contentSnippets.get(doc.id)}>
+                                {contentSnippets.get(doc.id)}
+                              </p>
+                            )}
 
                             <div className="flex items-center gap-2 mb-2">
                               <span className="text-[11px] text-stone-400">
@@ -4144,7 +4192,7 @@ export default function Knowledge() {
                               </span>
                               <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />
                               <span className="text-[11px] text-stone-400">
-                                {doc.created_at ? new Date(doc.created_at).toLocaleDateString() : "--"}
+                                {doc.created_at ? new Date(doc.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) : "--"}
                               </span>
                             </div>
 
@@ -4214,7 +4262,7 @@ export default function Knowledge() {
                               key={folder.id}
                               className={`cursor-pointer${draggingItem?.id === folder.id ? " dragging" : ""}${dragOverTarget === folder.id ? " drag-over" : ""}${selectMode && selectedIds.has(folder.id) ? " bg-manor-50/50" : ""}`}
                               draggable={!selectMode && folderManage}
-                              onDragStart={(e) => { if (!selectMode && folderManage) handleDragStartItem(e, { id: folder.id, type: "folder", name: folder.name }); }}
+                              onDragStart={(e) => { if (!selectMode && folderManage) handleDragStartItem(e, { id: folder.id, type: "folder", name: folderDisplayName(folder) }); }}
                               onDragEnd={handleDragEndItem}
                               onDragOver={(e) => {
                                 if (draggingItem && draggingItem.id !== folder.id) {
@@ -4254,14 +4302,14 @@ export default function Knowledge() {
                                   <div className="w-9 h-9 rounded-[10px] bg-gradient-to-br from-amber-500/10 to-orange-500/10 flex items-center justify-center flex-shrink-0">
                                     <IconFolder size={16} className="text-amber-600" />
                                   </div>
-                                  <span className="text-sm font-semibold text-stone-800">{folder.name}</span>
+                                  <span className="text-sm font-semibold text-stone-800">{folderDisplayName(folder)}</span>
                                 </div>
                               </td>
                               <td className="text-right text-xs text-stone-500">
                                 {folder.document_count ?? "—"}
                               </td>
                               <td className="text-right">
-                                {folderManage && (
+                                {canDeleteFolderItem(folder) && (
                                   <button
                                     onClick={(e) => { e.stopPropagation(); deleteFolderMutation.mutate(folder.id); }}
                                     className="kb-delete-btn"
@@ -4432,6 +4480,11 @@ export default function Knowledge() {
                                       ) : doc.source && (
                                         <p className="text-[11px] text-stone-400 m-0">{doc.source}</p>
                                       )}
+                                      {isSearching && contentSnippets.get(doc.id) && (
+                                        <p className="kb-search-snippet text-[11px] text-stone-500 m-0" title={contentSnippets.get(doc.id)}>
+                                          {contentSnippets.get(doc.id)}
+                                        </p>
+                                      )}
                                     </div>
                                   </div>
                                 </td>
@@ -4447,7 +4500,7 @@ export default function Knowledge() {
                                   {doc.file_size != null ? formatFileSize(doc.file_size) : "--"}
                                 </td>
                                 <td className="text-right text-xs text-stone-500">
-                                  {doc.created_at ? new Date(doc.created_at).toLocaleDateString() : "--"}
+                                  {doc.created_at ? new Date(doc.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) : "--"}
                                 </td>
                                 <td className="text-center">
                                   {doc.vector_status === VectorStatus.GENERATING && (
@@ -4553,7 +4606,7 @@ export default function Knowledge() {
                 <h4 className="text-xs font-bold text-stone-400 uppercase tracking-wide mb-3">{t("page.knowledge.file_details")}</h4>
                 {[
                   { label: t("page.qr.size"), value: quickLookDoc.file_size != null ? formatFileSize(quickLookDoc.file_size) : t("page.workspace_detail.unknown") },
-                  { label: t("page.dashboard.created"), value: quickLookDoc.created_at ? new Date(quickLookDoc.created_at).toLocaleString() : t("page.workspace_detail.unknown") },
+                  { label: t("page.dashboard.created"), value: quickLookDoc.created_at ? new Date(quickLookDoc.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.workspace_detail.unknown") },
                   { label: t("page.skills.source"), value: quickLookDoc.source || "Upload" },
                 ].map((row) => (
                   <div key={row.label} className="flex items-center justify-between py-1.5 border-b border-stone-100">
@@ -4675,7 +4728,7 @@ export default function Knowledge() {
               { label: t("page.custom_fields.type"), value: infoTarget.file_type || infoTarget.name?.split(".").pop() || "Unknown" },
               { label: t("page.qr.size"), value: infoTarget.file_size != null ? formatFileSize(infoTarget.file_size) : t("page.workspace_detail.unknown") },
               { label: t("page.skills.source"), value: infoTarget.source || "Upload" },
-              { label: t("page.dashboard.created"), value: infoTarget.created_at ? new Date(infoTarget.created_at).toLocaleString() : t("page.workspace_detail.unknown") },
+              { label: t("page.dashboard.created"), value: infoTarget.created_at ? new Date(infoTarget.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.workspace_detail.unknown") },
             ].map((row) => (
               <div key={row.label} className="flex items-center justify-between py-1.5">
                 <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">{row.label}</span>
@@ -4841,7 +4894,7 @@ export default function Knowledge() {
                 onClick={() => { moveMutation.mutate({ id: movePickerDoc.id, folder_id: f.id, filing_only: filingOnly }); setMovePickerDoc(null); setFilingOnly(false); }}
               >
                 <IconFolder size={16} className="text-amber-500 shrink-0" />
-                <span className="text-sm font-medium text-stone-700 truncate">{f.name}</span>
+                <span className="text-sm font-medium text-stone-700 truncate">{folderDisplayName(f)}</span>
               </button>
             ))}
             {(folders as any[]).filter((f: any) => f.id !== movePickerDoc?.folder_id && canManageFolderItem(f)).length === 0 && !movePickerDoc.folder_id && (
@@ -5070,7 +5123,7 @@ export default function Knowledge() {
         <FolderPropertiesDialog
           open={!!folderPropsTarget}
           folderId={folderPropsTarget.id}
-          folderName={folderPropsTarget.name}
+          folderName={folderDisplayName(folderPropsTarget)}
           visibility={folderPropsTarget.visibility}
           classification={folderPropsTarget.classification}
           clientVisible={folderPropsTarget.client_visible}
@@ -5170,7 +5223,7 @@ function FolderShareDialogContainer({
       onClose={onClose}
       resourceType="document_folder"
       resourceId={folder.id}
-      resourceName={folder.name}
+      resourceName={folderDisplayName(folder)}
       classification={folder.classification}
       visibility={folder.visibility}
       externalShareNeedsApproval={folder.classification === "confidential"}

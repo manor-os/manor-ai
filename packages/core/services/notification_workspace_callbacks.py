@@ -425,15 +425,14 @@ async def _resolve_message_via_chat_service(
                         "open; please retry."
                     ),
                 }
-            if (
-                delivery_disposition
-                is ApprovedExternalReplyDeliveryDisposition.OUTCOME_UNKNOWN
-            ):
-                resolution.update({
-                    "delivery_outcome": "unknown",
-                    "message_log_id": delivery_result.get("message_log_id"),
-                    "delivery_error": delivery_result.get("error"),
-                })
+            from packages.core.services.channel_outbound_delivery import (
+                approved_external_reply_resolution_fields,
+            )
+
+            # The answered card shows the delivery result on its own line.
+            resolution.update(
+                approved_external_reply_resolution_fields(delivery_result)
+            )
         else:
             ack_message = "Rejected — the draft external reply was not sent."
         # Provider I/O above ran without a Message lock or staged approval
@@ -504,12 +503,11 @@ async def _resolve_external_message_action(
     on later).
     """
     pa = pending_action
-    from packages.core.models.task import Conversation, Message as ChatMessage
+    from packages.core.models.task import Conversation
     from packages.core.services.channel_outbound_delivery import (
         ApprovedExternalReplyDeliveryDisposition,
         ApprovedExternalReplyDeliveryError,
         approved_external_reply_delivery_disposition,
-        approved_external_reply_outcome_message,
         deliver_approved_external_reply,
     )
 
@@ -545,20 +543,6 @@ async def _resolve_external_message_action(
     ):
         reason = str(result.get("reason") or result.get("error") or "unknown")
         raise ApprovedExternalReplyDeliveryError(reason)
-    body = approved_external_reply_outcome_message(result)
-    db.add(ChatMessage(
-        conversation_id=msg.conversation_id,
-        role="system",
-        content=body,
-        author_kind="system",
-        message_kind="system",
-        refs=[
-            {"type": "message", "id": msg.id},
-            {"type": "channel_conversation", "id": pa.get("channel_conversation_id")},
-            {"type": "message_log", "id": result.get("message_log_id")},
-        ],
-    ))
-    await db.flush()
     return result
 
 
@@ -566,6 +550,30 @@ register_callback(CALLBACK_KIND, _resolve_message_via_chat_service)
 
 
 # ── Producer helper ──────────────────────────────────────────────────────
+
+
+async def resolve_workspace_hitl_recipients(db, *, entity_id: str, workspace_id: str | None) -> list[str]:
+    """Who answers this Workspace's cards: its policy list, else entity owners/admins.
+
+    An explicit empty ``hitl_notify_user_ids`` opts the Workspace out (``[]``).
+    """
+    from packages.core.models.user import User
+    from packages.core.models.workspace import Workspace
+
+    if workspace_id:
+        ws = (await db.execute(
+            select(Workspace).where(Workspace.id == workspace_id, Workspace.entity_id == entity_id)
+        )).scalar_one_or_none()
+        if ws and isinstance(ws.settings, dict):
+            configured = (ws.settings.get("notification_policy") or {}).get("hitl_notify_user_ids")
+            if isinstance(configured, list):
+                return [str(u) for u in configured if isinstance(u, str) and u]
+    rows = (await db.execute(
+        select(User.id).where(
+            User.entity_id == entity_id, User.status == "active", User.role.in_(("owner", "admin")),
+        )
+    )).scalars().all()
+    return [str(value) for value in rows]
 
 
 async def notify_workspace_hitl_approvers(
@@ -587,44 +595,17 @@ async def notify_workspace_hitl_approvers(
     Returns the number of users notified. Failures per-user are logged
     and swallowed — one bad address never holds up the rest.
     """
-    from packages.core.models.user import User
-    from packages.core.models.workspace import Workspace
     from packages.core.services.notify import notify
 
     user_ids: list[str] = list(recipient_user_ids or [])
-    # Empty list passed in by the caller is an explicit "no recipients"
-    # — honour it and skip the workspace/entity fallback. ``None`` means
-    # "no preference, please resolve".
-    explicit_empty = recipient_user_ids is not None and not user_ids
-
-    if not user_ids and not explicit_empty and workspace_id:
+    # An empty list passed in by the caller is an explicit "no recipients"
+    # — honour it and skip resolution. ``None`` means "no preference,
+    # please resolve".
+    if recipient_user_ids is None:
         async with async_session() as db:
-            ws = (await db.execute(
-                select(Workspace).where(
-                    Workspace.id == workspace_id,
-                    Workspace.entity_id == entity_id,
-                )
-            )).scalar_one_or_none()
-            if ws and isinstance(ws.settings, dict):
-                policy = ws.settings.get("notification_policy") or {}
-                configured = policy.get("hitl_notify_user_ids")
-                if isinstance(configured, list):
-                    # Same semantics at the workspace tier: an empty
-                    # list opt-outs the workspace; absence falls through.
-                    user_ids = [str(u) for u in configured if isinstance(u, str) and u]
-                    if not user_ids:
-                        explicit_empty = True
-
-    if not user_ids and not explicit_empty:
-        async with async_session() as db:
-            rows = (await db.execute(
-                select(User).where(
-                    User.entity_id == entity_id,
-                    User.status == "active",
-                    User.role.in_(("owner", "admin")),
-                )
-            )).scalars().all()
-            user_ids = [u.id for u in rows]
+            user_ids = await resolve_workspace_hitl_recipients(
+                db, entity_id=entity_id, workspace_id=workspace_id,
+            )
 
     if not user_ids:
         logger.info(

@@ -12,6 +12,24 @@ from packages.core.services import tiktok_publish_review as reviews
 from test_tiktok_mcp import ARGS, CREATOR, MEDIA
 
 
+@pytest.mark.parametrize(("format_name", "suffix"), [("JPEG", ".jpg"), ("WEBP", ".webp")])
+def test_tiktok_photo_snapshot_requires_decodable_provider_image(tmp_path, format_name, suffix):
+    from PIL import Image
+
+    path = tmp_path / f"poster{suffix}"
+    Image.new("RGB", (8, 6), "blue").save(path, format=format_name)
+
+    assert reviews._inspect_tiktok_photo_snapshot(str(path)) == {"width": 8, "height": 6}
+
+
+def test_tiktok_photo_snapshot_rejects_suffix_only_fake_image(tmp_path):
+    path = tmp_path / "pretend.jpg"
+    path.write_bytes(b"not an image")
+
+    with pytest.raises(reviews.TikTokPublishReviewError, match="bytes are invalid"):
+        reviews._inspect_tiktok_photo_snapshot(str(path))
+
+
 @pytest.fixture
 def review():
     return {
@@ -250,6 +268,44 @@ def test_verified_duration_must_fit_creator_limit(review, submitted, duration):
     review["media"]["duration_sec"] = duration
     with pytest.raises(reviews.TikTokPublishReviewError, match="duration"):
         reviews.apply_tiktok_publish_review(review, submitted, ARGS)
+
+
+@pytest.mark.asyncio
+async def test_photo_review_binds_ordered_sources_and_requires_human_cover(monkeypatch):
+    photos = [
+        {"source_kind": "chat_attachment", "rel_path": "uploads/chat/1111111111111111.jpg", "source_sha256": "1" * 64, "size_bytes": 101},
+        {"source_kind": "workspace_document", "document_id": "doc-2", "rel_path": "Knowledge/second.webp", "source_sha256": "2" * 64, "size_bytes": 102},
+    ]
+    args = {
+        "photo_urls": [photos[0]["rel_path"], {"source_kind": "workspace_document", "document_id": "doc-2"}],
+        "title": "Original caption", "privacy_level": "PUBLIC_TO_EVERYONE",
+    }
+    monkeypatch.setattr(reviews, "inspect_tiktok_photo_sources", AsyncMock(return_value=photos))
+    monkeypatch.setattr(reviews, "_creator_for_actor", AsyncMock(return_value=("account", copy.deepcopy(CREATOR))))
+    prepared = await reviews.prepare_tiktok_publish_review(
+        "mcp__tiktok__post_photo", args,
+        entity_id="entity", user_id="actor", conversation_id="conversation", workspace_id="workspace",
+    )
+    assert prepared["review"]["version"] == 2
+    assert [item["name"] for item in prepared["review"]["media"]["items"]] == ["1111111111111111.jpg", "second.webp"]
+    evidence = prepared["tiktok_publish_evidence"]
+    assert evidence["tool_name"] == "mcp__tiktok__post_photo"
+    assert evidence["media_sources"] == photos
+    submitted_photo = {
+        "kind": "tiktok_publish", "version": 2, "review_id": prepared["review"]["review_id"],
+        "caption": "Human caption", "privacy_level": "PUBLIC_TO_EVERYONE",
+        "allow_comment": False, "allow_duet": False, "allow_stitch": False,
+        "commercial_content": False, "brand_organic_toggle": False, "brand_content_toggle": False,
+        "music_usage_confirmed": True, "branded_content_policy_confirmed": False,
+        "consent_confirmed": True,
+    }
+    with pytest.raises(reviews.TikTokPublishReviewError, match="cover photo"):
+        reviews.apply_tiktok_publish_review(prepared["review"], submitted_photo, args)
+    final = reviews.apply_tiktok_publish_review(
+        prepared["review"], {**submitted_photo, "photo_cover_index": 1}, args,
+    )
+    assert final["photo_cover_index"] == 1
+    assert final["photo_urls"] == args["photo_urls"]
 
 
 @pytest.mark.asyncio

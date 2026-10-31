@@ -216,7 +216,7 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
         "scopes": (
             "user.info.basic,user.info.profile,user.info.stats,"
-            "video.list,video.publish,video.upload"
+            "video.list,video.publish"
         ),
         "client_id_env": "TIKTOK_CLIENT_ID",
         "client_secret_env": "TIKTOK_CLIENT_SECRET",

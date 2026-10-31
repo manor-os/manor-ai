@@ -1,7 +1,8 @@
 """The durable run-row protocol: stage, claim, renew, checkpoint, settle, release.
 
 A durable run is one database row that a worker drives one wake at a time.
-Every kind of run (today the Task coordinator run) shares the same fencing:
+Every kind of run (the Task coordinator run and its delegated child runs)
+shares the same fencing:
 
 * A wake is an outbox row with one stable dedupe key per run. Staging a wake
   replaces that row and gives the run a fresh opaque ``wake_generation``.
@@ -78,6 +79,9 @@ class DurableRunSpec:
     terminal_phases: frozenset[str]
     # ``last_error`` of a staged, undelivered wake row.
     wake_pending_error: str
+    # Extra envelope fields read from the locked run row when a wake is
+    # staged (a child run's ``task_id``); the spec's own payload wins.
+    payload_fields: Callable[[Any], dict[str, Any]] | None = None
 
     def key_of(self, run: Any) -> str:
         return str(getattr(run, self.key_column.key))
@@ -266,6 +270,8 @@ async def _stage_locked_run_wake(
     available_at = bounded_wake_time(now, delay_seconds=delay_seconds, available_at=available_at)
     wake_generation = generate_ulid()
     payload = spec.payload(key, wake_generation, str(reason or "state_transition")[:160])
+    if spec.payload_fields is not None:
+        payload = {**spec.payload_fields(run), **payload}
     insert_statement = pg_insert(RuntimeOutboxEvent).values(
         id=generate_ulid(),
         event_type=spec.outbox_event,

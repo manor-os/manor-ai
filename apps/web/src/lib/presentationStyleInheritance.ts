@@ -4,7 +4,11 @@ export interface PresentationTextLevelStyle {
   indent?: number;
   indentRight?: number;
   hanging?: number;
+  /** Line-height multiplier from `spcPct`. */
   lineSpacing?: number;
+  /** Exact line height in points from `spcPts`; resolve per paragraph with
+   * presentationLineSpacingMultiplier, since its runs set the font size. */
+  lineSpacingPoints?: number;
   spaceBefore?: number;
   spaceAfter?: number;
   bold?: boolean;
@@ -30,6 +34,24 @@ interface PresentationStyleResolvers {
  */
 export function presentationPointsToCqh(points: number): string {
   return `calc(${(points / 5.4).toFixed(3)}cqh * var(--pptx-point-scale, 1))`;
+}
+
+/** OOXML `a:bodyPr` inset defaults (91440 / 45720 EMU), in points. */
+export const PRESENTATION_DEFAULT_TEXT_INSETS = { l: 7.2, t: 3.6, r: 7.2, b: 3.6 } as const;
+
+/**
+ * CSS padding for a shape's text insets. Shapes are border-box children of a
+ * slide-sized container, so each side is capped at half the shape's size:
+ * insets never make a shape larger than its xfrm (a 5.76pt accent bar keeps
+ * its height instead of growing to its 7.2pt of insets).
+ */
+export function presentationTextInsetPadding(
+  insets: { l: number; t: number; r: number; b: number },
+  shape: { w: number; h: number },
+): string {
+  const vertical = (points: number) => `min(${presentationPointsToCqh(points)}, ${(shape.h / 2).toFixed(3)}cqh)`;
+  const horizontal = (points: number) => `min(${presentationPointsToCqh(points)}, ${(shape.w / 2).toFixed(3)}cqw)`;
+  return `${vertical(insets.t)} ${horizontal(insets.r)} ${vertical(insets.b)} ${horizontal(insets.l)}`;
 }
 
 function xmlAttr(xml: string, name: string): string | undefined {
@@ -110,14 +132,31 @@ function parseTextLevel(xml: string | undefined, resolvers: PresentationStyleRes
     indent: marginLeft == null ? undefined : parseInt(marginLeft, 10) / 12700,
     indentRight: marginRight == null ? undefined : parseInt(marginRight, 10) / 12700,
     hanging: firstLineIndent == null ? undefined : parseInt(firstLineIndent, 10) / 12700,
-    lineSpacing: linePercent
-      ? parseInt(linePercent, 10) / 100000
+    // A level sets one kind of line spacing; naming both keys lets it
+    // replace the other kind inherited from a lower level when merged.
+    ...(linePercent
+      ? { lineSpacing: parseInt(linePercent, 10) / 100000, lineSpacingPoints: undefined }
       : linePoints
-        ? parseInt(linePoints, 10) / 100 / (defaultRun.fontSize || 12)
-        : undefined,
+        ? { lineSpacing: undefined, lineSpacingPoints: parseInt(linePoints, 10) / 100 }
+        : {}),
     spaceBefore: spacingPoints(xmlElement(xml, "a:spcBef"), defaultRun.fontSize),
     spaceAfter: spacingPoints(xmlElement(xml, "a:spcAft"), defaultRun.fontSize),
   };
+}
+
+/**
+ * CSS line-height multiplier for a paragraph with exact (`spcPts`) spacing.
+ * The largest run sets the line box, so dividing by its size keeps every line
+ * at the stated height whatever size the paragraph's first run has.
+ */
+export function presentationLineSpacingMultiplier(
+  points: number,
+  runFontSizes: Array<number | undefined>,
+  fallbackFontSize?: number,
+): number {
+  const sizes = runFontSizes.filter((size): size is number => typeof size === "number" && size > 0);
+  const fontSize = sizes.length > 0 ? Math.max(...sizes) : fallbackFontSize || 18;
+  return points / fontSize;
 }
 
 export function parsePresentationTextStyleLevels(

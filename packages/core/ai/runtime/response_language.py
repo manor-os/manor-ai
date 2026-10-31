@@ -91,6 +91,12 @@ async def resolve_runtime_response_language(
     return RuntimeResponseLanguage(entity_id, user_id, locale=locale)
 
 
+def current_response_locale() -> str | None:
+    """The reply language of the run in progress (the user's saved locale), if any."""
+    language = _response_language.get()
+    return language.locale if language is not None else None
+
+
 @contextmanager
 def runtime_response_language_scope(language: RuntimeResponseLanguage):
     token = _response_language.set(language)

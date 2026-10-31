@@ -34,8 +34,20 @@ class OAuthClientApp(Base, TimestampMixin):
     # Public identifier shared with the client app
     client_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
 
-    # Bcrypt hash of the client secret (never stored in plaintext)
-    client_secret_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Bcrypt hash of the client secret (never stored in plaintext). Null for a
+    # public client (RFC 8252 native app), which must redeem codes with S256 PKCE.
+    client_secret_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # "configured" (env/admin seeded) or "dynamic" (RFC 7591 self-registration).
+    # Dynamic clients chose their own name, so consent shows them as unverified.
+    registration_source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="configured", server_default="configured",
+    )
+
+    # Audience of the access tokens this client receives. Null keeps the normal
+    # Manor API audience; a resource audience (e.g. the MCP endpoint) yields
+    # tokens that the REST API rejects and only that resource accepts.
+    token_audience: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Human-readable name for admin UI
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -97,3 +109,31 @@ class OAuthAuthorizationCode(Base, TimestampMixin):
 
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthRefreshToken(Base, TimestampMixin):
+    """Rotating refresh token for a public OAuth client (OAuth 2.1 §4.3.1).
+
+    Each redemption replaces the row with a new one in the same family. Presenting
+    an already-rotated token revokes the whole family (theft detection). Tokens
+    also die with the user's ``token_version`` (sign out everywhere).
+    """
+    __tablename__ = "oauth_refresh_tokens"
+    __table_args__ = (
+        Index("ix_oauth_refresh_tokens_hash", "token_hash", unique=True),
+        Index("ix_oauth_refresh_tokens_family", "family_id"),
+        Index("ix_oauth_refresh_tokens_user", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    # SHA-256 hex of the opaque token; the plaintext is only ever returned once.
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    family_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    scope: Mapped[list] = mapped_column(JSONB, nullable=False, server_default='[]')
+    token_version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

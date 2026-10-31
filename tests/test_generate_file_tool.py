@@ -94,6 +94,8 @@ def test_generate_file_audio_schema_exposes_task_scoped_narrator_mode():
         "random_per_conversation",
         "fixed_per_workspace",
     ]
+    assert params_properties["narration_voice_mode"]["enum"] == properties["narration_voice_mode"]["enum"]
+    # voice_role stays out of the eager schema (params accept it; kind=search documents it).
     language_description = properties["language"]["description"]
     assert "BCP-47" in language_description
     assert "Workspace audio language" in language_description
@@ -365,6 +367,131 @@ async def test_managed_openai_tts_prefers_vercel_then_falls_back_to_openrouter(m
 
 
 @pytest.mark.asyncio
+async def test_vercel_music_sends_exact_length_and_returns_gateway_cost(monkeypatch):
+    import base64
+
+    import httpx
+
+    captured: list[dict] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "audio": base64.b64encode(b"music-bytes").decode(),
+                "providerMetadata": {"gateway": {"cost": "0.2250"}},
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            captured.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    audio, cost = await extended_tools._vercel_music_bytes(
+        api_key="vck-test-gateway-key",
+        base_url="https://ai-gateway.vercel.sh/v1",
+        model="elevenlabs/music-v2.5",
+        prompt="Anthemic rock.\n[Chorus]\nRaise that flag",
+        duration_seconds=180,
+    )
+    # Below the provider minimum is raised to it rather than rejected.
+    await extended_tools._vercel_music_bytes(
+        api_key="vck-test-gateway-key",
+        base_url="",
+        model="elevenlabs/music-v2.5",
+        prompt="Sting",
+        duration_seconds=1,
+    )
+
+    assert (audio, cost) == (b"music-bytes", 0.225)
+    assert captured[0]["url"] == "https://ai-gateway.vercel.sh/v4/ai/speech-model"
+    assert captured[0]["headers"]["ai-model-id"] == "elevenlabs/music-v2.5"
+    assert captured[0]["json"] == {
+        "text": "Anthemic rock.\n[Chorus]\nRaise that flag",
+        "outputFormat": "mp3",
+        "providerOptions": {"elevenlabs": {"musicLengthMs": 180_000}},
+    }
+    assert captured[1]["json"]["providerOptions"]["elevenlabs"]["musicLengthMs"] == 3_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_byok", [False, True])
+async def test_eleven_music_runs_only_on_the_managed_vercel_route(monkeypatch, is_byok):
+    routes: list[dict] = []
+    saved: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "elevenlabs/music-v2.5", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "audio"
+        return ("sk-or-user-music-key", "", True) if is_byok else ("", "", False)
+
+    async def fake_route(model, **kwargs):
+        routes.append({"model": model, **kwargs})
+        return type(
+            "Route",
+            (),
+            {"api_key": "vck-gateway", "base_url": "https://ai-gateway.vercel.sh/v1", "provider": "vercel"},
+        )()
+
+    async def fake_music(**kwargs):
+        assert kwargs["api_key"] == "vck-gateway"
+        assert kwargs["duration_seconds"] == 95
+        return b"music", 0.11875
+
+    async def fake_save(**kwargs):
+        saved.update(kwargs)
+        return "/api/v1/fs/entity/audio/song.mp3"
+
+    async def no_credit_gate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_resolve_official_model_route", fake_route)
+    monkeypatch.setattr(extended_tools, "_vercel_music_bytes", fake_music)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save)
+    monkeypatch.setattr(extended_tools, "runtime_assert_credit_available", no_credit_gate)
+
+    result = json.loads(
+        await extended_tools._generate_live_audio(
+            entity_id="entity",
+            user_id="user",
+            prompt="Anthemic rock about raising a flag",
+            purpose="music",
+            model="elevenlabs/music-v2.5",
+            duration_seconds=95,
+        )
+    )
+
+    if is_byok:
+        # A user's key cannot run Eleven Music, and platform credit is never spent for it.
+        assert result["status"] != "completed"
+        assert "Music & Score API key cannot use" in result["error"]
+        assert routes == [] and saved == {}
+    else:
+        assert result["status"] == "completed"
+        assert routes[0]["gateway_provider"] == "vercel"
+        assert saved["provider_cost_usd"] == 0.11875
+        assert saved["is_byok"] is False
+
+
+@pytest.mark.asyncio
 async def test_managed_google_tts_skips_unsupported_vercel_speech_route(monkeypatch):
     calls: list[str] = []
     route_calls: list[str | None] = []
@@ -434,7 +561,9 @@ async def test_managed_google_tts_skips_unsupported_vercel_speech_route(monkeypa
     )
 
     assert calls == ["openrouter"]
-    assert route_calls == ["openrouter"]
+    # Route availability and generation both resolve the managed route; neither
+    # may ask for the Vercel speech gateway this model is not listed on.
+    assert route_calls and set(route_calls) == {"openrouter"}
     assert result["status"] == "completed"
     assert result["provider"] == "openrouter"
     assert result["provider_response_format"] == "pcm"
@@ -1272,6 +1401,20 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
         )
 
         assert image_url == f"/api/v1/fs/{entity_id}/{expected_path}"
+        # The tool result names the Document the image was saved as, so a workflow
+        # receipt can cite it instead of asking the model to invent one.
+        result = await extended_tools._generated_image_result_payload(
+            image_url=image_url,
+            prompt="Hero product image",
+            size="1024x1024",
+            model="gpt-image-1",
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            workspace_asset_key="",
+            saved_to_knowledge=True,
+            include_fs_path=True,
+        )
+        assert result["document_id"] == document_id
         db_session.expire_all()
         docs = list(
             (
@@ -2828,47 +2971,6 @@ async def test_openai_tts_uses_saved_openrouter_byok_in_oss(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_suno_missing_key_in_oss_requires_entity_music_byok(monkeypatch):
-    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
-        assert purpose == "music"
-        return "suno/music", "audio"
-
-    async def fake_credentials(_user_id, _entity_id, *, role):
-        assert role == "audio"
-        return "", "", False
-
-    async def fake_platform_credentials(_provider):
-        assert _provider == "suno"
-        return "", ""
-
-    async def start_job_must_not_run(**_kwargs):  # pragma: no cover - should not be called
-        raise AssertionError("OSS must reject missing Suno BYOK before starting a provider job")
-
-    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
-    monkeypatch.setenv("SUNO_API_KEY", "platform-suno-key")
-    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
-    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
-    monkeypatch.setattr(
-        extended_tools,
-        "_platform_native_media_credential_async",
-        fake_platform_credentials,
-    )
-    monkeypatch.setattr(extended_tools, "_start_suno_audio_job", start_job_must_not_run)
-
-    result = json.loads(await extended_tools._generate_live_audio(
-        entity_id="entity",
-        user_id="user",
-        prompt="Warm synth score",
-        purpose="music",
-    ))
-
-    assert result["status"] == "error"
-    assert result["code"] == "provider_key_required"
-    assert "Music & Score" in result["error"]
-    assert "SUNO_API_KEY" not in result["error"]
-
-
-@pytest.mark.asyncio
 async def test_official_openai_tts_ignores_primary_byok_when_voice_key_is_missing(monkeypatch):
     from packages.core.ai.tools import extended_tools
 
@@ -3944,6 +4046,44 @@ async def test_lyria_clip_uses_native_google_music_and_reports_fixed_duration(mo
 
 
 @pytest.mark.asyncio
+async def test_generated_music_reports_the_document_it_was_saved_as(monkeypatch):
+    """A Flow step or App view references the saved music by its Document id."""
+    from packages.core.ai.tools import extended_tools
+
+    looked_up: list = []
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "google/lyria-3-clip-preview", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        return "AIza-user-google-key", "", True
+
+    async def fake_google_music_bytes(**_kwargs):
+        return b"ID3\x04music", "mp3"
+
+    async def fake_save_audio(**_kwargs):
+        return "/api/v1/fs/entity/Workspaces/_by_id/ws/score.mp3"
+
+    async def fake_document_id(entity_id, fs_path):
+        looked_up.append((entity_id, fs_path))
+        return "doc-score"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_google_music_bytes", fake_google_music_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+    monkeypatch.setattr(extended_tools, "_document_id_for_fs_path", fake_document_id)
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="entity", user_id="user", prompt="Warm piano ballad", purpose="music", response_format="mp3",
+    ))
+
+    assert result["status"] == "completed"
+    assert looked_up == [("entity", result["fs_path"])]
+    assert result["document_id"] == "doc-score"
+
+
+@pytest.mark.asyncio
 async def test_lyria_pro_accepts_wav_and_duration_prompt(monkeypatch):
     from packages.core.ai.tools import extended_tools
 
@@ -3985,6 +4125,466 @@ async def test_lyria_pro_accepts_wav_and_duration_prompt(monkeypatch):
     assert "exactly 90 seconds" in captured["prompt"]
     assert captured["saved_format"] == "wav"
     assert result["duration_seconds"] == 90.0
+
+
+class _FakeSSEStream:
+    """``httpx.AsyncClient.stream`` context yielding OpenRouter SSE lines."""
+
+    def __init__(self, events: list[dict], status_code: int = 200):
+        self.status_code = status_code
+        self._lines = [f"data: {json.dumps(event)}" for event in events] + ["data: [DONE]"]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def aread(self):
+        return b"error body"
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+def _fake_openrouter_stream_client(monkeypatch, events: list[dict], requests: list[dict]):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            requests.append({"timeout": kwargs.get("timeout")})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, method, url, **kwargs):
+            requests.append({"method": method, "url": url, **kwargs})
+            return _FakeSSEStream(events)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+
+@pytest.mark.asyncio
+async def test_lyria_openrouter_request_streams_audio_first_and_reports_cost(monkeypatch):
+    mp3 = b"ID3\x04\x00lyria-mp3-frames"
+    encoded = base64.b64encode(mp3).decode("ascii")
+    requests: list[dict] = []
+    _fake_openrouter_stream_client(
+        monkeypatch,
+        [
+            {"choices": [{"delta": {"content": "[Verse] lyrics"}}]},
+            {"choices": [{"delta": {"audio": {"data": encoded[:8]}}}]},
+            {"choices": [{"delta": {"audio": {"data": encoded[8:]}}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"cost": 0.04}},
+        ],
+        requests,
+    )
+
+    audio_bytes, audio_format, cost = await extended_tools._openrouter_music_bytes(
+        api_key="sk-or-key",
+        model="google/lyria-3-clip-preview",
+        prompt="Upbeat synthwave bed",
+    )
+
+    assert (audio_bytes, audio_format, cost) == (mp3, "mp3", 0.04)
+    request = requests[-1]
+    assert request["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert request["headers"]["Authorization"] == "Bearer sk-or-key"
+    assert request["json"] == {
+        "model": "google/lyria-3-clip-preview",
+        "messages": [{"role": "user", "content": "Upbeat synthwave bed"}],
+        "modalities": ["audio", "text"],
+        "audio": {"format": "mp3"},
+        "stream": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lyria_openrouter_mid_stream_error_is_not_saved_as_audio(monkeypatch):
+    _fake_openrouter_stream_client(
+        monkeypatch,
+        [{
+            "error": {"code": 502, "message": "Provider returned error"},
+            "choices": [{"delta": {"content": ""}, "finish_reason": "error"}],
+        }],
+        [],
+    )
+
+    with pytest.raises(RuntimeError, match="502"):
+        await extended_tools._openrouter_music_bytes(
+            api_key="sk-or-key", model="google/lyria-3-pro-preview", prompt="Score",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credentials", "platform_google", "expected_route", "expected_key", "expected_byok"),
+    [
+        # Managed: Manor's native Google key wins over its OpenRouter key.
+        (("sk-or-platform", "", False), ("AIza-platform", ""), "google", "AIza-platform", False),
+        # Managed without a Google key: Manor's OpenRouter key, billed in credits.
+        (("sk-or-platform", "", False), ("", ""), "openrouter", "sk-or-platform", False),
+        # BYOK OpenRouter key: OpenRouter on the user's key, never Manor's.
+        (("sk-or-user", "https://openrouter.ai/api/v1", True), ("AIza-platform", ""), "openrouter", "sk-or-user", True),
+        # BYOK native Google key keeps the native route.
+        (("AIza-user", "", True), ("", ""), "google", "AIza-user", True),
+    ],
+)
+async def test_lyria_routes_native_google_before_openrouter(
+    monkeypatch, credentials, platform_google, expected_route, expected_key, expected_byok,
+):
+    calls: dict = {}
+    mp3 = b"ID3\x04\x00music"
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "google/lyria-3-clip-preview", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "audio"
+        return credentials
+
+    async def fake_platform(provider):
+        return platform_google if provider == "google" else ("", "")
+
+    async def fake_google(**kwargs):
+        calls["google"] = kwargs["api_key"]
+        return mp3, "mp3"
+
+    async def fake_openrouter(**kwargs):
+        calls["openrouter"] = kwargs["api_key"]
+        return mp3, "mp3", 0.04
+
+    async def fake_save(**kwargs):
+        calls["save"] = kwargs
+        return "/api/v1/fs/entity/audio/music.mp3"
+
+    async def no_credit_check(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_platform_native_media_credential_async", fake_platform)
+    monkeypatch.setattr(extended_tools, "_google_music_bytes", fake_google)
+    monkeypatch.setattr(extended_tools, "_openrouter_music_bytes", fake_openrouter)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save)
+    monkeypatch.setattr(extended_tools, "runtime_assert_credit_available", no_credit_check)
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="entity", user_id="user", prompt="Warm lo-fi bed", purpose="music",
+    ))
+
+    assert result["status"] == "completed"
+    assert result["provider"] == expected_route
+    assert calls[expected_route] == expected_key
+    assert set(calls) == {expected_route, "save"}
+    assert calls["save"]["is_byok"] is expected_byok
+    assert calls["save"]["audio_format"] == "mp3"
+    # Only the OpenRouter stream reports a gateway cost to bill.
+    assert calls["save"].get("provider_cost_usd") == (0.04 if expected_route == "openrouter" else None)
+    assert result["duration_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_lyria_without_google_or_openrouter_key_reports_both_options(monkeypatch):
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "google/lyria-3-clip-preview", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        return "sk-openai-user", "", True
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+
+    result = json.loads(await extended_tools._generate_live_audio(
+        entity_id="", user_id="user", prompt="Score", purpose="music",
+        model="google/lyria-3-clip-preview",
+    ))
+
+    assert result["code"] == "native_music_key_required"
+    assert "OpenRouter key" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.media_integration
+@pytest.mark.oss_regression
+@pytest.mark.parametrize("requested", ["wav", "mp3"])
+async def test_openrouter_lyria_mp3_is_saved_in_the_requested_format(monkeypatch, tmp_path, requested):
+    # 2026-10-20 eval: Video Studio asked for WAV, OpenRouter's Lyria returned
+    # MP3, and the FFmpeg-converted WAV was rejected as "truncated WAV frame data"
+    # because a WAV written to a pipe carries placeholder sizes.
+    import asyncio
+    import shutil
+
+    from packages.core.ai.tools import media_tools
+
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg/ffprobe is not installed")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+        "-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    lyria_mp3, _ = await process.communicate()
+    assert lyria_mp3[:3] == b"ID3" or lyria_mp3[0] == 0xFF
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "google/lyria-3-clip-preview", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        return "sk-or-user", "https://openrouter.ai/api/v1", True
+
+    async def fake_platform(_provider):
+        return "", ""
+
+    async def fake_openrouter(**_kwargs):
+        return lyria_mp3, "mp3", 0.04
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_platform_native_media_credential_async", fake_platform)
+    monkeypatch.setattr(extended_tools, "_openrouter_music_bytes", fake_openrouter)
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="", user_id="user", prompt="Warm lo-fi bed", purpose="music",
+        response_format=requested, name=f"music-bed.{requested}",
+    ))
+
+    assert result["status"] == "completed", result
+    assert result["format"] == requested
+    assert result["provider_response_format"] == "mp3"
+    # Without an Entity the artifact comes back inline: its MIME must match its bytes.
+    mime, encoded = result["audio_url"].removeprefix("data:").split(";base64,", 1)
+    assert mime == {"wav": "audio/wav", "mp3": "audio/mpeg"}[requested]
+    saved = base64.b64decode(encoded)
+    assert saved[:4] == b"RIFF" if requested == "wav" else saved[:3] == b"ID3"
+    saved_path = tmp_path / f"music-bed.{requested}"
+    saved_path.write_bytes(saved)
+    probed = await media_tools._probe_media(ffprobe, str(saved_path))
+    assert probed["has_audio"] is True
+    assert probed["duration_seconds"] == pytest.approx(3.0, abs=0.15)
+    assert result["duration_seconds"] == pytest.approx(probed["duration_seconds"], abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_label_follows_its_bytes_when_no_format_was_requested():
+    # A route that declares one container but returns another (the provider
+    # ignored the requested format) keeps its real container instead of being
+    # saved under a false label, both when conformed and at the final save.
+    mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00provider-mp3"
+
+    conformed = await extended_tools._conform_generated_audio(
+        mp3, declared_format="wav", measure_duration=False,
+    )
+    assert (conformed.audio_format, conformed.source_format, conformed.audio_bytes) == ("mp3", "mp3", mp3)
+
+    url = await extended_tools._save_generated_audio_bytes(
+        entity_id="", user_id="user", prompt="p", model="m", purpose="music",
+        audio_bytes=mp3, audio_format="wav", is_byok=True,
+    )
+    assert url.startswith("data:audio/mpeg;base64,")
+
+
+def test_generated_audio_cost_prefers_gateway_cost_and_counts_speech_characters():
+    assert extended_tools._generated_audio_cost_usd(
+        "google/lyria-3-clip-preview", purpose="music", prompt="x", provider_cost_usd=0.05,
+    ) == 0.05
+    assert extended_tools._generated_audio_cost_usd(
+        "google/lyria-3-pro-preview", purpose="music", prompt="x",
+    ) == 0.08
+    # ElevenLabs v4 is $0.00008 per character; Flash v2.5 half that.
+    assert extended_tools._generated_audio_cost_usd(
+        "elevenlabs/eleven-v4", purpose="narration", prompt="a" * 1000,
+    ) == pytest.approx(0.08)
+    assert extended_tools._generated_audio_cost_usd(
+        "elevenlabs/eleven-flash-v2.5", purpose="speech", prompt="a" * 250,
+    ) == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_tts_runs_through_openrouter_speech(monkeypatch):
+    requests: list[dict] = []
+    saved: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b"\x01\x00\x02\x00\x03\x00"
+        headers = {"content-type": "audio/pcm"}
+        text = ""
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            requests.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return "elevenlabs/eleven-v4", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-user", "https://openrouter.ai/api/v1", True
+
+    async def fake_save(**kwargs):
+        saved.update(kwargs)
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save)
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="", user_id="user", prompt="Hola a todos.", purpose="narration",
+        voice="alloy", language="es-ES", response_format="wav",
+        voice_instructions="Calm and slow",
+    ))
+
+    assert result["status"] == "completed"
+    assert result["provider"] == "openrouter"
+    # Another provider's voice name maps to a valid ElevenLabs premade voice.
+    assert result["voice"] == "george"
+    assert requests[-1]["url"] == "https://openrouter.ai/api/v1/audio/speech"
+    assert requests[-1]["headers"]["Authorization"] == "Bearer sk-or-user"
+    # ElevenLabs reads input verbatim: no prepended directions or instructions.
+    assert requests[-1]["json"] == {
+        "model": "elevenlabs/eleven-v4",
+        "input": "Hola a todos.",
+        "response_format": "pcm",
+        "voice": "george",
+        "provider": {"options": {"elevenlabs": {"language_code": "es"}}},
+    }
+    assert saved["audio_format"] == "wav"
+    assert saved["audio_bytes"].startswith(b"RIFF")
+    assert saved["is_byok"] is True
+
+
+def test_elevenlabs_voice_and_language_mapping():
+    assert extended_tools._elevenlabs_voice("Sarah") == "sarah"
+    assert extended_tools._elevenlabs_voice("JBFqnCBsd6RMkjVDRZzb") == "JBFqnCBsd6RMkjVDRZzb"
+    assert extended_tools._elevenlabs_voice("Zephyr") == "george"
+    # Multilingual v2 does not accept language_code.
+    assert extended_tools._elevenlabs_language_code("elevenlabs/eleven-multilingual-v2", "fr-FR") == ""
+    assert extended_tools._elevenlabs_language_code("elevenlabs/eleven-flash-v2.5", "zh-CN") == "zh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["elevenlabs/eleven-v4-turbo", "google/lyria-3-clip-preview"])
+async def test_openrouter_byok_key_tests_and_saves_only_openrouter_served_media(monkeypatch, model):
+    import apps.api.routers.auth as auth_router
+
+    role = "voice" if model.startswith("elevenlabs/") else "audio"
+    auth_router._validate_role_api_key_for_model(role, "sk-or-v1-user-key-1234567890", model)
+    auth_router._validate_role_base_url_for_model(role, "https://openrouter.ai/api/v1", model)
+    with pytest.raises(auth_router.HTTPException):
+        auth_router._validate_role_api_key_for_model("audio", "sk-or-v1-user-key-1234567890", "openai/gpt-audio")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def get(self, url, headers=None):
+            captured.update(url=url, headers=headers)
+            return FakeResponse()
+
+    monkeypatch.setattr(auth_router.httpx, "AsyncClient", FakeAsyncClient)
+    # The Account form pre-fills the native Google base URL for Lyria; an
+    # OpenRouter key must still be tested against OpenRouter's model.
+    await auth_router._probe_custom_model(
+        role, model, "sk-or-v1-user-key-1234567890",
+        "https://generativelanguage.googleapis.com/v1beta" if role == "audio" else "",
+    )
+    assert captured == {
+        "url": f"https://openrouter.ai/api/v1/models/{model}/endpoints",
+        "headers": {"Authorization": "Bearer sk-or-v1-user-key-1234567890"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_model", "credentials", "expected_model", "expected_route"),
+    [
+        # OpenRouter-only deployment: Lyria stays selected and runs on OpenRouter.
+        ("google/lyria-3-clip-preview", ("sk-or-platform", "", False), "google/lyria-3-clip-preview", "openrouter"),
+        # Nothing configured: keep the selection and say it cannot run.
+        ("google/lyria-3-clip-preview", ("", "", False), "google/lyria-3-clip-preview", None),
+    ],
+)
+async def test_music_inspection_selects_a_runnable_model_and_generation_agrees(
+    monkeypatch, account_model, credentials, expected_model, expected_route,
+):
+    from packages.core.ai.tools.generate_file.tool import _generate_file_handler
+    from packages.core.contracts.audio_generation import AudioGenerationRole
+
+    generated: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        return account_model, AudioGenerationRole.AUDIO
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        return credentials
+
+    async def no_platform_key(_provider):
+        return "", ""
+
+    async def fake_openrouter(**kwargs):
+        generated["model"] = kwargs["model"]
+        return b"ID3\x04\x00music", "mp3", None
+
+    async def fake_save(**_kwargs):
+        return "/api/v1/fs/entity/audio/music.mp3"
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_platform_native_media_credential_async", no_platform_key)
+    monkeypatch.setattr(extended_tools, "_openrouter_music_bytes", fake_openrouter)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save)
+
+    selected = json.loads(await _generate_file_handler(
+        entity_id="", user_id="user-1", kind="search",
+        params={"media_kind": "audio", "purpose": "music"},
+    ))["selected_model"]
+
+    assert selected["model"] == selected["expected_model"] == expected_model
+    assert selected["account_selected_model"] == account_model
+    assert selected["route"] == expected_route
+    assert selected["runnable"] is (expected_route is not None)
+    assert selected["model_source"] == (
+        "account_selection" if expected_model == account_model else "runnable_fallback"
+    )
+    if expected_route is None:
+        return
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="", user_id="user-1", prompt="Warm jazz", purpose="music",
+        expected_model=selected["expected_model"],
+    ))
+    assert result["status"] == "completed"
+    assert generated["model"] == result["model"] == expected_model
 
 
 @pytest.mark.asyncio
@@ -4817,7 +5417,7 @@ async def test_music_ignores_a_narration_voice_passed_as_its_expected_model(monk
     # A real change between two music models is still refused.
     refused = json.loads(await extended_tools._generate_live_audio(
         entity_id="entity", user_id="user", prompt="calm bed", purpose="music",
-        expected_model="suno/music",
+        expected_model="google/lyria-3-pro-preview",
     ))
     assert refused["code"] == "audio_model_changed_reinspect_required"
     assert "Retry with expected_model=google/lyria-3-clip-preview" in refused["error"]
@@ -4837,3 +5437,18 @@ def test_code_files_accept_subtitles_and_a_single_named_file():
     # A project name without a file, or no content, is not a single file.
     assert _single_file_from_name("rental-website", "<html>") is None
     assert _single_file_from_name("video/run-1/subtitles.ass", None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_full_knowledge_store_is_reported_not_skipped(monkeypatch):
+    from packages.core.ai.tools.generate_file import tool as generate_file_module
+    from packages.core.services.document_service import StorageLimitExceeded
+
+    async def full_store(**_kwargs):
+        raise StorageLimitExceeded("Storage is full.", plan="pro", limit=5120, current=5120)
+
+    monkeypatch.setattr(generate_file_module, "_generate_file", full_store)
+    result = json.loads(await generate_file_module._generate_file_handler(
+        entity_id="entity-1", kind="audio", prompt="Hello", name="audio/segment-001.wav"))
+    # The file is unusable without its Document, so the caller is told to free space.
+    assert (result["status"], result["code"], result["plan"]) == ("blocked", "knowledge_storage_limit", "pro")

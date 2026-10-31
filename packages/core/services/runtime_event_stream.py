@@ -70,6 +70,11 @@ async def read_runtime_sse_events(
         redis_client = await _get_redis()
     if redis_client is None:
         return []
+    if block_ms:
+        from packages.core.cache import blocking_slice_seconds
+
+        # A short read on a quiet stream is an empty page; the caller reads again.
+        block_ms = max(1, int(blocking_slice_seconds(redis_client, block_ms / 1000) * 1000))
     try:
         rows = await redis_client.xread(
             {runtime_event_stream_key(run_id): after_id},

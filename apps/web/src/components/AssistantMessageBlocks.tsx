@@ -1003,15 +1003,20 @@ function AssistantProcessBlock({
     sub_agent_events: [...subAgentRunByStep.values()],
   });
   const processFailed = lifecycle === "failed" || (!lifecycle && hasError);
+  // A persisted "waiting" block whose every request was answered is not waiting.
+  const waitAnswered = !pendingActionKind
+    && Boolean(hitlRequests?.length)
+    && Boolean(hitlRequests?.every((request) => request.resolved));
   const completedOutcomeTitle = lifecycle === "completed"
     ? completedProcessOutcomeTitle(block.outcome_status)
     : undefined;
-  let title = t("component.assistant_message_blocks.processed");
+  let title: string | null = null;
+  const plainSuccess = completedOutcomeTitle === t("component.assistant_message_blocks.processed");
   if (queueStatus) {
     title = queueStatus;
   } else if (pendingActionKind === "approval") {
     title = t("component.assistant_message_blocks.process_waiting_approval");
-  } else if (pendingActionKind === "input" || lifecycle === "waiting") {
+  } else if (pendingActionKind === "input" || (lifecycle === "waiting" && !waitAnswered)) {
     title = t("component.assistant_message_blocks.process_waiting_input");
   } else if (isLiveTurn) {
     title = summarizing
@@ -1023,7 +1028,8 @@ function AssistantProcessBlock({
     title = t("component.assistant_message_blocks.process_error");
   } else if (completedOutcomeTitle && hasNotRunApproval) {
     title = t("component.assistant_message_blocks.process_not_run");
-  } else if (completedOutcomeTitle) {
+  } else if (completedOutcomeTitle && !(minimal && plainSuccess && displaySteps.length > 0)) {
+    // In Workspace chat a plain success reads "Process · N steps" (below).
     title = completedOutcomeTitle;
   } else if (lifecycle === "completed" && (hasError || hasNotRun)) {
     title = t("component.assistant_message_blocks.processed_with_issues");
@@ -1034,6 +1040,15 @@ function AssistantProcessBlock({
   } else if (hasRecoveredError) {
     title = t("component.assistant_message_blocks.processed_after_retry");
   }
+  // A finished turn in Workspace chat folds into one quiet "Process · N steps".
+  title ??= minimal && displaySteps.length > 0
+    ? t(
+      displaySteps.length === 1
+        ? "component.assistant_message_blocks.process_steps_one"
+        : "component.assistant_message_blocks.process_steps_other",
+      { count: displaySteps.length },
+    )
+    : t("component.assistant_message_blocks.processed");
 
   const clockTiming = processClockTiming(block);
   const elapsedMs = useLiveProcessClock({
@@ -1194,6 +1209,7 @@ export default function AssistantMessageBlocks({
   hitlRequests,
   queueStatus,
   enableFileCards,
+  part = "all",
 }: {
   blocks?: AssistantBlock[] | null;
   content?: string | null;
@@ -1224,6 +1240,9 @@ export default function AssistantMessageBlocks({
   hideProcess?: boolean;
   /** Collapse long final answers on compact surfaces such as Workspace Chat. */
   collapseLongFinal?: boolean;
+  /** Workspace chat puts the process at the top of the bubble, live or
+   *  finished: "process" renders only it, "content" leaves it out. */
+  part?: "all" | "content" | "process";
 }) {
   const hasLiveProcess = streaming && !isUser && !pendingActionKind;
   const activeQueueStatus = hasLiveProcess ? queueStatus : undefined;
@@ -1265,6 +1284,49 @@ export default function AssistantMessageBlocks({
   } = projectAssistantText(content, blocks, streaming);
   const firstProcessIndex = blocks.findIndex((block) => block.type === "process");
   const lastProcessIndex = blocks.reduce((last, block, index) => block.type === "process" ? index : last, -1);
+
+  const renderProcess = (block: Extract<AssistantBlock, { type: "process" }>, index: number) => {
+    if (isToolFreeCompletedProcess(block, {
+      hasFinalOutput: Boolean(hasFinalOutput),
+      pending: Boolean(pendingActionKind),
+      live: Boolean(activeQueueStatus) || (streaming && index === lastProcessIndex),
+    })) {
+      // A finished answer that called no tools has no process to report.
+      return null;
+    }
+    return (
+      <AssistantProcessBlock
+        key={block.id || `${keyPrefix}-process-${index}`}
+        block={block}
+        timeline={projectAssistantProcessTimeline({
+          steps: block.steps || [],
+          openingText: index === firstProcessIndex ? processOpeningText : "",
+          processNote: block.note,
+          progressByStepSeq,
+          trailingProgressText: index === lastProcessIndex ? trailingProgressText : "",
+        })}
+        hasFinalOutput={Boolean(hasFinalOutput)}
+        minimal={minimal}
+        pendingActionKind={pendingActionKind}
+        hitlRequests={hitlRequests}
+        returnTo={returnTo}
+        subAgentRuns={subAgentRuns}
+        streaming={streaming}
+        queueStatus={!hasFinalOutput && index === lastProcessIndex ? activeQueueStatus : undefined}
+        enableFileCards={enableFileCards}
+      />
+    );
+  };
+
+  if (part === "process") {
+    return (
+      <>
+        {blocks.map((block, index) => (
+          block.type === "process" ? renderProcess(block, index) : null
+        ))}
+      </>
+    );
+  }
 
   return (
     <>
@@ -1313,36 +1375,8 @@ export default function AssistantMessageBlocks({
             />
           );
         }
-        if (isToolFreeCompletedProcess(block, {
-          hasFinalOutput: Boolean(hasFinalOutput),
-          pending: Boolean(pendingActionKind),
-          live: Boolean(activeQueueStatus) || (streaming && index === lastProcessIndex),
-        })) {
-          // A finished answer that called no tools has no process to report.
-          return null;
-        }
-        return (
-          <AssistantProcessBlock
-            key={block.id || `${keyPrefix}-process-${index}`}
-            block={block}
-            timeline={projectAssistantProcessTimeline({
-              steps: block.steps || [],
-              openingText: index === firstProcessIndex ? processOpeningText : "",
-              processNote: block.note,
-              progressByStepSeq,
-              trailingProgressText: index === lastProcessIndex ? trailingProgressText : "",
-            })}
-            hasFinalOutput={Boolean(hasFinalOutput)}
-            minimal={minimal}
-            pendingActionKind={pendingActionKind}
-            hitlRequests={hitlRequests}
-            returnTo={returnTo}
-            subAgentRuns={subAgentRuns}
-            streaming={streaming}
-            queueStatus={!hasFinalOutput && index === lastProcessIndex ? activeQueueStatus : undefined}
-            enableFileCards={enableFileCards}
-          />
-        );
+        if (part === "content") return null;
+        return renderProcess(block, index);
       })}
       {recoveredFinalText && (
         <CollapsibleFinalMarkdown

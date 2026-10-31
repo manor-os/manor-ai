@@ -3,12 +3,151 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import asyncio
 import sys
 from pathlib import Path
 import smtplib
+import socket
+import ssl
+import threading
 import tomllib
 
 import pytest
+
+
+@pytest.fixture(scope="module")
+def mail_tls_certificates(tmp_path_factory):
+    """Disposable certificates for real TLS over local socket pairs."""
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    directory = tmp_path_factory.mktemp("mail-tls")
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Mail test CA")])
+    ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+          .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(hours=1))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+          .sign(ca_key, hashes.SHA256()))
+    ca_path = directory / "ca.pem"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    certificate = (x509.CertificateBuilder()
+                   .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mail.example.test")]))
+                   .issuer_name(ca_name).public_key(key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(hours=1))
+                   .add_extension(x509.SubjectAlternativeName([x509.DNSName("mail.example.test")]), critical=False)
+                   .sign(ca_key, hashes.SHA256()))
+    cert_path, key_path = directory / "server.pem", directory / "server.key"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    return ca_path, cert_path, key_path
+
+
+@pytest.mark.parametrize("protocol,mode,case", [
+    ("smtp", "direct", "trusted"), ("smtp", "direct", "unknown-ca"), ("smtp", "direct", "wrong-host"),
+    ("imap", "direct", "trusted"), ("imap", "direct", "unknown-ca"), ("imap", "direct", "wrong-host"),
+    ("smtp", "socks", "trusted"), ("smtp", "socks", "unknown-ca"),
+    ("imap", "socks", "trusted"), ("imap", "socks", "unknown-ca"),
+    ("smtp-starttls-health", "direct", "trusted"),
+    ("smtp-starttls-health", "direct", "unknown-ca"),
+    ("smtp-starttls-health", "direct", "wrong-host"),
+])
+def test_mail_tls_verifies_certificate_and_hostname(monkeypatch, mail_tls_certificates, protocol, mode, case):
+    from packages.core.services import smtp_transport
+
+    ca_path, cert_path, key_path = mail_tls_certificates
+    monkeypatch.setenv("SMTP_EGRESS_MODE", mode)
+    monkeypatch.setenv("SMTP_SOCKS_HOST", "proxy.example.test")
+    if case == "unknown-ca":
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    else:
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_path))
+    host = "wrong.example.test" if case == "wrong-host" else "mail.example.test"
+    client_socket, peer_socket = socket.socketpair()
+    client_socket.settimeout(3)
+    peer_socket.settimeout(3)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert_path, key_path)
+    received = []
+    errors = []
+
+    def server():
+        try:
+            if protocol == "smtp-starttls-health":
+                peer_socket.sendall(b"220 mail.example.test fixture ready\r\n")
+                with peer_socket.makefile("rb") as plain:
+                    assert plain.readline().upper().startswith(b"EHLO ")
+                    peer_socket.sendall(b"250-fixture\r\n250 STARTTLS\r\n")
+                    assert plain.readline().strip().upper() == b"STARTTLS"
+                    peer_socket.sendall(b"220 ready for TLS\r\n")
+            with server_context.wrap_socket(peer_socket, server_side=True) as secured:
+                if protocol == "smtp-starttls-health":
+                    with secured.makefile("rb") as stream:
+                        assert stream.readline().upper().startswith(b"EHLO ")
+                        secured.sendall(b"250-fixture\r\n250 AUTH PLAIN\r\n")
+                        authentication = stream.readline()
+                        received.append(authentication)
+                        assert authentication.upper().startswith(b"AUTH PLAIN ")
+                        secured.sendall(b"235 authenticated\r\n")
+                        assert stream.readline().strip().upper() == b"QUIT"
+                        secured.sendall(b"221 bye\r\n")
+                elif protocol == "smtp":
+                    secured.sendall(b"220 mail.example.test fixture ready\r\n")
+                else:
+                    secured.sendall(b"* OK fixture ready\r\n")
+                    line = secured.makefile("rb").readline()
+                    received.append(line)
+                    tag = line.split()[0]
+                    secured.sendall(b"* CAPABILITY IMAP4rev1\r\n" + tag + b" OK fixture capabilities\r\n")
+        except ssl.SSLError:
+            # The certificate-negative client terminates the TLS handshake.
+            pass
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    # Only the external TCP/proxy boundary is replaced. Python's real TLS,
+    # SMTP/IMAP constructors and certificate/hostname checks execute unchanged.
+    if mode == "direct":
+        monkeypatch.setattr(socket, "create_connection", lambda *_args, **_kwargs: client_socket)
+    else:
+        monkeypatch.setattr(smtp_transport, "open_tcp_socket", lambda *_args, **_kwargs: client_socket)
+    opener = smtp_transport.open_smtp_client if protocol == "smtp" else smtp_transport.open_imap_client
+    client = None
+    try:
+        if protocol == "smtp-starttls-health":
+            from packages.core.services.integration_health import test_email_login as check_email
+            result = asyncio.run(check_email({"smtp_host": host, "smtp_port": 587,
+                                             "use_tls_smtp": True, "use_ssl_smtp": False,
+                                             "username": "synthetic-user", "password": "synthetic-password"}))
+            assert result["ok"] is (case == "trusted"), result
+            if case != "trusted":
+                assert "CERTIFICATE_VERIFY_FAILED" in result["detail"]
+                assert not received
+        elif case == "trusted":
+            client = opener(host, 465 if protocol == "smtp" else 993, use_ssl=True, timeout=3)
+            context = client.context if protocol == "smtp" else client.ssl_context
+            assert context.verify_mode == ssl.CERT_REQUIRED
+            assert context.check_hostname is True
+        else:
+            with pytest.raises(ssl.SSLCertVerificationError):
+                client = opener(host, 465 if protocol == "smtp" else 993, use_ssl=True, timeout=3)
+            assert not received
+    finally:
+        if client is not None:
+            client.close() if protocol == "smtp" else client.shutdown()
+        client_socket.close()
+        thread.join(timeout=4)
+        peer_socket.close()
+    assert not thread.is_alive()
+    assert not errors
 
 
 def test_socks_egress_runtime_dependency_is_declared() -> None:
@@ -125,6 +264,53 @@ def test_email_mcp_opens_imap_through_shared_transport(
     )
     assert isinstance(client, FakeIMAP)
     assert events == [("imap.example.com", 993, True, 20)]
+
+
+def test_check_login_authenticates_like_send_message_without_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packages.core.services import smtp_transport
+
+    events: list[tuple] = []
+
+    class FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            events.append(("close",))
+
+        def ehlo(self):
+            events.append(("ehlo",))
+
+        def starttls(self, context=None):
+            events.append(("starttls",))
+
+        def login(self, username, password):
+            events.append(("login", username, password))
+
+        def send_message(self, *_args, **_kwargs):
+            events.append(("send_message",))
+
+    monkeypatch.setattr(smtp_transport, "open_smtp_client", lambda *_a, **_k: FakeSMTP())
+    options = dict(host="smtp.example", port=587, username="u", password="p", use_ssl=False, timeout=5)
+
+    smtp_transport.check_login(use_starttls=True, **options)
+
+    assert events == [("ehlo",), ("starttls",), ("ehlo",), ("login", "u", "p"), ("close",)]
+
+
+def test_check_login_rejects_implicit_tls_with_starttls(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packages.core.services import smtp_transport
+
+    def unexpected_connect(*_args, **_kwargs):
+        raise AssertionError("must not connect with a contradictory TLS configuration")
+
+    monkeypatch.setattr(smtp_transport, "open_smtp_client", unexpected_connect)
+
+    with pytest.raises(smtp_transport.SMTPTransportConfigurationError):
+        smtp_transport.check_login(
+            host="smtp.example", port=465, username="u", password="p",
+            use_starttls=True, use_ssl=True, timeout=5,
+        )
 
 
 def test_all_smtp_senders_delegate_connection_creation_to_shared_transport() -> None:

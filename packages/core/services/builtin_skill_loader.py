@@ -14,18 +14,18 @@ entity sees them without duplicating rows per tenant.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import os
 import re
+from functools import lru_cache
 from pathlib import Path
-from stat import S_ISREG
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime import builtin_skill_bundle
 from packages.core.ai.runtime.skill_capability_companion import (
     SkillCapabilityCompanion,
 )
@@ -42,7 +42,7 @@ _SKILLS_ROOT = (
 )
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _AGENT_SKILLS_ROOT = _REPO_ROOT / ".agents" / "skills"
-_PLATFORM_GUIDE_SKILL_NAMES = ("cloud-intro", "intro")
+_PLATFORM_GUIDE_SKILL_NAMES = builtin_skill_bundle.PLATFORM_GUIDE_SKILL_NAMES
 # Path markers that locate a built-in bundle inside any checkout or image.
 _BUILTIN_SKILL_PATH_MARKERS = ("packages/core/ai/skills/", ".agents/skills/")
 
@@ -79,10 +79,7 @@ def resolve_builtin_skill_dir(value: str | None) -> Path | None:
         return Path(portable)
     return _REPO_ROOT / portable
 
-_RETIRED_BUILTIN_SKILL_SLUGS = frozenset({
-    "mcp_desktop_recording",
-    "remotion",
-})
+_RETIRED_BUILTIN_SKILL_SLUGS = builtin_skill_bundle.RETIRED_BUILTIN_SKILL_SLUGS
 
 # Parent tools that script-backed built-in skills need after `invoke_skill`
 # prepares the sandbox and returns a sandbox_id.
@@ -128,7 +125,7 @@ def _read_skill_config(skill_dir: Path) -> dict:
 
 
 def _has_skill_manifest(skill_dir: Path) -> bool:
-    return skill_dir.is_dir() and (skill_dir / "SKILL.md").is_file()
+    return builtin_skill_bundle.has_skill_manifest(skill_dir)
 
 
 def _builtin_skill_dirs(
@@ -138,29 +135,14 @@ def _builtin_skill_dirs(
 ) -> list[Path]:
     """Return built-ins plus the guide for the current product edition.
 
-    Cloud source trees contain ``cloud-intro`` while OSS exports remove that
-    directory. Prefer the Cloud guide when it exists; otherwise register the
-    OSS ``intro`` guide. Other repository-maintenance Skills under ``.agents``
-    are intentionally never exposed to Manor users.
+    The selection lives in ``builtin_skill_bundle`` because the sandbox image
+    bakes exactly this set (docker/Dockerfile.sandbox, ``baked-skills``).
     """
 
-    package_root = skills_root or _SKILLS_ROOT
-    project_root = agent_skills_root or _AGENT_SKILLS_ROOT
-    directories = (
-        sorted(
-            path
-            for path in package_root.iterdir()
-            if path.is_dir() and path.name not in _RETIRED_BUILTIN_SKILL_SLUGS
-        )
-        if package_root.exists()
-        else []
+    return builtin_skill_bundle.builtin_skill_dirs(
+        skills_root=skills_root or _SKILLS_ROOT,
+        agent_skills_root=agent_skills_root or _AGENT_SKILLS_ROOT,
     )
-    for name in _PLATFORM_GUIDE_SKILL_NAMES:
-        candidate = project_root / name
-        if _has_skill_manifest(candidate):
-            directories.append(candidate)
-            break
-    return directories
 
 
 # Set on ``db.info`` when a seed changed rows; callers that memoize a "seeded"
@@ -186,55 +168,14 @@ async def _retire_removed_builtin_skills(db: AsyncSession) -> None:
             existing.is_public = False
 
 
-# skill_dir -> (stat signature, digest). seed_builtin_skills runs on every
-# list_skills call; re-reading ~12k bundle files each time cost seconds of
-# event-loop time, while a stat walk is ~30x cheaper.
-_SOURCE_SHA256_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], str]] = {}
-
-
 def _skill_source_sha256(skill_dir: Path) -> str:
-    """Fingerprint the complete repository-controlled Skill bundle."""
+    """Fingerprint the complete repository-controlled Skill bundle.
 
-    entries: list[tuple[tuple[str, ...], str, os.stat_result]] = []
-    root = str(skill_dir)
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
-        rel_dir = os.path.relpath(dirpath, root)
-        parts = () if rel_dir == "." else tuple(rel_dir.split(os.sep))
-        for name in filenames:
-            if name.endswith(".pyc") or name == ".DS_Store":
-                continue
-            full = os.path.join(dirpath, name)
-            try:
-                stat = os.stat(full)
-            except OSError:
-                continue
-            if not S_ISREG(stat.st_mode):
-                continue
-            entries.append(((*parts, name), full, stat))
-    # Path ordering compares component-wise; keep it so digests are unchanged.
-    entries.sort(key=lambda entry: entry[0])
-    files = [(Path(full), "/".join(parts)) for parts, full, _ in entries]
-    signature = [
-        ("/".join(parts), stat.st_size, stat.st_mtime_ns)
-        for parts, _, stat in entries
-    ]
+    The same function digests the sandbox image's baked copy, so equal
+    digests mean the image holds exactly these files.
+    """
 
-    key = str(skill_dir)
-    frozen = tuple(signature)
-    cached = _SOURCE_SHA256_CACHE.get(key)
-    if cached is not None and cached[0] == frozen:
-        return cached[1]
-
-    digest = hashlib.sha256()
-    for path, rel in files:
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    value = digest.hexdigest()
-    _SOURCE_SHA256_CACHE[key] = (frozen, value)
-    return value
+    return builtin_skill_bundle.skill_source_sha256(skill_dir)
 
 
 def _read_builtin_skill_extra_files(skill_dir: Path) -> dict[str, str]:
@@ -480,6 +421,52 @@ def _packaged_builtin_skill_spec(slug: str) -> dict | None:
         if str(frontmatter.get("name") or skill_dir.name).strip() == slug:
             matches.append(skill_dir)
     return _read_builtin_skill_spec(matches[0]) if len(matches) == 1 else None
+
+
+@lru_cache(maxsize=1)
+def _packaged_builtin_skill_dirs_by_slug() -> dict[str, Path]:
+    found: dict[str, list[Path]] = {}
+    for skill_dir in _builtin_skill_dirs():
+        manifest = skill_dir / "SKILL.md"
+        if manifest.is_file():
+            frontmatter, _ = _parse_frontmatter(manifest.read_text(encoding="utf-8"))
+            found.setdefault(str(frontmatter.get("name") or skill_dir.name).strip(), []).append(skill_dir)
+    return {slug: dirs[0] for slug, dirs in found.items() if len(dirs) == 1}
+
+
+@lru_cache(maxsize=None)
+def packaged_builtin_skill_declaration(slug: str) -> SimpleNamespace | None:
+    """A packaged built-in's tool declaration, read from config.json only.
+
+    Skill-shaped (``slug``, ``tools``, ``config``) for the runtime's tool
+    surface rules, without hashing the bundle or touching the database, so
+    authoring checks can ask what a Skill needs wherever it is invoked.
+    """
+    from packages.core.services.skill_service import _determine_skill_type
+
+    skill_dir = _packaged_builtin_skill_dirs_by_slug().get(str(slug or "").strip())
+    if skill_dir is None:
+        return None
+    raw = _read_skill_config(skill_dir)
+    guidance = raw.get("type") == "runtime_guidance"
+    config: dict = {
+        key: raw[key]
+        for key in (
+            "type", "execution_mode", "invocable_skills", "scripts", "requirements",
+            "discoverable_provider_keys", "discoverable_tool_prefixes",
+        )
+        if key in raw
+    }
+    config.update(source="builtin", skill_dir=portable_builtin_skill_dir(skill_dir))
+    if not guidance and not raw.get("tools"):
+        config["tools_defaulted"] = True
+    declaration = SimpleNamespace(
+        id=None, slug=slug, name=slug, entity_id=None, config=config,
+        tools=list(raw.get("tools") or ([] if guidance else _DEFAULT_SKILL_TOOLS)),
+    )
+    if not guidance and _determine_skill_type(declaration) == "sandbox":
+        config["type"] = "sandbox"
+    return declaration
 
 
 async def resolve_packaged_builtin_skill(db: AsyncSession, slug: str) -> Skill:

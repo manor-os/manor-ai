@@ -2,7 +2,6 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -10,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.core.constants.task import TaskRuntimeKind, TaskStatus, TaskType
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan
 from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.task import Task, TaskLog
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
@@ -27,10 +25,10 @@ pytestmark = pytest.mark.oss_regression
 
 
 async def _coordinated_task(db: AsyncSession) -> tuple[Task, AgentSubscription]:
-    # The publisher is intentionally shared by Task starts, Plan cycles,
+    # The publisher is intentionally shared by Task starts, Task run wakes,
     # approvals, and Sandbox work. This module asserts exact global delivery
     # counts, so isolate all event categories instead of allowing an older
-    # due Plan wake from another test file to make those counts order-dependent.
+    # due wake from another test file to make those counts order-dependent.
     await db.execute(delete(RuntimeOutboxEvent))
     await db.commit()
     entity_id = generate_ulid()
@@ -318,7 +316,7 @@ async def test_update_keeps_workspace_foreground_start_adapters(
 
 
 @pytest.mark.asyncio
-async def test_update_keeps_standalone_legacy_agent_start_behavior(
+async def test_update_starts_a_standalone_agent_task_through_its_durable_start_intent(
     db_session: AsyncSession,
 ) -> None:
     from packages.core.services.task_service import update_task
@@ -326,7 +324,7 @@ async def test_update_keeps_standalone_legacy_agent_start_behavior(
     task = Task(
         id=generate_ulid(),
         entity_id=generate_ulid(),
-        title="Standalone legacy Agent task",
+        title="Standalone Agent task",
         status=TaskStatus.PENDING.value,
         status_changed_at=datetime.now(timezone.utc),
         task_type=TaskType.GENERAL.value,
@@ -336,10 +334,10 @@ async def test_update_keeps_standalone_legacy_agent_start_behavior(
     db_session.add(task)
     await db_session.commit()
 
-    assert (await resolve_task_execution(
-        db_session,
-        task,
-    )).runtime_kind is TaskRuntimeKind.LEGACY_AGENT
+    dispatch = await resolve_task_execution(db_session, task)
+    assert dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+    assert dispatch.coordinator.is_agent_only
+    assert dispatch.coordinator.root.agent_id == task.agent_id
     updated = await update_task(
         db_session,
         task.id,
@@ -354,7 +352,40 @@ async def test_update_keeps_standalone_legacy_agent_start_behavior(
     ).where(
         RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
         RuntimeOutboxEvent.aggregate_id == task.id,
-    )) == 0
+    )) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_task_runs_under_its_personal_hire_and_never_a_workspace_subscription(
+    db_session: AsyncSession,
+) -> None:
+    entity_id, agent_id = generate_ulid(), generate_ulid()
+    personal = AgentSubscription(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=None,
+        agent_id=agent_id, name="Personal hire", status="active",
+    )
+    workspace_hire = AgentSubscription(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=generate_ulid(),
+        agent_id=agent_id, name="Workspace hire", service_key="ops", status="active",
+    )
+    db_session.add_all([personal, workspace_hire])
+    await db_session.flush()
+
+    def standalone(subscription_id: str) -> Task:
+        return Task(
+            id=generate_ulid(), entity_id=entity_id, title="Personal Agent task",
+            status=TaskStatus.PENDING.value, task_type=TaskType.GENERAL.value,
+            agent_id=agent_id, owner_subscription_id=subscription_id,
+        )
+
+    hired = await resolve_task_execution(db_session, standalone(personal.id))
+    assert hired.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+    assert (hired.coordinator.root.agent_id, hired.coordinator.root.subscription_id) == (agent_id, personal.id)
+    # A Workspace deployment is not a personal hire: no runner, not a fallback.
+    assert (await resolve_task_execution(
+        db_session, standalone(workspace_hire.id),
+    )).runtime_kind is TaskRuntimeKind.MANUAL
+    await db_session.rollback()
 
 
 @pytest.mark.asyncio
@@ -557,85 +588,6 @@ async def test_task_execution_consumer_re_resolves_factory_before_admission(
 
 
 @pytest.mark.asyncio
-async def test_late_v2_planner_cannot_replace_admitted_task_owner(
-    db_session: AsyncSession,
-    monkeypatch,
-) -> None:
-    from packages.core import database
-    from packages.core.plans.planner import (
-        TaskPlanOwnedByCoordinatorError,
-        plan_task,
-    )
-    from packages.core.tasks import runtime_tasks
-
-    task, _subscription = await _coordinated_task(db_session)
-    generation = await stage_task_execution_intent(db_session, task)
-    await db_session.commit()
-    event = await _event_for_generation(
-        db_session, task_id=task.id, generation=generation,
-    )
-    session_factory = async_sessionmaker(
-        db_session.bind, class_=AsyncSession, expire_on_commit=False,
-    )
-    monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    assert (await runtime_tasks.consume_task_execution_intent_once(
-        event_id=event.id, task_id=task.id, intent_generation=generation,
-    ))["status"] == "admitted"
-
-    with pytest.raises(TaskPlanOwnedByCoordinatorError):
-        await plan_task(db_session, task.id)
-
-    from packages.core.models.task_coordinator import TaskCoordinatorRun
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
-
-    run = (await db_session.execute(select(TaskCoordinatorRun).where(
-        TaskCoordinatorRun.task_id == task.id,
-    ))).scalar_one()
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status="running", plan_dag={},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-    )
-    db_session.add(plan)
-    run.current_plan_id = plan.id
-    await db_session.flush()
-    with pytest.raises(TaskPlanOwnedByCoordinatorError):
-        await plan_task(db_session, task.id)
-
-
-def test_queued_v2_planner_message_does_not_fail_v3_task(monkeypatch) -> None:
-    from packages.core.plans.planner import TaskPlanOwnedByCoordinatorError
-    from packages.core.tasks import ai_tasks
-
-    def old_delivery(coroutine):
-        coroutine.close()
-        raise TaskPlanOwnedByCoordinatorError(
-            "task-v3", TaskStatus.IN_PROGRESS.value,
-            "Task-level coordinator owns this Workspace Task",
-        )
-
-    monkeypatch.setattr(ai_tasks, "_run_async", old_delivery)
-    monkeypatch.setattr(
-        ai_tasks, "_mark_task_failed",
-        lambda *_args, **_kwargs: pytest.fail("old V2 message failed a V3 Task"),
-    )
-    assert ai_tasks.plan_and_run_task.run("task-v3") == {
-        "plan_id": None,
-        "status": TaskStatus.IN_PROGRESS.value,
-        "duplicate_suppressed": True,
-        "task_coordinator_owned": True,
-    }
-
-
-@pytest.mark.asyncio
 async def test_duplicate_start_consumers_admit_one_task_run_and_one_wake(
     db_session: AsyncSession,
     monkeypatch,
@@ -766,11 +718,6 @@ async def test_unacknowledged_current_intent_stays_pending_for_redelivery(
     )
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
     monkeypatch.setattr(runtime_tasks, "_durable_external_sandbox_enabled", lambda: False)
-    monkeypatch.setattr(
-        runtime_tasks,
-        "_recover_task_runtime_resume_outbox",
-        AsyncMock(return_value=0),
-    )
     published = []
     monkeypatch.setattr(
         runtime_tasks.celery_app,
@@ -806,7 +753,7 @@ async def test_unacknowledged_current_intent_stays_pending_for_redelivery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("closure", ["active_plan", "terminal_task", "superseded"])
+@pytest.mark.parametrize("closure", ["terminal_task", "superseded"])
 async def test_task_execution_recovery_closes_non_current_delivery(
     db_session: AsyncSession,
     monkeypatch,
@@ -825,16 +772,7 @@ async def test_task_execution_recovery_closes_non_current_delivery(
     )
     task_id = task.id
     event.available_at = now - timedelta(minutes=5)
-    if closure == "active_plan":
-        db_session.add(ExecutionPlan(
-            id=generate_ulid(),
-            entity_id=task.entity_id,
-            workspace_id=task.workspace_id,
-            task_id=task.id,
-            status="running",
-            plan_dag={},
-        ))
-    elif closure == "terminal_task":
+    if closure == "terminal_task":
         task.status = TaskStatus.COMPLETED.value
         task.status_changed_at = now
     else:
@@ -856,11 +794,6 @@ async def test_task_execution_recovery_closes_non_current_delivery(
     )
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
     monkeypatch.setattr(runtime_tasks, "_durable_external_sandbox_enabled", lambda: False)
-    monkeypatch.setattr(
-        runtime_tasks,
-        "_recover_task_runtime_resume_outbox",
-        AsyncMock(return_value=0),
-    )
     published = []
     monkeypatch.setattr(
         runtime_tasks.celery_app,

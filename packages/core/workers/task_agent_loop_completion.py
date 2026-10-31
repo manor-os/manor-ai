@@ -3,13 +3,21 @@
 The main agent verifies its own work (design §5.5); the host only checks that
 the submission is *coherent with what this run observably did*:
 
-1. every acceptance criterion of the current plan has an answer (and all are
-   met when the outcome is ``completed``);
+1. every acceptance criterion of the current plan has an answer. A
+   ``completed`` delivery may leave criteria unmet or unverified (each with
+   evidence): the host reports them as acceptance exceptions of the
+   delivery, never as met, and only when something was delivered
+   (``delivery_problems``). ``blocked`` is for no usable delivery, or work
+   that needs something from a person;
 2. every deliverable is real: a receipt handle in this run's ledger, or a
    Knowledge file that exists and is readable in the Task's scope;
 3. every file deliverable was inspected after this run last wrote it;
 4. nothing this Task started is still running (delegation, media jobs);
-5. an unconfirmed effect is never reported as success (W1a outcome rule).
+5. an unconfirmed effect is never reported as confirmed (W1a outcome rule,
+   "delivered + exceptions"): a ``completed`` report with at least one
+   host-verified delivery completes the Task and lists every call whose effect
+   is still unconfirmed as an exception (``unconfirmed_effects``); without a
+   verified delivery it is ``completed_non_success`` (blocked for review).
 
 A failed check is returned to the loop as a preflight error, so the model
 corrects itself in place without spending the continuation budget.
@@ -24,7 +32,7 @@ from typing import Any
 from sqlalchemy import or_, select
 
 from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
-from packages.core.ai.runtime.outcome import Disposition, OutcomeDecision, decide_outcome
+from packages.core.ai.runtime.outcome import Disposition, OutcomeDecision, RunOutcome, decide_outcome
 from packages.core.ai.runtime.receipts import EffectState
 from packages.core.services.file_refs import is_open_address
 from packages.core.services.generated_file_refs import (
@@ -281,13 +289,54 @@ def acceptance_problems(submission: dict[str, Any], task_plan: Any) -> list[str]
             )
     if submission.get("outcome") == "completed":
         for entry in entries:
-            if entry.get("met") is not True:
+            if entry.get("met") is not True and not _text(entry.get("evidence")):
                 problems.append(
-                    f"acceptance criterion '{entry.get('criterion')}' is met=false, but "
-                    "outcome=completed needs every criterion met. Finish the work, or report "
-                    "outcome=blocked with blocked_reason."
+                    f"acceptance criterion '{entry.get('criterion')}' is met=false without "
+                    "evidence. Say what you found, or why it could not be checked: it is shown "
+                    "to the person as an exception to the delivery."
                 )
     return problems
+
+
+def acceptance_exceptions(submission: dict[str, Any]) -> list[dict[str, Any]]:
+    """The criteria a delivery left unmet or unverified, as the person sees them.
+
+    Derived by the host from the submission's own acceptance report and never
+    marked met: a ``completed`` Task with exceptions is a delivery whose
+    acceptance is incomplete, not a block.
+    """
+
+    return [
+        {"criterion": _text(entry.get("criterion")), "evidence": _text(entry.get("evidence"))}
+        for entry in submission.get("acceptance") or []
+        if isinstance(entry, dict) and _text(entry.get("criterion")) and entry.get("met") is not True
+    ]
+
+
+def delivery_problems(
+    submission: dict[str, Any], resolved: list[dict[str, Any]], evidence_state: Any,
+) -> list[str]:
+    """A ``completed`` report with exceptions must have delivered something.
+
+    Delivered = a verified deliverable, a criterion met with evidence, or a
+    confirmed effect a person would see (a sent message, a created Task).
+    Without any of them there is no delivery to carry the exceptions.
+    """
+
+    if submission.get("outcome") != "completed" or not acceptance_exceptions(submission):
+        return []
+    met = any(
+        isinstance(entry, dict) and entry.get("met") is True
+        for entry in submission.get("acceptance") or []
+    )
+    effects, _omitted = output_effects(evidence_state)
+    if resolved or met or people_facing_effects(effects):
+        return []
+    return [
+        "No acceptance criterion is met and nothing verified was delivered, so this is not a "
+        "delivery. Finish the work, or report outcome=blocked with a blocked_reason that names "
+        "what is needed and from whom."
+    ]
 
 
 # ── 2/3. Deliverables are real and inspected ───────────────────────────
@@ -496,6 +545,26 @@ async def running_work_problems(
                 f"A delegated agent is still working on this Task ({names}). Wait for its "
                 "result before completing."
             )
+    from packages.core.models.task_agent_child import (
+        TASK_AGENT_CHILD_TERMINAL_PHASES,
+        TaskAgentChildRun,
+    )
+
+    # Durable delegated runs are open only while the loop waits on them; a
+    # safety net, never expected while the loop itself runs.
+    open_children = list((await db.execute(
+        select(TaskAgentChildRun.id, TaskAgentChildRun.agent_label, TaskAgentChildRun.service_key).where(
+            TaskAgentChildRun.entity_id == entity_id,
+            TaskAgentChildRun.task_id == task_id,
+            TaskAgentChildRun.phase.not_in(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+        ).limit(10)
+    )).all())
+    if open_children:
+        names = ", ".join(str(row.agent_label or row.service_key or row.id) for row in open_children)
+        problems.append(
+            f"A delegated agent is still working on this Task ({names}). Wait for its "
+            "result before completing."
+        )
     jobs = list((await db.execute(
         select(MediaJob.id, MediaJob.kind).where(
             MediaJob.entity_id == entity_id,
@@ -515,13 +584,80 @@ async def running_work_problems(
 # ── 5. Outcome rule ────────────────────────────────────────────────────
 
 
-def outcome_decision(effect_state: Any, outcome: str) -> OutcomeDecision:
+def outcome_decision(effect_state: Any, outcome: str, *, verified_delivery: bool = False) -> OutcomeDecision:
+    """W1a, "delivered + exceptions".
+
+    A ``completed`` report over an unconfirmed effect is a delivery when the
+    host verified something delivered: the Task completes, the unconfirmed
+    calls ride on it as exceptions, and the effect state stays unconfirmed
+    (never replayed). Without a verified delivery it stays
+    ``completed_non_success``.
+    """
     try:
         state = EffectState(str(effect_state or EffectState.NONE.value))
     except ValueError:
         state = EffectState.UNCONFIRMED
     disposition = Disposition.SUCCESS if outcome == "completed" else Disposition.NON_SUCCESS
+    if state is EffectState.UNCONFIRMED and disposition is Disposition.SUCCESS and verified_delivery:
+        return OutcomeDecision(RunOutcome.COMPLETED, state, retryable=False, do_not_replay=True)
     return decide_outcome(state, disposition)
+
+
+def has_verified_delivery(resolved: list[dict[str, Any]], evidence_state: Any) -> bool:
+    """Host facts that something was delivered: a verified deliverable or a
+    confirmed effect a person would see. The model's own "met" never counts."""
+    effects, _omitted = output_effects(evidence_state)
+    return bool(resolved) or bool(people_facing_effects(effects))
+
+
+_MAX_UNCONFIRMED_EFFECTS = 50
+_MAX_EFFECT_TARGETS_SHOWN = 10
+
+
+def unconfirmed_effects(evidence: Any) -> list[dict[str, Any]]:
+    """The calls whose effect the host could not confirm, as a person sees them.
+
+    Per call: the tool, its operation and the concrete things it may have
+    changed (files it reported that the host never observed). Never marked
+    confirmed. An unconfirmed ledger with no listed call (past its list cap,
+    an older checkpoint) is one entry for "an earlier tool call".
+    """
+    out: list[dict[str, Any]] = []
+    for call in getattr(evidence, "unconfirmed_calls", None) or []:
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or "")
+        if tool == "ledger":
+            entry: dict[str, Any] = {"tool": "earlier tool call"}
+        else:
+            entry = {"tool": tool or "unknown"}
+            operation = str(call.get("operation") or "")
+            if operation and operation != tool:
+                entry["operation"] = operation
+        targets: list[str] = []
+        for target in call.get("targets") or ():
+            if not isinstance(target, dict) or target.get("observed_by"):
+                continue
+            label = str(target.get("fs_path") or target.get("document_id") or "").strip()
+            if label and label not in targets:
+                targets.append(label)
+        if targets:
+            entry["targets"] = targets[:_MAX_EFFECT_TARGETS_SHOWN]
+        if entry not in out:
+            out.append(entry)
+        if len(out) >= _MAX_UNCONFIRMED_EFFECTS:
+            break
+    if not out and getattr(evidence, "effect_state", None) == EffectState.UNCONFIRMED.value:
+        out.append({"tool": "earlier tool call"})
+    return out
+
+
+def describe_unconfirmed_effect(entry: dict[str, Any]) -> str:
+    name = str(entry.get("tool") or "unknown")
+    if entry.get("operation"):
+        name += f"/{entry['operation']}"
+    targets = entry.get("targets") or []
+    return f"{name}: {', '.join(str(t) for t in targets)}" if targets else name
 
 
 def unconfirmed_call_ids(evidence: Any) -> list[str]:

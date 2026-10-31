@@ -20,16 +20,18 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.staff import Department, Staff, StaffRole
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.worker import WorkLease, Worker, WorkerActivityLog
-from packages.core.plans.step_reset import renew_step_approval_intent
+from packages.core.dispatcher.step_state import renew_step_approval_intent
 from packages.core.services.runtime_authorization.domain import PermissionDecision
-from tests.approval_settings_test_utils import action_rule, initialize_test_account_approval
+from tests.approval_settings_test_utils import (
+    POLICY_WRITE_SIDE_EFFECT_MODELS, action_rule, initialize_test_account_approval,
+)
 
 
 @pytest.fixture
 async def failure_db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     metadata = MetaData()
-    for model in (Entity, User, UserMembership, Department, StaffRole, Staff, AuditLog, HitlRequest, WorkLease, Worker, WorkerActivityLog, ExecutionPlan, ExecutionStep):
+    for model in (Entity, User, UserMembership, Department, StaffRole, Staff, AuditLog, HitlRequest, WorkLease, Worker, WorkerActivityLog, ExecutionPlan, ExecutionStep, *POLICY_WRITE_SIDE_EFFECT_MODELS):
         table = model.__table__.to_metadata(metadata)
         for column in table.columns:
             if isinstance(column.type, (JSONB, ARRAY)):
@@ -132,7 +134,6 @@ async def test_transient_failure_keeps_legacy_and_current_consumed_grants_termin
     # fencing, retry accounting and all persisted approval rows remain real.
     monkeypatch.setattr(dispatcher_module, "_safe_chat_step_failed", AsyncMock())
     monkeypatch.setattr(dispatcher_module, "_safe_task_log", AsyncMock())
-    monkeypatch.setattr("packages.core.plans.wakeup.stage_plan_cycle_wake", AsyncMock())
     step = ExecutionStep(id="s", plan_id="p", entity_id="e", step_key="work", kind="llm",
         params={}, step_status="running", attempt_count=1, max_attempts=3, current_lease_id="l")
     lease = WorkLease(id="l", step_id="s", plan_id="p", entity_id="e", worker_id="worker",
@@ -151,3 +152,58 @@ async def test_transient_failure_keeps_legacy_and_current_consumed_grants_termin
     assert step.approval_operation_revision == 0
     assert request.status == "consumed" and request.consumed_at is not None
     assert request.decided_by_user_id == "operator" and request.resolved_reason == "approved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minted_key", ["social_post.publish", "post_video"])
+async def test_failed_review_finds_a_grant_minted_under_the_canonical_or_raw_key(failure_db, minted_key):
+    """Step grants are minted under the canonical action key (a raw MCP step
+    name is canonicalised); rows from before canonicalisation keep the raw
+    key. Missing either reuses the consumed operation id and the retry is
+    refused as terminal instead of getting its ERROR recovery card."""
+    step = SimpleNamespace(id="s", plan_id="p", entity_id="e", workspace_id="w", kind="action",
+                           provider="tiktok", action_key="post_video", params={},
+                           capability_id=None, risk_level="low", approval_operation_revision=0)
+    request = HitlRequest(id="r", entity_id="e", workspace_id="w", origin_kind="step",
+        origin_step_id="s", origin_plan_id="p", action_key=minted_key, status="consumed",
+        dedup_key="operation:step:p:s", context={"operation_id": "step:p:s"})
+    lease = WorkLease(id="l", step_id="s", plan_id="p", entity_id="e", worker_id="worker",
+        status="failed", lease_until=datetime.now(timezone.utc))
+    failure_db.add_all([request, lease])
+    await failure_db.flush()
+    assert await _failed_step_review_operation_id(failure_db, step) == "step:p:s:failure:l"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("minted_key", "outcome"), [
+    ("post_video", ApprovalOutcome.ALLOW),           # minted before canonicalisation
+    ("social_post.publish", ApprovalOutcome.ALLOW),  # minted under the canonical key
+    ("other.action", ApprovalOutcome.DENY),          # a genuinely different operation
+])
+async def test_a_grant_matches_the_canonical_step_by_raw_or_canonical_identity(monkeypatch, minted_key, outcome):
+    from packages.core.dispatcher.service import _step_policy_subject
+
+    step = SimpleNamespace(id="s", plan_id="p", entity_id="e", workspace_id="w", kind="action",
+                           provider="tiktok", action_key="post_video", params={},
+                           capability_id=None, risk_level="low")
+    request = SimpleNamespace(status="granted", hitl_type="authorize", action_key=minted_key,
+                              resource_id=None, matched_rule="rule", context={
+                                  "args_hash": "h", "approval_requirements": []})
+    monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=PolicyDecision(True)))
+    monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=request))
+    result = await approvals.resolve_approval(None,
+        subject=_step_policy_subject(step, capability_id="external.social"),
+        origin=approvals.ApprovalOrigin(kind="step", step_id="s", operation_id="step:p:s", args_hash="h"),
+        permission_decision=PermissionDecision.allow())
+    assert result.outcome == outcome
+
+
+def test_step_cards_and_denials_name_the_canonical_action():
+    from packages.core.dispatcher.service import _step_policy_subject
+
+    step = SimpleNamespace(id="s", plan_id="p", entity_id="e", workspace_id="w", kind="action",
+                           provider="tiktok", action_key="post_video", params={},
+                           capability_id=None, risk_level="low")
+    subject = _step_policy_subject(step, capability_id="external.social")
+    assert (subject.action_key, subject.category, subject.risk_level) == ("social_post.publish", "publishing", "high")
+    assert subject.action_key_aliases == ("post_video",)

@@ -348,3 +348,36 @@ async def test_office_content_previews_are_extracted_text(tmp_path, monkeypatch)
     assert "Client-ready narrative" in pptx_preview
     assert "PK\x03\x04" not in docx_preview
     assert "PK\x03\x04" not in pptx_preview
+
+
+@pytest.mark.asyncio
+async def test_list_documents_narrows_to_media_kinds_and_leaves_out_work_files(db_session):
+    entity_id = generate_ulid()
+
+    def doc(name, file_type, mime_type, role=None):
+        return Document(
+            id=generate_ulid(), entity_id=entity_id, name=name, file_type=file_type, mime_type=mime_type,
+            source="ai_generated", vector_status=VectorStatus.READY,
+            metadata_=merge_document_metadata(artifact={"role": role}) if role else {},
+        )
+
+    song = doc("fighter.mp3", "mp3", "audio/mpeg", "final")
+    upload = doc("demo.wav", "wav", None)
+    qa_frame = doc("frame-001.png", "png", "image/png", "qa_evidence")
+    poster = doc("poster.png", "png", "image/png", "poster")
+    recipe = doc("cut.video-edit.json", "json", "application/json", "editor_recipe")
+    brief = doc("brief.md", "md", "text/markdown")
+    db_session.add_all([song, upload, qa_frame, poster, recipe, brief])
+    await db_session.flush()
+
+    async def names(**filters):
+        docs, total = await list_documents(db_session, entity_id, **filters)
+        assert total == len(docs)
+        return {item.name for item in docs}
+
+    # A kind matches by MIME type or by extension when the MIME type is missing.
+    assert await names(media_kinds=["audio"]) == {"fighter.mp3", "demo.wav"}
+    assert await names(media_kinds=["document"]) == {"cut.video-edit.json", "brief.md"}
+    # Files made on the way to a result stay out; a role nobody listed (a poster) and no role stay in.
+    assert await names(exclude_work_artifacts=True) == {"fighter.mp3", "demo.wav", "poster.png", "brief.md"}
+    assert await names(media_kinds=["image"], exclude_work_artifacts=True) == {"poster.png"}

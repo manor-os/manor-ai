@@ -12,12 +12,14 @@ export default function MediaPreview({
   maxHeight = 180,
   compact = false,
   onVideoReady,
+  onPreviewReady,
   onPreviewError,
 }: {
   refItem: MediaRef;
   maxHeight?: number;
   compact?: boolean;
   onVideoReady?: (duration: number) => void;
+  onPreviewReady?: () => void;
   onPreviewError?: () => void;
 }) {
   const { url, type, name } = refItem;
@@ -65,6 +67,8 @@ export default function MediaPreview({
           display: "block", width: "100%", maxHeight: compact ? 120 : maxHeight,
           objectFit: "contain", borderRadius: radius, background: "var(--surface-sunken)",
         }}
+        onLoad={onPreviewReady}
+        onError={() => { setErr(true); onPreviewError?.(); }}
       />
     );
   }

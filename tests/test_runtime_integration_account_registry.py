@@ -94,6 +94,10 @@ class _FakeResult:
     def scalars(self) -> _FakeScalarResult:
         return _FakeScalarResult(self._rows)
 
+    def one_or_none(self) -> object | None:
+        assert len(self._rows) <= 1
+        return self._rows[0] if self._rows else None
+
 
 class _FakeDB:
     def __init__(
@@ -106,7 +110,7 @@ class _FakeDB:
 
     async def execute(self, _query) -> _FakeResult:
         query = str(_query)
-        if "resource_grants" in query or "user_memberships" in query:
+        if "resource_grants" in query or "user_memberships" in query or "users.role" in query:
             return _FakeResult([])
         if "users.preferences" in query:
             return _FakeResult(
@@ -244,92 +248,6 @@ def test_partial_registry_schema_requires_an_exact_known_account() -> None:
     assert "must select" in parameters["properties"][
         "integration_account_id"
     ]["description"]
-
-
-def test_task_agent_dynamic_schema_preserves_partial_registry_selector(
-    monkeypatch,
-) -> None:
-    from packages.core.ai.runtime.task_agent import (
-        _load_search_result_tool_schemas,
-    )
-
-    schema = {
-        "type": "function",
-        "function": {
-            "name": "mcp__gmail__list_messages",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
-    monkeypatch.setattr(
-        "packages.core.ai.runtime.task_agent.runtime_tool_schema",
-        lambda name: schema if name == "mcp__gmail__list_messages" else None,
-    )
-    tools: list[dict] = []
-    loaded_tool_names: set[str] = set()
-
-    _load_search_result_tool_schemas(
-        tools=tools,
-        loaded_tool_names=loaded_tool_names,
-        search_result={
-            "loaded_tools": ["mcp__gmail__list_messages"],
-            "matches": [{
-                "name": "mcp__gmail__list_messages",
-                "available": True,
-                "requires_explicit_account": True,
-                "account_options": [{
-                    "id": "healthy-account",
-                    "display_name": "healthy@example.com",
-                    "scope": "user",
-                    "is_default": False,
-                }],
-            }],
-        },
-        allowed_tool_names={"mcp__gmail__list_messages"},
-    )
-
-    parameters = tools[0]["function"]["parameters"]
-    assert parameters["required"] == ["integration_account_id"]
-    assert "integration_account_selection" not in parameters["properties"]
-
-
-def test_task_agent_loads_a_tool_discovered_after_initial_allowlist_resolution(
-    monkeypatch,
-) -> None:
-    from packages.core.ai.runtime.task_agent import (
-        _load_search_result_tool_schemas,
-    )
-
-    dynamic_name = "mcp__stripe__future_vendor_tool"
-    dynamic_schema = {
-        "type": "function",
-        "function": {
-            "name": dynamic_name,
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
-    monkeypatch.setattr(
-        "packages.core.ai.runtime.task_agent.runtime_tool_schema",
-        lambda _name: None,
-    )
-    tools: list[dict] = []
-    loaded_tool_names: set[str] = {"search_tools"}
-
-    _load_search_result_tool_schemas(
-        tools=tools,
-        loaded_tool_names=loaded_tool_names,
-        search_result={
-            "loaded_tools": [dynamic_name],
-            "matches": [{
-                "name": dynamic_name,
-                "available": True,
-                "schema": dynamic_schema,
-            }],
-        },
-        allowed_tool_names={"search_tools"},
-    )
-
-    assert tools == [dynamic_schema]
-    assert dynamic_name in loaded_tool_names
 
 
 @pytest.mark.asyncio

@@ -340,10 +340,11 @@ async def test_delete_restore_syncs_runtime_schedules(client: AsyncClient, db_se
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("on_demand_trigger", ["manual", "mcp"])
-async def test_pause_pauses_workspace_automations(client: AsyncClient, db_session, on_demand_trigger):
+async def test_pause_keeps_independent_workflow_automations_enabled(client: AsyncClient, db_session, on_demand_trigger):
     from sqlalchemy import select
 
     from packages.core.models.base import generate_ulid
+    from packages.core.models.event import EventLog
     from packages.core.models.scheduler import ScheduledJob
     from packages.core.models.workflow import WorkflowBinding
     from packages.core.models.workspace import Workspace, WorkspaceOperationDraft
@@ -369,6 +370,7 @@ async def test_pause_pauses_workspace_automations(client: AsyncClient, db_sessio
         name="Workspace automation",
         schedule_kind="every",
         every_seconds=60,
+        execution_type="workflow",
         enabled=True,
     )
     unrelated_job = ScheduledJob(
@@ -401,7 +403,17 @@ async def test_pause_pauses_workspace_automations(client: AsyncClient, db_sessio
         enabled=True,
         status="active",
     )
-    db_session.add_all([job, unrelated_job, automation_binding, manual_binding])
+    pending_event = EventLog(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=ws_id,
+        event_type="workflow.completed",
+        source="workflow",
+        payload={},
+        external_delivery_status="pending",
+    )
+    pending_event_id = pending_event.id
+    db_session.add_all([job, unrelated_job, automation_binding, manual_binding, pending_event])
     await db_session.commit()
 
     before_ids = set((await db_session.execute(
@@ -439,17 +451,20 @@ async def test_pause_pauses_workspace_automations(client: AsyncClient, db_sessio
     refreshed_automation_binding = await db_session.get(WorkflowBinding, automation_binding_id)
     refreshed_manual_binding = await db_session.get(WorkflowBinding, manual_binding_id)
     refreshed_unrelated_job = await db_session.get(ScheduledJob, unrelated_job_pk)
+    refreshed_event = await db_session.get(EventLog, pending_event_id)
 
     assert {row.id for row in workspace_jobs} == before_ids
-    assert workspace_jobs and all(row.enabled is False for row in workspace_jobs)
+    assert workspace_jobs and all(row.enabled is True for row in workspace_jobs)
     assert refreshed_automation_binding is not None
-    assert refreshed_automation_binding.enabled is False
-    assert refreshed_automation_binding.status == "paused"
+    assert refreshed_automation_binding.enabled is True
+    assert refreshed_automation_binding.status == "active"
     assert refreshed_manual_binding is not None
     assert refreshed_manual_binding.enabled is True
     assert refreshed_manual_binding.status == "active"
     assert refreshed_unrelated_job is not None
     assert refreshed_unrelated_job.enabled is True
+    assert refreshed_event is not None
+    assert refreshed_event.external_delivery_status == "canceled"
 
 
 @pytest.mark.asyncio

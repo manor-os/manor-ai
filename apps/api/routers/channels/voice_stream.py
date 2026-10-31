@@ -318,6 +318,7 @@ async def voice_stream(ws: WebSocket, session_token: str):
         realtime_route = await resolve_realtime_route(
             entity_id,
             user_id=billing_user_id,
+            workspace_id=billing_workspace_id,
         )
     except Exception as exc:
         logger.exception("Failed to initialize Twilio Voice engines")

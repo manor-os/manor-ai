@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 import re
 
+from packages.core.services.sensitive_data import redact_sensitive_text
+
 
 _SENSITIVE_QUERY_RE = re.compile(
-    r"([?&](?:token|access_token|refresh_token|id_token|api_?key|key|client_secret|password|code)=)"
+    r"([?&](?:token|access_token|refresh_token|id_token|api_?key|key|client_secret|password|code|ticket)=)"
     r"[^&\s\"']+",
     re.IGNORECASE,
 )
@@ -17,12 +19,25 @@ _SENSITIVE_LOG_VALUE_RE = re.compile(
     r"x-manor-geo-token|geo_cloudflare_token)"
     r"([\"']?\s*(?:for\s+[^\s:]+)?\s*[:=]\s*[\"']?)([^\s,;&\"']+)"
 )
+_QUOTED_SECRET_HEADER_RE = re.compile(
+    r'''(?i)(?P<prefix>(?P<key_quote>["'])(?:cookie|set[-_]cookie|'''
+    r'''(?:proxy[-_])?authorization)(?P=key_quote)\s*[:=]\s*)'''
+    r'''(?P<value_quote>["'])(?:\\.|(?!(?P=value_quote))[^\\])*(?P=value_quote)'''
+)
 
 
 def redact_sensitive_log_text(value: str) -> str:
     """Remove credentials and verification material before log emission."""
-    redacted = _SENSITIVE_QUERY_RE.sub(r"\1<redacted>", value)
-    return _SENSITIVE_LOG_VALUE_RE.sub(r"\1\2<redacted>", redacted)
+    # Structured log messages often contain quoted dict/JSON header keys. Match
+    # the full quoted value (including escaped quotes and Cookie separators),
+    # so credentials are removed without consuming sibling context fields.
+    redacted = _QUOTED_SECRET_HEADER_RE.sub(
+        lambda match: f'{match["prefix"]}{match["value_quote"]}<redacted>{match["value_quote"]}',
+        value,
+    )
+    redacted = _SENSITIVE_QUERY_RE.sub(r"\1<redacted>", redacted)
+    redacted = _SENSITIVE_LOG_VALUE_RE.sub(r"\1\2<redacted>", redacted)
+    return redact_sensitive_text(redacted) or ""
 
 
 class SensitiveQueryStringFilter(logging.Filter):

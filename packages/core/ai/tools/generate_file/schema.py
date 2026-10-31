@@ -6,6 +6,7 @@ from packages.core.contracts.audio_generation import (
     AudioGenerationFormat,
     AudioGenerationPurpose,
     GenerateFileKind,
+    REQUESTABLE_NARRATION_VOICE_MODES,
 )
 
 _CAPABILITIES = {
@@ -14,7 +15,7 @@ _CAPABILITIES = {
     "document": "Create from content (.md/.txt/.csv/.json/.diagram.json/.html/.docx/.pptx/.pdf), blank DOCX/PPTX/XLSX operations, template DOCX/PPTX/XLSX/XLSM operations, or convert an existing file using source={path,expected_sha256} plus name and target file_type. Native Office-to-PDF, legacy-to-OOXML and image-to-PNG/JPEG/WebP conversion preserves the original; inspect_file_engine lists supported pairs. Source/operations cannot mix with content/prompt/options. XLSM generation requires template={path,expected_sha256} of the same type.",
     "word_document": "Create DOCX from patch_file operations. For uploaded DOCX edits, use template={path,expected_sha256} from read_file plus operations to create a new Knowledge file; the upload stays unchanged. A PDF is not a DOCX template: read and verify the full PDF, then use the document specialist without template or operations. Convert a resulting DOCX to PDF using source.",
     "pdf": "Convert an existing Office file to PDF with source={path,expected_sha256} and a new name. To edit an uploaded PDF, use prompt referencing its current file path and the PDF specialist; omit source, template and operations. Read and verify the full source PDF.",
-    "presentation": "Create PPTX from patch_file operations; without operations, use presentation specialist skills.",
+    "presentation": "Create PPTX from patch_file operations; without operations, use presentation specialist skills (designed templates by default; set params.mode='free_design' when the user asks, in any words, for no template, a different design on every page or a bespoke look).",
     "spreadsheet": "Create XLSX, or XLSM from a same-type template, using patch_file operations; without operations, use spreadsheet specialist skills.",
     "image": "Convert an existing image (including HEIC/HEIF) to PNG/JPEG/WebP using source={path,expected_sha256}, name and file_type; this preserves resolution and uses no image model. Without source, generate an image with the Account-selected image model and BYOK/platform billing rules.",
     "video": "Generate one clip with the Account-selected video model and BYOK/platform billing rules. Inspect the selected model before choosing clip duration and inputs; segment longer runtimes as needed.",
@@ -226,7 +227,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                 },
                 "narration_voice_mode": {
                     "type": "string",
-                    "enum": ["random_per_task", "random_per_conversation", "fixed_per_workspace"],
+                    "enum": list(REQUESTABLE_NARRATION_VOICE_MODES),
                     "description": "Voice scope.",
                 },
                 "voice_instructions": {
@@ -275,7 +276,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                 },
                 "narration_voice_mode": {
                     "type": "string",
-                    "enum": ["random_per_task", "random_per_conversation", "fixed_per_workspace"],
+                    "enum": list(REQUESTABLE_NARRATION_VOICE_MODES),
                     "description": "Voice scope.",
                 },
                 "language": {

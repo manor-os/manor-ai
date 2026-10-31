@@ -936,6 +936,39 @@ async def test_relationship_idempotency_distinguishes_omitted_and_explicit_perso
 
 
 @pytest.mark.asyncio
+async def test_relationship_replay_from_another_run_keeps_first_provenance(
+    relationship_runtime: Path,
+) -> None:
+    request = {
+        "entity_id": "entity-1",
+        "workspace_id": "workspace-1",
+        "identity_key": "instagram:@ada",
+        "subject_type": "organization",
+        "status": "tracked",
+        "event": "watchlist_added",
+        "occurred_at": "2026-10-24T08:00:00Z",
+        "idempotency_key": "watchlist:instagram:@ada",
+        "payload": {"handle": "@ada"},
+    }
+    first = await relationship_ledger.record_relationship_event(
+        **request, task_id="task-1", workflow_run_id="run-1",
+    )
+    replay = await relationship_ledger.record_relationship_event(
+        **request, task_id="task-2", workflow_run_id="run-2",
+    )
+
+    assert replay["idempotent"] is True
+    assert replay["event_id"] == first["event_id"]
+    ledger = await relationship_ledger.read_relationship_ledger(
+        entity_id="entity-1", workspace_id="workspace-1",
+    )
+    assert [
+        (entry["source_task_id"], entry["source_workflow_run_id"])
+        for entry in ledger["entries"]
+    ] == [("task-1", "run-1")]
+
+
+@pytest.mark.asyncio
 async def test_relationship_legacy_person_idempotency_replay_remains_compatible(
     relationship_runtime: Path,
 ) -> None:

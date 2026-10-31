@@ -367,6 +367,88 @@ async def capture_components(db, *, workspace, payload: dict, baseline: dict | N
     return result
 
 
+def _step_configs(steps: Any):
+    """Yield every step config, including nested loop/branch bodies."""
+    if not isinstance(steps, list):
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        config = step.get("config")
+        if isinstance(config, dict):
+            yield step, config
+            yield from _step_configs(config.get("steps"))
+
+
+def _variable_keys(variables: Any) -> set[str]:
+    if isinstance(variables, dict):
+        return {str(key) for key in variables}
+    return {
+        str(variable.get("key") or variable.get("name"))
+        for variable in variables or []
+        if isinstance(variable, dict) and (variable.get("key") or variable.get("name"))
+    }
+
+
+def _compatibility_issues(key: str, *, kept: dict, blueprint: dict, desired_by_key: dict, payload: dict) -> list[dict]:
+    """What the Blueprint's components need from this one that the kept version lacks.
+
+    Requirements come from the reviewed Blueprint itself: the component's own
+    Blueprint version, the contract's required tools/Skills, and the upgraded
+    components that reference it. Nothing here is scenario-specific.
+    """
+    kind, component_key = key.split(":", 1)
+    requires = (payload.get("contract") or {}).get("requires") or {}
+    contract_tools = {str(tool) for tool in requires.get("tools") or []}
+    contract_skills = {str(ref.get("slug")) for ref in requires.get("skills") or [] if isinstance(ref, dict)}
+    slug = blueprint.get("slug") or component_key
+
+    def dependant(other_key: str) -> dict:
+        other = desired_by_key[other_key]
+        return {"key": other_key, "kind": other_key.split(":", 1)[0], "name": other.get("name") or other_key}
+
+    def workflows_using_skills(skills: set[str]) -> list[dict]:
+        return [dependant(other) for other, content in sorted(desired_by_key.items())
+                if other.startswith("workflow:") and any(
+                    config.get("skill") in skills for _step, config in _step_configs(content.get("steps")))]
+
+    issues = []
+    if kind == "skill":
+        missing = sorted(set(blueprint.get("tools") or []) - set(kept.get("tools") or []))
+        required_by = workflows_using_skills({slug}) + [
+            dependant(other) for other, content in sorted(desired_by_key.items())
+            if other.startswith("agent:") and slug in (content.get("skill_bindings") or [])
+        ]
+        if missing and (required_by or contract_tools.intersection(missing)):
+            issues.append({"code": "missing_tools", "names": missing, "required_by": required_by,
+                           "contract_required": sorted(contract_tools.intersection(missing))})
+    elif kind == "agent":
+        missing_tools = sorted(set(blueprint.get("tool_bindings") or []) - set(kept.get("tool_bindings") or []))
+        required_by = [dependant(other) for other, content in sorted(desired_by_key.items())
+                       if other.startswith("workflow:") and any(
+                           slug in {config.get("agent"), config.get("agent_slug")}
+                           for _step, config in _step_configs(content.get("steps")))]
+        if missing_tools and (required_by or contract_tools.intersection(missing_tools)):
+            issues.append({"code": "missing_tools", "names": missing_tools, "required_by": required_by,
+                           "contract_required": sorted(contract_tools.intersection(missing_tools))})
+        missing_skills = sorted(set(blueprint.get("skill_bindings") or []) - set(kept.get("skill_bindings") or []))
+        skill_users = workflows_using_skills(set(missing_skills))
+        if missing_skills and (skill_users or required_by or contract_skills.intersection(missing_skills)):
+            issues.append({"code": "missing_skills", "names": missing_skills,
+                           "required_by": required_by + [item for item in skill_users if item not in required_by],
+                           "contract_required": sorted(contract_skills.intersection(missing_skills))})
+    elif kind == "workflow":
+        missing = sorted(_variable_keys(blueprint.get("variables")) - _variable_keys(kept.get("variables")))
+        callers = [dependant(other) for other, content in sorted(desired_by_key.items())
+                   if other.startswith("workflow:") and other != key and any(
+                       (step.get("type") or step.get("kind")) in WorkflowDependencyFactory.STEP_TYPES
+                       and config.get("source_workflow_key") in {slug, component_key}
+                       for step, config in _step_configs(content.get("steps")))]
+        if missing and callers:
+            issues.append({"code": "missing_inputs", "names": missing, "required_by": callers, "contract_required": []})
+    return issues
+
+
 async def plan_components(db, *, workspace, payload: dict, baseline: dict | None = None, actor=None) -> dict:
     current = await capture_components(db, workspace=workspace, payload=payload, baseline=baseline, actor=actor)
     specs = _specs(payload)
@@ -381,8 +463,9 @@ async def plan_components(db, *, workspace, payload: dict, baseline: dict | None
             action = "unchanged"
         elif prior is not None and "source" in prior and desired == prior["source"]:
             # The author did not change this component. Both an earlier
-            # reviewed customization and later local edits remain local.
-            action = "unchanged"
+            # reviewed customization and later local edits remain local by
+            # default, but stay visible so a broken edit can be replaced.
+            action = "customized"
         elif before is None and desired is not None:
             action = "missing"
         elif prior is not None and before == prior.get("content") and prior.get("source", prior.get("content")) == prior.get("content"):
@@ -398,6 +481,13 @@ async def plan_components(db, *, workspace, payload: dict, baseline: dict | None
             "expected_fingerprint": _hash(current.get(key)),
             "changes": ["Remove Blueprint deployment" if desired is None else "Install Blueprint component" if before is None else "Component configuration and bindings"],
         })
+    desired_by_key = {item["key"]: item["new_content"] for item in items if item["new_content"] is not None}
+    for item in items:
+        if item["action"] in {"customized", "keep_yours"} and item["current_content"] is not None and item["new_content"] is not None:
+            item["compatibility_issues"] = _compatibility_issues(
+                item["key"], kept=item["current_content"], blueprint=item["new_content"],
+                desired_by_key=desired_by_key, payload=payload,
+            )
     return {"items": items, "current": current, "source": specs}
 
 
@@ -625,6 +715,9 @@ async def apply_components(db, *, workspace, payload: dict, plan: dict, choices:
     choices = choices or {}
     selected = []
     kept = []
+    # Local edits to components the author did not change. Keeping them is not
+    # a conflict resolution, so shared-dependency rebinding still applies.
+    retained = []
     for item in plan["items"]:
         if _hash(fresh.get(item["key"])) != item["expected_fingerprint"]:
             raise BlueprintUpgradePlanChangedError("Blueprint component changed after review; refresh the upgrade plan")
@@ -635,7 +728,12 @@ async def apply_components(db, *, workspace, payload: dict, plan: dict, choices:
             raise BlueprintUpgradePlanChangedError("Unknown Blueprint component choice")
         if item["action"] == "keep_yours" and decision is None:
             raise BlueprintUpgradePlanChangedError("Review every component conflict before upgrading")
-        if decision == "keep_yours":
+        if item["action"] == "customized":
+            if decision == "use_blueprint":
+                selected.append(item)
+            else:
+                retained.append(item["key"])
+        elif decision == "keep_yours":
             kept.append(item["key"])
         elif item["action"] != "unchanged":
             selected.append(item)
@@ -849,7 +947,7 @@ async def apply_components(db, *, workspace, payload: dict, plan: dict, choices:
         item["key"]: {**(actual.get(item["key"]) or {"id": None, "kind": item["kind"], "slug": item["slug"], "content": None}), "source": _desired(item["kind"], specs[item["key"]], current=(actual.get(item["key"]) or {}).get("content")) if item["key"] in specs else None}
         for item in plan["items"]
     }
-    return {"restore": journal, "baseline": baseline, "updated": [{"kind": i["kind"], "name": i["name"], "key": i["key"]} for i in selected], "kept": kept, "component_ids": {key: value["id"] for key, value in actual.items()}, "agent_replacements": {old: new for old, new in replacements.items() if any(item["kind"] == "agent" and inventory.get(item["key"]) is not None and inventory[item["key"]].id == new for item in selected)}}
+    return {"restore": journal, "baseline": baseline, "updated": [{"kind": i["kind"], "name": i["name"], "key": i["key"]} for i in selected], "kept": kept + retained,"component_ids": {key: value["id"] for key, value in actual.items()}, "agent_replacements": {old: new for old, new in replacements.items() if any(item["kind"] == "agent" and inventory.get(item["key"]) is not None and inventory[item["key"]].id == new for item in selected)}}
 
 
 async def validate_components_restore(db, *, workspace, restore: list, actor=None) -> None:

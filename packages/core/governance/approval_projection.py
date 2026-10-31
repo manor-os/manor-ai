@@ -161,7 +161,8 @@ def import_blueprint_governance(raw: dict[str, Any], rules: list[Any], *, preser
             f"{field}_capabilities": [capabilities] if isinstance(capabilities, str) else capabilities,
         }, safe_import=not preserve_hard_blocks)
         source["approval_selectors"] = [rule.selector.model_dump() for rule in policy_override(source_policy).rules]
-        if not preserve_hard_blocks:
+        # An imported automatic grant keeps its wording but enforces nothing.
+        if not preserve_hard_blocks and field != "auto_approve":
             source["rule_type"] = "approval_required"
         for key in ("action_patterns", "actions", "patterns", "capability_patterns", "capabilities", "capability_ids"):
             source.pop(key, None)

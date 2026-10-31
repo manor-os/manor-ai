@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,11 @@ PLANS: dict[str, dict[str, Any]] = dict(_FALLBACK_PLANS)
 a live reference. **Do not reassign — call the loader instead.**"""
 
 _cache_loaded_from_db: bool = False
+# Monotonic time of this process's last catalog read. Every API process and
+# every Celery child keeps its own cache; the beat refresh lands in one child
+# only, so each process re-reads on its own once the cache is this old.
+_cache_read_at: float | None = None
+PLAN_CACHE_MAX_AGE_SECONDS = 300
 
 
 if "_PLAN_ALIASES" not in globals():
@@ -79,7 +85,6 @@ def is_dev() -> bool:
         "dev",
         "development",
         "local",
-        "local-k8s",
     )
 
 
@@ -114,11 +119,27 @@ def get_plan_limit(plan_id: str | None, key: str) -> int | float | None:
 
 # ── Async loader (called at startup + after admin mutations) ──────────
 
+async def ensure_plans_fresh(db, *, max_age_seconds: float = PLAN_CACHE_MAX_AGE_SECONDS) -> None:
+    """Re-read the plan catalog when this process has not read it recently.
+
+    Worker children never run the API startup load, and an admin edit only
+    refreshed the process that made it (plus whichever child ran the beat
+    task), so plan limits could stay at the code fallback indefinitely.
+    """
+    if not is_cloud():
+        return
+    if _cache_read_at is not None and time.monotonic() - _cache_read_at < max_age_seconds:
+        return
+    await load_plans_into_cache(db)
+
+
+
 async def load_plans_into_cache(db) -> int:
     """Refresh plan metadata when the deployment provides a plan catalog."""
-    global _cache_loaded_from_db
+    global _cache_loaded_from_db, _cache_read_at
     if not is_cloud():
         return 0
+    _cache_read_at = time.monotonic()
     return 0
 
 

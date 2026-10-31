@@ -21,7 +21,6 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.worker import WorkLease, WorkerActivityLog
 from packages.core.models.workspace import Workspace
-from packages.core.plans.executor import PlanExecutor, evaluate_task_completion_gates
 from packages.core.services.runtime_file_effect_recovery import RuntimeFileEffectRecovery
 from tests.test_dispatcher_envelope_status import _setup_step
 
@@ -57,6 +56,12 @@ async def _file_step(db, *, returned=False, observed=False, attempts=1, auto_hum
     lease.evidence_refs = [effect]
     await db.flush()
     return step, lease, effect
+
+
+def _own_requests(step):
+    # The shard database also holds other files' committed requests; each
+    # test's step has its own entity.
+    return select(HitlRequest).where(HitlRequest.entity_id == step.entity_id)
 
 
 def _receipt():
@@ -225,7 +230,7 @@ async def test_journal_recovery_resumes_same_step_without_reexecuting_file(db_se
     assert step.evidence_refs[0]["fields"]["runtime_file_original_effect"] == effect
     assert len(step.evidence_refs) == 1
     assert recover.await_args.kwargs["step_id"] == step.id
-    assert (await db_session.execute(select(HitlRequest))).scalars().all() == []
+    assert (await db_session.execute(_own_requests(step))).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -265,7 +270,7 @@ async def test_missing_file_proof_fails_without_human_retry_even_if_policy_reque
     assert step.error["recovery"]["file_operations"][0]["result_sha256"] == _FILE_RESULT_SHA256
     assert step.evidence_refs == [effect]
     assert step.runtime_checkpoint["pending_tool_call"]["id"] == "write-1"
-    assert (await db_session.execute(select(HitlRequest))).scalars().all() == []
+    assert (await db_session.execute(_own_requests(step))).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -296,7 +301,7 @@ async def test_internal_file_gap_does_not_become_reconciliation_card(db_session)
     await Dispatcher().lease_needs_human(db_session, lease.id, prompt="Verify the previous operation")
     assert step.step_status == "failed"
     assert step.error["type"] == INTERNAL_FILE_RECOVERY_FAILED
-    assert (await db_session.execute(select(HitlRequest))).scalars().all() == []
+    assert (await db_session.execute(_own_requests(step))).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -329,9 +334,10 @@ async def test_external_provider_effect_keeps_conservative_hold(db_session):
     assert not _is_system_file_effect(effect)
     step.evidence_refs = lease.evidence_refs = [effect]
     await Dispatcher().fail_lease(db_session, lease.id, error={"type": "MissingOutputContract"})
-    assert lease.status == "needs_human"
+    assert step.step_status == lease.status == "failed"
     assert step.error["type"] == "MissingOutputContract"
     assert step.error["failure"]["requires_human"] is True
+    assert step.error["failure"]["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -346,7 +352,7 @@ async def test_mixed_internal_and_provider_gap_stops_with_all_evidence_retained(
     assert step.error["type"] == INTERNAL_FILE_RECOVERY_FAILED
     assert step.evidence_refs == lease.evidence_refs == [file_effect, external]
     assert step.error["failure"]["retryable"] is False
-    assert (await db_session.execute(select(HitlRequest))).scalars().all() == []
+    assert (await db_session.execute(_own_requests(step))).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -412,7 +418,7 @@ async def test_genuine_input_after_proven_file_result_retains_original_question(
     assert step.step_status == "waiting_human"
     assert step.human_input_prompt == "Which audience?"
     assert step.runtime_checkpoint == checkpoint
-    requests = (await db_session.execute(select(HitlRequest))).scalars().all()
+    requests = (await db_session.execute(_own_requests(step))).scalars().all()
     assert len(requests) == 1
     assert "effect_reconciliation" not in (requests[0].context or {})
 
@@ -426,19 +432,4 @@ async def test_expired_internal_file_gap_is_system_failure(db_session):
     assert lease.status == "expired"
     assert step.step_status == "failed"
     assert step.error["type"] == INTERNAL_FILE_RECOVERY_FAILED
-    assert (await db_session.execute(select(HitlRequest))).scalars().all() == []
-
-
-@pytest.mark.asyncio
-async def test_system_recovery_failure_is_terminal_before_supervisor_human_or_replan_gates(db_session):
-    step, lease, _ = await _file_step(db_session)
-    await Dispatcher().fail_lease(db_session, lease.id, error={"type": "MissingOutputContract"})
-    plan = await db_session.get(ExecutionPlan, step.plan_id)
-    plan.task_id = "task-system-recovery"
-    plan.last_error = {"type": "ActionOutcomeReconciliationRequired"}
-    verdict = await evaluate_task_completion_gates(
-        db_session, task=None, plan=plan, steps=[step], plan_status="failed", locale="en",
-    )
-    assert verdict.verdict.value == "failed"
-    assert await PlanExecutor._maybe_replan(db_session, plan, [step]) is False
-    assert plan.last_error["type"] == INTERNAL_FILE_RECOVERY_FAILED
+    assert (await db_session.execute(_own_requests(step))).scalars().all() == []

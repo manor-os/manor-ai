@@ -25,6 +25,7 @@ import LoadingSpinner from "../ui/LoadingSpinner";
 import StatusPill from "../ui/StatusPill";
 import { useAuthStore } from "../../stores/auth";
 import { useToastStore } from "../../stores/toast";
+import { getPreferredTimeZone } from "../../lib/format";
 
 export default function DeveloperTab() {
   return (
@@ -126,7 +127,7 @@ function WorkersSection() {
                     <td>{w.kind}</td>
                     <td><StatusPill status={w.status} size="sm" /></td>
                     <td className="mono" style={{ fontSize: 12 }}>
-                      {w.last_heartbeat_at ? new Date(w.last_heartbeat_at).toLocaleString() : "—"}
+                      {w.last_heartbeat_at ? new Date(w.last_heartbeat_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : "—"}
                     </td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                       {w.status === "active" && (

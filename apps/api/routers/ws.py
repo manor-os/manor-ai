@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -17,10 +18,59 @@ from sqlalchemy import and_, or_, select, tuple_
 from packages.core import database as db_module
 from packages.core.database_runtime import DatabaseFailureKind
 from packages.core.services.auth_service import decode_token
+from packages.core.services.external_collaboration_access import (
+    COLLABORATOR_MEMBERSHIP_ROLE,
+    collaborator_workspace_ids,
+    live_collaborator_grants,
+)
+from packages.core.services.collaborator_session import (
+    collaborator_session_matches,
+    session_claims,
+    session_scope,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websocket"])
+
+# External Workspace collaborators
+# --------------------------------
+# A collaborator membership (role ``collaborator``, derived from a
+# WorkspaceCollaboration grant) is admitted only while
+# ``collaborator_workspace_ids`` -- the live grants, never the derived seat --
+# is non-empty, and receives only events that belong to one of those
+# Workspaces. Per relay target:
+#
+#   entity          never: presence, typing, notifications and legacy unscoped
+#                   events are company-wide (``_entity_broadcast_recipients``
+#                   excludes collaborators). Only a task_update or job_update
+#                   whose row names a Workspace (``data.workspace_id``) also
+#                   reaches collaborators live-granted for that Workspace.
+#   workspace       only when its workspace_id is live-granted
+#                   (``_workspace_broadcast_recipients``).
+#   workspace_user  same, except ``_COLLABORATOR_WITHHELD_EVENTS``.
+#   user            never. Every user-target event emitted today names no
+#                   Workspace and concerns a company or personal surface the
+#                   HTTP boundary closes to collaborators: task_update,
+#                   job_update and goal_progress for rows outside any
+#                   Workspace; chat_stream_snapshot and conversation_message
+#                   for personal (global/DM) conversations; notification
+#                   without a Workspace. None is about the socket's own session.
+#   chat_room       never: rooms are a company surface.
+#
+# The grant set is re-read on every delivery, and every client frame
+# re-checks it with the token version (the client heartbeats every 30 s), so an
+# ended collaboration stops receiving at once and its socket closes on the
+# next frame. A collaborator socket also never originates company-wide state:
+# its presence and typing frames only refresh its own session, and it has no
+# notification center to mark read.
+
+# The notification center is a company surface (the HTTP boundary denies
+# /notifications); a collaborator follows the Workspace through its own
+# Workspace-targeted events instead.
+_COLLABORATOR_WITHHELD_EVENTS = frozenset({"notification"})
+# Entity-target events about one Task or scheduled Job row; see the notes above.
+_WORKSPACE_ROW_ENTITY_EVENTS = frozenset({"task_update", "job_update"})
 
 
 class ConnectionManager:
@@ -39,6 +89,8 @@ class ConnectionManager:
         self._entity_users: dict[str, set[str]] = {}
         self._connection_entities: dict[WebSocket, str] = {}
         self._connection_token_versions: dict[WebSocket, int] = {}
+        # A collaborator's scoped session: the one Workspace it pins and when it expires.
+        self._connection_pins: dict[WebSocket, tuple[str, float | None]] = {}
         self._session_ids: dict[tuple[str, str], str] = {}
         self._session_lease_ids: dict[tuple[str, str], str] = {}
         self._session_start_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -72,8 +124,13 @@ class ConnectionManager:
         entity_id: str,
         token_version: int,
         websocket: WebSocket,
+        *,
+        pinned_workspace_id: str | None = None,
+        expires_at: float | None = None,
     ) -> bool:
         await websocket.accept()
+        if pinned_workspace_id:
+            self._connection_pins[websocket] = (pinned_workspace_id, expires_at)
         first_connection = not any(
             self._connection_entities.get(existing) == entity_id
             for existing in self._connections.get(user_id, [])
@@ -93,6 +150,7 @@ class ConnectionManager:
             conns.remove(websocket)
         self._connection_entities.pop(websocket, None)
         self._connection_token_versions.pop(websocket, None)
+        self._connection_pins.pop(websocket, None)
         self._send_locks.pop(websocket, None)
         if not conns:
             self._connections.pop(user_id, None)
@@ -231,6 +289,7 @@ class ConnectionManager:
         *,
         entity_id: str | None = None,
         token_versions: dict[str, int] | None = None,
+        workspace_id: str | None = None,
     ):
         """Send an event to all connections for a user."""
         if entity_id:
@@ -238,6 +297,7 @@ class ConnectionManager:
                 entity_id,
                 user_ids={user_id},
                 token_versions=token_versions,
+                workspace_id=workspace_id,
             )
         else:
             targets = [(user_id, ws) for ws in tuple(self._connections.get(user_id, []))]
@@ -259,7 +319,13 @@ class ConnectionManager:
         *,
         user_ids: set[str] | None = None,
         token_versions: dict[str, int] | None = None,
+        workspace_id: str | None = None,
     ) -> list[tuple[str, WebSocket]]:
+        """Connections of the entity to deliver to.
+
+        A scoped collaborator connection receives only events of the
+        Workspace it pins (``workspace_id``), and nothing once it expired.
+        """
         if not entity_id:
             return []
         # A room's authorized audience is already resolved. Do not scan every
@@ -276,7 +342,15 @@ class ConnectionManager:
                 token_versions is None
                 or self._connection_token_versions.get(ws) == token_versions.get(user_id)
             )
+            and self._pin_admits(ws, workspace_id)
         ]
+
+    def _pin_admits(self, websocket: WebSocket, workspace_id: str | None) -> bool:
+        pin = self._connection_pins.get(websocket)
+        if pin is None:
+            return True
+        pinned, expires_at = pin
+        return workspace_id == pinned and (expires_at is None or time.time() < expires_at)
 
     async def _send_to_connections(
         self,
@@ -323,14 +397,30 @@ class ConnectionManager:
         *,
         user_ids: set[str] | None = None,
         token_versions: dict[str, int] | None = None,
+        workspace_id: str | None = None,
     ):
         """Broadcast only to connections authenticated for the target entity."""
         targets = self._entity_connection_snapshot(
             entity_id,
             user_ids=user_ids,
             token_versions=token_versions,
+            workspace_id=workspace_id,
         )
         await self._send_to_connections(targets, event, data)
+
+    async def broadcast_resync(self) -> None:
+        """Tell every local socket that events may have been lost.
+
+        Content-free on purpose: no tenant data travels, so no authorization
+        lookup is needed. Clients answer by refetching their own views.
+        """
+        targets = [
+            (user_id, ws)
+            for user_id, conns in tuple(self._connections.items())
+            for ws in tuple(conns)
+        ]
+        if targets:
+            await self._send_to_connections(targets, "resync", {})
 
     @property
     def count(self) -> int:
@@ -346,8 +436,12 @@ _session_geo_lookup_semaphore = asyncio.Semaphore(8)
 async def _resolve_active_websocket_identity(
     payload: dict,
     user_id: str,
-) -> tuple[str, int] | None:
-    """Resolve the token against current account and membership state."""
+) -> tuple[str, int, bool] | None:
+    """Resolve the token against current account and membership state.
+
+    Returns ``(entity_id, token_version, collaborator)``; a collaborator is
+    admitted only while a live grant places them in some Workspace.
+    """
     try:
         async with db_module.async_session() as db:
             from packages.core.services.auth_service import (
@@ -375,8 +469,17 @@ async def _resolve_active_websocket_identity(
             )
             if membership is None or membership.status != "active":
                 return None
+            collaborator = membership.role == COLLABORATOR_MEMBERSHIP_ROLE
+            # Only a scoped session admits a collaborator, and only while a
+            # live grant covers the Workspace it pins (collaborator_session).
+            if not collaborator_session_matches(payload, collaborator=collaborator):
+                return None
+            if collaborator and not session_scope(
+                payload, await live_collaborator_grants(db, user_id=user_id, entity_id=entity_id)
+            ):
+                return None
             await db.commit()
-            return entity_id, current_token_version
+            return entity_id, current_token_version, collaborator
     except Exception as exc:
         if DatabaseFailureKind.from_exception(exc) is not None:
             # Temporary DB overload/outage is retryable, not revoked identity.
@@ -411,6 +514,29 @@ async def _notification_workspace_scope(
     if readable is None:
         return [], []
     return [entity_id], sorted(readable)
+
+
+async def _initial_unread_count(*, entity_id: str, user_id: str) -> int:
+    try:
+        async with db_module.async_session() as db:
+            from packages.core.services.notification_service import count_unread
+            restricted_entity_ids, readable_workspace_ids = (
+                await _notification_workspace_scope(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
+            )
+            return await count_unread(
+                db,
+                entity_id,
+                user_id,
+                restricted_workspace_entity_ids=restricted_entity_ids,
+                readable_workspace_ids=readable_workspace_ids,
+            )
+    except Exception as e:
+        logger.debug("WS unread count unavailable: %s", e)
+        return 0
 
 
 async def _start_tracked_session(
@@ -599,7 +725,10 @@ async def _entity_broadcast_recipients(
     entity_id: str,
     candidate_user_ids: set[str],
 ) -> dict[str, int]:
-    """Return current token versions for active entity members."""
+    """Return current token versions for active entity members.
+
+    Collaborators are never entity recipients; see the module notes.
+    """
     if not entity_id or not candidate_user_ids:
         return {}
     try:
@@ -616,6 +745,7 @@ async def _entity_broadcast_recipients(
                     UserMembership.entity_id == entity_id,
                     UserMembership.status == "active",
                     UserMembership.deleted_at.is_(None),
+                    UserMembership.role != COLLABORATOR_MEMBERSHIP_ROLE,
                 )
             )).all()
             return {
@@ -633,13 +763,63 @@ async def _entity_broadcast_recipients(
         return {}
 
 
+def _claim_epoch(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_expired(expires_at: float | None) -> bool:
+    return expires_at is not None and time.time() >= expires_at
+
+
+async def _collaborator_connection_version(
+    *, entity_id: str, user_id: str, claims: dict | None = None,
+) -> int | None:
+    """Current token version of a collaborator socket, or None once its access ended.
+
+    The collaborator counterpart of the per-frame ``_entity_broadcast_recipients``
+    check: the membership must still be an active collaborator one and a live
+    grant must still place the person in some Workspace.
+    """
+    async with db_module.async_session() as db:
+        from packages.core.models.user import User, UserMembership
+
+        row = (await db.execute(
+            select(User.token_version)
+            .join(UserMembership, UserMembership.user_id == User.id)
+            .where(
+                User.id == user_id,
+                User.deleted_at.is_(None),
+                User.status == "active",
+                UserMembership.entity_id == entity_id,
+                UserMembership.status == "active",
+                UserMembership.deleted_at.is_(None),
+                UserMembership.role == COLLABORATOR_MEMBERSHIP_ROLE,
+            )
+        )).first()
+        if row is None:
+            return None
+        grants = await live_collaborator_grants(db, user_id=user_id, entity_id=entity_id)
+        # A scoped session's socket: the grant it names must still be live on its Workspace.
+        if not (session_scope(claims, grants) if claims is not None else grants):
+            return None
+        return int(row.token_version or 0)
+
+
 async def _workspace_broadcast_recipients(
     *,
     entity_id: str,
     workspace_id: str,
     candidate_user_ids: set[str],
+    include_collaborators: bool = True,
 ) -> dict[str, int]:
-    """Return current token versions for readable Workspace recipients."""
+    """Return current token versions for readable Workspace recipients.
+
+    A collaborator qualifies only through a live grant for this Workspace,
+    never through the derived seat or a membership role.
+    """
     if not entity_id or not workspace_id or not candidate_user_ids:
         return {}
     try:
@@ -720,6 +900,12 @@ async def _workspace_broadcast_recipients(
                 == WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE
             )
             for user_id, (user, membership) in identity_by_user.items():
+                if membership.role == COLLABORATOR_MEMBERSHIP_ROLE:
+                    if include_collaborators and workspace.id in await collaborator_workspace_ids(
+                        db, user_id=user_id, entity_id=entity_id
+                    ):
+                        allowed[user_id] = int(user.token_version or 0)
+                    continue
                 staff_history = staff_by_user.get(user_id, [])
                 active_staff = [
                     assignment
@@ -827,6 +1013,7 @@ async def _relay_workspace_user_target(payload: dict) -> None:
         entity_id=entity_id,
         workspace_id=workspace_id,
         candidate_user_ids={user_id},
+        include_collaborators=event not in _COLLABORATOR_WITHHELD_EVENTS,
     )
     await manager.send_to_user(
         user_id,
@@ -834,6 +1021,7 @@ async def _relay_workspace_user_target(payload: dict) -> None:
         payload.get("data", {}),
         entity_id=entity_id,
         token_versions=recipients,
+        workspace_id=workspace_id,
     )
 
 
@@ -947,6 +1135,9 @@ async def _relay_chat_room_target(payload: dict) -> None:
                     User.deleted_at.is_(None),
                     UserMembership.status == "active",
                     UserMembership.deleted_at.is_(None),
+                    # A collaborator socket in a customer company never
+                    # carries rooms; their home-company socket still does.
+                    UserMembership.role != COLLABORATOR_MEMBERSHIP_ROLE,
                 )
             )).all()
             data = payload.get("data")
@@ -994,12 +1185,75 @@ async def _relay_chat_room_target(payload: dict) -> None:
         )
 
 
+async def _relay_event(payload: dict) -> None:
+    """Deliver one published event to the connections its target authorizes now."""
+    event = payload.get("event")
+    data = payload.get("data", {})
+    target = payload.get("target", "entity")
+    if target == "user":
+        await _relay_user_target(payload)
+    elif target == "chat_room":
+        await _relay_chat_room_target(payload)
+    elif target == "workspace_user":
+        await _relay_workspace_user_target(payload)
+    elif target == "workspace":
+        entity_id = str(payload.get("entity_id") or "")
+        workspace_id = str(payload.get("workspace_id") or "")
+        recipients = await _workspace_broadcast_recipients(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            candidate_user_ids=manager.connected_user_ids_for_entity(entity_id),
+        )
+        await manager.broadcast_to_entity(
+            entity_id,
+            event,
+            data,
+            user_ids=set(recipients),
+            token_versions=recipients,
+            workspace_id=workspace_id,
+        )
+    else:
+        entity_id = str(payload.get("entity_id") or "")
+        candidates = manager.connected_user_ids_for_entity(entity_id)
+        recipients = await _entity_broadcast_recipients(
+            entity_id=entity_id,
+            candidate_user_ids=candidates,
+        )
+        workspace_id = (
+            str(data.get("workspace_id") or "")
+            if event in _WORKSPACE_ROW_ENTITY_EVENTS and isinstance(data, dict)
+            else ""
+        )
+        if workspace_id and candidates - set(recipients):
+            # A Task or Job row of a Workspace also reaches the collaborators
+            # whose live grant covers that Workspace.
+            recipients = {
+                **await _workspace_broadcast_recipients(
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    candidate_user_ids=candidates - set(recipients),
+                ),
+                **recipients,
+            }
+        await manager.broadcast_to_entity(
+            entity_id,
+            event,
+            data,
+            user_ids=set(recipients),
+            token_versions=recipients,
+            workspace_id=workspace_id or None,
+        )
+
+
 async def _redis_relay_loop():
     """Subscribe to Redis and relay events to WS clients with reconnect."""
     import redis.asyncio as aioredis
     from packages.core.config import get_settings
 
     retry_delay = 1.0
+    # Redis pub/sub has no replay: events published while this relay was down
+    # never reach sockets that stayed connected through the outage.
+    missed_events = False
     while True:
         r = None
         pubsub = None
@@ -1010,6 +1264,12 @@ async def _redis_relay_loop():
             pubsub = r.pubsub()
             await pubsub.subscribe("manor:ws_broadcast")
             logger.info("WS Redis relay subscribed to manor:ws_broadcast")
+            if missed_events:
+                missed_events = False
+                try:
+                    await manager.broadcast_resync()
+                except Exception:
+                    logger.debug("Could not send WS resync after relay recovery", exc_info=True)
             async for raw_msg in pubsub.listen():
                 if raw_msg["type"] != "message":
                     continue
@@ -1022,50 +1282,14 @@ async def _redis_relay_loop():
                     retry_delay = 1.0
                     saw_message = True
                 try:
-                    payload = json.loads(raw_msg["data"])
-                    event = payload.get("event")
-                    data = payload.get("data", {})
-                    target = payload.get("target", "entity")
-                    if target == "user":
-                        await _relay_user_target(payload)
-                    elif target == "chat_room":
-                        await _relay_chat_room_target(payload)
-                    elif target == "workspace_user":
-                        await _relay_workspace_user_target(payload)
-                    elif target == "workspace":
-                        entity_id = str(payload.get("entity_id") or "")
-                        workspace_id = str(payload.get("workspace_id") or "")
-                        recipients = await _workspace_broadcast_recipients(
-                            entity_id=entity_id,
-                            workspace_id=workspace_id,
-                            candidate_user_ids=manager.connected_user_ids_for_entity(entity_id),
-                        )
-                        await manager.broadcast_to_entity(
-                            entity_id,
-                            event,
-                            data,
-                            user_ids=set(recipients),
-                            token_versions=recipients,
-                        )
-                    else:
-                        entity_id = str(payload.get("entity_id") or "")
-                        recipients = await _entity_broadcast_recipients(
-                            entity_id=entity_id,
-                            candidate_user_ids=manager.connected_user_ids_for_entity(entity_id),
-                        )
-                        await manager.broadcast_to_entity(
-                            entity_id,
-                            event,
-                            data,
-                            user_ids=set(recipients),
-                            token_versions=recipients,
-                        )
+                    await _relay_event(json.loads(raw_msg["data"]))
                 except Exception:
                     logger.debug("Could not relay one Redis WS event", exc_info=True)
             raise ConnectionError("Redis WS pubsub stream ended")
         except asyncio.CancelledError:
             return
         except Exception:
+            missed_events = True
             logger.exception("Redis relay loop disconnected; retrying in %.1fs", retry_delay)
         finally:
             for resource in (pubsub, r):
@@ -1097,27 +1321,45 @@ def stop_redis_relay():
         _redis_listener_task.cancel()
 
 
+def _handshake_bearer_token(authorization: str | None) -> str | None:
+    """Return the credential of an ``Authorization: Bearer <jwt>`` handshake header."""
+    if not authorization:
+        return None
+    scheme, _, credentials = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return credentials.strip() or None
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(...),
+    token: Optional[str] = Query(None),
 ):
     """
     WebSocket connection for real-time events.
 
-    Connect with: ws://host/ws?token=<jwt_token>
+    Connect with: ws://host/ws?token=<jwt_token>, or send the same JWT as
+    ``Authorization: Bearer <jwt_token>`` on the handshake (native clients). A
+    query token takes precedence; both paths share one validation.
 
     Events pushed:
       - notification: new notification created
       - task_update: task status changed
       - goal_progress: goal step completed
+      - resync: events may have been lost (relay recovered); refetch views
       - ping: keepalive (every 30s)
 
     Client can send:
       - {"type": "ping"} -- keepalive response
       - {"type": "mark_read", "notification_id": "..."} -- mark notification read
     """
-    # Authenticate via JWT token in query param
+    # Authenticate the JWT from the query string, or from the handshake header
+    # when no query token is given (mobile keeps tokens out of URLs and logs).
+    token = token or _handshake_bearer_token(websocket.headers.get("authorization"))
+    if not token:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
     try:
         payload = decode_token(token)
         if not payload:
@@ -1135,12 +1377,19 @@ async def websocket_endpoint(
     if identity is None:
         await websocket.close(code=4001, reason="Inactive or revoked identity")
         return
-    entity_id, token_version = identity
+    entity_id, token_version, collaborator = identity
+    # A collaborator's scoped session: events of its pinned Workspace only,
+    # and the socket closes when the session expires (the frame re-mints and
+    # reconnects).
+    pinned_workspace_id = session_claims(payload)[0] if collaborator else None
+    session_expires_at = _claim_epoch(payload.get("exp")) if collaborator else None
     first_connection = await manager.connect(
         user_id,
         entity_id,
         token_version,
         websocket,
+        pinned_workspace_id=pinned_workspace_id,
+        expires_at=session_expires_at,
     )
     if first_connection:
         await _ensure_tracked_session(
@@ -1150,26 +1399,11 @@ async def websocket_endpoint(
         )
 
     # Send initial connected event with unread count
-    unread = 0
-    try:
-        async with db_module.async_session() as db:
-            from packages.core.services.notification_service import count_unread
-            restricted_entity_ids, readable_workspace_ids = (
-                await _notification_workspace_scope(
-                    db,
-                    entity_id=entity_id,
-                    user_id=user_id,
-                )
-            )
-            unread = await count_unread(
-                db,
-                entity_id,
-                user_id,
-                restricted_workspace_entity_ids=restricted_entity_ids,
-                readable_workspace_ids=readable_workspace_ids,
-            )
-    except Exception as e:
-        logger.debug("WS unread count unavailable: %s", e)
+    # A collaborator has no notification center (see the module notes).
+    unread = 0 if collaborator else await _initial_unread_count(
+        entity_id=entity_id,
+        user_id=user_id,
+    )
 
     try:
         await websocket.send_text(json.dumps({
@@ -1197,11 +1431,21 @@ async def websocket_endpoint(
             try:
                 # Wait for client message with timeout (keepalive)
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
-                current_versions = await _entity_broadcast_recipients(
-                    entity_id=entity_id,
-                    candidate_user_ids={user_id},
-                )
-                if current_versions.get(user_id) != token_version:
+                if _session_expired(session_expires_at):
+                    await websocket.close(code=4001, reason="Session expired")
+                    break
+                if collaborator:
+                    current_version = await _collaborator_connection_version(
+                        entity_id=entity_id,
+                        user_id=user_id,
+                        claims=payload,
+                    )
+                else:
+                    current_version = (await _entity_broadcast_recipients(
+                        entity_id=entity_id,
+                        candidate_user_ids={user_id},
+                    )).get(user_id)
+                if current_version != token_version:
                     await websocket.close(code=4003, reason="Identity no longer active")
                     break
                 msg = json.loads(data)
@@ -1213,6 +1457,15 @@ async def websocket_endpoint(
                         websocket=websocket,
                     )
                     await websocket.send_text(json.dumps({"event": "pong", "data": {}}))
+                elif collaborator:
+                    # Presence, typing and mark_read are company-wide state.
+                    if msg.get("type") == "presence":
+                        await _touch_tracked_session(
+                            user_id=user_id,
+                            entity_id=entity_id,
+                            websocket=websocket,
+                            viewing=msg.get("viewing"),
+                        )
                 elif msg.get("type") == "mark_read":
                     nid = msg.get("notification_id")
                     if nid:
@@ -1270,6 +1523,9 @@ async def websocket_endpoint(
                     )
 
             except asyncio.TimeoutError:
+                if _session_expired(session_expires_at):
+                    await websocket.close(code=4001, reason="Session expired")
+                    break
                 # Send keepalive ping
                 try:
                     await websocket.send_text(json.dumps({"event": "ping", "data": {}}))

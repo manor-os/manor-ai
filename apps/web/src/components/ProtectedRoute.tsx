@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
+import { signInPath } from "../lib/persistentSession";
 
 export default function ProtectedRoute() {
   const { token, isLoading, checkAuth } = useAuthStore();
@@ -20,7 +21,7 @@ export default function ProtectedRoute() {
 
   if (!token) {
     const next = `${location.pathname}${location.search}${location.hash}`;
-    return <Navigate to={`/login?next=${encodeURIComponent(next)}`} replace />;
+    return <Navigate to={signInPath(next)} replace />;
   }
 
   return <Outlet />;

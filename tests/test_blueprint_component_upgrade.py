@@ -194,7 +194,8 @@ async def test_a_kept_customization_is_not_overwritten_on_the_next_upgrade(monke
     baseline = {"skill:writer": {**current["skill:writer"], "source": source}}
     monkeypatch.setattr(components, "capture_components", AsyncMock(return_value=current))
     plan = await components.plan_components(None, workspace=SimpleNamespace(), payload=payload, baseline=baseline)
-    assert plan["items"][0]["action"] == "unchanged"
+    assert plan["items"][0]["action"] == "customized"
+    assert plan["items"][0]["compatibility_issues"] == []
     changed = deepcopy(payload)
     changed["embedded"]["skills"][0]["system_prompt"] = "Author changed the procedure again"
     plan = await components.plan_components(None, workspace=SimpleNamespace(), payload=changed, baseline=baseline)
@@ -263,6 +264,43 @@ async def test_metadata_binding_removal_and_revert_are_complete(db_session):
     assert (await db_session.execute(select(AgentToolBinding).where(AgentToolBinding.agent_id == agent_id))).scalar_one().tool_id == tool.id
     restored = await components.capture_components(db_session, workspace=workspace, payload=payload)
     assert restored["workflow:publish"]["content"]["binding"]["name"] == "Publish draft"
+
+
+@pytest.mark.asyncio
+async def test_kept_local_edit_missing_tools_an_upgraded_flow_needs_is_surfaced_and_replaceable(db_session):
+    workspace = await _workspace(db_session)
+    payload = _payload()
+    payload["contract"]["requires"]["tools"] = ["draft_text", "build_timeline"]
+    payload["embedded"]["skills"][0]["tools"] = ["draft_text", "build_timeline"]
+    payload["recipe"]["workflows"][0]["steps"].append(
+        {"id": "write", "type": "agent", "config": {"skill": "writer", "prompt": "Write it."}, "next": []})
+    initial = await _install(db_session, workspace, payload)
+    skill = await db_session.get(Skill, initial["component_ids"]["skill:writer"])
+    skill.tools = ["draft_text"]  # A local edit the author never made.
+    await db_session.flush()
+    changed = deepcopy(payload)
+    changed["recipe"]["workflows"][0]["description"] = "Now builds the timeline first"
+
+    plan = await components.plan_components(db_session, workspace=workspace, payload=changed, baseline=initial["baseline"])
+    item = next(item for item in plan["items"] if item["key"] == "skill:writer")
+    assert item["action"] == "customized"
+    [issue] = item["compatibility_issues"]
+    assert issue["code"] == "missing_tools" and issue["names"] == ["build_timeline"]
+    assert issue["contract_required"] == ["build_timeline"]
+    assert {dependant["key"] for dependant in issue["required_by"]} == {"workflow:publish", "agent:author"}
+
+    # Without a choice the local edit is kept, and reported as kept.
+    kept = await components.apply_components(db_session, workspace=workspace, payload=changed, plan=plan)
+    assert "skill:writer" in kept["kept"] and skill.tools == ["draft_text"]
+    await components.revert_components(db_session, workspace=workspace, restore=kept["restore"])
+
+    plan = await components.plan_components(db_session, workspace=workspace, payload=changed, baseline=initial["baseline"])
+    result = await components.apply_components(db_session, workspace=workspace, payload=changed, plan=plan,
+                                               choices={"skill:writer": "use_blueprint"})
+    assert sorted(skill.tools) == ["build_timeline", "draft_text"]
+    assert "skill:writer" in {entry["key"] for entry in result["updated"]}
+    await components.revert_components(db_session, workspace=workspace, restore=result["restore"])
+    assert skill.tools == ["draft_text"]
 
 
 @pytest.mark.asyncio

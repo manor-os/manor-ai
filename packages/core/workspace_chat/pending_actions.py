@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy import and_, cast, exists, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONPATH
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import aliased, load_only
 
 from packages.core.constants.approvals import ApprovalStatus
 from packages.core.constants.pending_actions import PendingActionKind
@@ -111,9 +111,57 @@ async def pending_actions_by_workspace(
         or is_coordinator_owned_nested_approval(request)
         or (request.origin_kind == "tool_call" and request.origin_step_id in coordinator_steps)
     }
+    # An approval whose Workflow run has ended can never be decided into
+    # anything; counting it shows "needs you" with nothing to open.
+    from packages.core.services.workflow_runtime_approvals import ENDED_RUN_STATUSES, workflow_approval_run_id
+
+    approval_runs = {request.id: workflow_approval_run_id(request) for request in requests.values()}
+    if any(approval_runs.values()):
+        ended_runs = set((await db.execute(select(WorkflowRun.id).where(
+            WorkflowRun.entity_id == entity_id,
+            WorkflowRun.id.in_({run_id for run_id in approval_runs.values() if run_id}),
+            WorkflowRun.status.in_(tuple(ENDED_RUN_STATUSES)),
+        ))).scalars())
+        suppressed |= {request_id for request_id, run_id in approval_runs.items() if run_id in ended_runs}
+    # Likewise a request whose Task was cancelled (a failed Task keeps its
+    # recovery card, a completed one its review).
+    task_ids = {request.origin_task_id for request in requests.values() if request.origin_task_id}
+    if task_ids:
+        from packages.core.constants.task import TaskStatus
+        from packages.core.models.task import Task
+
+        cancelled_tasks = set((await db.execute(select(Task.id).where(
+            Task.entity_id == entity_id, Task.id.in_(task_ids), Task.status == TaskStatus.CANCELLED.value,
+        ))).scalars())
+        suppressed |= {request.id for request in requests.values() if request.origin_task_id in cancelled_tasks}
 
     # Missing message mirrors do not make a canonical decision disappear.
     represented = {(wid, request_id) for _, wid, _, request_id in candidates}
+    # An Agent's request_input question is saved as its own chat message (the
+    # live card exists only while the turn streams); that message is its card.
+    unmirrored = {
+        request.id: request for request in requests.values()
+        if request.status == ApprovalStatus.PENDING and request.workspace_id in counts
+        and (request.workspace_id, request.id) not in represented
+    }
+    if unmirrored:
+        question_of = Message.meta["runtime_input_request_id"].as_string()
+        for message_id, wid, request_id in (await db.execute(
+            select(Message.id, Conversation.workspace_id, question_of)
+            .join(Conversation, Conversation.id == Message.conversation_id).where(
+                Conversation.entity_id == entity_id, Conversation.workspace_id.in_(workspace_ids),
+                question_of.in_(list(unmirrored)),
+                Message.meta["runtime_input_role"].as_string() == "question",
+            )
+        )).all():
+            request = unmirrored[request_id]
+            if wid != request.workspace_id:
+                continue
+            question = (request.context if isinstance(request.context, dict) else {}).get("question") or {}
+            candidates.append((message_id, wid, {
+                "kind": "runtime_input", "title": str(question.get("question") or "").strip(),
+            }, request_id))
+            represented.add((wid, request_id))
     cohort_actions = {}
     for request in requests.values():
         context = request.context if isinstance(request.context, dict) else {}
@@ -149,6 +197,10 @@ async def pending_actions_by_workspace(
         WorkflowRun.workspace_id.in_(workspace_ids),
         retry_parent.in_(run_ids),
     ))).scalars()) if run_ids else set()
+    if run_ids:
+        superseded_runs |= set((await db.execute(select(WorkflowRun.id).where(
+            WorkflowRun.entity_id == entity_id, WorkflowRun.id.in_(run_ids), ended_run_replaced(WorkflowRun),
+        ))).scalars())
 
     for message_id, wid, action, request_id in candidates:
         request = requests.get(request_id)
@@ -164,7 +216,11 @@ async def pending_actions_by_workspace(
             PendingActionKind.APPROVE_PROPOSALS.value: "proposal_actions",
             PendingActionKind.RETRY_STRATEGIST_REVIEW.value: "failed_actions",
         }.get(action.get("kind"), "chat_pending_actions")
-        decision = counts[wid].setdefault(identity, {"bucket": bucket, "messages": {}, "occurrences": set(), "request_ids": set()})
+        decision = counts[wid].setdefault(identity, {
+            "bucket": bucket, "messages": {}, "occurrences": set(), "request_ids": set(),
+            # What the decision is when its message carries no card of its own.
+            "action": action,
+        })
         if message_id:
             decision["messages"].setdefault(message_id, set()).add(request_id or message_id)
         decision["occurrences"].add(request_id or message_id or identity)
@@ -184,11 +240,37 @@ async def count_pending_actions_by_workspace(db, *, entity_id: str, workspace_id
     return {wid: pending_action_counts(items) for wid, items in decisions.items()}
 
 
+PENDING_ACTION_BUCKETS = ("chat_pending_actions", "proposal_actions", "failed_actions")
+
+
 def pending_action_counts(decisions: dict) -> dict[str, int]:
-    counts = {"chat_pending_actions": 0, "proposal_actions": 0, "failed_actions": 0}
+    counts = dict.fromkeys(PENDING_ACTION_BUCKETS, 0)
     for decision in decisions.values():
         counts[decision["bucket"]] += 1
     return counts
+
+
+def pending_action_total(counts: dict) -> int:
+    """What needs the person: the sidebar badge, the chat banner, ``pending_actions``."""
+    return sum(counts[bucket] for bucket in PENDING_ACTION_BUCKETS)
+
+
+def ended_run_replaced(run):
+    """An ended run whose Flow has run again since: its cards need nothing.
+
+    A newer run of the same Flow from the same entry replaces it, whatever that
+    run's outcome, so a Flow that keeps failing is one problem: its latest run.
+    """
+    from packages.core.services.workflow_runtime_approvals import ENDED_RUN_STATUSES
+
+    newer = aliased(WorkflowRun)
+    return and_(run.status.in_(tuple(ENDED_RUN_STATUSES)), exists().where(
+        newer.entity_id == run.entity_id,
+        newer.workspace_id == run.workspace_id,
+        newer.workflow_id == run.workflow_id,
+        newer.binding_id.is_not_distinct_from(run.binding_id),
+        or_(newer.created_at > run.created_at, and_(newer.created_at == run.created_at, newer.id > run.id)),
+    ))
 
 
 def _owner_is_actionable(action: dict, workspace_id: str, owners: dict) -> bool:
@@ -215,4 +297,8 @@ def _owner_is_actionable(action: dict, workspace_id: str, owners: dict) -> bool:
             return run.status == "paused" and not run.step_results
         if kind in {PendingActionKind.WORKFLOW_INPUT, PendingActionKind.WORKFLOW_APPROVAL}:
             return run.status == "paused" and run.current_step_id == action.get("step_id")
+        # Any other card a run raised can only be answered while the run lives.
+        from packages.core.services.workflow_runtime_approvals import ENDED_RUN_STATUSES
+
+        return run.status not in ENDED_RUN_STATUSES
     return True

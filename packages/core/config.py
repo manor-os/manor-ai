@@ -6,12 +6,16 @@ from functools import lru_cache
 
 # The insecure built-in JWT signing key. Because it ships in the source, any
 # deployment left on this value has forgeable auth tokens. App startup refuses
-# to boot on it in cloud mode and warns loudly in OSS mode (see apps/api/main.py).
+# to boot on it in cloud mode and warns loudly in OSS mode (see
+# enforce_jwt_secret_policy, run by the API and the Celery worker).
 INSECURE_DEFAULT_JWT_SECRET = "dev-secret-change-in-production-32-bytes"
 _INSECURE_JWT_SECRET_PLACEHOLDERS = frozenset({
     INSECURE_DEFAULT_JWT_SECRET,
     "change-this-to-a-random-string",
     "replace-with-openssl-rand-hex-32",
+    "replace-with-a-strong-random-secret",
+    "replace-me",
+    "dev-secret-change-in-production",
 })
 
 
@@ -21,6 +25,31 @@ def is_insecure_jwt_secret(value: str) -> bool:
         not value
         or len(value.encode("utf-8")) < 32
         or value in _INSECURE_JWT_SECRET_PLACEHOLDERS
+    )
+
+
+INSECURE_JWT_SECRET_CLOUD_ERROR = (
+    "JWT_SECRET_KEY is empty, too short, or a shipped placeholder; "
+    "refusing to start in cloud mode. Set at least 32 random bytes."
+)
+
+
+def enforce_jwt_secret_policy(settings: "Settings", logger) -> None:
+    """Refuse an insecure JWT_SECRET_KEY in cloud mode; warn in OSS mode.
+
+    Every process that signs or verifies with JWT_SECRET_KEY (the API and the
+    Celery worker) must run this at startup. A worker left on the placeholder
+    while the API has a real secret signs Workflow approval continuations the
+    API then rejects, stranding the run.
+    """
+    if not is_insecure_jwt_secret(settings.JWT_SECRET_KEY):
+        return
+    if settings.DEPLOYMENT_MODE.strip().lower() == "cloud":
+        raise RuntimeError(INSECURE_JWT_SECRET_CLOUD_ERROR)
+    logger.warning(
+        "SECURITY: JWT_SECRET_KEY is empty, too short, or a shipped "
+        "placeholder — tokens are forgeable. Set at least 32 random bytes before "
+        "exposing this instance."
     )
 
 
@@ -130,12 +159,35 @@ class Settings:
         os.getenv("SANDBOX_QUEUE_MAX_WAIT_SECONDS", "300")
     )
     SANDBOX_QUEUE_POLL_SECONDS: int = int(os.getenv("SANDBOX_QUEUE_POLL_SECONDS", "5"))
+    # How long a command may wait for one of its (shared) sandbox's execution
+    # slots in the runner's fair FIFO before it is answered "not started". A
+    # durable run parks meanwhile (waiting_resource / sandbox_exec_slot); a
+    # task worker or delegate waits in-process for at most this long.
+    SANDBOX_EXEC_QUEUE_WAIT_SECONDS: int = int(
+        os.getenv("SANDBOX_EXEC_QUEUE_WAIT_SECONDS", "600")
+    )
     SANDBOX_RUNNER_HEALTH_INTERVAL_SECONDS: int = int(
         os.getenv("SANDBOX_RUNNER_HEALTH_INTERVAL_SECONDS", "15")
     )
     SANDBOX_ALLOCATION_LEASE_SECONDS: int = int(
         os.getenv("SANDBOX_ALLOCATION_LEASE_SECONDS", "240")
     )
+    # Base URL the in-sandbox ``manor`` CLI uses to reach this API
+    # (``/api/v1/sandbox-cli``). Sandboxes run on the runner's bridge network,
+    # so this must be reachable from inside a sandbox container: the public
+    # APP_URL on cloud runners, a VPC/LB URL when one exists, or
+    # http://host.docker.internal:<port> for a local runner. Empty falls back
+    # to CLI_PUBLIC_API_URL, then APP_URL.
+    SANDBOX_CLI_API_URL: str = os.getenv("SANDBOX_CLI_API_URL", "")
+    # Bash stages the Knowledge files a command names into the agent's
+    # sandbox before running it; these bound one command's staging.
+    BASH_SANDBOX_STAGE_MAX_BYTES: int = int(
+        os.getenv("BASH_SANDBOX_STAGE_MAX_BYTES", str(64 * 1024 * 1024))
+    )
+    BASH_SANDBOX_STAGE_MAX_FILES: int = int(
+        os.getenv("BASH_SANDBOX_STAGE_MAX_FILES", "2000")
+    )
+
 
     # Deployment
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "oss")  # oss | cloud

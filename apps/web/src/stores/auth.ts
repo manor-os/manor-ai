@@ -6,7 +6,9 @@ import {
   getAuthToken,
   isSameAuthIdentity,
 } from "../lib/authToken";
-import { setPreferredTimeZone } from "../lib/format";
+import { deviceTimeZone, setPreferredTimeZone, setPreferredTimeZoneForUser } from "../lib/format";
+import { EMBED } from "../embed/embedContext";
+import { closeEmbeddedSession } from "../embed/embeddedSession";
 import { normalizeLocale, setLocaleIfCurrent, type Locale } from "../lib/i18n";
 import type { User } from "../lib/types";
 import { useChatStreamStore } from "./chatStream";
@@ -67,9 +69,37 @@ async function rememberUser(user: User, isCurrent: () => boolean, throwOnLocaleE
   }
   if (!isCurrent()) return false;
   useDisplayPreferences.getState().initializeForUser(user.created_at);
-  setPreferredTimeZone(user.timezone);
+  setPreferredTimeZoneForUser(user);
   localStorage.setItem("manor_user", JSON.stringify(user));
   return true;
+}
+
+let pendingTimeZoneSync: string | null = null;
+
+/** A zone the user never chose follows the signed-in device, so schedules match the display. */
+async function syncDeviceTimeZone(user: User) {
+  const timeZone = deviceTimeZone();
+  // Only a loaded profile states its zone; without one this would be a blind write.
+  if (typeof user.timezone !== "string") return;
+  if (EMBED || user.timezone_user_set || !timeZone || timeZone === user.timezone) return;
+  const key = `${user.id}:${timeZone}`;
+  if (pendingTimeZoneSync === key) return;
+  pendingTimeZoneSync = key;
+  const token = getAuthToken();
+  try {
+    const updated = await api.auth.updateProfile({ timezone: timeZone, timezone_source: "device" });
+    const current = useAuthStore.getState().user;
+    if (!current || !isSameAuthIdentity(token, getAuthToken()) || current.id !== updated.id) return;
+    // PUT /me omits permissions and memberships; merge only the zone fields.
+    const next = { ...current, timezone: updated.timezone, timezone_user_set: updated.timezone_user_set };
+    setPreferredTimeZoneForUser(next);
+    localStorage.setItem("manor_user", JSON.stringify(next));
+    useAuthStore.setState({ user: next });
+  } catch {
+    // Best effort: the display already follows this device and the next sign-in retries.
+  } finally {
+    if (pendingTimeZoneSync === key) pendingTimeZoneSync = null;
+  }
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -126,12 +156,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       invitation_code?: string;
       invite_token?: string;
       chat_invite_token?: string;
+      timezone?: string;
     } = {
       email, password,
       entity_name: entityName,
       invitation_code: invitationCode || undefined,
       invite_token: inviteToken || undefined,
       chat_invite_token: chatInviteToken || undefined,
+      timezone: deviceTimeZone(),
     };
     const res: any = await api.auth.register(registerPayload);
     if (res.requires_verification) {
@@ -186,6 +218,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   switchEntity: async (entityId) => {
+    // The embedded frame's session is pinned to one customer Workspace.
+    if (EMBED) throw new Error("Switching companies is not available here");
     const res = await api.auth.switchEntity(entityId);
     clearVolatileUserState();
     localStorage.setItem("manor_token", res.access_token);
@@ -199,6 +233,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   renewSession: async () => {
+    if (EMBED) {
+      await restorePersistentSession();
+      return;
+    }
     const token = getAuthToken();
     if (!token) {
       await get().checkAuth();
@@ -235,6 +273,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: async () => {
+    // The parent page owns the sign-in; the frame only asks to be closed.
+    if (EMBED) {
+      closeEmbeddedSession();
+      return;
+    }
     clearVolatileUserState();
     localStorage.setItem("manor_session_signed_out", "1");
     const logoutRequest = api.auth.logout();
@@ -305,3 +348,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     }
   },
 }));
+
+// Runs after every path that stores a signed-in user (sign-in, signup, reload, switch).
+useAuthStore.subscribe((state, previous) => {
+  if (state.user && state.user !== previous.user) void syncDeviceTimeZone(state.user);
+});

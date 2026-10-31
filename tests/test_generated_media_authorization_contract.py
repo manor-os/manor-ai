@@ -180,6 +180,216 @@ async def test_workflow_approval_and_save_share_lineage_archive(media_storage):
     assert url == entity_fs_open_url(ENTITY, f"Workspaces/_by_id/{FOLDER}/workflow/firstrun/images/cover.png")
 
 
+RUN = "01M5EY2EGFM4DPCMJECTPJJP0J"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injected,user_id,archive", [
+    # A user-run Workflow step: no conversation, Workflow binding key.
+    ({"_workflow_run_id_from_context": RUN, "_workflow_lineage_root_run_id_from_context": RUN},
+     "user_media_qa", f"workflow/{RUN}"),
+    # A Task worker: no conversation, Task binding key.
+    ({"task_id": TASK}, "user_media_qa", f"tasks/{TASK}"),
+    # A user-less Task with a conversation: Task binding key, real conversation.
+    ({"task_id": TASK, "conversation_id": "conv_media_qa"}, None, f"tasks/{TASK}"),
+])
+async def test_sandbox_save_result_receipt_matches_its_inner_write(media_storage, injected, user_id, archive):
+    """The sandbox binding is the approval scope, never the receipt's conversation.
+
+    The handler checks its inner save against the run's real conversation, so
+    the receipt must record that conversation whatever binding the run uses.
+    """
+    from packages.core.ai.runtime.tool_context import (
+        runtime_authorization_sandbox_binding_key,
+        runtime_tool_call_context_from_kwargs,
+    )
+    from packages.core.services.generated_media_naming import WorkspaceArtifactScope, workspace_artifact_scope
+
+    context = runtime_tool_call_context_from_kwargs(
+        injected, entity_id=ENTITY, user_id=user_id, workspace_id=WORKSPACE,
+    )
+    arguments = {"action": "save_result", "params": {
+        "sandbox_id": "sb", "file_path": "/skill/work/cues.json", "filename": "EP.05-n1-cues.json",
+    }}
+    with workspace_artifact_scope(WorkspaceArtifactScope(
+        ENTITY, WORKSPACE, context.workflow_run_id, context.workflow_lineage_root_run_id,
+    )):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="sandbox", arguments=arguments, entity_id=ENTITY, workspace_id=WORKSPACE,
+            task_id=context.task_id,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="sandbox", arguments=arguments, entity_id=ENTITY, user_id=context.user_id or "",
+            workspace_id=WORKSPACE, conversation_id=context.conversation_id, task_id=context.task_id,
+            sandbox_binding_key=runtime_authorization_sandbox_binding_key(context, "sandbox"),
+            workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classify_runtime_tool(
+                "sandbox", arguments, entity_id=ENTITY, workspace_id=WORKSPACE, task_id=context.task_id,
+                workspace_file_scope=scope,
+            )),
+            request=request,
+        )
+
+    assert request.approval_scope_id and request.approval_scope_id != context.conversation_id
+    assert receipt.authorizes_workspace_file_mutation(
+        capability_id="file.write", action_key="workspace.file.create",
+        paths=[f"Workspaces/_by_id/{FOLDER}/{archive}/artifacts/EP.05-n1-cues.json"],
+        entity_id=ENTITY, user_id=context.user_id, workspace_id=WORKSPACE,
+        conversation_id=context.conversation_id, task_id=context.task_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_frame_sample_directory_receipt_matches_scoped_dynamic_outputs(media_storage):
+    """A multi-file writer must authorize every derived child in its run archive."""
+    from packages.core.services.generated_media_naming import (
+        WorkspaceArtifactScope,
+        workspace_artifact_scope,
+    )
+
+    arguments = {"input_path": "source.mp4", "output_dir": "qa/frames"}
+    with workspace_artifact_scope(WorkspaceArtifactScope(ENTITY, WORKSPACE, "retryrun", "firstrun")):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="render_frame_samples",
+            arguments=arguments,
+            entity_id=ENTITY,
+            workspace_id=WORKSPACE,
+            task_id=TASK,
+        )
+        classification = classify_runtime_tool(
+            "render_frame_samples",
+            arguments,
+            entity_id=ENTITY,
+            workspace_id=WORKSPACE,
+            task_id=TASK,
+            workspace_file_scope=scope,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="render_frame_samples",
+            arguments=arguments,
+            entity_id=ENTITY,
+            user_id="user_media_qa",
+            workspace_id=WORKSPACE,
+            task_id=TASK,
+            workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classification),
+            request=request,
+        )
+
+    assert receipt is not None
+    output_dir = f"Workspaces/_by_id/{FOLDER}/workflow/firstrun/qa/frames"
+    assert receipt.resource_ids == (output_dir,)
+    for filename in ("frame-001-000000000ms.png", "frame-002-000005000ms.png"):
+        assert receipt.authorizes_workspace_file_commit(
+            entity_id=ENTITY,
+            path=f"{output_dir}/{filename}",
+            target_exists=False,
+        )
+    assert not receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY,
+        path=f"Workspaces/_by_id/{FOLDER}/workflow/firstrun/qa/other/frame.png",
+        target_exists=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [
+    "technical/narration-timeline.json",
+    # Agents copy the run-relative path from earlier receipts.
+    "workflow/firstrun/technical/narration-timeline.json",
+])
+async def test_nested_media_output_receipt_matches_the_written_target(media_storage, name):
+    from packages.core.ai.tools.media_tools import _build_media_target
+    from packages.core.services.generated_media_naming import (
+        WorkspaceArtifactScope,
+        workspace_artifact_scope,
+    )
+
+    arguments = {"timeline_name": name, "cues_name": name.replace("narration-timeline", "subtitle-cues")}
+    with workspace_artifact_scope(WorkspaceArtifactScope(ENTITY, WORKSPACE, "retryrun", "firstrun")):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="build_narration_timeline", arguments=arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=TASK,
+        )
+        classification = classify_runtime_tool(
+            "build_narration_timeline", arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=TASK, workspace_file_scope=scope,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="build_narration_timeline", arguments=arguments, entity_id=ENTITY,
+            user_id="user_media_qa", workspace_id=WORKSPACE, task_id=TASK, workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classification), request=request,
+        )
+        targets = [
+            await _build_media_target(
+                entity_id=ENTITY, workspace_id=WORKSPACE, task_id=TASK, output_name=output_name,
+                ext=".json", fallback=fallback, default_dir="artifacts",
+            )
+            for output_name, fallback in (
+                ("", "narration-manifest"),
+                (arguments["timeline_name"], "narration-timeline"),
+                (arguments["cues_name"], "subtitle-cues"),
+            )
+        ]
+
+    assert receipt is not None
+    assert targets[1].rel_path == f"Workspaces/_by_id/{FOLDER}/workflow/firstrun/technical/narration-timeline.json"
+    for target in targets:
+        assert receipt.authorizes_workspace_file_commit(
+            entity_id=ENTITY, path=target.rel_path, target_exists=False,
+        ), target.rel_path
+
+
+@pytest.mark.asyncio
+async def test_run_relative_file_name_is_authorized_where_it_is_written(media_storage):
+    """Any writer: an approved workflow/<run>/... name matches its run-folder target."""
+    from packages.core.services.generated_media_naming import (
+        WorkspaceArtifactScope,
+        workspace_artifact_scope,
+    )
+
+    arguments = {
+        "kind": "document", "name": "workflow/firstrun/technical/narration-script.txt",
+        "params": {"content": "Narration"},
+    }
+    with workspace_artifact_scope(WorkspaceArtifactScope(ENTITY, WORKSPACE, "retryrun", "firstrun")):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="generate_file", arguments=arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=TASK,
+        )
+        classification = classify_runtime_tool(
+            "generate_file", arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=TASK, workspace_file_scope=scope,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="generate_file", arguments=arguments, entity_id=ENTITY,
+            user_id="user_media_qa", workspace_id=WORKSPACE, task_id=TASK, workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classification), request=request,
+        )
+
+    run_folder = f"Workspaces/_by_id/{FOLDER}/workflow/firstrun"
+    assert receipt is not None
+    assert receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY, path=f"{run_folder}/technical/narration-script.txt", target_exists=False,
+    )
+    # Still exactly that file, inside this run only.
+    assert not receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY, path=f"{run_folder}/technical/other.txt", target_exists=False,
+    )
+    assert not receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY, path=f"Workspaces/_by_id/{FOLDER}/workflow/otherrun/technical/narration-script.txt",
+        target_exists=False,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool,args,leaf", [
     ("write_file", {"path": "report.md", "content": "Report"}, "report.md"),
@@ -220,6 +430,65 @@ async def test_root_narration_freezes_exact_audio_target(media_storage):
         )
     assert target.rel_path == f"Workspaces/_by_id/{FOLDER}/voice-intro.wav"
     assert receipt.media_output_plan.target_for_extension(".wav") == target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [
+    "workflow/firstrun/b01-hook.wav",
+    f"Workspaces/_by_id/{FOLDER}/workflow/firstrun/b01-hook.wav",
+])
+async def test_narration_named_at_the_run_folder_root_saves(media_storage, name):
+    """Narration authorizes its requested parent; that parent may be the run folder itself.
+
+    Local 2026-10-28 (Stickman run 01M60VW74HZZ1Z3M4FAYQFYK0Q): narration named
+    workflow/<run>/b01-hook.wav got a receipt for the workflow/<run> tree, which
+    the matcher collapsed to "the artifact base" and rejected, so every TTS save
+    failed with "Workspace file target or existence changed after approval".
+    """
+    import io
+    import wave
+
+    from packages.core.services.generated_media_naming import WorkspaceArtifactScope, workspace_artifact_scope
+
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(8000)
+        writer.writeframes(b"\x00\x00\x80\x01" * 80)
+    arguments = {"kind": "audio", "name": name, "prompt": PROMPT, "purpose": "narration"}
+    with workspace_artifact_scope(WorkspaceArtifactScope(ENTITY, WORKSPACE, "firstrun", "firstrun")):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="generate_file", arguments=arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=None,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="generate_file", arguments=arguments, entity_id=ENTITY,
+            user_id="user_media_qa", workspace_id=WORKSPACE, workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classify_runtime_tool(
+                "generate_file", arguments, entity_id=ENTITY, workspace_id=WORKSPACE,
+                workspace_file_scope=scope,
+            )),
+            request=request,
+        )
+        with _authorized(request, receipt):
+            url = await extended_tools._save_generated_audio_bytes(
+                entity_id=ENTITY, user_id="user_media_qa", prompt=PROMPT, model="openai/tts-1-hd",
+                purpose="narration", audio_bytes=stream.getvalue(), audio_format="wav", is_byok=True,
+                output_name=name, workspace_id=WORKSPACE, bill_media=False,
+            )
+
+    run_folder = f"Workspaces/_by_id/{FOLDER}/workflow/firstrun"
+    assert url == entity_fs_open_url(ENTITY, f"{run_folder}/b01-hook.wav")
+    # The tree is still this run's folder only.
+    assert not receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY, path=f"Workspaces/_by_id/{FOLDER}/workflow/otherrun/b01-hook.wav", target_exists=False,
+    )
+    assert not receipt.authorizes_workspace_file_commit(
+        entity_id=ENTITY, path=f"Workspaces/_by_id/{FOLDER}/b01-hook.wav", target_exists=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -267,6 +536,49 @@ async def test_explicit_workspace_destination_from_task_keeps_exact_plan(media_s
 
 
 @pytest.mark.asyncio
+async def test_a_run_writing_into_a_project_folder_is_authorized_for_every_declared_output(media_storage):
+    """A series episode's narration is normalized into its project folder, outside the run's archive.
+
+    Local 2026-10-25: prepare_narration_timeline names its outputs
+    normalized_output_directory/manifest_name/..., so the explicit Workspace
+    destination was missed, the receipt stayed bound to the run archive, and
+    every normalized segment failed at commit.
+    """
+    from packages.core.services.generated_media_naming import WorkspaceArtifactScope, workspace_artifact_scope
+
+    episode = "projects/daily-calm/e03-kettle"
+    arguments = {
+        "segments": [{"input_path": f"{episode}/audio/segment-001.wav"}],
+        "normalized_output_directory": f"{episode}/audio/normalized",
+        "manifest_name": f"{episode}/technical/narration-manifest.json",
+        "timeline_name": f"{episode}/technical/narration-timeline.json",
+        "cues_name": f"{episode}/technical/subtitle-cues.json",
+    }
+    with workspace_artifact_scope(WorkspaceArtifactScope(ENTITY, WORKSPACE, "run1", "run1")):
+        scope = await resolve_runtime_workspace_file_scope(
+            tool_name="prepare_narration_timeline", arguments=arguments,
+            entity_id=ENTITY, workspace_id=WORKSPACE, task_id=None,
+        )
+        request = RuntimeApprovalRequest(
+            tool_name="prepare_narration_timeline", arguments=arguments, entity_id=ENTITY,
+            user_id="user_media_qa", workspace_id=WORKSPACE, workspace_file_scope=scope,
+        )
+        classification = classify_runtime_tool(
+            "prepare_narration_timeline", arguments, entity_id=ENTITY, workspace_id=WORKSPACE,
+            workspace_file_scope=scope,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            request=request, decision=RuntimeApprovalDecision.allow(classification),
+        )
+
+    home = f"Workspaces/_by_id/{FOLDER}"
+    assert receipt.workspace_artifact_base_dir == home
+    for path in (f"{home}/{episode}/audio/normalized/puck/segment-001.wav",
+                 f"{home}/{episode}/technical/narration-timeline.json"):
+        assert receipt.authorizes_workspace_file_commit(entity_id=ENTITY, path=path, target_exists=False), path
+
+
+@pytest.mark.asyncio
 async def test_bash_approval_execution_and_projection_share_task_destination(media_storage, monkeypatch):
     from packages.core.ai.tools import bash_tool
     from packages.core.services import ai_file_permissions, runtime_authorization
@@ -293,17 +605,27 @@ async def test_bash_approval_execution_and_projection_share_task_destination(med
     monkeypatch.setattr(bash_tool, "_bash_resource_mutation_error", AsyncMock(return_value=None))
     monkeypatch.setattr(runtime_authorization, "authorize_runtime_action", AsyncMock(return_value=SimpleNamespace(allowed=True)))
     monkeypatch.setattr(ai_file_permissions, "_resource_file_acl_denial", AsyncMock(return_value=None))
-    monkeypatch.setattr(bash_tool, "_sync_documents_after_bash", AsyncMock())
+    monkeypatch.setattr(bash_tool, "_unreadable", AsyncMock(return_value=set()))
+
+    @asynccontextmanager
+    async def unlocked(_entity_id, _root):
+        yield
+
+    monkeypatch.setattr(bash_tool, "_entity_mutation_section", unlocked)
     repair = AsyncMock(return_value=1)
     monkeypatch.setattr(bash_tool, "_repair_projection_paths", repair)
+    from tests.bash_sandbox_fakes import install
+
+    sandbox = install(monkeypatch, media_storage.parent)
     with _authorized(request, receipt):
-        result = json.loads(await bash_tool._bash_impl(
+        result = json.loads(await bash_tool._bash(
             ENTITY, user_id="user_media_qa", workspace_id=WORKSPACE, task_id=TASK, **args,
         ))
     assert result.get("exit_code") == 0, result
+    assert "artifacts/report.txt" in sandbox.user_commands()[-1]["command"]
     assert (media_storage / target).read_text() == "report\n"
     assert not (media_storage / "report.txt").exists()
-    assert repair.await_args.kwargs["paths"] == [target]
+    assert target in repair.await_args.kwargs["paths"]
 
 
 @pytest.mark.asyncio

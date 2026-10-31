@@ -139,6 +139,16 @@ export function IconReply(props: IconProps) {
   );
 }
 
+/** Insert an emoji */
+export function IconSmile(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+      <path d="M8.25 14.25a4.5 4.5 0 0 0 7.5 0M9 9.75h.01m6 0h.01" />
+    </Svg>
+  );
+}
+
 /** Add an emoji reaction */
 export function IconSmilePlus(props: IconProps) {
   return (

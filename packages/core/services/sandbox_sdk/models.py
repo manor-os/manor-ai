@@ -22,45 +22,59 @@ class SkillManifest:
     needs_sandbox: bool = False
 
 
+#: The container settings a caller may override; the runner owns every other
+#: field (image, security posture, mounts, naming, workdir) and answers 400
+#: ``config_override_rejected`` when one is sent.
+#: Container settings only the runner's own config decides (``SANDBOX_IMAGE``,
+#: ``SANDBOX_WORKDIR``, its security posture and mounts). A create that names
+#: one is refused before it is sent; the runner refuses it too (400
+#: ``config_override_rejected``).
+RUNNER_OWNED_CONTAINER_FIELDS = (
+    "image",
+    "workdir",
+    "read_only_root",
+    "tmpfs",
+    "volumes",
+    "cap_drop",
+    "dns",
+    "container_prefix",
+    "service_scope",
+)
+
+OVERRIDABLE_CONTAINER_FIELDS = (
+    "memory",
+    "cpus",
+    "pids_limit",
+    "workdir_tmpfs_size",
+    "network",
+    "exec_timeout",
+    "install_timeout",
+)
+
+
 @dataclass
 class ContainerConfig:
-    image: str = "sandbox-skill:latest"
-    network: str = "bridge"
-    dns: list[str] = field(default_factory=list)
-    memory: str = "512m"
-    cpus: float = 1.0
-    pids_limit: int = 256
-    read_only_root: bool = True
-    # Paths are mount targets inside a short-lived, read-only-root container.
-    tmpfs: list[str] = field(default_factory=lambda: ["/tmp", "/var/tmp"])  # nosec B108
-    workdir_tmpfs_size: str = "256m"
-    cap_drop: list[str] = field(default_factory=lambda: ["ALL"])
-    container_prefix: str = "skill-sbx-"
-    workdir: str = "/skill"
-    install_timeout: int = 120
-    exec_timeout: int = 60
-    volumes: list[str] = field(default_factory=list)  # bind mounts: ["host:container:mode"]
+    """Overrides for a sandbox's container; unset (None) fields keep the runner default.
+
+    Each runner bounds every field (``SANDBOX_OVERRIDE_MAX_*``) and clamps
+    memory/cpus to what its host can give, reporting that in the create
+    response's ``warnings``.
+    """
+
+    memory: Optional[str] = None
+    cpus: Optional[float] = None
+    pids_limit: Optional[int] = None
+    workdir_tmpfs_size: Optional[str] = None
+    network: Optional[str] = None
+    exec_timeout: Optional[int] = None
+    install_timeout: Optional[int] = None
 
     def to_dict(self) -> dict:
-        d = {
-            "image": self.image,
-            "network": self.network,
-            "dns": self.dns,
-            "memory": self.memory,
-            "cpus": self.cpus,
-            "pids_limit": self.pids_limit,
-            "read_only_root": self.read_only_root,
-            "tmpfs": self.tmpfs,
-            "workdir_tmpfs_size": self.workdir_tmpfs_size,
-            "cap_drop": self.cap_drop,
-            "container_prefix": self.container_prefix,
-            "workdir": self.workdir,
-            "install_timeout": self.install_timeout,
-            "exec_timeout": self.exec_timeout,
+        return {
+            name: getattr(self, name)
+            for name in OVERRIDABLE_CONTAINER_FIELDS
+            if getattr(self, name) is not None
         }
-        if self.volumes:
-            d["volumes"] = self.volumes
-        return d
 
 
 @dataclass
@@ -76,6 +90,12 @@ class SandboxInfo:
     active_command: Optional[str] = None
     active_execution_id: Optional[str] = None
     expires_at: Optional[float] = None
+    # Every command running now: agents of one conversation share a sandbox.
+    active_execution_ids: list[str] = field(default_factory=list)
+    max_concurrent_executions: Optional[int] = None
+    # Commands waiting for a slot (fair FIFO) and the Skills loaded side by side.
+    queued_execution_ids: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +109,14 @@ class CreateSandboxResult:
     # "exec": skill env is handed to each docker exec and replaced by
     # load_skill; "create": an older service baked it into the container.
     env_injection: str = "create"
+    # The container's effective config (runner defaults + overrides + host
+    # clamp); empty from older runners.
+    config: dict = field(default_factory=dict)
+    # Adjustments the runner made, e.g. memory clamped to this host.
+    warnings: list[str] = field(default_factory=list)
+    # Where the Skill's files live (/skills/<name>) on a runner that keeps
+    # Skills side by side; None on an older runner with one /skill.
+    skill_dir: Optional[str] = None
 
 
 @dataclass
@@ -97,6 +125,9 @@ class ExecResult:
     stderr: str
     exit_code: int
     execution_id: Optional[str] = None
+    # oom_killed / pids_killed / disk_killed when the runner killed it.
+    outcome: Optional[str] = None
+    outcome_detail: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -147,6 +178,11 @@ class ExecutionStatusResult:
     events: list[ExecutionEventResult] = field(default_factory=list)
     next_sequence: int = 0
     waiting_for_response: bool = False
+    # oom_killed / pids_killed / disk_killed / queue_timeout / sandbox_lost
+    outcome: Optional[str] = None
+    outcome_detail: Optional[str] = None
+    # Place in the sandbox's slot queue while "queued".
+    queue_position: Optional[int] = None
 
     @property
     def terminal(self) -> bool:
@@ -175,6 +211,15 @@ class FileReadBase64Result:
     path: str
     content_base64: str
     size: int
+
+
+@dataclass
+class TailFileResult:
+    path: str
+    data: bytes
+    next_offset: int
+    size: int
+    eof: bool
 
 
 @dataclass
@@ -253,3 +298,5 @@ class LoadSkillResult:
     skill: SkillManifest
     reused: bool = True
     env_blocked: list[str] = field(default_factory=list)
+    # Where the Skill's files live on a runner that keeps Skills side by side.
+    skill_dir: Optional[str] = None

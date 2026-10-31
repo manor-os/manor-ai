@@ -3,16 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
     ACTION_EFFECT_GENERATION_PARAM_KEY,
-    COORDINATOR_CHILD_PARAM_KEY,
-    COORDINATOR_PARAM_KEY,
     ExecutionStepStatus,
 )
 from packages.core.constants.tool_effects import (
@@ -40,87 +37,6 @@ def canonical_effect_digest(effect: dict[str, Any]) -> str:
         separators=(",", ":"),
         default=str,
     ).encode("utf-8")).hexdigest()
-
-
-def _same_legacy_effect_representation(
-    left: dict[str, Any],
-    right: dict[str, Any],
-    *,
-    owner_plan_id: str,
-    owner_step_id: str,
-) -> bool:
-    """Recognize only an unscoped legacy copy of one scoped tool receipt."""
-
-    if (
-        left.get("kind") != ToolEffectEvidenceKind.TOOL_EFFECT.value
-        or right.get("kind") != ToolEffectEvidenceKind.TOOL_EFFECT.value
-        or left.get("effect") != right.get("effect")
-        or left.get("coordinator_child_step_id")
-        != right.get("coordinator_child_step_id")
-    ):
-        return False
-    left_fields = left.get("fields") if isinstance(left.get("fields"), dict) else {}
-    right_fields = right.get("fields") if isinstance(right.get("fields"), dict) else {}
-    scoped, legacy = (
-        (left_fields, right_fields)
-        if left_fields.get("effect_id")
-        else (right_fields, left_fields)
-    )
-    if (
-        not scoped.get("effect_id")
-        or legacy.get("effect_id")
-        or str(scoped.get("owner_plan_id") or "") != owner_plan_id
-        or str(scoped.get("owner_step_id") or "") != owner_step_id
-        or not ToolEffectEvidenceFactory.has_valid_effect_id(
-            left if left_fields is scoped else right
-        )
-    ):
-        return False
-    if not all(
-        scoped.get(key) and scoped.get(key) == legacy.get(key)
-        for key in ("tool", "tool_call_id", "arguments_hash")
-    ):
-        return False
-    if str(scoped.get("effect_generation") or "0") != str(
-        legacy.get("effect_generation") or "0"
-    ):
-        return False
-    return all(key in scoped and scoped[key] == value for key, value in legacy.items())
-
-
-def effect_action_group_ids(
-    evidence_refs: Any,
-    *,
-    owner_plan_id: str,
-    owner_step_id: str,
-) -> dict[str, str]:
-    """Group a unique scoped/legacy duplicate without merging distinct calls."""
-
-    refs = {
-        canonical_effect_digest(ref): ref
-        for ref in (evidence_refs or [])
-        if isinstance(ref, dict)
-        and ref.get("kind") == ToolEffectEvidenceKind.TOOL_EFFECT.value
-    }
-    peers = {
-        digest: [
-            other_digest
-            for other_digest, other in refs.items()
-            if other_digest != digest
-            and _same_legacy_effect_representation(
-                ref,
-                other,
-                owner_plan_id=owner_plan_id,
-                owner_step_id=owner_step_id,
-            )
-        ]
-        for digest, ref in refs.items()
-    }
-    groups = {digest: digest for digest in refs}
-    for digest, matches in peers.items():
-        if len(matches) == 1 and peers[matches[0]] == [digest]:
-            groups[digest] = min(digest, matches[0])
-    return groups
 
 
 def _reconciliation_markers(evidence_refs: Any) -> dict[str, dict[str, Any]]:
@@ -238,92 +154,6 @@ def _validated_marker_for_effect(
     return inherited, True
 
 
-def effect_reconciliation_snapshot(
-    steps: Iterable[ExecutionStep],
-    *,
-    plan_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Describe the exact unresolved effects a human must reconcile."""
-
-    rows: dict[str, dict[str, Any]] = {}
-    max_generation = 0
-    for step in steps:
-        evidence_refs = getattr(step, "evidence_refs", None) or []
-        group_ids = effect_action_group_ids(
-            evidence_refs,
-            owner_plan_id=str(getattr(step, "plan_id", None) or plan_id or ""),
-            owner_step_id=str(getattr(step, "id", "") or ""),
-        )
-        params = getattr(step, "params", None)
-        params = params if isinstance(params, dict) else {}
-        is_agentic = (
-            getattr(step, "kind", None) in {"llm", "subagent"}
-            or params.get(COORDINATOR_CHILD_PARAM_KEY) is True
-            or params.get(COORDINATOR_PARAM_KEY) is True
-        )
-        markers = _reconciliation_markers(evidence_refs)
-        for marker in markers.values():
-            try:
-                max_generation = max(
-                    max_generation,
-                    int(marker.get("generation") or 0),
-                )
-            except (TypeError, ValueError):
-                continue
-        for ref in evidence_refs:
-            if (
-                not isinstance(ref, dict)
-                or ref.get("kind") != ToolEffectEvidenceKind.TOOL_EFFECT.value
-            ):
-                continue
-            digest = canonical_effect_digest(ref)
-            if digest in markers:
-                continue
-            fields = ref.get("fields") if isinstance(ref.get("fields"), dict) else {}
-            grouped_refs = [
-                item for item in evidence_refs
-                if isinstance(item, dict)
-                and item.get("kind") == ToolEffectEvidenceKind.TOOL_EFFECT.value
-                and group_ids.get(canonical_effect_digest(item)) == group_ids[digest]
-            ]
-            saved_result = any(
-                isinstance(item.get("fields"), dict)
-                and item["fields"].get("result") is not None
-                for item in grouped_refs
-            ) or (
-                not is_agentic
-                and getattr(step, "result", None) is not None
-                and all(
-                    item.get("effect") != ToolEffectOutcome.PENDING.value
-                    for item in grouped_refs
-                )
-            )
-            rows.setdefault(digest, {
-                "effect_digest": digest,
-                "action_group_id": group_ids[digest],
-                "applied_result_required": not saved_result,
-                "step_id": str(getattr(step, "id", "") or ""),
-                "step_key": str(getattr(step, "step_key", "") or ""),
-                "coordinator_child_step_id": str(
-                    ref.get("coordinator_child_step_id") or ""
-                ) or None,
-                "effect": str(ref.get("effect") or ""),
-                "tool": str(fields.get("tool") or "") or None,
-                "action_key": str(fields.get("action_key") or "") or None,
-                "provider": str(fields.get("provider") or "") or None,
-                "arguments_hash": str(fields.get("arguments_hash") or "") or None,
-                "tool_call_id": str(fields.get("tool_call_id") or "") or None,
-            })
-    if not rows:
-        return None
-    return {
-        "version": 1,
-        "plan_id": plan_id,
-        "generation": max_generation + 1,
-        "effects": [rows[key] for key in sorted(rows)],
-    }
-
-
 def _checkpoint_contains_tool_result(
     checkpoint: Any,
     tool_call_id: str | None,
@@ -339,12 +169,6 @@ def _checkpoint_contains_tool_result(
 
     call_id = str(tool_call_id or "").strip()
     if not call_id or not isinstance(checkpoint, dict):
-        return False
-    from packages.core.workers.transcript import (
-        worker_transcript_dropped_tool_result_ids,
-    )
-
-    if call_id in worker_transcript_dropped_tool_result_ids(checkpoint):
         return False
     from packages.core.ai.runtime.workspace_delegation_actions import (
         _raw_tool_call_name,
@@ -411,7 +235,6 @@ def _checkpoint_contains_tool_result(
 
     from packages.core.ai.runtime.control import RuntimeAgentCheckpoint, RuntimeTurnAborted
     from packages.core.ai.runtime.nested_agent import _qualified_call_id, runtime_nested_skill_state
-    from packages.core.workers.transcript import is_worker_transcript_checkpoint
 
     node, path = checkpoint, []
     included = within_parent_call_id is None
@@ -422,7 +245,8 @@ def _checkpoint_contains_tool_result(
             parsed = None
             if "pending_tool_call" in node:
                 return False
-            if depth == 0 and not is_worker_transcript_checkpoint(node):
+            if depth == 0:
+                # Only a Runtime checkpoint can prove a returned call.
                 return False
         if parsed is not None:
             pending = parsed.pending_tool_call
@@ -553,12 +377,10 @@ async def has_ambiguous_external_effect(
 ) -> bool:
     """Whether replay could repeat an external effect without proof of safety.
 
-    A receipt scoped to a durable DONE coordinator child is safe for its
-    parent to replay because the child handler returns storage. Other effects
-    need an exact observation or host-owned handoff before replay is safe.
-    This detects uncertainty, not who must resolve it: first-party file
-    recovery belongs to the system, while provider reconciliation has its
-    own decision boundary.
+    An effect needs an exact observation or host-owned handoff before replay
+    is safe. This detects uncertainty, not who must resolve it: first-party
+    file recovery belongs to the system, while an unconfirmed provider
+    effect fails the worker-job Step without replay.
     """
 
     effects = [
@@ -596,255 +418,30 @@ async def has_ambiguous_external_effect(
         active_effects.append(ref)
     if not active_effects:
         return False
-    child_ids = {
-        str(ref.get("coordinator_child_step_id") or "").strip()
-        for ref in active_effects
-    }
-    unscoped_effects = [
-        effect
-        for effect in active_effects
-        if not str(effect.get("coordinator_child_step_id") or "").strip()
-    ]
-    if unscoped_effects:
-        checkpoint = getattr(owner_step, "runtime_checkpoint", None)
-        owner_done = (
-            str(getattr(owner_step, "step_status", ""))
-            == ExecutionStepStatus.DONE.value
-        )
-        if any(
-            not (
-                owner_done
-                and effect.get("effect") != ToolEffectOutcome.PENDING.value
-            )
-            and not _checkpoint_proves_tool_effect(
-                    checkpoint, effect, evidence_refs=evidence_refs, owner_step=owner_step,
-            )
-            for effect in unscoped_effects
-        ):
-            return True
-    child_ids.discard("")
-    if not child_ids:
-        return False
-    rows = list((await db.execute(
-        select(ExecutionStep).where(ExecutionStep.id.in_(sorted(child_ids)))
-    )).scalars().all())
-    children = {str(row.id): row for row in rows}
-    from packages.core.constants.execution import (
-        COORDINATOR_CHILD_PARAM_KEY,
-        COORDINATOR_PARENT_STEP_PARAM_KEY,
-        COORDINATOR_PARAM_KEY,
-    )
-
-    owner_params = (
-        owner_step.params if isinstance(getattr(owner_step, "params", None), dict)
-        else {}
-    )
-    for effect in active_effects:
-        child_id = str(effect.get("coordinator_child_step_id") or "").strip()
-        child = children.get(child_id)
-        if child is None:
-            return True
-        child_params = child.params if isinstance(child.params, dict) else {}
-        same_child = str(getattr(owner_step, "id", "")) == child_id
-        same_parent = (
-            owner_params.get(COORDINATOR_PARAM_KEY) is True
-            and child_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY)
-            == getattr(owner_step, "step_key", None)
-        )
-        if (
-            child_params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
-            or child.plan_id != getattr(owner_step, "plan_id", None)
-            or child.entity_id != getattr(owner_step, "entity_id", None)
-            or child.workspace_id != getattr(owner_step, "workspace_id", None)
-            or not (same_child or same_parent)
-            or canonical_effect_digest(effect) not in {
-                canonical_effect_digest(ref)
-                for ref in (child.evidence_refs or [])
-                if (
-                    isinstance(ref, dict)
-                    and ref.get("kind") == ToolEffectEvidenceKind.TOOL_EFFECT.value
-                )
-            }
-        ):
-            return True
-        status = str(child.step_status)
-        if status == ExecutionStepStatus.DONE.value:
-            continue
-        if (
-            status in {
-                ExecutionStepStatus.PENDING.value,
-                ExecutionStepStatus.RUNNING.value,
-            }
-            and _checkpoint_proves_tool_effect(
-                child.runtime_checkpoint, effect,
-                evidence_refs=child.evidence_refs, owner_step=child,
-            )
-        ):
-            # Its receipt and exact returned tool result were committed in one
-            # child checkpoint. A successor resumes after that result.
-            continue
+    if any(str(ref.get("coordinator_child_step_id") or "").strip() for ref in active_effects):
+        # Coordinator child Steps were retired with the Plan engine; no
+        # durable child can prove a child-scoped receipt safe to replay.
         return True
-    return False
-
-
-async def ambiguous_effect_reconciliation_snapshot(
-    db: AsyncSession,
-    steps: Iterable[ExecutionStep],
-    *,
-    plan_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Snapshot only effects that cannot be resumed from durable state."""
-
-    filtered: list[Any] = []
-    max_generation = 0
-    for step in steps:
-        evidence = [
-            ref for ref in (getattr(step, "evidence_refs", None) or [])
-            if isinstance(ref, dict)
-        ]
-        markers = [
-            ref for ref in evidence
-            if ref.get("kind") in (TOOL_EFFECT_RECONCILIATION_KIND, ToolEffectEvidenceKind.RESULT_HANDOFF.value)
-        ]
-        validated_markers = await _validated_reconciliation_markers(
-            db,
-            step,
-            evidence,
-        )
-        for marker in validated_markers.values():
-            try:
-                max_generation = max(
-                    max_generation,
-                    int(marker.get("generation") or 0),
-                )
-            except (TypeError, ValueError):
-                continue
-        ambiguous: list[dict[str, Any]] = []
-        for effect in evidence:
-            if effect.get("kind") != ToolEffectEvidenceKind.TOOL_EFFECT.value:
-                continue
-            if await has_ambiguous_external_effect(
-                db,
-                [effect, *markers],
-                owner_step=step,
-            ):
-                ambiguous.append(effect)
-        if ambiguous:
-            filtered.append(SimpleNamespace(
-                id=getattr(step, "id", None),
-                plan_id=getattr(step, "plan_id", None),
-                step_key=getattr(step, "step_key", None),
-                kind=getattr(step, "kind", None),
-                params=getattr(step, "params", None),
-                result=getattr(step, "result", None),
-                # Do not pass raw markers into the synchronous snapshotter.
-                # A forged/legacy marker must not hide an effect after the
-                # async validator correctly classified it as ambiguous.
-                evidence_refs=ambiguous,
-            ))
-    snapshot = effect_reconciliation_snapshot(filtered, plan_id=plan_id)
-    if snapshot is not None:
-        snapshot["generation"] = max_generation + 1
-    return snapshot
-
-
-async def retry_effect_block_detail(
-    db: AsyncSession,
-    steps: Iterable[ExecutionStep],
-) -> str | None:
-    """Return a stable 409 detail before any retry mutation is applied."""
-
-    for step in steps:
-        if await has_ambiguous_external_effect(
-            db,
-            getattr(step, "evidence_refs", None),
-            owner_step=step,
-        ):
-            return (
-                f"Step {step.step_key!r} recorded an external action whose "
-                "outcome is not safely replayable; reconcile it or create a "
-                "fresh plan before retrying"
-            )
-    return None
-
-
-def new_plan_effect_block_detail(steps: Iterable[ExecutionStep]) -> str | None:
-    """Block cross-Plan replay when any external-effect identity would change."""
-
-    for step in steps:
-        if any(
-            isinstance(ref, dict)
-            and ref.get("kind") == ToolEffectEvidenceKind.TOOL_EFFECT.value
-            for ref in (getattr(step, "evidence_refs", None) or [])
-        ):
-            return (
-                f"Step {step.step_key!r} recorded an external action. A new "
-                "plan cannot safely reuse its prior idempotency identity; "
-                "reconcile that action before replanning"
-            )
-    return None
-
-
-async def validated_new_plan_effect_block_detail(
-    db: AsyncSession,
-    steps: Iterable[ExecutionStep],
-) -> str | None:
-    """Cross-Plan gate that honors only server-validated NOT_APPLIED decisions."""
-
-    for step in steps:
-        evidence = [
-            ref
-            for ref in (getattr(step, "evidence_refs", None) or [])
-            if isinstance(ref, dict)
-        ]
-        markers = await _validated_reconciliation_markers(db, step, evidence)
-        for effect in evidence:
-            if effect.get("kind") != ToolEffectEvidenceKind.TOOL_EFFECT.value:
-                continue
-            marker, _ = _validated_marker_for_effect(effect, markers)
-            marker = marker or {}
-            if marker.get("decision") == EFFECT_NOT_APPLIED_DECISION:
-                continue
-            return (
-                f"Step {step.step_key!r} recorded an external action. A new "
-                "plan cannot safely reuse its prior idempotency identity; "
-                "reconcile that action before replanning"
-            )
-    return None
-
-
-async def task_execution_effect_block_detail(
-    db: AsyncSession,
-    task_id: str,
-    *,
-    exclude_plan_id: str | None = None,
-) -> str | None:
-    """Backstop every cross-Plan/agent admission against Task history."""
-
-    from packages.core.models.execution import ExecutionPlan
-
-    statement = (
-        select(ExecutionStep)
-        .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
-        .where(ExecutionPlan.task_id == task_id)
-        .order_by(ExecutionPlan.created_at, ExecutionStep.created_at)
+    checkpoint = getattr(owner_step, "runtime_checkpoint", None)
+    owner_done = (
+        str(getattr(owner_step, "step_status", ""))
+        == ExecutionStepStatus.DONE.value
     )
-    if exclude_plan_id:
-        statement = statement.where(ExecutionPlan.id != exclude_plan_id)
-    steps = list((await db.execute(statement)).scalars().all())
-    return await validated_new_plan_effect_block_detail(db, steps)
+    return any(
+        not (
+            owner_done
+            and effect.get("effect") != ToolEffectOutcome.PENDING.value
+        )
+        and not _checkpoint_proves_tool_effect(
+            checkpoint, effect, evidence_refs=evidence_refs, owner_step=owner_step,
+        )
+        for effect in active_effects
+    )
 
 
 __all__ = [
     "canonical_effect_digest",
-    "effect_action_group_ids",
-    "ambiguous_effect_reconciliation_snapshot",
-    "effect_reconciliation_snapshot",
     "has_ambiguous_external_effect",
-    "new_plan_effect_block_detail",
-    "retry_effect_block_detail",
-    "task_execution_effect_block_detail",
-    "validated_new_plan_effect_block_detail",
     "EFFECT_APPLIED_DECISION",
     "EFFECT_NOT_APPLIED_DECISION",
     "TOOL_EFFECT_RECONCILIATION_KIND",

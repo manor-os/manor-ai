@@ -797,6 +797,10 @@ async def test_public_chat_stream_rejects_invalid_or_unroutable_subscription(
     workspace_routable,
 ):
     from packages.core.services import agent_subscription_service
+    # stream_message lazily imports the gateway and outbound module, which
+    # capture resolve_subscription at import time. Load them before patching
+    # so the fake cannot survive monkeypatch teardown in those consumers.
+    from packages.core.services import channel_gateway  # noqa: F401
 
     class FakeLease:
         def __init__(self) -> None:

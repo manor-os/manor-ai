@@ -20,6 +20,7 @@ import httpx
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_values import dumps_storable_json
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, VectorStatus
 from packages.core.cache import cache
@@ -248,12 +249,14 @@ async def _resolve_embedding_config_from_billing_context() -> dict | None:
                 user_id=billing.user_id,
                 entity_id=billing.entity_id,
                 db=db,
+                workspace_id=billing.workspace_id,
             )
             model = await resolve_model_for_user(
                 "embedding",
                 user_id=billing.user_id,
                 entity_id=billing.entity_id,
                 db=db,
+                workspace_id=billing.workspace_id,
             )
             if not metadata:
                 if (
@@ -645,6 +648,11 @@ async def _read_document_content(doc: Document) -> str:
     # Fall back only for docs without a stale filesystem pointer, or for
     # existing files whose format has no extractable text (images/video).
     if doc.metadata_:
+        from packages.core.services.knowledge_media_analysis import stored_media_text
+
+        media_text = stored_media_text(doc.metadata_)
+        if media_text:
+            return media_text
         for key in ("content", "content_text"):
             value = doc.metadata_.get(key)
             if isinstance(value, str):
@@ -713,7 +721,7 @@ async def _mark_document_content_unavailable(
             "run_id": run_id,
             "processing": VectorStatus.PROCESSING,
             "status": status,
-            "metadata": json.dumps(metadata),
+            "metadata": dumps_storable_json(metadata),
             "updated_at": updated_at,
         },
     )
@@ -832,7 +840,7 @@ async def _claim_document_indexing(
             "allow_ready": allow_ready,
             "processing": VectorStatus.PROCESSING,
             "stale_before": stale_before,
-            "indexing": json.dumps(indexing),
+            "indexing": dumps_storable_json(indexing),
         },
     )
     claimed = result.scalar_one_or_none()
@@ -885,7 +893,7 @@ async def _update_document_indexing_progress(
             "doc_id": document_id,
             "run_id": run_id,
             "processing": VectorStatus.PROCESSING,
-            "progress_data": json.dumps(progress_data),
+            "progress_data": dumps_storable_json(progress_data),
         },
     )
     if result.rowcount != 1:
@@ -994,7 +1002,7 @@ async def _mark_document_indexing_failed(
             "processing": VectorStatus.PROCESSING,
             "failed": VectorStatus.FAILED,
             "failed_at": failed_at,
-            "failure_data": json.dumps(failure_data),
+            "failure_data": dumps_storable_json(failure_data),
         },
     )
     await db.commit()
@@ -1332,6 +1340,11 @@ async def _build_content_preview(
                 return content[:effective_max_chars]
 
     if metadata and isinstance(metadata, dict):
+        from packages.core.services.knowledge_media_analysis import stored_media_text
+
+        media_text = stored_media_text(metadata)
+        if media_text:
+            return media_text[:effective_max_chars]
         for key in ("content", "content_text"):
             value = metadata.get(key)
             if isinstance(value, str) and value:

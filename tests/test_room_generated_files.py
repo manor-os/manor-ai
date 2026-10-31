@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from packages.core.models.base import generate_ulid
+from packages.core.models.billing import CreditReservation
 from packages.core.models.chat_room import (
     ChatRoom, ChatRoomAgentBinding, ChatRoomAgentRun, ChatRoomFile,
     ChatRoomMember, ChatRoomMessage, ChatRoomToolApproval,
@@ -169,6 +170,7 @@ async def test_approved_large_group_file_is_pinned_downloadable_and_not_republis
 async def test_slow_group_downloads_do_not_exhaust_small_database_pool(
     client, db_session, tmp_path, monkeypatch,
 ):
+    from fastapi import HTTPException
     from apps.api.routers.chat_rooms import download_room_file
 
     _, owner, room, run, _, document, _, content = await _approved_result(
@@ -205,7 +207,7 @@ async def test_slow_group_downloads_do_not_exhaust_small_database_pool(
             assert await db.scalar(select(User.id).where(User.id == owner["id"])) == owner["id"]
 
     try:
-        for _ in range(16):
+        for _ in range(8):
             async with sessions() as db:
                 user = await db.get(User, owner["id"])
                 response = await download_room_file(room.id, projected.id, user=user, db=db)
@@ -220,20 +222,34 @@ async def test_slow_group_downloads_do_not_exhaust_small_database_pool(
                 # Keep this session alive, like a request-scoped dependency.
                 # An independent request must still obtain a connection.
                 await asyncio.wait_for(fast_read(), 2)
-        await asyncio.wait_for(asyncio.gather(*(fast_read() for _ in range(32))), 5)
+        async with sessions() as db:
+            user = await db.get(User, owner["id"])
+            with pytest.raises(HTTPException) as busy:
+                await download_room_file(room.id, projected.id, user=user, db=db)
+            assert busy.value.status_code == 503
+        # Bound the burst to the pool size: every read must find a free
+        # connection immediately. An unbounded burst queues 30 waiters on
+        # pool_timeout and fails on a slow runner with no connection pinned.
+        burst = asyncio.Semaphore(engine.pool.size())
+
+        async def bounded_read():
+            async with burst:
+                await fast_read()
+
+        await asyncio.wait_for(asyncio.gather(*(bounded_read() for _ in range(32))), 5)
         assert engine.pool.checkedout() == 0
         assert all(not response._handle.closed for response in responses)
         release.set()
         await asyncio.wait_for(asyncio.gather(*tasks), 5)
         assert all(response._handle.closed for response in responses)
-        assert bodies == [content] * 16
+        assert bodies == [content] * 8
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for response in responses:
-            response._handle.close()
+            response.close()
         await engine.dispose()
 
 
@@ -292,7 +308,7 @@ async def test_group_copy_releases_connection_and_rechecks_authority(
             if expected == 200:
                 response = await chat_rooms.download_room_file(room.id, projected.id, user=user, db=db)
                 assert not db.in_transaction() and engine.pool.checkedout() == 0
-                response._handle.close()
+                response.close()
             else:
                 with pytest.raises(HTTPException) as error:
                     await chat_rooms.download_room_file(room.id, projected.id, user=user, db=db)
@@ -368,9 +384,13 @@ async def test_group_artifact_projection_rejects_stale_audience_and_unapproved_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("billing", ["byok", "trial_payer"])
 async def test_async_group_media_requires_completed_exact_job_receipt(
-    client: AsyncClient, db_session, tmp_path, monkeypatch,
+    client: AsyncClient, db_session, tmp_path, monkeypatch, billing,
 ):
+    # trial_payer catches: the settled-credits check only finding a
+    # reservation held by the job's entity, so a provider-paid trial job
+    # never projects.
     _, owner, room, run, approval, document, _, _ = await _approved_result(
         client, db_session, tmp_path, monkeypatch, size=1024,
     )
@@ -384,9 +404,16 @@ async def test_async_group_media_requires_completed_exact_job_receipt(
         id=generate_ulid(), entity_id=owner["entity_id"], user_id=owner["id"],
         agent_id=agent_id, room_agent_run_id=run.id,
         kind="video", status="pending", prompt="Group clip",
-        params={"result_document_id": document.id}, byok=True,
+        params={"result_document_id": document.id}, byok=billing == "byok",
+        credits=0 if billing == "byok" else 10,
     )
     db_session.add(job)
+    if billing == "trial_payer":
+        db_session.add(CreditReservation(
+            entity_id=generate_ulid(), workspace_id=None, amount_credits=10, consumed_credits=10,
+            source_kind="media_job", source_id=job.id, status="consumed",
+            meta={"data_owner_entity_id": owner["entity_id"]},
+        ))
     approval.tool_name = "room_generate_media"
     approval.result_document_id = None
     approval.result_media_job_id = job.id

@@ -62,13 +62,23 @@ async def soft_delete_user(
         return {"user_id": user_id, "entity_cascaded": False, "oauth_revoked": 0}
 
     now = datetime.now(timezone.utc)
-    user.deleted_at = now
     from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+    from packages.core.services.external_collaboration_access import (
+        lock_access_grant_workspaces,
+        sync_access_grants,
+    )
     from sqlalchemy import or_
-    await db.execute(sa_update(WorkspaceCollaboration).where(or_(
+    grant_conditions = (
         WorkspaceCollaboration.user_id == user_id, WorkspaceCollaboration.authorized_by == user_id,
         WorkspaceCollaboration.requested_by == user_id, WorkspaceCollaboration.email == user.email.casefold(),
-    )).values(status="revoked", snapshot={}))
+    )
+    # Workspace locks precede the User and grant writes below; derived
+    # membership/seat rows are cleared while user_id is still on the grant.
+    access_grant_ids = await lock_access_grant_workspaces(db, *grant_conditions)
+    user.deleted_at = now
+    await db.execute(sa_update(WorkspaceCollaboration).where(or_(*grant_conditions))
+        .values(status="revoked", snapshot={}))
+    await sync_access_grants(db, access_grant_ids)
 
     # Best-effort OAuth revocation — running in foreground so the
     # caller (the API request handler) gets a deterministic answer.
@@ -478,11 +488,21 @@ async def _anonymize_user_references(
     requirements get stricter we'll add a per-row policy later.
     """
     from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
+    from packages.core.services.external_collaboration_access import (
+        lock_access_grant_workspaces,
+        sync_access_grants,
+    )
     from sqlalchemy import or_
-    await db.execute(sa_update(WorkspaceCollaboration).where(or_(
+    grant_conditions = (
         WorkspaceCollaboration.user_id == user_id, WorkspaceCollaboration.authorized_by == user_id,
         WorkspaceCollaboration.requested_by == user_id,
-    )).values(status="revoked", snapshot={}, email="deleted-user@invalid.test", user_id=None, requested_by=None, authorized_by=None))
+    )
+    # Clear derived access before user_id is nulled below.
+    access_grant_ids = await lock_access_grant_workspaces(db, *grant_conditions)
+    await db.execute(sa_update(WorkspaceCollaboration).where(WorkspaceCollaboration.id.in_(access_grant_ids))
+        .values(status="revoked"))
+    await sync_access_grants(db, access_grant_ids)
+    await db.execute(sa_update(WorkspaceCollaboration).where(or_(*grant_conditions)).values(status="revoked", snapshot={}, email="deleted-user@invalid.test", user_id=None, requested_by=None, authorized_by=None))
     await db.execute(sa_update(WorkspaceCollaborationEntry).where(WorkspaceCollaborationEntry.created_by == user_id)
         .values(created_by="deleted-user"))
 

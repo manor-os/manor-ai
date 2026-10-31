@@ -11,19 +11,15 @@ from packages.core.ai.tools.bash_tool import (
     BASH_SCHEMA,
     _bash_mutation_action,
     _bash,
-    _expanded_read_paths,
-    _handle_mv_cp,
     _may_create_files,
     _split_simple_shell_commands,
     _validate_command,
-    _visible_read_paths,
     _visible_mutation_paths,
 )
 from packages.core.ai.tools.file_tools import DELETE_FILE_SCHEMA, PATCH_FILE_SCHEMA
 from packages.core.ai.tools.generate_file_tool import GENERATE_FILE_SCHEMA
 from packages.core.ai.tools.manor_tool import MANOR_SCHEMA
 from packages.core.ai.tools.sandbox_tools import _SANDBOX_SAVE_RESULT_SCHEMA
-from packages.core.ai.tools.sandbox_file_tools import SAVE_SANDBOX_FILE_SCHEMA
 from packages.core.ai.runtime.file_contracts import (
     FileApprovalOperationFactory,
     FileMutationAction,
@@ -220,7 +216,7 @@ async def test_manor_upload_approval_commits_the_staged_bytes(monkeypatch, tmp_p
     ))
 
     target = tmp_path / "entity-fs" / "ent_upload" / "docs" / "report.md"
-    assert result["status"] == "uploaded"
+    assert result.get("status") == "uploaded", result
     assert target.read_bytes() == b"approved bytes"
     assert approval_calls[0]["approval_payload"]["content_sha256"] == hashlib.sha256(
         b"approved bytes"
@@ -321,7 +317,7 @@ async def test_manor_upload_ignores_model_supplied_provenance_ids(
         agent_id="trusted_agent",
     ))
 
-    assert result["status"] == "uploaded"
+    assert result.get("status") == "uploaded", result
     assert sync_calls[0]["workspace_id"] is None
     assert sync_calls[0]["task_id"] is None
     assert sync_calls[0]["agent_id"] == "trusted_agent"
@@ -388,7 +384,6 @@ def test_mutating_file_tools_receive_the_runtime_envelope():
         "delete_file",
         "generate_file",
         "generate_document_file",
-        "save_sandbox_file",
         "sandbox_save_result",
         "bash",
         "manor",
@@ -403,6 +398,21 @@ def test_file_approval_reply_classifier_is_conservative():
     assert classify_file_approval_reply("不要") == "reject"
     assert classify_file_approval_reply("不是这个文件") == "reject"
     assert classify_file_approval_reply("yes, but use the other draft instead because this is wrong") is None
+
+
+@pytest.mark.parametrize("message", [
+    # "Knowledge" contains "no": this request rejected the card it asked for.
+    "请求把草稿写入 Knowledge，先停在审批卡片。",
+    "book it", "unconfirmed", "notes",
+])
+def test_english_reply_hints_match_whole_words_only(message):
+    assert classify_file_approval_reply(message) is None
+
+
+def test_whole_word_hints_still_read_short_replies():
+    assert classify_file_approval_reply("No.") == "reject"
+    assert classify_file_approval_reply("ok") == "approve"
+    assert classify_file_approval_reply("please always approve") == "always_approve"
 
 
 def test_visible_user_paths_preserves_root_marker_and_filters_hidden_paths():
@@ -1359,7 +1369,8 @@ async def test_runtime_receipt_never_records_a_task_binding_key_as_the_conversat
 
     The inner file mutation is checked against the real conversation (none for
     a task worker), so a receipt that recorded the key would mismatch every
-    save. The factory must translate the key back to "no conversation".
+    save. The key travels as ``sandbox_binding_key`` beside the conversation:
+    it is the approval scope, never the receipt's conversation.
     """
     from packages.core.ai.runtime.approvals import (
         RuntimeApprovalAction,
@@ -1401,13 +1412,15 @@ async def test_runtime_receipt_never_records_a_task_binding_key_as_the_conversat
         entity_id="ent_1",
         user_id="user_1",
         workspace_id="ws_1",
-        conversation_id=runtime_task_binding_key(task_id),
+        conversation_id=None,
+        sandbox_binding_key=runtime_task_binding_key(task_id),
         task_id=task_id,
     )
 
     decision = await middleware.guard_request(request)
     receipt = RuntimeToolAuthorizationReceiptFactory.create(decision=decision, request=request)
 
+    assert request.approval_scope_id == runtime_task_binding_key(task_id)
     assert receipt is not None
     assert receipt.conversation_id is None
     assert receipt.task_id == task_id
@@ -1537,9 +1550,9 @@ def test_runtime_receipt_factory_projects_media_outputs_from_typed_contracts():
 
     assert receipt is not None
     assert receipt.resource_ids == (
-        "runs/topic/audio/normalized",
+        "Workspaces/_by_id/folder_1/tasks/task_1/runs/topic/audio/normalized",
         "artifacts",
-        "runs/topic/timeline",
+        "Workspaces/_by_id/folder_1/tasks/task_1/runs/topic/timeline",
     )
     assert all(
         resource.match_kind is WorkspaceFileResourceMatchKind.TREE
@@ -4206,15 +4219,29 @@ async def test_workspace_file_receipt_mismatch_fails_closed_before_legacy_policy
                 "Workspaces/_by_id/folder_1/tasks/task_1/documents/another-file.md"
             ],
         )
+        wrong_scope_result = await guard_ai_file_mutation(
+            entity_id="ent_1",
+            user_id=None,
+            conversation_id=None,
+            workspace_id="ws_1",
+            task_id="task_2",
+            runtime_envelope=SimpleNamespace(allowed_tool_names=("generate_file",)),
+            tool_name="generate_document_file",
+            action="create_document",
+            paths=["Workspaces/_by_id/folder_1/tasks/task_2/documents/cram-pack.md"],
+        )
     finally:
         runtime_end_tool_authorization_scope(scope)
 
-    assert json.loads(modify_result or "{}")["mode"] == (
-        "authorization_receipt_mismatch"
-    )
-    assert json.loads(wrong_resource_result or "{}")["mode"] == (
-        "authorization_receipt_mismatch"
-    )
+    for result in (modify_result, wrong_resource_result):
+        payload = json.loads(result or "{}")
+        assert payload["mode"] == "authorization_receipt_mismatch"
+        assert "scope_mismatch" not in payload
+    # A scope mismatch names the differing field: the paths alone hid that a
+    # Workflow save's receipt had recorded its binding key as the conversation.
+    wrong_scope = json.loads(wrong_scope_result or "{}")
+    assert wrong_scope["mode"] == "authorization_receipt_mismatch"
+    assert wrong_scope["scope_mismatch"] == ["task_id"]
 
 
 def test_bash_visible_mutation_paths_for_user_visible_changes():
@@ -4262,264 +4289,6 @@ def test_bash_mutations_use_their_real_authorization_action():
     assert _bash_mutation_action("echo hi > docs/a.md && rm docs/b.md") == "delete"
     assert _bash_mutation_action("mv docs/a.md docs/b.md") == "edit"
     assert _bash_mutation_action("mkdir docs/new") == "write"
-
-
-def test_bash_projection_sync_stays_bounded_to_recoverable_paths():
-    import inspect
-
-    from packages.core.ai.tools import bash_tool
-
-    source = inspect.getsource(bash_tool._bash_impl)
-    assert "_repair_projection_paths" in source
-    assert "reconcile_entity_filesystem" not in source
-
-
-@pytest.mark.asyncio
-async def test_bash_projection_failure_is_durable_and_repaired_before_next_command(
-    monkeypatch, tmp_path,
-):
-    from packages.core.ai.tools import bash_tool
-    from packages.core.config import get_settings
-    from packages.core.services import ai_file_permissions, knowledge_sync
-    from packages.core.services.knowledge_sync import KnowledgeSyncResult
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    root = tmp_path / "entity-recovery"
-    root.mkdir()
-
-    async def allow_mutation(**_kwargs):
-        return None
-
-    async def fake_execute(command: str, _timeout: int, cwd: str) -> str:
-        if command.startswith("touch "):
-            (root / "report.md").write_text("changed", encoding="utf-8")
-        return json.dumps({"exit_code": 0, "stdout": "", "stderr": ""})
-
-    async def no_structured_sync(*_args, **_kwargs):
-        return None
-
-    async def fail_projection(**_kwargs):
-        raise RuntimeError("knowledge unavailable")
-
-    monkeypatch.setattr(ai_file_permissions, "guard_ai_file_mutation", allow_mutation)
-    monkeypatch.setattr(bash_tool, "_execute_local", fake_execute)
-    monkeypatch.setattr(bash_tool, "_sync_documents_after_bash", no_structured_sync)
-    monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", fail_projection)
-
-    failed = json.loads(await _bash("entity-recovery", command="touch report.md"))
-    marker = root / ".ai" / "bash-projection-recovery.json"
-    assert failed["exit_code"] == 1
-    assert failed["filesystem_changed"] is True
-    assert failed["knowledge_sync_pending"] is True
-    assert marker.is_file()
-    marker_text = marker.read_text(encoding="utf-8")
-    assert "report.md" in marker_text
-    assert "touch" not in marker_text
-
-    async def repair_projection(**_kwargs):
-        return KnowledgeSyncResult(True, document_id="doc-repaired")
-
-    monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", repair_projection)
-    repaired = json.loads(await _bash("entity-recovery", command="date"))
-    assert repaired["exit_code"] == 0
-    assert not marker.exists()
-
-
-@pytest.mark.asyncio
-async def test_bash_serializes_mutations_while_allowing_concurrent_shared_reads(
-    monkeypatch,
-    tmp_path,
-):
-    from packages.core.ai.tools import bash_tool
-    from packages.core import database
-    from packages.core.config import get_settings
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class FakeSession(FakeTransaction):
-        def begin(self):
-            return FakeTransaction()
-
-        async def execute(self, *_args, **_kwargs):
-            return None
-
-    monkeypatch.setattr(database, "async_session", FakeSession)
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    (tmp_path / "entity-serialized").mkdir()
-    active = 0
-    maximum_active = 0
-
-    async def observed_impl(_entity_id: str, **_kwargs):
-        nonlocal active, maximum_active
-        active += 1
-        maximum_active = max(maximum_active, active)
-        await asyncio.sleep(0.05)
-        active -= 1
-        return json.dumps({"exit_code": 0})
-
-    monkeypatch.setattr(bash_tool, "_bash_impl", observed_impl)
-    await asyncio.gather(
-        _bash("entity-serialized", command="ls"),
-        _bash("entity-serialized", command="ls"),
-    )
-    assert maximum_active == 2
-
-    maximum_active = 0
-    await asyncio.gather(
-        _bash("entity-serialized", command="touch first.md"),
-        _bash("entity-serialized", command="touch second.md"),
-    )
-    assert maximum_active == 1
-
-
-@pytest.mark.asyncio
-async def test_bash_shared_read_blocks_a_concurrent_mutation(monkeypatch, tmp_path):
-    from packages.core import database
-    from packages.core.ai.tools import bash_tool
-    from packages.core.config import get_settings
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class FakeSession(FakeTransaction):
-        def begin(self):
-            return FakeTransaction()
-
-        async def execute(self, *_args, **_kwargs):
-            return None
-
-    monkeypatch.setattr(database, "async_session", FakeSession)
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    (tmp_path / "entity-read-write").mkdir()
-    read_started = asyncio.Event()
-    release_read = asyncio.Event()
-    mutation_started = asyncio.Event()
-
-    async def observed_impl(_entity_id: str, **kwargs):
-        if kwargs["command"] == "ls":
-            read_started.set()
-            await release_read.wait()
-        else:
-            mutation_started.set()
-        return json.dumps({"exit_code": 0})
-
-    monkeypatch.setattr(bash_tool, "_bash_impl", observed_impl)
-    reader = asyncio.create_task(_bash("entity-read-write", command="ls"))
-    await asyncio.wait_for(read_started.wait(), timeout=1)
-    writer = asyncio.create_task(_bash("entity-read-write", command="touch report.md"))
-    await asyncio.sleep(0.05)
-    assert not mutation_started.is_set()
-
-    release_read.set()
-    await asyncio.gather(reader, writer)
-    assert mutation_started.is_set()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_bash_mutation_finishes_before_releasing_its_lock(
-    monkeypatch,
-    tmp_path,
-):
-    from packages.core.ai.tools import bash_tool
-    from packages.core import database
-    from packages.core.config import get_settings
-    from packages.core.services import ai_file_permissions
-    from packages.core.services.entity_fs import entity_filesystem_mutation_lock
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class FakeSession(FakeTransaction):
-        def begin(self):
-            return FakeTransaction()
-
-        async def execute(self, *_args, **_kwargs):
-            return None
-
-    monkeypatch.setattr(database, "async_session", FakeSession)
-
-    async def allow_mutation(**_kwargs):
-        return None
-
-    monkeypatch.setattr(ai_file_permissions, "guard_ai_file_mutation", allow_mutation)
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    (tmp_path / "entity-cancelled").mkdir()
-    started = asyncio.Event()
-    execute_release = asyncio.Event()
-    projection_started = asyncio.Event()
-    projection_release = asyncio.Event()
-    projection_finished = asyncio.Event()
-    contender_entered = asyncio.Event()
-
-    async def observed_execute(_command: str, _timeout: int, _cwd: str):
-        started.set()
-        await execute_release.wait()
-        return json.dumps({"exit_code": 0, "stdout": "", "stderr": ""})
-
-    async def observed_sync(*_args, **_kwargs):
-        return None
-
-    async def observed_projection(**_kwargs):
-        projection_started.set()
-        await projection_release.wait()
-        projection_finished.set()
-        return 1
-
-    monkeypatch.setattr(bash_tool, "_execute_local", observed_execute)
-    monkeypatch.setattr(bash_tool, "_sync_documents_after_bash", observed_sync)
-    monkeypatch.setattr(bash_tool, "_repair_projection_paths", observed_projection)
-    request = asyncio.create_task(
-        _bash("entity-cancelled", command="touch report.md"),
-    )
-    await asyncio.wait_for(started.wait(), timeout=1)
-    request.cancel()
-    await asyncio.sleep(0)
-
-    assert not request.done()
-    assert not projection_started.is_set()
-
-    async def contend_for_lock():
-        async with entity_filesystem_mutation_lock(
-            str(tmp_path / "entity-cancelled"),
-            timeout_seconds=1,
-        ):
-            contender_entered.set()
-
-    contender = asyncio.create_task(contend_for_lock())
-    execute_release.set()
-    await asyncio.wait_for(projection_started.wait(), timeout=1)
-    await asyncio.sleep(0.05)
-    assert not contender_entered.is_set()
-
-    projection_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
-    assert projection_finished.is_set()
-    await asyncio.wait_for(contender, timeout=1)
-    assert contender_entered.is_set()
 
 
 @pytest.mark.asyncio
@@ -4598,255 +4367,16 @@ async def test_bash_move_into_directory_allows_only_new_child(tmp_path):
     assert json.loads(denied)["operation"]["paths"] == ["archive/source.md"]
 
 
-def test_bash_validate_checks_each_shell_segment_and_nested_commands():
-    assert _validate_command("rg old docs | head -20") is None
-    assert "xargs" in (_validate_command("rg -l old docs | xargs rm") or "")
-    assert "find" in (_validate_command("find docs -name '*.tmp' -exec rm {} \\;") or "")
-
-    assert "git" in (_validate_command("ls; git status") or "")
-    assert "xargs" in (_validate_command("echo sh | xargs sh") or "")
-    assert "find" in (_validate_command("find docs -exec sh -c 'echo hi' \\;") or "")
-    assert _validate_command("echo $(rm docs/private.md)") is not None
-    assert _validate_command("echo `cat docs/private.md`") is not None
-    assert _validate_command("rg secret docs | python3 -c 'print(1)'") is not None
-    assert _validate_command("awk 'BEGIN { system(\"rm docs/private.md\") }'") is not None
-    assert _validate_command("sed -n '1p' docs/private.md") is not None
-    assert _validate_command("cp --target-directory=docs source.md") is not None
-    assert _validate_command("mv -tprivate source.md") is not None
-    assert _validate_command("sort --output=private.md public.md") is not None
-    assert _validate_command("file -f public.list") is not None
-    assert _validate_command("file --files-from=public.list") is not None
-    assert _validate_command("file -m private.magic public.bin") is not None
-    assert _validate_command("wc --files0-from=public.list") is not None
-    assert _validate_command("diff --from-file=private.md public.md") is not None
-    assert _validate_command("diff --to-file private.md public.md") is not None
-    assert _validate_command("echo secret >& private.md") is not None
-    assert _validate_command("echo secret 2>&1") is not None
-    assert _validate_command("echo .ai/*") is not None
-    assert _validate_command("which /etc/*") is not None
-    assert _validate_command("echo ~") is not None
-    assert _validate_command("chmod --reference=.ai/mode docs/report.md") is not None
-    assert _validate_command("touch -r .ai/timestamp docs/report.md") is not None
-
-
-def test_bash_search_read_paths_cover_option_patterns_and_implicit_rg_root():
-    assert _visible_read_paths("rg TOP_SECRET") == ["."]
-    assert _visible_read_paths("rg -e TOP_SECRET private.md") == ["private.md"]
-    assert _visible_read_paths("rg -g '*.md' TOP_SECRET") == ["."]
-    assert _visible_read_paths("rg -g '*.md' TOP_SECRET docs") == ["docs"]
-    assert _visible_read_paths("grep --regexp=TOP_SECRET private.md") == [
-        "private.md"
-    ]
-    assert _visible_read_paths("grep -f patterns.txt public.md") == [
-        "patterns.txt",
-        "public.md",
-    ]
-    assert _visible_read_paths("ls /etc") == ["/etc"]
-    assert _visible_read_paths("rg --files /etc") == ["/etc"]
-
-
-@pytest.mark.parametrize(
-    "command",
-    (
-        "find /etc -maxdepth 1",
-        "tree /etc",
-        "ls -la .",
-        "grep --directories=recurse TOP_SECRET .",
-        "grep -d recurse TOP_SECRET .",
-        "grep -drecurse TOP_SECRET .",
-    ),
-)
-def test_bash_metadata_and_recursive_hidden_reads_fail_closed(command):
-    with pytest.raises(ValueError, match="permission checking"):
-        _visible_read_paths(command)
-
-
-def test_bash_search_read_paths_reject_unsupported_options():
-    with pytest.raises(ValueError, match="Unsupported rg option"):
-        _visible_read_paths("rg --pre 'cat private.md' TOP_SECRET")
-    with pytest.raises(ValueError, match="Unsupported rg option"):
-        _visible_read_paths("rg --follow TOP_SECRET")
-    with pytest.raises(ValueError, match="Unsupported grep option"):
-        _visible_read_paths("grep -R TOP_SECRET")
-    with pytest.raises(ValueError, match="Unsupported grep option"):
-        _visible_read_paths("grep -r TOP_SECRET")
-    with pytest.raises(ValueError, match="Unsupported rg option"):
-        _visible_read_paths("rg --hidden TOP_SECRET")
-    with pytest.raises(ValueError, match="hidden files"):
-        _visible_read_paths("rg -uu TOP_SECRET")
-    with pytest.raises(ValueError, match="hidden files"):
-        _visible_read_paths("rg -u -u TOP_SECRET")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("runtime_user_id", [None, "user_1"])
-@pytest.mark.parametrize(
-    "command",
-    ["cat private.md", "rg TOP_SECRET", "grep --regexp=TOP_SECRET private.md"],
-)
-async def test_bash_read_acl_uses_runtime_actor_and_workspace(
-    monkeypatch,
-    tmp_path,
-    runtime_user_id,
-    command,
-):
-    from packages.core import database
-    from packages.core.ai.tools import bash_tool
-    from packages.core.config import get_settings
-    from packages.core.services import document_access
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    entity_root = tmp_path / "entity"
-    entity_root.mkdir()
-    (entity_root / "private.md").write_text("TOP_SECRET", encoding="utf-8")
-    calls = []
-
-    class SessionContext:
-        async def __aenter__(self):
-            return SimpleNamespace()
-
-        async def __aexit__(self, *_args):
-            return False
-
-    async def unreadable(_db, **kwargs):
-        calls.append(kwargs)
-        return {"private.md"}
-
-    async def forbidden_execute(*_args, **_kwargs):
-        raise AssertionError("denied Bash reads must not execute")
-
-    monkeypatch.setattr(database, "async_session", SessionContext)
-    monkeypatch.setattr(document_access, "unreadable_document_paths", unreadable)
-    monkeypatch.setattr(bash_tool, "_execute_local", forbidden_execute)
-
-    denied = json.loads(await bash_tool._bash_impl(
-        "entity",
-        command=command,
-        workspace_id="ws_1",
-        _user_id_from_context=runtime_user_id,
-        _projection_repaired=True,
-    ))
-
-    assert "Access denied" in denied["error"]
-    assert calls == [{
-        "entity_id": "entity",
-        "rel_paths": ["private.md"],
-        "user_id": runtime_user_id,
-        "workspace_id": "ws_1",
-        "actor_type": "agent",
-    }]
-
-
 @pytest.mark.asyncio
 async def test_bash_code_execution_fails_closed_without_sandbox(monkeypatch):
-    from packages.core.ai.tools import bash_tool
+    from packages.core.ai.tools import bash_tool, sandbox_tools
 
-    async def forbidden_local(*_args, **_kwargs):
-        raise AssertionError("executable commands must never run in the API container")
-
-    monkeypatch.delenv("SANDBOX_SERVICE_URL", raising=False)
-    monkeypatch.setattr(bash_tool, "_execute_local", forbidden_local)
-    result = json.loads(await _bash("", command="python3 --version"))
-
-    assert result["error"] == "sandbox_required"
-    assert result["command_executed"] is False
-
-
-@pytest.mark.asyncio
-async def test_bash_local_file_commands_require_entity_filesystem(monkeypatch, tmp_path):
-    from packages.core.ai.tools import bash_tool
-    from packages.core.config import get_settings
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", False)
-    host_file = tmp_path / "host-secret.md"
-    host_file.write_text("HOST_ONLY_SECRET", encoding="utf-8")
-
-    async def forbidden_local(*_args, **_kwargs):
-        raise AssertionError("host filesystem commands must not execute")
-
-    monkeypatch.setattr(bash_tool, "_execute_local", forbidden_local)
-    denied = json.loads(await bash_tool._bash_impl(
-        "entity",
-        user_id="user_1",
-        command=f"cat {host_file}",
-        _projection_repaired=True,
-    ))
-
-    assert denied["error"] == "entity_filesystem_unavailable"
-    assert denied["command_executed"] is False
-
-
-@pytest.mark.asyncio
-async def test_bash_internal_content_reads_fail_before_execution(monkeypatch, tmp_path):
-    from packages.core.ai.tools import bash_tool
-    from packages.core.config import get_settings
-
-    settings = get_settings()
-    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
-    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
-    secret = (
-        tmp_path
-        / "entity"
-        / ".ai"
-        / "workspaces"
-        / "ws_other"
-        / "memory"
-        / "facts"
-        / "secret.md"
-    )
-    secret.parent.mkdir(parents=True)
-    secret.write_text("OTHER_WORKSPACE_MEMORY", encoding="utf-8")
-
-    async def forbidden_local(*_args, **_kwargs):
-        raise AssertionError("internal paths must be denied before execution")
-
-    monkeypatch.setattr(bash_tool, "_execute_local", forbidden_local)
-    denied = json.loads(await bash_tool._bash_impl(
-        "entity",
-        user_id="user_1",
-        workspace_id="ws_current",
-        command="cat .ai/workspaces/ws_other/memory/facts/secret.md",
-        _projection_repaired=True,
-    ))
-
-    assert denied["error"] == "file_permission_denied"
-    assert "internal" in denied["reason"]
-
-
-def test_bash_content_reads_cannot_escape_entity_root(tmp_path):
-    root = tmp_path / "entity"
-    root.mkdir()
-
-    with pytest.raises(ValueError, match="inside the entity filesystem"):
-        _expanded_read_paths(
-            entity_root=str(root),
-            cwd=str(root),
-            paths=["/etc/passwd"],
-        )
-    for path in (
-        "~/outside-secret",
-        "{private,public}.md",
-    ):
-        with pytest.raises(ValueError, match="shell expansion"):
-            _expanded_read_paths(
-                entity_root=str(root),
-                cwd=str(root),
-                paths=[path],
-            )
-
-    internal = root / ".ai" / "memory.md"
-    internal.parent.mkdir()
-    internal.write_text("private", encoding="utf-8")
-    with pytest.raises(ValueError, match="internal"):
-        _expanded_read_paths(
-            entity_root=str(root),
-            cwd=str(root),
-            paths=[".ai/memory.md"],
-        )
-    assert _visible_read_paths("echo ignored < /etc/passwd") == ["/etc/passwd"]
+    assert not hasattr(bash_tool, "_execute_local"), "bash never runs a local subprocess"
+    monkeypatch.setattr(sandbox_tools, "_sandbox_available", lambda: False)
+    for entity_id in ("", "entity"):
+        result = json.loads(await _bash(entity_id, command="python3 --version"))
+        assert result["error"] == "sandbox_required"
+        assert result["command_executed"] is False
 
 
 @pytest.mark.asyncio
@@ -5093,59 +4623,6 @@ def _resolver_for(root):
     return _resolve
 
 
-@pytest.mark.asyncio
-async def test_post_bash_mv_directory_rename_uses_destination_path(monkeypatch, tmp_path):
-    from packages.core.services import knowledge_sync
-
-    root = tmp_path / "entity"
-    (root / "NewFolder").mkdir(parents=True)
-    calls: list[tuple[str, str]] = []
-
-    async def fake_move_path(_entity_id: str, old_rel: str, new_rel: str) -> bool:
-        calls.append((old_rel, new_rel))
-        return True
-
-    monkeypatch.setattr(knowledge_sync, "move_path", fake_move_path)
-
-    await _handle_mv_cp(
-        "mv",
-        ["OldFolder", "NewFolder"],
-        "ent_1",
-        str(root),
-        _resolver_for(str(root)),
-        str(root),
-    )
-
-    assert calls == [("OldFolder", "NewFolder")]
-
-
-@pytest.mark.asyncio
-async def test_post_bash_mv_into_directory_uses_child_path(monkeypatch, tmp_path):
-    from packages.core.services import knowledge_sync
-
-    root = tmp_path / "entity"
-    (root / "Target" / "brief.md").parent.mkdir(parents=True)
-    (root / "Target" / "brief.md").write_text("moved", encoding="utf-8")
-    calls: list[tuple[str, str]] = []
-
-    async def fake_move_path(_entity_id: str, old_rel: str, new_rel: str) -> bool:
-        calls.append((old_rel, new_rel))
-        return True
-
-    monkeypatch.setattr(knowledge_sync, "move_path", fake_move_path)
-
-    await _handle_mv_cp(
-        "mv",
-        ["brief.md", "Target"],
-        "ent_1",
-        str(root),
-        _resolver_for(str(root)),
-        str(root),
-    )
-
-    assert calls == [("brief.md", "Target/brief.md")]
-
-
 def test_mutating_file_tool_schemas_accept_approval_token():
     schemas = [
         BASH_SCHEMA,
@@ -5153,7 +4630,6 @@ def test_mutating_file_tool_schemas_accept_approval_token():
         DELETE_FILE_SCHEMA,
         GENERATE_FILE_SCHEMA,
         _SANDBOX_SAVE_RESULT_SCHEMA,
-        SAVE_SANDBOX_FILE_SCHEMA,
         MANOR_SCHEMA,
     ]
     assert all("approval_token" in _props(schema) for schema in schemas)

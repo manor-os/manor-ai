@@ -31,14 +31,35 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-def _envelope_granted_sandbox_skips_durable_catalog(request: RuntimeAuthorizationRequest) -> bool:
-    if "sandbox" not in request.bound_tool_names:
-        return False
-    if not request.tool_name or request.tool_name not in request.bound_tool_names:
-        return False
-    from packages.core.ai.runtime.composite_tools import SANDBOX_LEGACY_TOOL_BY_ACTION
+def _internal_default_grant_skips_durable_catalog(request: RuntimeAuthorizationRequest) -> bool:
+    """Server-owned internal grants (the Sandbox) need no durable binding.
 
-    return request.tool_name in {"sandbox", *SANDBOX_LEGACY_TOOL_BY_ACTION.values()}
+    Only on an internal surface. The caller has already required the tool in
+    this loop's allowlist (a narrowed or blocked loop stays narrowed) and
+    still checks agent identity, entity membership and the role permission.
+    """
+
+    from packages.core.ai.runtime.profiles import runtime_surface_is_internal
+    from packages.core.ai.runtime.tool_visibility import (
+        runtime_tool_is_internal_default_grant,
+    )
+
+    return runtime_surface_is_internal(
+        request.runtime_surface
+    ) and runtime_tool_is_internal_default_grant(request.tool_name or "")
+
+
+async def _request_user_role(db: "AsyncSession", request: RuntimeAuthorizationRequest) -> str | None:
+    """``request.user_id``'s role: the collaborator gate's resolution when the service passed one."""
+    if request.user_role_resolved:
+        return request.resolved_user_role
+    from packages.core.services.resource_access import resolve_user_role
+
+    return await resolve_user_role(
+        db,
+        user_id=request.user_id,
+        entity_id=request.entity_id,
+    )
 
 
 class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
@@ -122,7 +143,7 @@ class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
                 request.access is RuntimeAuthorizationAccess.CONTROL
                 and request.tool_name in RUNTIME_LOOP_CONTROL_TOOL_NAMES
             )
-            and not _envelope_granted_sandbox_skips_durable_catalog(request)
+            and not _internal_default_grant_skips_durable_catalog(request)
         ):
             binding = await self._binding_verifier.verify(db, request)
             if not binding.current:
@@ -144,14 +165,13 @@ class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
                     "Runtime actor does not match the execution user.",
                     AuthorizationRule.RUNTIME_IDENTITY_MISMATCH,
                 )
+            if request.collaborator_workspace_ids is not None:
+                # Admitted by the service's collaborator gate in a live-granted
+                # Workspace; the binding above still had to be current.
+                return PermissionDecision.allow(AuthorizationRule.COLLABORATOR_WORKSPACE)
             from packages.core.permissions import user_has_effective_permission
-            from packages.core.services.resource_access import resolve_user_role
 
-            role = await resolve_user_role(
-                db,
-                user_id=request.user_id,
-                entity_id=request.entity_id,
-            )
+            role = await _request_user_role(db, request)
             if role is None:
                 return PermissionDecision.deny(
                     "The execution user is not an active member of this entity.",
@@ -213,10 +233,29 @@ class ExternalRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
                 "This external runtime is not bound to the requested tool.",
                 AuthorizationRule.EXTERNAL_TOOL_BINDING,
             )
+        from packages.core.ai.runtime.tool_visibility import (
+            runtime_tool_is_internal_default_grant,
+        )
+
+        if runtime_tool_is_internal_default_grant(request.tool_name):
+            # Internal-only server grants (the Sandbox) never reach an
+            # external principal, whatever its tool list carries.
+            return PermissionDecision.deny(
+                "External principals cannot use internal-only runtime tools.",
+                AuthorizationRule.EXTERNAL_TOOL_BINDING,
+            )
         if request.access in {
             RuntimeAuthorizationAccess.READ,
             RuntimeAuthorizationAccess.USE,
         }:
+            return PermissionDecision.allow(AuthorizationRule.EXTERNAL_TOOL_BINDING)
+        if (
+            request.access is RuntimeAuthorizationAccess.CONTROL
+            and request.tool_name == "call_tool"
+            and request.subject.action_key == "runtime.control.call_tool"
+        ):
+            # A gateway-rejected call executes nothing; the bound discovery
+            # tool only echoes the rejection back to the model.
             return PermissionDecision.allow(AuthorizationRule.EXTERNAL_TOOL_BINDING)
         if (
             request.access is RuntimeAuthorizationAccess.CONTROL
@@ -291,20 +330,30 @@ class HumanRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
                 "Runtime actor does not match the execution user.",
                 AuthorizationRule.RUNTIME_IDENTITY_MISMATCH,
             )
+        if request.collaborator_workspace_ids is not None:
+            # The service's collaborator gate already admitted this subject in a
+            # live-granted Workspace; company permissions do not apply to them.
+            return await self.authorize_collaborator(db, request)
 
-        from packages.core.services.resource_access import resolve_user_role
-
-        role = await resolve_user_role(
-            db,
-            user_id=request.user_id,
-            entity_id=request.entity_id,
-        )
+        role = await _request_user_role(db, request)
         if role is None:
             return PermissionDecision.deny(
                 "The user is not an active member of this entity.",
                 AuthorizationRule.ENTITY_MEMBERSHIP,
             )
         return await self.authorize_active_actor(db, request, str(role))
+
+    async def authorize_collaborator(
+        self,
+        db: "AsyncSession",
+        request: RuntimeAuthorizationRequest,
+    ) -> PermissionDecision:
+        """Entity-scope requests have no Workspace, so the gate never admits them."""
+        del db, request
+        return PermissionDecision.deny(
+            "External collaborators work only inside the Workspace their collaboration covers.",
+            AuthorizationRule.COLLABORATOR_WORKSPACE,
+        )
 
     @abstractmethod
     def missing_actor_decision(
@@ -369,6 +418,17 @@ class WorkspaceRuntimeAuthorizationStrategy(HumanRuntimeAuthorizationStrategy):
             "Workspace access requires an authenticated user or delegated agent.",
             AuthorizationRule.WORKSPACE_ACTOR_REQUIRED,
         )
+
+    async def authorize_collaborator(
+        self,
+        db: "AsyncSession",
+        request: RuntimeAuthorizationRequest,
+    ) -> PermissionDecision:
+        # The live grant makes the collaborator this Workspace's owner for the
+        # trial: READ through MANAGE. MCP bindings still apply.
+        if denial := await self._mcp_binding_denial(db, request):
+            return denial
+        return PermissionDecision.allow(AuthorizationRule.COLLABORATOR_WORKSPACE)
 
     async def authorize_active_actor(
         self,
@@ -631,6 +691,29 @@ class RuntimeAuthorizationStrategyFactory:
         else:
             strategy_kind = AuthorizationStrategyKind.ENTITY
         return self._strategies[strategy_kind]
+
+
+def runtime_strategy_resolves_user_role(request: RuntimeAuthorizationRequest) -> bool:
+    """Whether the strategy ``RuntimeAuthorizationStrategyFactory`` picks resolves ``user_id``'s role.
+
+    The human strategies always do; the delegated one only for READ/USE/CONTROL
+    with a user. The service's collaborator gate resolves it up front then and
+    hands it over, so the role is resolved once.
+    """
+    if not request.user_id or (request.principal_kind_supplied and request.principal_kind is None):
+        return False
+    kind = request.principal_kind
+    if kind in {AuthorizationPrincipalKind.AGENT, AuthorizationPrincipalKind.DELEGATED}:
+        return request.access in {
+            RuntimeAuthorizationAccess.READ,
+            RuntimeAuthorizationAccess.USE,
+            RuntimeAuthorizationAccess.CONTROL,
+        }
+    return kind not in {
+        AuthorizationPrincipalKind.SYSTEM_WORKER,
+        AuthorizationPrincipalKind.EXTERNAL_CONTACT,
+        AuthorizationPrincipalKind.ANONYMOUS_PUBLIC,
+    }
 
 
 class HitlAuthorizationStrategyFactory:

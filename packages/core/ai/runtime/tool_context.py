@@ -6,7 +6,7 @@ from typing import Any
 
 from packages.core.ai.runtime.capabilities import _TOOL_CAPABILITY_ALIAS_TARGETS
 from packages.core.ai.runtime.profiles import RuntimeProfile
-from packages.core.ai.runtime.sandbox import runtime_task_binding_key
+from packages.core.ai.runtime.sandbox import runtime_task_binding_key, runtime_workflow_binding_key
 from packages.core.ai.runtime.surfaces import ChatSurface
 
 
@@ -15,10 +15,9 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 # cannot silently fall out of the set.
 #
 # This is narrower than the ``sandbox.execute`` capability on purpose: that
-# capability also covers ``video_edit`` and ``coding_based_video``, which
-# resolve their own sessions by the run's real conversation id and never read
-# the sandbox binding. Handing them the binding key would authorize them
-# against a scope they do not use.
+# capability also covers ``video_edit``, which keeps its own session record
+# (scoped by the same binding key) and never reads a sandbox-tool binding, so
+# it is authorized against the run's real conversation like any other tool.
 RUNTIME_SANDBOX_BOUND_TOOL_NAMES = frozenset(
     {"sandbox"}
     | {
@@ -66,12 +65,15 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "_workflow_scene_id_from_context",
         "_workflow_batch_capture_from_context",
         "_approved_plan_version_from_context",
+        "_workflow_effect_deadline_at_from_context",
+        "_workflow_effect_deadline_action_keys_from_context",
+        "_media_lineage_from_context",
     }
 )
 
 
 def _string_set(values: Iterable[Any] | None) -> set[str]:
-    if not isinstance(values, (list, tuple, set)):
+    if not isinstance(values, (list, tuple, set, frozenset)):
         return set()
     return {str(value).strip() for value in values if str(value or "").strip()}
 
@@ -82,7 +84,7 @@ def _url_set(values: Iterable[Any] | None) -> set[str]:
 
 def runtime_allowed_tool_names_from_context(kwargs: dict[str, Any]) -> set[str] | None:
     allowed_tool_names = kwargs.get("_allowed_tool_names_from_context")
-    if isinstance(allowed_tool_names, (list, tuple, set)):
+    if isinstance(allowed_tool_names, (list, tuple, set, frozenset)):
         return _string_set(allowed_tool_names)
     return None
 
@@ -133,6 +135,8 @@ class RuntimeToolCallContext:
     workflow_scene_id: str | None = None
     workflow_batch_capture: str | None = None
     approved_plan_version: str | None = None
+    workflow_effect_deadline_at: str | None = None
+    workflow_effect_deadline_action_keys: frozenset[str] = frozenset()
     performance_run_id: str | None = None
     runtime_run_id: str | None = None
     runtime_tool_call_id: str | None = None
@@ -252,7 +256,8 @@ def runtime_tool_call_context_from_kwargs(
     #   - the sandbox tool handlers' per-call owner match and context load
     #   - the sandbox media guard in generate_file and the office skill handoff
     #   - the authorization request for the ``sandbox`` tool and its aliases,
-    #     selected by ``runtime_authorization_conversation_id``
+    #     carried as ``sandbox_binding_key`` beside the real conversation
+    #     (``runtime_authorization_sandbox_binding_key``)
     #
     # The key is sized to fit a ``String(26)`` conversation column, so the
     # sites that persist this scope -- the sandbox binding itself, and
@@ -264,26 +269,40 @@ def runtime_tool_call_context_from_kwargs(
     # unforgeable: ``conversation_id`` and ``task_id`` are both trusted
     # runtime keys, and a model-supplied value that disagrees with the
     # runtime's raises a conflict rather than winning. The residual case is
-    # a run that carries a user but neither a runtime task nor a
-    # conversation, where an unopposed model-supplied task_id could mint a
-    # key. That key is bounded to the same user's owner scope, so it can
-    # only reach sandboxes that user already owns.
+    # a run that carries neither a runtime task nor a conversation, where an
+    # unopposed model-supplied task_id could mint a key. A binding slot is
+    # keyed on (entity, user, binding key, agent, kind), so such a key can
+    # only reach sandboxes bound to the same entity, user (or the same
+    # user-less identity), and agent.
     #
-    # Requires an actor: every consumer of the key (admission's owner
-    # registry, the authorization recheck, the per-call owner match) is
-    # keyed on user_id, and a call with neither conversation nor user is
-    # the identity-free trusted-internal path that those checks skip.
+    # A user-less run (Strategist/scheduler tasks run with user_id=None by
+    # design) gets the key too. There is no identity-free path: a sandbox
+    # call with no binding key is denied, so a user-less task without its
+    # key could not operate the sandbox it opened, and before scoped
+    # bindings it skipped every owner check instead.
     #
     # With cloud external-runner coordination these runs have no durable
     # ``RuntimeRun`` to suspend on a reservation, so the session service
     # enqueues a *task* reservation keyed on ``task_id`` and waits
     # synchronously for the scheduler to allocate a runner; the key below is
     # still what binds and re-finds the resulting sandbox.
-    sandbox_binding_key = resolved_conversation_id or (
-        runtime_task_binding_key(resolved_task_id)
-        if resolved_task_id and resolved_user_id
-        else None
-    )
+    #
+    # Ownership (see ``packages.core.ai.runtime.sandbox``): a human run's
+    # sandboxes belong to the user in the run's conversation, which delegates
+    # and sub-agents share because they run in their parent's conversation. A
+    # user-less run (no human owner) is keyed by its TASK even when it carries
+    # a conversation, so system work never shares a container with a human's
+    # conversation sandbox.
+    task_key = runtime_task_binding_key(resolved_task_id) if resolved_task_id else None
+    workflow_run_id = str(kwargs.get("_workflow_run_id_from_context") or "").strip() or None
+    workflow_key = runtime_workflow_binding_key(workflow_run_id) if workflow_run_id else None
+    # Standalone Workflow agents (including nested Skills) need a work area
+    # too. Only the trusted run context supplies it; Task/Conversation fields
+    # stay real and existing human-chat and Task bindings keep precedence.
+    if resolved_user_id:
+        sandbox_binding_key = resolved_conversation_id or task_key or workflow_key
+    else:
+        sandbox_binding_key = task_key or workflow_key or resolved_conversation_id
     return RuntimeToolCallContext(
         entity_id=_runtime_scope_value("entity_id", entity_id, *envelope_values("entity_id")),
         agent_id=_runtime_scope_value(
@@ -318,7 +337,7 @@ def runtime_tool_call_context_from_kwargs(
         sandbox_binding_key=sandbox_binding_key,
         task_id=resolved_task_id,
         workflow_project_id=str(kwargs.get("_workflow_project_id_from_context") or "") or None,
-        workflow_run_id=str(kwargs.get("_workflow_run_id_from_context") or "") or None,
+        workflow_run_id=workflow_run_id,
         workflow_lineage_root_run_id=(
             str(kwargs.get("_workflow_lineage_root_run_id_from_context") or "") or None
         ),
@@ -335,6 +354,12 @@ def runtime_tool_call_context_from_kwargs(
         ),
         approved_plan_version=(
             str(kwargs.get("_approved_plan_version_from_context") or "") or None
+        ),
+        workflow_effect_deadline_at=(
+            str(kwargs.get("_workflow_effect_deadline_at_from_context") or "") or None
+        ),
+        workflow_effect_deadline_action_keys=frozenset(
+            _string_set(kwargs.get("_workflow_effect_deadline_action_keys_from_context"))
         ),
         performance_run_id=(
             str(kwargs.get("_performance_run_id_from_context") or "") or None
@@ -396,21 +421,21 @@ def runtime_tool_call_context_from_handler(
     return runtime_tool_call_context_from_kwargs(kwargs, user_id=direct_user_id)
 
 
-def runtime_authorization_conversation_id(
+def runtime_authorization_sandbox_binding_key(
     context: RuntimeToolCallContext,
     tool_name: str | None,
 ) -> str | None:
-    """Return the conversation scope an authorization request should carry.
+    """Return the sandbox binding an authorization request should carry.
 
     Sandbox-bound tools are authorized against the sandbox binding, so a
-    conversation-less task-worker run must present its binding key or the
-    storage recheck has nothing to look up. Every other tool is authorized
-    against the run's real conversation.
+    conversation-less Task or Workflow run still presents a scope the
+    binding check can look up. The request keeps the real conversation
+    separately; every other tool carries no binding.
     """
 
     if str(tool_name or "").strip() in RUNTIME_SANDBOX_BOUND_TOOL_NAMES:
         return context.sandbox_binding_key
-    return context.conversation_id
+    return None
 
 
 def runtime_tool_call_context_is_external_customer(kwargs: dict[str, Any]) -> bool:
@@ -463,6 +488,8 @@ def runtime_injected_tool_context_args(
     chrome_sequence_child: bool = False,
     chrome_expected_connection_id: str | None = None,
     runtime_validation_duration_ms: float | None = None,
+    workflow_effect_deadline_at: str | None = None,
+    workflow_effect_deadline_action_keys: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     args: dict[str, Any] = {
         "_agent_id_from_context": agent_id,
@@ -507,6 +534,12 @@ def runtime_injected_tool_context_args(
         args["conversation_id"] = conversation_id
     if task_id:
         args["task_id"] = task_id
+    if workflow_effect_deadline_at:
+        args["_workflow_effect_deadline_at_from_context"] = workflow_effect_deadline_at
+    if workflow_effect_deadline_action_keys is not None:
+        args["_workflow_effect_deadline_action_keys_from_context"] = list(
+            _string_set(workflow_effect_deadline_action_keys)
+        )
     if chrome_interaction_mode == "fast":
         args["_runtime_chrome_interaction_mode_from_context"] = "fast"
     if chrome_sequence_child:

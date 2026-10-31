@@ -94,13 +94,15 @@ def test_builds_the_versioned_verified_backfill_contract() -> None:
 
 
 def test_uses_authoritative_public_channel_when_studio_channel_is_not_supplied() -> None:
-    receipt = _build_receipt(expected_channel_name="")
+    receipt = _build_receipt(expected_channel_name="", expected_channel_id=_metrics().channel_id)
 
     assert receipt["channel_id"] == _metrics().channel_id
     assert receipt["channel_name"] == _metrics().channel_name
 
 
 def test_rejects_public_identity_mismatches() -> None:
+    with pytest.raises(ValueError, match="channel ID"):
+        _build_receipt(expected_channel_id="UC-another-channel")
     with pytest.raises(ValueError, match="video ID"):
         _build_receipt(expected_video_id="a-different-id")
 

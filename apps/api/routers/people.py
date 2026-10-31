@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.database import get_db
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.staff import Staff, StaffRole
+from packages.core.services.user_avatars import person_avatar_url, real_avatar_url
 from packages.core.permissions import (
     Permission,
     check_effective_permission,
@@ -24,16 +25,24 @@ from packages.core.permissions import (
     user_staff_role_summary,
 )
 from packages.core.services.auth_service import (
+    COLLABORATOR_NOT_SWITCHABLE,
+    COLLABORATOR_ROLE,
     activate_user_membership,
     create_access_token,
     ensure_user_membership,
     get_user_membership,
     hash_password,
     list_user_memberships,
+    require_assignable_role,
 )
 from packages.core.services.team_invite_service import (
     accept_team_invite_for_user,
     decline_team_invite_for_user,
+)
+from packages.core.services.team_authority import (
+    require_can_grant_role,
+    require_can_manage_member,
+    require_resettable_account,
 )
 from packages.core.services.people_service import (
     list_clients, get_client, create_client, update_client, delete_client,
@@ -245,6 +254,8 @@ class StaffCreateRequest(BaseModel):
     role: str = "staff"
     skills: list[str] = []
     service_categories: list[str] = []
+
+    _assignable_role = field_validator("role")(require_assignable_role)
     user_id: str | None = None
 
     company_name: str | None = None
@@ -273,6 +284,8 @@ class StaffUpdateRequest(BaseModel):
     role: str | None = None
     skills: list[str] | None = None
     service_categories: list[str] | None = None
+
+    _assignable_role = field_validator("role")(require_assignable_role)
 
     company_name: str | None = None
     tax_id: str | None = None
@@ -397,10 +410,7 @@ async def _staff_response(
         or "Team member"
     )
     display_email = s.email or (linked_user.email if linked_user else None)
-    avatar_url = (
-        (linked_user.avatar_url if linked_user else None)
-        or s.avatar_url
-    )
+    avatar_url = person_avatar_url(linked_user.avatar_url if linked_user else None, s.avatar_url)
     return StaffResponse(
         id=s.id,
         entity_id=s.entity_id,
@@ -416,7 +426,7 @@ async def _staff_response(
         role=legacy_role,
         role_name=role_row.name if role_row else None,
         login_email=linked_user.email if linked_user else None,
-        login_avatar_url=linked_user.avatar_url if linked_user else None,
+        login_avatar_url=real_avatar_url(linked_user.avatar_url) if linked_user else None,
         skills=s.skills or [],
         service_categories=getattr(s, "service_categories", None) or [],
         company_name=getattr(s, "company_name", None),
@@ -450,7 +460,7 @@ def _gateway_user(user: User) -> GatewayUserResponse:
         first_name=user.first_name,
         last_name=user.last_name,
         phone=user.phone,
-        avatar_url=user.avatar_url,
+        avatar_url=real_avatar_url(user.avatar_url),
         timezone=user.timezone,
         locale=user.locale,
     )
@@ -686,7 +696,7 @@ async def _billing_response(
 
 async def _people_context(db: AsyncSession, user: User) -> PeopleContextResponse:
     current_entity = await db.get(Entity, user.entity_id)
-    membership_rows = await list_user_memberships(db, user)
+    membership_rows = await list_user_memberships(db, user, include_collaborator=False)
     memberships = [
         await _membership_response(
             db,
@@ -821,7 +831,7 @@ async def people_directory(
             id=row_user.id,
             email=row_user.email,
             display_name=row_user.display_name,
-            avatar_url=row_user.avatar_url,
+            avatar_url=person_avatar_url(row_user.avatar_url, staff.avatar_url if staff else None),
             membership_status=membership.status,
             staff_id=staff.id if staff else None,
             staff_name=staff.name if staff else None,
@@ -877,6 +887,8 @@ async def switch_people_membership(
     membership = await get_user_membership(db, user=user, entity_id=entity_id)
     if not membership or membership.status != "active":
         raise HTTPException(403, "You do not have an active membership in this company.")
+    if membership.role == COLLABORATOR_ROLE:
+        raise HTTPException(403, COLLABORATOR_NOT_SWITCHABLE)
     await activate_user_membership(db, user=user, membership=membership)
     access_token = create_access_token(
         user.id,
@@ -942,6 +954,9 @@ async def leave_people_membership(
                 UserMembership.user_id == user.id,
                 UserMembership.status == "active",
                 UserMembership.entity_id != user.entity_id,
+                # Only a company the person works in, never a collaborator one.
+                UserMembership.role != COLLABORATOR_ROLE,
+                UserMembership.deleted_at.is_(None),
             )
             .order_by(UserMembership.is_primary.desc(), UserMembership.created_at.asc())
             .limit(1)
@@ -1068,6 +1083,18 @@ async def create_new_staff(
     ):
         await _require_user_management(db, user)
     await _require_role_in_entity(db, req.role_id, user.entity_id)
+    await require_can_grant_role(db, user, role_id=req.role_id, role_name=req.role)
+    if req.user_id is not None:
+        linked = (await db.execute(
+            select(Staff.id).where(
+                Staff.user_id == req.user_id,
+                Staff.entity_id == user.entity_id,
+                Staff.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if linked is not None:
+            # A second live row for one person disables their membership.
+            raise HTTPException(409, "This person is already on the team")
     s = await create_staff_member(
         db, user.entity_id, **req.model_dump(exclude_none=True),
     )
@@ -1095,10 +1122,26 @@ async def update_one_staff(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if req.role_id is not None or req.role is not None or req.status is not None:
-        await _require_user_management(db, user)
+    # Every field is team management: an unguarded email edit let any member
+    # redirect a pending invite to their own address and accept its role.
+    await _require_user_management(db, user)
     await _require_role_in_entity(db, req.role_id, user.entity_id)
-    s = await update_staff_member(db, staff_id, user.entity_id, **req.model_dump(exclude_none=True))
+    target = await get_staff_member(db, staff_id, user.entity_id)
+    if not target:
+        raise HTTPException(404, "Staff member not found")
+    await require_can_manage_member(db, user, staff=target)
+    await require_can_grant_role(db, user, role_id=req.role_id, role_name=req.role)
+    fields = req.model_dump(exclude_none=True)
+    if (
+        "email" in fields
+        and target.status == "invited"
+        and _normalized_email(fields["email"]) != _normalized_email(target.email)
+    ):
+        # The emailed link belongs to the old address; it must be re-sent.
+        meta = dict(target.meta or {})
+        meta.pop("invite_token", None)
+        target.meta = meta
+    s = await update_staff_member(db, staff_id, user.entity_id, **fields)
     if not s:
         raise HTTPException(404, "Staff member not found")
     existing_user_emails = await _existing_user_emails(db, user.entity_id, [s.email])
@@ -1116,6 +1159,8 @@ async def delete_one_staff(
     # UI cleanup path smooth without leaking whether a cross-entity ID exists.
     await _require_user_management(db, user)
     staff = await get_staff_member(db, staff_id, user.entity_id)
+    if staff is not None:
+        await require_can_manage_member(db, user, staff=staff)
     if staff is not None and staff.user_id:
         from packages.core.models.document import Document, DocumentFolder
 
@@ -1276,6 +1321,9 @@ async def leave_my_team(
                 UserMembership.user_id == user.id,
                 UserMembership.status == "active",
                 UserMembership.entity_id != user.entity_id,
+                # Only a company the person works in, never a collaborator one.
+                UserMembership.role != COLLABORATOR_ROLE,
+                UserMembership.deleted_at.is_(None),
             )
             .order_by(UserMembership.is_primary.desc(), UserMembership.created_at.asc())
             .limit(1)
@@ -1384,6 +1432,8 @@ async def create_staff_account(
     member = await get_staff_member(db, staff_id, user.entity_id)
     if not member:
         raise HTTPException(404, "Staff member not found")
+    # The caller learns the password: an admin must not mint an owner/admin login.
+    await require_can_manage_member(db, user, staff=member)
     if not member.email:
         raise HTTPException(400, "Staff member must have an email address before creating an account")
     if member.user_id:
@@ -1393,7 +1443,6 @@ async def create_staff_account(
     if existing.scalar_one_or_none():
         raise HTTPException(409, "A user with that email already exists")
 
-    from packages.core.services.auth_service import _generate_avatar_url
     from packages.core.models.base import generate_ulid
 
     plain_password = secrets.token_urlsafe(12)
@@ -1413,7 +1462,7 @@ async def create_staff_account(
         email=member.email,
         display_name=member.name,
         password_hash=hash_password(plain_password),
-        avatar_url=member.avatar_url or _generate_avatar_url(member.name),
+        avatar_url=member.avatar_url or None,
         role=role,
         status="active",
     )
@@ -1461,6 +1510,8 @@ async def reset_staff_account_password(
         raise HTTPException(404, "Staff member not found")
     if not member.user_id:
         raise HTTPException(409, "Staff member does not have a login account")
+    await require_can_manage_member(db, user, staff=member)
+    await require_resettable_account(db, user, user_id=member.user_id)
 
     linked = (
         await db.execute(
@@ -1472,6 +1523,9 @@ async def reset_staff_account_password(
 
     plain_password = secrets.token_urlsafe(12)
     linked.password_hash = hash_password(plain_password)
+    if linked.id != user.id:
+        # Whoever held the old password must not keep a live session.
+        linked.token_version = int(linked.token_version or 0) + 1
     await db.flush()
 
     return StaffAccountResponse(

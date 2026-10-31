@@ -43,6 +43,7 @@ class ResourceType:
 class SubjectType:
     """String constants for resource_grants.subject_type."""
     USER = "user"
+    ENTITY = "entity"                   # subject_id = entity_id; active non-client members
     STAFF_ROLE = "staff_role"
     WORKSPACE_ROLE = "workspace_role"   # subject_id = "{workspace_id}:{role}"
     TEAM = "team"                       # reserved for future

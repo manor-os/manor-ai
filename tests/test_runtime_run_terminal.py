@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.core.models.base import generate_ulid
@@ -21,7 +21,6 @@ from packages.core.models.runtime_run import (
     RuntimeOutboxEvent,
     RuntimeRun,
     RuntimeRunStatus,
-    SandboxReservation,
     SandboxReservationStatus,
     SandboxRunner,
     SandboxRunnerStatus,
@@ -99,7 +98,9 @@ async def _allocating(db, reservation, *, attempts: int) -> SandboxRunner:
     runner = SandboxRunner(
         id=f"runner-{reservation.id}"[:80],
         base_url=f"http://10.9.0.1:8000/{reservation.id}",
-        status=SandboxRunnerStatus.HEALTHY.value,
+        # Bookkeeping only: some tests here commit it, and a committed healthy
+        # runner with a free slot would take other tests' tickets.
+        status=SandboxRunnerStatus.DRAINING.value,
         active_limit=2,
         executing_limit=1,
         active_count=1,
@@ -288,6 +289,11 @@ async def test_outbox_dispatch_announces_failure_to_stream_and_realtime(
     from packages.core.services import realtime, runtime_event_stream
     from packages.core.tasks import runtime_tasks
 
+    # This global publisher also recovers expired runs. Earlier tests may have
+    # committed both runs and notices; clear them before creating this target.
+    await db_session.execute(delete(RuntimeOutboxEvent))
+    await db_session.execute(delete(RuntimeRun))
+    await db_session.commit()
     now = datetime.now(timezone.utc)
     run, message, reservation = await _parked_run(db_session, now=now)
     await _allocating(db_session, reservation, attempts=5)

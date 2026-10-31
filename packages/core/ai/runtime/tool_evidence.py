@@ -177,10 +177,107 @@ def _child_identity_digest(item: dict) -> str:
 # that keeps opening sandboxes cannot grow this list without bound.
 _MAX_SANDBOX_HANDOFFS = 16
 _MAX_HANDOFF_FAILURES = 8
+#: Calls that run something inside a handed-off sandbox.
+_SANDBOX_RUN_TOOLS = frozenset({"sandbox_exec", "sandbox_status"})
 
 
 # Ledger bookkeeping stays host-only; handles become model-visible only in W2.
-_HOST_ONLY_OBSERVATION_KEYS = frozenset({"receipt_records", "receipt_handles", *_CLASSIFIER_FACT_KEYS})
+# A platform fault's raw payload is for the operator, never model context.
+_HOST_ONLY_OBSERVATION_KEYS = frozenset({
+    "receipt_records", "receipt_handles", "effect_targets", "effect_source", "platform_error_details",
+    *_CLASSIFIER_FACT_KEYS,
+})
+# ``effect_source`` of a call whose effect state is its child ledger's (a Skill).
+_CHILD_LEDGER_SOURCE = "child_ledger"
+
+
+# ── Reconciliation: an unconfirmed call confirmed by a later host observation ──
+#
+# An unconfirmed call (it errored, or reported an uncertain status) may still
+# name the exact artifacts it produced: the receipts its host projection reads
+# from its payload. Those are its *targets* (identity plus content hash). A
+# later host observation of the same target with the same hash (read_file
+# hashing the bytes, or a confirmed receipt of another call) proves the
+# effect is in place, and once every target of the call is observed the call
+# is confirmed. Only host facts count: a target without a hash, or a hash the
+# model quotes, never confirms anything.
+_MAX_TARGETS_PER_CALL = 8
+_MAX_RECONCILED_CALLS = 64
+# Host-native reads whose payload is the target's measured identity and hash.
+_HOST_HASH_READ_TOOLS = frozenset({"read_file"})
+
+
+def _norm_path(value: Any) -> str | None:
+    text = str(value or "").strip().lstrip("/")
+    return text or None
+
+
+def _norm_hash(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text or None
+
+
+def _effect_targets(receipts: Iterable[dict]) -> list[dict]:
+    """Identity (+ hash when known) of each file a call reported.
+
+    A target with a hash can be confirmed by a host read of those bytes; one
+    without can only be superseded by a later confirmed rewrite. Either way
+    it names what the call may have changed.
+    """
+    targets: list[dict] = []
+    for receipt in receipts:
+        sha256 = _norm_hash(receipt.get("sha256"))
+        identity = {
+            key: value for key, value in (
+                ("document_id", str(receipt.get("document_id") or "").strip() or None),
+                ("fs_path", _norm_path(receipt.get("fs_path"))),
+            ) if value
+        }
+        if not identity:
+            continue
+        target = {**identity, **({"sha256": sha256} if sha256 else {})}
+        if target not in targets:
+            targets.append(target)
+        if len(targets) >= _MAX_TARGETS_PER_CALL:
+            break
+    return targets
+
+
+def _same_identity(target: dict, observed: dict) -> bool:
+    same_document = bool(target.get("document_id")) and target.get("document_id") == observed.get("document_id")
+    same_path = bool(target.get("fs_path")) and _norm_path(target.get("fs_path")) == _norm_path(observed.get("fs_path"))
+    return same_document or same_path
+
+
+def _same_target(target: dict, observed: dict) -> bool:
+    if _norm_hash(target.get("sha256")) != _norm_hash(observed.get("sha256")) or not observed.get("sha256"):
+        return False
+    return _same_identity(target, observed)
+
+
+# Receipt operations that edit a file in place: the result builds on whatever
+# the file held, so they never supersede an earlier uncertain write to it.
+_IN_PLACE_RECEIPT_OPERATIONS = frozenset({"patch"})
+
+
+def _host_read_identity(tool_name: str, payload: Any) -> dict | None:
+    """The identity and hash a host read measured, or None."""
+    if tool_name not in _HOST_HASH_READ_TOOLS or not isinstance(payload, dict):
+        return None
+    sha256 = _norm_hash(payload.get("source_sha256"))
+    if not sha256 or _has_error(payload):
+        return None
+    observed = {
+        "document_id": str(payload.get("document_id") or "").strip() or None,
+        # The file the read resolved to, not the name it was asked for.
+        "fs_path": _norm_path(payload.get("resolved_path") or payload.get("path")),
+        "sha256": sha256,
+    }
+    return observed if observed["document_id"] or observed["fs_path"] else None
+
+
+def _has_error(payload: dict) -> bool:
+    return bool(payload.get("error")) or payload.get("isError") is True or payload.get("ok") is False
 
 
 def runtime_model_view_of_observation(item: dict) -> dict:
@@ -269,12 +366,20 @@ def runtime_child_evidence_from_state(state: Any) -> list[dict]:
             "tool": call.get("tool"),
             "operation": call.get("operation"),
             "effect_state": EffectState.UNCONFIRMED.value,
+            **({"effect_targets": copy.deepcopy(call["targets"])} if call.get("targets") else {}),
         }
     items = observations + list(evicted.values())
     # A call retried under the same ID can leave the child unconfirmed with no
-    # unconfirmed item left to say so; carry the sticky floor explicitly.
-    if state.get("effect_floor") == EffectState.UNCONFIRMED.value and not any(
-        _known_effect_state(item.get("effect_state")) == EffectState.UNCONFIRMED.value for item in items
+    # unconfirmed item left to say so; carry the sticky floor explicitly. So
+    # do calls past the child's list cap (its unlisted floor), which no item
+    # names and no reconciliation can clear.
+    if state.get("unlisted_floor") == EffectState.UNCONFIRMED.value or (
+        state.get("effect_floor") == EffectState.UNCONFIRMED.value and not any(
+            _known_effect_state(item.get("effect_state")) == EffectState.UNCONFIRMED.value
+            # A Skill call is unconfirmed only through its own (listed) children.
+            and item.get("effect_source") != _CHILD_LEDGER_SOURCE
+            for item in items
+        )
     ):
         items.append({**_EFFECT_FLOOR_MARKER, "effect_state": EffectState.UNCONFIRMED.value})
     effects = state.get("effects")
@@ -290,6 +395,36 @@ def runtime_child_evidence_from_state(state: Any) -> list[dict]:
             "effects_omitted": omitted if isinstance(omitted, int) and omitted > 0 else 0,
         })
     return items
+
+
+def runtime_unresolved_platform_error(state: Any) -> dict | None:
+    """The latest platform fault of a run that no later call recovered, or None.
+
+    Reads a ledger checkpoint (``RuntimeToolEvidence.checkpoint_state()``),
+    child Skill calls included. A later successful call of the same tool
+    operation means the run got past the fault.
+    """
+    observations = state.get("observations") if isinstance(state, dict) else None
+    unresolved: dict[tuple, dict] = {}
+    for item in observations or ():
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("tool"), item.get("operation"))
+        if item.get("platform_error"):
+            unresolved.pop(key, None)
+            unresolved[key] = item
+        elif item.get("result") == "returned":
+            unresolved.pop(key, None)
+    if not unresolved:
+        return None
+    item = list(unresolved.values())[-1]
+    return {
+        "code": str(item["platform_error"]),
+        "tool": item.get("tool"),
+        "operation": item.get("operation"),
+        "call_id": item.get("call_id"),
+        "details": copy.deepcopy(item.get("platform_error_details") or {}),
+    }
 
 
 class RuntimeToolEvidence:
@@ -324,6 +459,16 @@ class RuntimeToolEvidence:
         self._child_effects_accounted: dict[str, int] = {}
         # Effect call IDs counted during the merge in progress (None outside one).
         self._merge_counted: list[str] | None = None
+        # Unconfirmed calls later confirmed by a host observation of their
+        # targets (bounded audit trail, oldest dropped first).
+        self.reconciled_calls: list[dict] = []
+        # The floor without the listed unconfirmed calls (each counts as "may
+        # have had an effect"): what the floor drops back to once those calls
+        # are reconciled. A call past the list cap keeps it unconfirmed.
+        self._unlisted_floor = EffectState.NONE
+        # Call-ID prefix of the child ledger being merged: its calls were
+        # reconciled inside the child, in the child's order, never again here.
+        self._merging_prefix: str | None = None
 
     def configure_capability_scope(self, scope: dict[str, Any]) -> None:
         from packages.core.ai.runtime.capability_continuation import runtime_capability_scope
@@ -369,7 +514,16 @@ class RuntimeToolEvidence:
         # A receipt proves an artifact exists: at least confirmed, even when the
         # call that surfaced it was read-only (e.g. wait_media_jobs).
         receipt_state = runtime_aggregate_effect_state([observed, EffectState.CONFIRMED]).value
+        unconfirmed = _known_effect_state(observed) == EffectState.UNCONFIRMED.value
+        # A call that took its child ledger's state is unconfirmed exactly
+        # through its child calls, which are merged and listed themselves.
+        by_children = unconfirmed and observation.get("effect_source") == _CHILD_LEDGER_SOURCE
+        tracked = unconfirmed and not by_children and len(self.unconfirmed_calls) < _MAX_UNCONFIRMED_CALLS
+        # Without a listed call (or its listed children) to clear, unconfirmed
+        # stays in the unlisted floor for good.
+        unlisted_state = EffectState.CONFIRMED if tracked or by_children else observed
         self._effect_floor = runtime_aggregate_effect_state([self._effect_floor, observed])
+        self._unlisted_floor = runtime_aggregate_effect_state([self._unlisted_floor, unlisted_state])
         for receipt in projected:
             if len(self.receipts) >= _MAX_RECEIPTS:
                 self.receipts_truncated = True
@@ -386,17 +540,128 @@ class RuntimeToolEvidence:
             })
             handles.append(handle)
             self._effect_floor = runtime_aggregate_effect_state([self._effect_floor, receipt_state])
+            self._unlisted_floor = runtime_aggregate_effect_state(
+                [self._unlisted_floor, EffectState.CONFIRMED if tracked or by_children else receipt_state]
+            )
         if handles:
             observation["receipt_handles"] = handles
         effect = _listed_effect(observation, projected)
         if effect is not None:
             self._record_effect(effect)
-        if observation.get("effect_state") == "unconfirmed" and len(self.unconfirmed_calls) < _MAX_UNCONFIRMED_CALLS:
-            self.unconfirmed_calls.append({
+        if tracked:
+            call = {
                 "call_id": observation["call_id"],
                 "tool": observation["tool"],
                 "operation": observation.get("operation"),
-            })
+            }
+            targets = observation.get("effect_targets")
+            if isinstance(targets, list) and targets:
+                call["targets"] = copy.deepcopy(targets[:_MAX_TARGETS_PER_CALL])
+            self.unconfirmed_calls.append(call)
+        elif receipt_state == EffectState.CONFIRMED.value:
+            # A confirmed artifact is a host observation of its own target.
+            for receipt in projected:
+                if receipt.get("sha256"):
+                    self.reconcile_observed_target({
+                        "document_id": str(receipt.get("document_id") or "").strip() or None,
+                        "fs_path": _norm_path(receipt.get("fs_path")),
+                        "sha256": _norm_hash(receipt.get("sha256")),
+                    }, by=observation["call_id"], supersedes=(
+                        str(receipt.get("operation") or "") not in _IN_PLACE_RECEIPT_OPERATIONS
+                    ))
+
+    def reconcile_observed_target(self, observed: dict, *, by: str, supersedes: bool = False) -> list[str]:
+        """Confirm unconfirmed calls whose every target the host has now settled.
+
+        ``observed`` is a host measurement (identity + sha256) taken after the
+        calls ran. A target is settled when the host observes it holding the
+        bytes the call reported (same hash), or, with ``supersedes``, when a
+        later confirmed write replaced it whole with a new artifact (another
+        hash): whatever the earlier call left there is gone, and the target now
+        holds a host-confirmed result. A plain read showing other bytes settles
+        nothing (they may be the failed call's own partial output), nor does an
+        in-place edit, which builds on them. Returns the call IDs confirmed.
+        """
+        if not observed.get("sha256") or not self.unconfirmed_calls:
+            return []
+        touched: set[str] = set()
+        for call in self.unconfirmed_calls:
+            call_id = call.get("call_id")
+            if call_id == by or (
+                self._merging_prefix is not None and str(call_id).startswith(f"{self._merging_prefix}/")
+            ):
+                continue
+            for target in call.get("targets") or ():
+                if not isinstance(target, dict) or target.get("observed_by"):
+                    continue
+                if _same_target(target, observed):
+                    target["observed_by"] = by
+                    touched.add(str(call_id))
+                elif supersedes and _same_identity(target, observed):
+                    target["observed_by"] = by
+                    target["superseded"] = True
+                    touched.add(str(call_id))
+        if not touched:
+            return []
+        # A call is confirmed only when all of its entries (a retried call can
+        # have several) have targets and every target was observed.
+        entries: dict[str, list[dict]] = {}
+        for call in self.unconfirmed_calls:
+            entries.setdefault(str(call.get("call_id")), []).append(call)
+        confirmed = [
+            call_id for call_id in touched
+            if all(
+                entry.get("targets") and all(
+                    isinstance(t, dict) and t.get("observed_by") for t in entry["targets"]
+                )
+                for entry in entries[call_id]
+            )
+        ]
+        if not confirmed:
+            return []
+        done = set(confirmed)
+        self.unconfirmed_calls = [c for c in self.unconfirmed_calls if str(c.get("call_id")) not in done]
+        for call_id in confirmed:
+            entry = entries[call_id][0]
+            observation = self.observations.get(call_id)
+            if observation is not None:
+                observation["effect_state"] = EffectState.CONFIRMED.value
+                observation["reconciled_by"] = by
+            for receipt in self.receipts:
+                if receipt.get("call_id") == call_id:
+                    receipt["effect_state"] = EffectState.CONFIRMED.value
+            record = {
+                "call_id": call_id, "tool": entry.get("tool"), "operation": entry.get("operation"),
+                "reconciled_by": by,
+            }
+            if any(
+                isinstance(t, dict) and t.get("superseded")
+                for e in entries[call_id] for t in e.get("targets") or ()
+            ):
+                # Its uncertain write was replaced by a later confirmed one.
+                record["superseded"] = True
+            self.reconciled_calls.append(record)
+        del self.reconciled_calls[:-_MAX_RECONCILED_CALLS]
+        # A call that took its child ledger's state is confirmed once none of
+        # its child calls is left unconfirmed.
+        remaining = [str(c.get("call_id")) for c in self.unconfirmed_calls]
+        for observation in self.observations.values():
+            if (
+                observation.get("effect_source") == _CHILD_LEDGER_SOURCE
+                and observation.get("effect_state") == EffectState.UNCONFIRMED.value
+                and not any(call_id.startswith(f"{observation['call_id']}/") for call_id in remaining)
+            ):
+                observation["effect_state"] = EffectState.CONFIRMED.value
+                observation["reconciled_by"] = by
+        # The floor drops back to what it holds without the listed calls, plus
+        # the ones still listed.
+        self._effect_floor = runtime_aggregate_effect_state(
+            [self._unlisted_floor, EffectState.CONFIRMED]
+            + [r.get("effect_state") for r in self.receipts]
+            + ["unconfirmed" for _ in self.unconfirmed_calls]
+            + [o.get("effect_state") for o in self.observations.values()]
+        )
+        return confirmed
 
     def _record_effect(self, effect: dict) -> None:
         """Count one effect call once, under its action_key (informational only)."""
@@ -539,6 +804,12 @@ class RuntimeToolEvidence:
                 observation["capability_availability"] = "not_established"
         if error:
             observation["message"] = str(sanitize_sensitive_payload(str(error)))[:600]
+            from packages.core.ai.runtime.tool_error_contract import runtime_platform_error
+
+            platform_error = runtime_platform_error(call.tool_name, result)
+            if platform_error is not None:
+                observation["platform_error"] = platform_error["code"]
+                observation["platform_error_details"] = platform_error["details"]
         from packages.core.ai.runtime.receipts import runtime_project_receipts, runtime_tool_effect_state
 
         # The classifier already looks through call_tool / composite wrappers.
@@ -546,20 +817,27 @@ class RuntimeToolEvidence:
         classification = _classify(tool_name, arguments)
         effect_state = runtime_tool_effect_state(tool_name, arguments, result, classification=classification)
         observation["effect_state"] = effect_state.value
+        if isinstance(result, RuntimeStructuredToolResult) and result.child_effect_state is not None:
+            # Its state is its child ledger's, merged below call by call.
+            observation["effect_source"] = _CHILD_LEDGER_SOURCE
         # What the call does (action/control/...), so a non-file effect such
         # as a created Task is visible in the run's result.
         observation.update(_classifier_facts(classification))
         # Project unless the call may have failed mid-effect. Read-only calls
         # (e.g. wait_media_jobs, whose batch status can be "failed" while some
         # jobs completed) still yield receipts; projections filter per item.
-        projected = (
-            [
-                {**receipt, "tool": call.tool_name}
-                for receipt in runtime_project_receipts(call.tool_name, call.arguments, payload)
-            ]
-            if effect_state is not EffectState.UNCONFIRMED
-            else []
-        )
+        reported = [
+            {**receipt, "tool": call.tool_name}
+            for receipt in runtime_project_receipts(call.tool_name, call.arguments, payload)
+        ]
+        projected = reported if effect_state is not EffectState.UNCONFIRMED else []
+        if effect_state is EffectState.UNCONFIRMED:
+            # Not receipts: the artifacts the call reported, which a later host
+            # observation (same file, same hash) can confirm.
+            targets = _effect_targets(reported)
+            if targets:
+                observation["effect_targets"] = targets
+        self.observations.pop(call_id, None)
         self.observations[call_id] = observation
         existing_hint = next(
             (item for item in self._capability_hints if item["name"] == tool_name),
@@ -579,11 +857,19 @@ class RuntimeToolEvidence:
             scope=self._capability_scope, hints=self._capability_hints,
         )["hints"]
         self._record_ledger(observation, projected)
+        if effect_state is not EffectState.UNCONFIRMED and observation["result"] == "returned":
+            read = _host_read_identity(call.tool_name, payload)
+            if read is not None:
+                self.reconcile_observed_target(read, by=call_id)
         self._track_sandbox_handoff(call_id, call.tool_name, payload, observation, projected)
         # Serialized provider/model JSON cannot mint child evidence. Only the
         # host carrier, built from an executing child loop, supplies these facts.
         if isinstance(result, RuntimeStructuredToolResult):
             self.merge_child_observations(call_id, result.execution_evidence)
+            # The call outlives its own children in the bounded window: a Skill
+            # with more child calls than the window must not evict its caller.
+            self.observations.pop(call_id, None)
+            self.observations[call_id] = observation
         while len(self.observations) > _OBSERVATION_WINDOW:
             self.observations.pop(next(iter(self.observations)))
 
@@ -626,6 +912,11 @@ class RuntimeToolEvidence:
         # Only resuming the Skill closes a stage handoff; a file saved on the way
         # (the canvas itself) is not the requested result.
         pending = [handoff for handoff in pending if handoff.get("kind") != "skill_continuation"]
+        if tool_name in _SANDBOX_RUN_TOOLS:
+            # The skill has actually run. A request answered by what it read
+            # or computed (no file asked for) may now end the turn.
+            for handoff in pending:
+                handoff["ran"] = True
         # A saved file delivers the handoff. Only a filesystem-only scratch save
         # (role "intermediate" and not registered in Knowledge) is a step on the
         # way: the role defaults to "intermediate" whenever the model omits it,
@@ -658,10 +949,12 @@ class RuntimeToolEvidence:
         ledger-only so they cannot evict this run's own calls or add facts.
         """
         self._merge_counted = []
+        self._merging_prefix = call_id
         try:
             self._merge_children(call_id, children, observe=observe)
         finally:
             self._merge_counted = None
+            self._merging_prefix = None
         while len(self.observations) > _OBSERVATION_WINDOW:
             self.observations.pop(next(iter(self.observations)))
 
@@ -733,6 +1026,10 @@ class RuntimeToolEvidence:
         payload[key].pop("evidence_ref_prefix", None)
         return json.dumps(payload, ensure_ascii=False)
 
+    def unresolved_platform_error(self) -> dict | None:
+        """``runtime_unresolved_platform_error`` over the live ledger."""
+        return runtime_unresolved_platform_error({"observations": list(self.observations.values())})
+
     def checkpoint_state(self) -> dict:
         from packages.core.ai.runtime.capability_continuation import runtime_capability_hint_state
 
@@ -756,6 +1053,8 @@ class RuntimeToolEvidence:
             "effects_omitted": self.effects_omitted,
             "effect_calls": dict(self._effect_calls),
             "child_effects_accounted": dict(self._child_effects_accounted),
+            "reconciled_calls": copy.deepcopy(self.reconciled_calls),
+            "unlisted_floor": self._unlisted_floor.value,
         }
 
     def restore_checkpoint_state(self, state: dict) -> None:
@@ -826,6 +1125,7 @@ class RuntimeToolEvidence:
                    if item.get("kind") == "skill_continuation" else
                    {"sandbox_id": str(item.get("sandbox_id") or "")[:64]}),
                 "state": "delivered" if item.get("state") == "delivered" else "pending",
+                **({"ran": True} if item.get("ran") is True else {}),
                 "failed_call_ids": [
                     str(ref) for ref in item.get("failed_call_ids") or [] if isinstance(ref, str)
                 ][:_MAX_HANDOFF_FAILURES],
@@ -853,10 +1153,35 @@ class RuntimeToolEvidence:
             ]
             if isinstance(accounted, dict) else ()
         )
+        reconciled = state.get("reconciled_calls") if isinstance(state, dict) else None
+        self.reconciled_calls = [
+            copy.deepcopy(item) for item in reconciled if isinstance(item, dict)
+        ][-_MAX_RECONCILED_CALLS:] if isinstance(reconciled, list) else []
         floor = state.get("effect_floor") if isinstance(state, dict) else None
         self._effect_floor = runtime_aggregate_effect_state(
             ([floor] if floor is not None else [])
             + [r.get("effect_state") for r in self.receipts]
             + ["unconfirmed" for _ in self.unconfirmed_calls]
             + [o["effect_state"] for o in self.observations.values()]
+        )
+        unlisted = state.get("unlisted_floor") if isinstance(state, dict) else None
+        if unlisted is None:
+            # An older checkpoint cannot tell listed calls from the rest of its
+            # floor: nothing in it is ever reconciled.
+            self._unlisted_floor = self._effect_floor
+            return
+        listed = {call.get("call_id") for call in self.unconfirmed_calls}
+
+        def unlisted_part(item: dict) -> str:
+            known = _known_effect_state(item.get("effect_state"))
+            if known == EffectState.UNCONFIRMED.value and (
+                item.get("call_id") in listed or item.get("effect_source") == _CHILD_LEDGER_SOURCE
+            ):
+                return EffectState.CONFIRMED.value
+            return known
+
+        self._unlisted_floor = runtime_aggregate_effect_state(
+            [unlisted]
+            + [unlisted_part(r) for r in self.receipts]
+            + [unlisted_part(o) for o in self.observations.values()]
         )

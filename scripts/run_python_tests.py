@@ -238,7 +238,12 @@ def _environment_identity() -> dict[str, object]:
         },
         "deployment_mode": os.environ.get("DEPLOYMENT_MODE"),
         "packages": packages,
-        "platform": platform.platform(),
+        # Hosted runners in one CI run can boot different kernel patch
+        # releases; keep the kernel separate from the OS/libc identity.
+        "kernel": platform.release(),
+        "platform": "-".join(
+            part for part in (platform.system(), platform.machine(), *platform.libc_ver()) if part
+        ),
         "python": sys.version,
         "services": {
             "database": _service_configuration(os.environ.get("TEST_DATABASE_URL")),

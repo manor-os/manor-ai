@@ -18,7 +18,6 @@ from packages.core.constants.execution import (
     ExecutionPlanStatus,
     ExecutionStepStatus,
 )
-from packages.core.constants.task import TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -266,9 +265,6 @@ async def resume_step_for_retry(
 
     Caller commits.
     """
-    from packages.core.models.task import Task
-    from packages.core.services.task_state_machine import apply_task_status_transition
-
     if not await _workspace_allows_step_transition(
         db,
         entity_id=entity_id,
@@ -291,10 +287,7 @@ async def resume_step_for_retry(
         db, entity_id=entity_id, workspace_id=plan.workspace_id,
     ):
         return None
-    from packages.core.services.task_execution_origin import (
-        record_manual_plan_execution,
-        record_manual_task_execution,
-    )
+    from packages.core.services.task_execution_origin import record_manual_plan_execution
 
     record_manual_plan_execution(plan, user_id=user_id, action="step_resume")
 
@@ -318,35 +311,11 @@ async def resume_step_for_retry(
             step.id, exc_info=True,
         )
 
-    target_plan_id = step.plan_id
     plan.status = ExecutionPlanStatus.RUNNING.value
     plan.completed_at = None
     plan.last_error = None
-    if plan.task_id:
-        task = (await db.execute(
-            select(Task).where(
-                Task.id == plan.task_id,
-                Task.entity_id == entity_id,
-            )
-        )).scalar_one_or_none()
-        if task is not None:
-            record_manual_task_execution(task, user_id=user_id, action="step_resume")
-        if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
-            await apply_task_status_transition(
-                task, "in_progress", db=db, actor_kind="user", actor_id=user_id,
-            )
-
-    # ``enqueue=False`` historically meant "the caller will send the
-    # post-commit broker hint". It must not suppress the transactional
-    # recovery surface: the caller can crash after commit and before that hint.
-    from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-    await stage_plan_cycle_wake(
-        db,
-        target_plan_id,
-        reason="human_step_resumed",
-    )
-    return target_plan_id
+    # The worker that owns this job checks the pending Step out again.
+    return step.plan_id
 
 
 async def cancel_step(
@@ -408,15 +377,4 @@ async def cancel_step(
         human_decision=human_decision,
     )
 
-    target_plan_id = step.plan_id
-
-    # Re-enqueue the executor so it sees the failed step and decides
-    # whether to replan or terminate the plan.
-    from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-    await stage_plan_cycle_wake(
-        db,
-        target_plan_id,
-        reason="human_step_cancelled",
-    )
-    return target_plan_id
+    return step.plan_id

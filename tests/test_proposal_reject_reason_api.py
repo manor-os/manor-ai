@@ -23,7 +23,6 @@ from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.strategist import service as strategist_service
-from packages.core.tasks import ai_tasks
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 FLAG_KEY = "strategist_review_v2"
@@ -147,7 +146,6 @@ async def _seed_review_card(client: AsyncClient, monkeypatch, username: str) -> 
         async def _noop_post(*args, **kwargs):
             return None
         monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop_post)
-        monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
 
         result = await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
         assert not result.get("skipped")

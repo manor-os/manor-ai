@@ -868,6 +868,18 @@ async def test_http_rejects_selectors_and_duplicate_query(resident_http, query):
     assert "no-store" in response.headers["cache-control"]
 
 
+async def test_http_unknown_session_is_reported_as_missing_not_unavailable(resident_http, monkeypatch):
+    from unittest.mock import AsyncMock
+    from apps.api.routers import public_chat
+
+    monkeypatch.setattr(public_chat, "find_public_webchat_conversation_by_session", AsyncMock(return_value=None))
+    # The widget starts a fresh session on this code instead of retrying forever.
+    response = await resident_http.client.get("/api/v1/public/chat/entry/resident?session_id=never-created")
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "chat_session_not_found"
+    assert "no-store" in response.headers["cache-control"]
+
+
 async def test_scoped_sse_does_not_release_a_late_private_answer(resident_case):
     c = resident_case
     row, proof, _ = await authorize(c)

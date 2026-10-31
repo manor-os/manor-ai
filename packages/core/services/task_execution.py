@@ -1,9 +1,9 @@
 """Typed routing for a Task's first execution and subsequent attempts.
 
 ``TaskType`` describes business meaning and remains extensible.  This module is
-the closed runtime factory: executable Workspace Tasks use the coordinated Plan
-runtime, interactive and approval Tasks retain their dedicated surfaces, and
-standalone Agent Tasks keep the legacy runner only for compatibility.
+the closed runtime factory: every executable Task, in a Workspace or assigned
+directly to an Agent, runs as one durable Task run (``COORDINATED_PLAN``);
+interactive and approval Tasks retain their dedicated surfaces.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,27 +25,29 @@ from packages.core.models.task import Task
 from packages.core.models.workspace import AgentSubscription
 
 logger = logging.getLogger(__name__)
-_ENQUEUE_KEY = "task_execution_after_commit"
 TASK_EXECUTION_OUTBOX_EVENT = "runtime.dispatch_task_execution"
 _TASK_EXECUTION_INTENT_VERSION = 1
 
 
 _LEGACY_MODE_BY_RUNTIME = {
     TaskRuntimeKind.COORDINATED_PLAN: "plan_new",
-    TaskRuntimeKind.PLAN_RESUME: "plan",
     TaskRuntimeKind.INTERACTIVE_SESSION: "interactive_session",
     TaskRuntimeKind.HUMAN_DECISION: "human_decision",
     TaskRuntimeKind.MANUAL: "manual",
-    TaskRuntimeKind.LEGACY_AGENT: "agent",
 }
 
 
 @dataclass(frozen=True)
 class TaskPlanServiceBinding:
-    """Immutable execution identity for one Workspace service binding."""
+    """Immutable execution identity for one Workspace service binding.
 
-    subscription_id: str
-    service_key: str
+    A Task outside any Workspace runs as its assigned Agent alone: the binding
+    then has no service key, and a subscription only when the Task names the
+    Agent's personal hire.
+    """
+
+    subscription_id: str | None
+    service_key: str | None
     agent_id: str
 
 
@@ -88,9 +90,35 @@ class CoordinatorRuntimeSelection:
         )
         return cls(root=bindings[0], bindings=bindings)
 
+    @classmethod
+    def for_agent(
+        cls,
+        agent_id: str,
+        *,
+        subscription_id: str | None = None,
+    ) -> CoordinatorRuntimeSelection:
+        """The selection of a Task outside any Workspace: its Agent alone."""
+
+        binding = TaskPlanServiceBinding(
+            subscription_id=subscription_id or None,
+            service_key=None,
+            agent_id=str(agent_id),
+        )
+        return cls(root=binding, bindings=(binding,))
+
+    @property
+    def is_agent_only(self) -> bool:
+        """No Workspace service scope: the Task runs as its Agent alone."""
+
+        return self.root.service_key is None
+
     def __post_init__(self) -> None:
         if not self.bindings or self.root not in self.bindings:
             raise ValueError("coordinator root must belong to its service scope")
+        if self.root.service_key is None:
+            if len(self.bindings) != 1 or not self.root.agent_id:
+                raise ValueError("an Agent-only selection is exactly one Agent")
+            return
         service_keys = [binding.service_key for binding in self.bindings]
         subscription_ids = [binding.subscription_id for binding in self.bindings]
         if any(
@@ -122,8 +150,8 @@ class CoordinatorRuntimeSelection:
                 sorted(
                     self.bindings,
                     key=lambda binding: (
-                        binding.service_key,
-                        binding.subscription_id,
+                        binding.service_key or "",
+                        binding.subscription_id or "",
                         binding.agent_id,
                     ),
                 )
@@ -244,19 +272,7 @@ class TaskExecutionDispatch:
     def is_dispatchable(self) -> bool:
         return self.runtime_kind in {
             TaskRuntimeKind.COORDINATED_PLAN,
-            TaskRuntimeKind.PLAN_RESUME,
-            TaskRuntimeKind.LEGACY_AGENT,
         }
-
-
-def plan_resume_dispatch(*, task_id: str, plan_id: str) -> TaskExecutionDispatch:
-    """Build the typed continuation used by existing Plan retry paths."""
-
-    return TaskExecutionDispatch(
-        runtime_kind=TaskRuntimeKind.PLAN_RESUME,
-        task_id=task_id,
-        target_id=plan_id,
-    )
 
 
 def _clean_service_keys(values: object) -> set[str]:
@@ -417,44 +433,56 @@ async def resolve_task_execution(
                 coordinator=coordinator,
             )
         return TaskExecutionDispatch(TaskRuntimeKind.MANUAL, task_id)
-    agent_id = getattr(task, "agent_id", None)
-    agent_type = getattr(task, "agent_type", None)
-    if agent_id or is_master_agent(agent_id, agent_type):
+    coordinator = await task_agent_selection(
+        db,
+        task,
+        lock_for_update=lock_subscriptions,
+    )
+    if coordinator is not None:
         return TaskExecutionDispatch(
-            TaskRuntimeKind.LEGACY_AGENT,
+            TaskRuntimeKind.COORDINATED_PLAN,
             task_id,
-            agent_id or MANOR_AGENT_ID,
+            task_id,
+            coordinator=coordinator,
         )
     return TaskExecutionDispatch(TaskRuntimeKind.MANUAL, task_id)
 
 
-def dispatch_task_execution(task_id: str, dispatch: TaskExecutionDispatch) -> bool:
-    """Publish only standalone legacy work after the caller commits.
+async def task_agent_selection(
+    db: AsyncSession,
+    task: Task,
+    *,
+    lock_for_update: bool = False,
+) -> CoordinatorRuntimeSelection | None:
+    """The run identity of a Task assigned directly to an Agent, outside any Workspace.
 
-    Coordinated Workspace starts are exclusively admitted from their durable
-    Task intent; a direct V2 Planner enqueue would race the Task-level owner.
+    The assigned Agent (or the master agent) owns the run. A Task that names
+    the Agent's personal hire runs under that exact active subscription; one
+    naming a missing, inactive or Workspace subscription has no runner.
     """
-    from packages.core.tasks.ai_tasks import run_agent_task
 
-    if task_id != dispatch.task_id:
-        raise ValueError("Task execution dispatch does not belong to this Task")
-    if dispatch.runtime_kind is TaskRuntimeKind.PLAN_RESUME:
-        raise ValueError(
-            "Plan resume requires a transactionally staged Plan-cycle wake"
-        )
-    elif dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN:
-        raise ValueError(
-            "Coordinated Task start requires a transactionally staged Task execution intent"
-        )
-    elif dispatch.runtime_kind is TaskRuntimeKind.LEGACY_AGENT:
-        if not dispatch.target_id:
-            raise ValueError("Legacy Agent dispatch requires an Agent id")
-        run_agent_task.delay(dispatch.task_id, dispatch.target_id)
-    else:
-        raise ValueError(
-            f"Task runtime {dispatch.runtime_kind.value!r} is not dispatchable"
-        )
-    return True
+    agent_id = getattr(task, "agent_id", None)
+    agent_type = getattr(task, "agent_type", None)
+    if not (agent_id or is_master_agent(agent_id, agent_type)):
+        return None
+    root_agent_id = str(agent_id or MANOR_AGENT_ID)
+    subscription_id = str(getattr(task, "owner_subscription_id", None) or "").strip()
+    if not subscription_id:
+        return CoordinatorRuntimeSelection.for_agent(root_agent_id)
+    query = select(AgentSubscription.id).where(
+        AgentSubscription.id == subscription_id,
+        AgentSubscription.entity_id == task.entity_id,
+        AgentSubscription.agent_id == root_agent_id,
+        AgentSubscription.workspace_id.is_(None),
+        AgentSubscription.status == "active",
+    ).execution_options(populate_existing=True)
+    if lock_for_update:
+        query = query.with_for_update()
+    if (await db.execute(query)).scalar_one_or_none() is None:
+        return None
+    return CoordinatorRuntimeSelection.for_agent(
+        root_agent_id, subscription_id=subscription_id,
+    )
 
 
 def task_execution_intent_generation(task: Task) -> str:
@@ -513,7 +541,7 @@ async def stage_task_execution_intent(
     if resolved.task_id != task.id:
         raise ValueError("Task execution dispatch does not belong to this Task")
     if resolved.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN:
-        raise ValueError("Only coordinated Workspace Tasks use the durable start outbox")
+        raise ValueError("Only Task runs use the durable start outbox")
     if task.status != TaskStatus.IN_PROGRESS.value:
         raise ValueError("A coordinated Task start must be in progress before staging")
 
@@ -552,69 +580,12 @@ async def stage_task_execution_intent(
     return generation
 
 
-def _dispatch_committed_tasks(session) -> None:
-    if session.in_nested_transaction():
-        return
-    queued = session.info.pop(_ENQUEUE_KEY, [])
-    for task_id, dispatch in dict.fromkeys((item[0], item[1]) for item in queued):
-        try:
-            dispatch_task_execution(task_id, dispatch)
-        except Exception:
-            logger.exception("Could not dispatch committed Task %s", task_id)
-
-
-def _discard_rolled_back_tasks(session, previous_transaction) -> None:
-    if not session.in_transaction():
-        session.info.pop(_ENQUEUE_KEY, None)
-        return
-    retained = []
-    for item in session.info.get(_ENQUEUE_KEY, []):
-        owner = item[2]
-        while owner is not None and owner is not previous_transaction:
-            owner = owner.parent
-        if owner is None:
-            retained.append(item)
-    session.info[_ENQUEUE_KEY] = retained
-
-
-def queue_task_execution_after_commit(db: AsyncSession, task_id: str, dispatch: TaskExecutionDispatch) -> None:
-    """Compatibility publisher for standalone legacy Agent work.
-
-    Coordinated starts must use :func:`stage_task_execution_intent`; accepting
-    them here would silently reintroduce a process-local post-commit delivery
-    gap beside the durable outbox. Plan continuations likewise use the
-    generation-fenced Plan-cycle outbox.
-    """
-    if not dispatch.is_dispatchable:
-        raise ValueError(
-            f"Task runtime {dispatch.runtime_kind.value!r} cannot be queued"
-        )
-    if dispatch.runtime_kind in {
-        TaskRuntimeKind.COORDINATED_PLAN,
-        TaskRuntimeKind.PLAN_RESUME,
-    }:
-        raise ValueError(
-            "Coordinated starts and Plan resumes require a durable execution intent"
-        )
-    if dispatch.task_id != task_id:
-        raise ValueError("Task execution dispatch does not belong to this Task")
-    session = db.sync_session
-    owner = session.get_nested_transaction() or session.get_transaction()
-    session.info.setdefault(_ENQUEUE_KEY, []).append((task_id, dispatch, owner))
-    if not event.contains(session, "after_commit", _dispatch_committed_tasks):
-        event.listen(session, "after_commit", _dispatch_committed_tasks)
-        event.listen(session, "after_soft_rollback", _discard_rolled_back_tasks)
-
-
 async def queue_initial_task_execution(db: AsyncSession, task: Task, *, user_id: str) -> bool:
     """API assignment/start follows the same route as Task recovery."""
     dispatch = await resolve_task_execution(db, task)
-    if not dispatch.is_dispatchable:
+    if dispatch.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN:
         return False
-    if (
-        dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
-        and task.status != TaskStatus.IN_PROGRESS
-    ):
+    if task.status != TaskStatus.IN_PROGRESS:
         from packages.core.services.task_service import update_task
 
         updated = await update_task(
@@ -623,9 +594,5 @@ async def queue_initial_task_execution(db: AsyncSession, task: Task, *, user_id:
         )
         if updated is not None:
             task = updated
-    if dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN:
-        await stage_task_execution_intent(db, task, dispatch)
-    else:
-        # Standalone legacy Agent execution retains the compatibility publisher.
-        queue_task_execution_after_commit(db, task.id, dispatch)
+    await stage_task_execution_intent(db, task, dispatch)
     return True

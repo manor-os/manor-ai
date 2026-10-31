@@ -32,6 +32,7 @@ CANONICAL_NODE_TYPES = frozenset({
     "subworkflow", "foreach_subworkflow",
     # durable cross-run project state, scoped grants, and browser effects
     "workflow_project", "workflow_action_grant", "browser_effect",
+    "workflow_effect_deadline",
     "publication_receipt",
     # data-plumbing building blocks (n8n parity)
     "extract", "filter", "aggregate", "datetime",

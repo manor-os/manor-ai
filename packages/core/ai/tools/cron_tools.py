@@ -65,6 +65,7 @@ async def _list_jobs_handler(entity_id: str = "", **kwargs):
         entity_id=entity_id,
         user_id=runtime_context.user_id,
         workspace_id=trusted_workspace_id,
+        runtime_kwargs=kwargs,
     )
 
 

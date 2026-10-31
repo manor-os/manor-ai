@@ -1,7 +1,13 @@
+import asyncio
 import hashlib
+import itertools
 import json
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,12 +28,17 @@ def test_media_tools_registered():
         "normalize_audio_loudness",
         "compose_video_timeline",
         "probe_media",
+        "verify_media_sources",
+        "measure_media_audio_alignment",
         "verify_stickman_final_media",
         "render_frame_samples",
         "transcribe_video",
         "analyze_audio",
+        "analyze_music_structure",
+        "listen_to_audio",
         "validate_subtitles",
         "still_to_video",
+        "derive_image_aspect",
     ]
 
 
@@ -42,21 +53,25 @@ def test_composer_accepts_audio_list_from_saved_timeline():
     }) == ([narration], "audio_tracks")
 
 
-def test_verify_stickman_final_media_is_classified_as_read_only():
+def test_media_verification_tools_are_classified_as_read_only():
     from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
     from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
 
-    classification = classify_runtime_tool(
-        "verify_stickman_final_media",
-        {
-            "final_video_path": "runs/run-1/final/video.mp4",
-            "subtitle_path": "runs/run-1/subtitles/final.ass",
-            "narration_timeline_path": "runs/run-1/technical/narration-timeline.json",
-            "target_duration_seconds": 120,
-        },
-    )
-
-    assert classification.effect is RuntimeToolEffect.READ_ONLY
+    for name, arguments in (
+        ("verify_stickman_final_media", {
+            "final_video_path": "runs/run-1/final/video.mp4", "subtitle_path": "runs/run-1/subtitles/final.ass",
+            "narration_timeline_path": "runs/run-1/technical/narration-timeline.json", "target_duration_seconds": 120,
+        }),
+        ("verify_media_sources", {
+            "final_video_document_id": "video-document", "expected_final_video_sha256": "a" * 64,
+            "source_audio_document_id": "audio-document", "expected_source_audio_sha256": "b" * 64, "duration_seconds": 30,
+        }),
+        ("measure_media_audio_alignment", {
+            "reference_document_id": "reference-document", "target_document_id": "target-document",
+        }),
+    ):
+        classification = classify_runtime_tool(name, arguments)
+        assert classification.effect is RuntimeToolEffect.READ_ONLY
 
 
 def test_inspect_narration_recovery_is_classified_as_read_only():
@@ -80,6 +95,8 @@ def test_product_video_qa_tool_schemas_are_strict_and_bounded():
         schema["function"]["name"]: schema["function"]["parameters"]
         for schema in (
             media_tools.PROBE_MEDIA_SCHEMA,
+            media_tools.VERIFY_MEDIA_SOURCES_SCHEMA,
+            media_tools.MEASURE_MEDIA_AUDIO_ALIGNMENT_SCHEMA,
             media_tools.VERIFY_STICKMAN_FINAL_MEDIA_SCHEMA,
             media_tools.RENDER_FRAME_SAMPLES_SCHEMA,
             media_tools.ANALYZE_AUDIO_SCHEMA,
@@ -90,6 +107,8 @@ def test_product_video_qa_tool_schemas_are_strict_and_bounded():
 
     for name in (
         "probe_media",
+        "verify_media_sources",
+        "measure_media_audio_alignment",
         "verify_stickman_final_media",
         "render_frame_samples",
         "analyze_audio",
@@ -98,14 +117,50 @@ def test_product_video_qa_tool_schemas_are_strict_and_bounded():
     ):
         assert schemas[name]["additionalProperties"] is False
 
-    assert schemas["probe_media"]["required"] == ["input_path"]
+    from jsonschema import Draft202012Validator
+
+    probe_validator = Draft202012Validator(schemas["probe_media"])
+    for arguments in ({"input_path": "audio.wav"}, {"document_id": "document-1"}):
+        assert probe_validator.is_valid(arguments)
     assert schemas["verify_stickman_final_media"]["required"] == [
         "final_video_path",
         "subtitle_path",
         "narration_timeline_path",
         "target_duration_seconds",
     ]
-    assert schemas["render_frame_samples"]["required"] == ["input_path", "output_dir"]
+    assert schemas["verify_media_sources"]["required"] == [
+        "final_video_document_id", "expected_final_video_sha256", "source_audio_document_id",
+        "expected_source_audio_sha256", "duration_seconds",
+    ]
+    assert schemas["measure_media_audio_alignment"]["required"] == [
+        "reference_document_id", "target_document_id",
+    ]
+    assert schemas["measure_media_audio_alignment"]["properties"]["duration_seconds"] == {
+        "type": "number", "minimum": 5, "maximum": 60, "default": 20,
+    }
+    alignment_validator = Draft202012Validator(schemas["measure_media_audio_alignment"])
+    assert alignment_validator.is_valid({
+        "reference_document_id": "reference-document", "target_document_id": "target-document",
+    })
+    assert not alignment_validator.is_valid({
+        "reference_document_id": "reference-document", "target_document_id": "target-document",
+        "input_path": "forbidden-path.mp3",
+    })
+    assert not alignment_validator.is_valid({
+        "reference_document_id": "reference-document", "target_document_id": "target-document",
+        "duration_seconds": 4.9,
+    })
+    assert schemas["render_frame_samples"]["required"] == ["output_dir"]
+    frame_validator = Draft202012Validator(schemas["render_frame_samples"])
+    assert frame_validator.is_valid({"input_path": "video.mp4", "output_dir": "frames"})
+    assert frame_validator.is_valid({"document_id": "video-document", "output_dir": "frames"})
+    assert frame_validator.is_valid({
+        "document_id": "video-document", "output_dir": "frames", "expected_source_sha256": "a" * 64,
+    })
+    assert not frame_validator.is_valid({"document_id": "", "output_dir": "frames"})
+    assert not frame_validator.is_valid({
+        "document_id": "video-document", "output_dir": "frames", "expected_source_sha256": "not-a-hash",
+    })
     assert schemas["render_frame_samples"]["properties"]["max_samples"] == {
         "type": "integer",
         "minimum": 1,
@@ -113,7 +168,12 @@ def test_product_video_qa_tool_schemas_are_strict_and_bounded():
         "default": 12,
     }
     assert schemas["render_frame_samples"]["properties"]["interval_seconds"]["minimum"] == 0.25
-    assert schemas["analyze_audio"]["required"] == ["input_path"]
+    audio_validator = Draft202012Validator(schemas["analyze_audio"])
+    assert audio_validator.is_valid({"input_path": "audio.wav"})
+    assert audio_validator.is_valid({"document_id": "audio-document"})
+    assert audio_validator.is_valid({"document_id": "audio-document", "expected_source_sha256": "b" * 64})
+    assert not audio_validator.is_valid({"document_id": ""})
+    assert not audio_validator.is_valid({"document_id": "audio-document", "expected_source_sha256": "not-a-hash"})
     assert schemas["analyze_audio"]["properties"]["loudness_tolerance_lu"] == {
         "type": "number",
         "minimum": 0,
@@ -124,6 +184,124 @@ def test_product_video_qa_tool_schemas_are_strict_and_bounded():
     assert schemas["still_to_video"]["required"] == ["input_path", "output_name"]
     assert schemas["still_to_video"]["properties"]["duration_seconds"]["minimum"] == 0.1
     assert schemas["still_to_video"]["properties"]["duration_seconds"]["maximum"] == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "extra"),
+    [
+        (media_tools._render_frame_samples_handler, {"output_dir": "frames"}),
+        (media_tools._analyze_audio_handler, {}),
+    ],
+)
+async def test_document_source_hash_is_rejected_for_path_inputs_and_must_be_hex(handler, extra):
+    path_hash = json.loads(await handler(
+        entity_id="entity-1", input_path="source.mp4", expected_source_sha256="a" * 64, **extra,
+    ))
+    malformed_hash = json.loads(await handler(
+        entity_id="entity-1", document_id="source-document", expected_source_sha256="not-a-hash", **extra,
+    ))
+    missing_source = json.loads(await handler(entity_id="entity-1", **extra))
+    multiple_sources = json.loads(await handler(
+        entity_id="entity-1", input_path="source.mp4", document_id="source-document", **extra,
+    ))
+
+    assert path_hash["error"] == "expected_source_sha256 requires document_id"
+    assert malformed_hash["error"] == "expected_source_sha256 must be a 64-character hexadecimal SHA-256"
+    assert missing_source["error"].startswith("Neither input_path nor document_id")
+    # The caller learns which value to drop, not just the rule it broke.
+    assert "'source.mp4'" in multiple_sources["error"] and "'source-document'" in multiple_sources["error"]
+
+
+@pytest.mark.asyncio
+async def test_measure_media_audio_alignment_uses_workspace_document_scope(monkeypatch):
+    observed = {}
+
+    async def fake_measure(**kwargs):
+        observed.update(kwargs)
+        return {"status": "completed", "measured": True, "target_time_offset_seconds": 0.125}
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_media_source_verification.measure_media_audio_alignment",
+        fake_measure,
+    )
+
+    result = json.loads(
+        await media_tools._measure_media_audio_alignment_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            workspace_id="workspace-1",
+            conversation_id="conversation-1",
+            reference_document_id="reference-document",
+            target_document_id="target-document",
+            reference_start_seconds=12.5,
+            target_start_seconds=12.625,
+            duration_seconds=25,
+        )
+    )
+
+    assert result == {
+        "status": "completed", "measured": True, "target_time_offset_seconds": 0.125,
+    }
+    assert observed == {
+        "entity_id": "entity-1",
+        "user_id": "user-1",
+        "workspace_id": "workspace-1",
+        "conversation_id": "conversation-1",
+        "tool_name": "measure_media_audio_alignment",
+        "reference_document_id": "reference-document",
+        "target_document_id": "target-document",
+        "reference_start_seconds": 12.5,
+        "target_start_seconds": 12.625,
+        "duration_seconds": 25,
+    }
+
+
+@pytest.mark.asyncio
+async def test_measure_media_audio_alignment_requires_active_workspace_user_and_returns_tool_error():
+    result = json.loads(
+        await media_tools._measure_media_audio_alignment_handler(
+            entity_id="entity-1",
+            workspace_id="workspace-1",
+            reference_document_id="reference-document",
+            target_document_id="target-document",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "media_audio_alignment_failed"
+    assert "active Workspace and user" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_measure_media_audio_alignment_preserves_measurement_failure_code(monkeypatch):
+    from packages.core.services.workspace_media_source_verification import (
+        MediaSourceVerificationError,
+    )
+
+    async def failed_measure(**_kwargs):
+        raise MediaSourceVerificationError("The requested media span cannot be decoded.")
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_media_source_verification.measure_media_audio_alignment",
+        failed_measure,
+    )
+
+    result = json.loads(
+        await media_tools._measure_media_audio_alignment_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            workspace_id="workspace-1",
+            reference_document_id="reference-document",
+            target_document_id="target-document",
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "code": "media_audio_alignment_failed",
+        "error": "The requested media span cannot be decoded.",
+    }
 
 
 @pytest.mark.asyncio
@@ -226,6 +404,57 @@ async def test_verify_stickman_final_media_uses_measured_receipts(monkeypatch, t
     assert result["duration_tolerance_seconds"] == 6.0
     assert result["duration_within_target_tolerance"] is True
     assert result["subtitle_cue_count"] == 12
+
+
+@pytest.mark.asyncio
+async def test_verify_stickman_final_media_keeps_a_series_episode_in_its_project_folder(monkeypatch, tmp_path):
+    """A series episode is made in its project folder; its video and thumbnail become the episode's results."""
+    home = "Workspaces/_by_id/workspace-folder"
+    episode = f"{home}/projects/daily-calm/e02-slow-mornings"
+    for rel, data in (("final/video.mp4", b"video"), ("subtitles/final.ass", b"[Script Info]\n"),
+                      ("technical/narration-timeline.json", b'{"quality_warnings": []}')):
+        (tmp_path / episode / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / episode / rel).write_bytes(data)
+    marked = []
+
+    async def base_dir(**_kwargs):
+        return home
+
+    async def probe(_ffprobe, _path):
+        # The planned 60 seconds plus the series' 3-second intro.
+        return {"decodable": True, "duration_seconds": 63.4, "has_video": True, "has_audio": True,
+                "video_stream": {"width": 1280, "height": 720}}
+
+    async def passes(**_kwargs):
+        return json.dumps({"status": "completed", "verdict": "pass", "cue_count": 9})
+
+    async def documents(_entity_id, rel_paths):
+        return {rel_paths[0]: {"document_id": "doc-video", "fs_path": rel_paths[0], "mime_type": "video/mp4"}}
+
+    async def mark(entity_id, folder, final_paths):
+        marked.append((entity_id, folder, final_paths))
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", base_dir)
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", probe)
+    monkeypatch.setattr(media_tools, "_analyze_audio_handler", passes)
+    monkeypatch.setattr(media_tools, "_validate_subtitles_handler", passes)
+    monkeypatch.setattr(media_tools, "_lookup_documents_by_rel_paths", documents)
+    monkeypatch.setattr(media_tools, "mark_production_results", mark)
+
+    result = json.loads(await media_tools._verify_stickman_final_media_handler(
+        entity_id="entity-1", final_video_path=f"{episode}/final/video.mp4",
+        subtitle_path=f"{episode}/subtitles/final.ass",
+        narration_timeline_path=f"{episode}/technical/narration-timeline.json",
+        target_duration_seconds=60, opening_seconds=3,
+        result_paths=["projects/daily-calm/e02-slow-mornings/thumbnail.png"],
+        workflow_lineage_root_run_id="lineage-1",
+        _workflow_project_root_from_context="projects/daily-calm/e02-slow-mornings",
+    ))
+
+    assert result["publication_ready"] is True, result["findings"]
+    assert marked == [("entity-1", episode, {f"{episode}/final/video.mp4", f"{episode}/thumbnail.png"})]
 
 
 @pytest.mark.asyncio
@@ -723,6 +952,7 @@ async def test_build_narration_timeline_derives_text_from_audio_receipt(monkeypa
     monkeypatch.setattr(media_tools, "_audio_prompt_provenance", receipt_provenance)
     monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", matching_provenance)
     monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile)
+    monkeypatch.setattr(media_tools, "_audio_narrator_provenance", _with_reference(fake_profile))
     monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
     monkeypatch.setattr(media_tools, "_run_process", fake_run)
     monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
@@ -806,6 +1036,7 @@ async def test_build_narration_timeline_rejects_segments_with_different_narrator
     monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", fake_provenance)
     monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile, raising=False)
+    monkeypatch.setattr(media_tools, "_audio_narrator_provenance", _with_reference(fake_profile), raising=False)
     monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
     monkeypatch.setattr(media_tools, "_run_process", fake_run)
     monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
@@ -3286,12 +3517,12 @@ async def test_measured_transcription_resolves_stt_model_and_byok(monkeypatch, t
 
     async def fake_resolve_model(role, **kwargs):
         assert role == "stt"
-        assert kwargs == {"user_id": "user-1", "entity_id": "entity-1"}
+        assert kwargs == {"user_id": "user-1", "entity_id": "entity-1", "workspace_id": None}
         return "groq/whisper-large-v3"
 
     async def fake_resolve_metadata(role, **kwargs):
         assert role == "stt"
-        assert kwargs == {"user_id": "user-1", "entity_id": "entity-1"}
+        assert kwargs == {"user_id": "user-1", "entity_id": "entity-1", "workspace_id": None}
         return {"llm_api_key": "gsk_user_key"}
 
     async def fake_transcribe(blob, **kwargs):
@@ -3352,7 +3583,7 @@ async def test_platform_funded_measured_transcription_checks_credit_and_records_
     async def fake_resolve_metadata(_role, **_kwargs):
         return None
 
-    async def fake_credit(entity_id, *, source):
+    async def fake_credit(entity_id, *, source, workspace_id=None):
         events.append(("credit", {"entity_id": entity_id, "source": source}))
 
     async def fake_transcribe(_blob, **_kwargs):
@@ -4712,6 +4943,67 @@ async def test_normalize_audio_scopes_workspace_relative_input_path(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_normalize_audio_takes_a_video_track_and_trims_it(monkeypatch, tmp_path):
+    """A presenter clip's own voice: extract the track, cut it after the last
+    word, normalize. The tool used to refuse every video input."""
+    clip = tmp_path / "videos/ep-05-p1.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"mp4")
+    calls: list[list[str]] = []
+    probe = {"duration_seconds": 15.0, "has_audio": True}
+
+    async def fake_run_process(args, **_kwargs):
+        calls.append(args)
+        Path(args[-1]).write_bytes(b"RIFF-normalized-audio")
+        return "", ""
+
+    async def fake_probe_media(_ffprobe, _path):
+        return dict(probe)
+
+    async def none(**_kwargs):
+        return None
+
+    async def fake_register_file_artifact(**kwargs):
+        calls.append(["generation", kwargs["generation"]])
+        return "document-1"
+
+    def fake_commit(_entity_id, rel_path, source_path, **_kwargs):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(Path(source_path).read_bytes())
+        return str(target)
+
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _e: str(tmp_path))
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", fake_commit)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe_media)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", none)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register_file_artifact)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", none)
+
+    async def run(**kwargs):
+        return json.loads(await media_tools._normalize_audio_loudness_handler(
+            entity_id="entity-1", user_id="user-1", input_path="videos/ep-05-p1.mp4",
+            output_name="audio/ep-05-p1-voice.wav", **kwargs,
+        ))
+
+    result = await run(start_seconds=0.2, end_seconds=6.85)
+    assert result["status"] == "completed", result
+    args = calls[0]
+    assert args[args.index("-i") + 1] == str(clip)
+    assert args[args.index("-ss") + 1] == "0.200" and args[args.index("-to") + 1] == "6.850"
+    assert args.index("-i") < args.index("-ss") and "-vn" in args
+    generation = calls[1][1]
+    assert generation["source_duration_seconds"] == 6.65
+    assert (generation["start_seconds"], generation["end_seconds"]) == (0.2, 6.85)
+
+    assert (await run(start_seconds=5, end_seconds=4))["status"] != "completed"
+    probe["has_audio"] = False
+    assert "no audio track" in json.dumps(await run())
+
+
+@pytest.mark.asyncio
 async def test_normalize_task_narration_preserves_voice_folder_and_profile(monkeypatch, tmp_path):
     source = tmp_path / "audio" / "puck" / "segment-01.wav"
     source.parent.mkdir(parents=True)
@@ -4776,6 +5068,7 @@ async def test_normalize_task_narration_preserves_voice_folder_and_profile(monke
     )
     monkeypatch.setattr(media_tools, "_workspace_media_base_dir", fake_workspace_base_dir)
     monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile)
+    monkeypatch.setattr(media_tools, "_audio_narrator_provenance", _with_reference(fake_profile))
     monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
     monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
     monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", fake_commit)
@@ -4965,6 +5258,238 @@ def test_merge_video_clip_window_applies_trim_and_speed():
             end_seconds=None,
             speed=1.0,
         )
+    # A window that runs past its source must fail, not silently shorten the clip.
+    with pytest.raises(ValueError, match="beyond its source"):
+        media_tools._resolve_clip_window(
+            source_duration=4.042,
+            start_seconds=3.866,
+            end_seconds=7.674,
+            speed=1.0,
+        )
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed")
+@pytest.mark.parametrize("source_rate", [30, 24, 25])
+@pytest.mark.asyncio
+async def test_merge_videos_renders_the_planned_frame_count_for_whole_frame_shots(monkeypatch, tmp_path, source_rate):
+    """Shots whose planned lengths are not whole frames each lost a frame to flooring, so a 30 s
+    storyboard rendered 898 frames (29.98 s) and failed its exact-length contract. The merged picture
+    must carry the frames of its planned total, whatever the source frame rate."""
+    from packages.core.services import entity_fs
+    from packages.core.ai.runtime import media_outputs
+
+    fps = 30
+    planned = [3.37, 4.82, 2.91, 6.44, 5.46, 7.0]
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate={source_rate}:duration=60",
+        "-f", "lavfi", "-i", "sine=duration=60", "-shortest", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    merged_copy = tmp_path / "merged-copy.mp4"
+
+    async def fake_base_dir(**_kwargs):
+        return str(out_dir)
+
+    async def fake_commit(**kwargs):
+        shutil.copyfile(kwargs["source_path"], merged_copy)
+        return "merged-document"
+
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda entity_id: str(tmp_path))
+    monkeypatch.setattr(media_outputs, "runtime_generated_media_target", lambda **_kwargs: SimpleNamespace(
+        abs_dir=str(out_dir), abs_path=str(out_dir / "merged.mp4"), rel_path="merged.mp4", filename="merged.mp4",
+    ))
+    monkeypatch.setattr(media_tools, "_commit_merged_video_output", fake_commit)
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir", fake_base_dir,
+    )
+
+    inputs = []
+    start = 0.0
+    for duration in planned:
+        inputs.append(media_tools.VideoInput(
+            source_type="document", source_id=None, rel_path="source.mp4", abs_path=str(source),
+            start_seconds=start, end_seconds=start + duration,
+        ))
+        start += duration
+    await media_tools._merge_video_files(
+        ffmpeg=shutil.which("ffmpeg"), ffprobe=shutil.which("ffprobe"), entity_id="entity", output_name="merged",
+        workspace_id=None, inputs=inputs, width=320, height=180, fps=fps, crf=18, preset="veryfast",
+        include_source_audio=False, user_id="user", agent_id=None, conversation_id=None,
+        resolution="180p", aspect_ratio="16:9",
+    )
+
+    frames = subprocess.run([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(merged_copy),
+    ], capture_output=True, text=True, check=True).stdout.strip()
+    assert int(frames) == round(sum(planned) * fps)
+
+
+def _true_peak_dbfs(path: Path) -> float:
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    )
+    peaks = re.findall(r"Peak:\s+(-?[\d.]+) dBFS", result.stderr)
+    return float(peaks[-1])
+
+
+def _stub_compose_storage(monkeypatch, tmp_path):
+    from packages.core.ai.runtime import file_actions, media_outputs
+    from packages.core.services import entity_fs
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    result = tmp_path / "composed.mp4"
+
+    async def fake_base_dir(**_kwargs):
+        return str(out_dir)
+
+    class NoGuard:
+        @staticmethod
+        def create(*_args, **_kwargs):
+            return lambda *_a, **_k: None
+
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda entity_id: str(tmp_path))
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir", fake_base_dir,
+    )
+    monkeypatch.setattr(file_actions, "RuntimeFileCommitGuardFactory", NoGuard)
+    monkeypatch.setattr(media_outputs, "runtime_generated_media_target", lambda **_kwargs: SimpleNamespace(
+        abs_dir=str(out_dir), abs_path=str(out_dir / "composed.mp4"), rel_path="composed.mp4", filename="composed.mp4",
+    ))
+
+    def fake_copy(_entity_id, _rel_path, source_path, **_kwargs):
+        shutil.copyfile(source_path, result)
+
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", fake_copy)
+    return result
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed")
+@pytest.mark.asyncio
+async def test_composed_picture_keeps_the_timeline_frames_when_the_master_is_short(monkeypatch, tmp_path):
+    """A clean master with 894 frames under a 30 s timeline was padded by its container duration, which
+    added one frame, so the composed picture had 895 frames. The composed picture must carry the
+    timeline's frames, padded from the master's own frame count."""
+    fps = 30
+    master = tmp_path / "master.mp4"
+    # Production shape: 894 video frames (29.8 s) under a 29.977 s container, from the audio of the merged shots.
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate={fps}:duration=29.8",
+        "-f", "lavfi", "-i", "sine=duration=29.977", "-t", "29.977",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(master),
+    ], check=True)
+    audio = tmp_path / "track.wav"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=30", str(audio)], check=True)
+    composed = _stub_compose_storage(monkeypatch, tmp_path)
+    track = media_tools.TimelineAudioTrack(
+        track_id="song", track_type="music", rel_path="track.wav", abs_path=str(audio), start=0.0, end=30.0,
+        volume_db=0.0, loop=False, fade_in=0.0, fade_out=0.0, duration=30.0,
+    )
+    master_info = await media_tools._probe_media(shutil.which("ffprobe"), str(master))
+    await media_tools._compose_video_file(
+        ffmpeg=shutil.which("ffmpeg"), entity_id="entity", output_name="composed", workspace_id=None,
+        clean_video_abs=str(master), subtitle_abs="", subtitle_style={}, audio_tracks=[track],
+        include_source_audio=False, ducking_config={}, loudness_config={"enabled": False},
+        crf=18, preset="veryfast", total_duration=30.0,
+        clean_video_duration=float(master_info["duration_seconds"]),
+    )
+    frames = subprocess.run([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(composed),
+    ], capture_output=True, text=True, check=True).stdout.strip()
+    assert int(frames) == round(30.0 * fps)
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed")
+@pytest.mark.asyncio
+async def test_composed_audio_stays_under_the_true_peak_ceiling_when_the_source_is_hot(monkeypatch, tmp_path):
+    """A source excerpt already at full scale, mixed with +4 dB, clipped in the composed track and measured
+    +1.4 dBTP in the final video, which failed content review. The composed mix must stay under the ceiling."""
+    master = tmp_path / "master.mp4"
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=30",
+        "-pix_fmt", "yuv420p", str(master),
+    ], check=True)
+    hot = tmp_path / "hot.wav"
+    # A full-scale tone: the sine source is about -18 dBFS, so +18 dB brings it to 0 dBFS.
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=30", "-af", "volume=8", str(hot),
+    ], check=True)
+    composed = _stub_compose_storage(monkeypatch, tmp_path)
+    track = media_tools.TimelineAudioTrack(
+        track_id="song", track_type="music", rel_path="hot.wav", abs_path=str(hot), start=0.0, end=30.0,
+        volume_db=4.0, loop=False, fade_in=0.0, fade_out=0.0, duration=30.0,
+    )
+    await media_tools._compose_video_file(
+        ffmpeg=shutil.which("ffmpeg"), entity_id="entity", output_name="composed", workspace_id=None,
+        clean_video_abs=str(master), subtitle_abs="", subtitle_style={}, audio_tracks=[track],
+        include_source_audio=False, ducking_config={}, loudness_config={"enabled": False},
+        crf=18, preset="veryfast", total_duration=30.0, clean_video_duration=30.0,
+    )
+    assert _true_peak_dbfs(composed) <= -1.0
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed")
+@pytest.mark.parametrize("source_rate", [30, 24, 25])
+@pytest.mark.asyncio
+async def test_merge_videos_renders_the_planned_frame_count_for_whole_frame_shots(monkeypatch, tmp_path, source_rate):
+    """Shots whose planned lengths are not whole frames each lost a frame to flooring, so a 30 s
+    storyboard rendered 898 frames (29.98 s) and failed its exact-length contract. The merged picture
+    must carry the frames of its planned total, whatever the source frame rate."""
+    from packages.core.services import entity_fs
+    from packages.core.ai.runtime import media_outputs
+
+    fps = 30
+    planned = [3.37, 4.82, 2.91, 6.44, 5.46, 7.0]
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate={source_rate}:duration=60",
+        "-f", "lavfi", "-i", "sine=duration=60", "-shortest", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    merged_copy = tmp_path / "merged-copy.mp4"
+
+    async def fake_base_dir(**_kwargs):
+        return str(out_dir)
+
+    async def fake_commit(**kwargs):
+        shutil.copyfile(kwargs["source_path"], merged_copy)
+        return "merged-document"
+
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda entity_id: str(tmp_path))
+    monkeypatch.setattr(media_outputs, "runtime_generated_media_target", lambda **_kwargs: SimpleNamespace(
+        abs_dir=str(out_dir), abs_path=str(out_dir / "merged.mp4"), rel_path="merged.mp4", filename="merged.mp4",
+    ))
+    monkeypatch.setattr(media_tools, "_commit_merged_video_output", fake_commit)
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir", fake_base_dir,
+    )
+
+    inputs = []
+    start = 0.0
+    for duration in planned:
+        inputs.append(media_tools.VideoInput(
+            source_type="document", source_id=None, rel_path="source.mp4", abs_path=str(source),
+            start_seconds=start, end_seconds=start + duration,
+        ))
+        start += duration
+    await media_tools._merge_video_files(
+        ffmpeg=shutil.which("ffmpeg"), ffprobe=shutil.which("ffprobe"), entity_id="entity", output_name="merged",
+        workspace_id=None, inputs=inputs, width=320, height=180, fps=fps, crf=18, preset="veryfast",
+        include_source_audio=False, user_id="user", agent_id=None, conversation_id=None,
+        resolution="180p", aspect_ratio="16:9",
+    )
+
+    frames = subprocess.run([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(merged_copy),
+    ], capture_output=True, text=True, check=True).stdout.strip()
+    assert int(frames) == round(sum(planned) * fps)
 
 
 @pytest.mark.asyncio
@@ -5605,6 +6130,9 @@ async def test_compose_video_filter_attaches_audio_input_without_empty_filter(tm
     captured: dict = {}
 
     async def fake_run_process(args, *, timeout_seconds):
+        if "-filter_complex" not in args:
+            # The final mix's peak check probes the render; it is not the render.
+            return "", ""
         captured["args"] = args
         captured["timeout_seconds"] = timeout_seconds
         output = Path(args[-1])
@@ -5755,6 +6283,62 @@ async def test_timeline_audio_track_without_audio_stream_is_unusable(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_timeline_audio_track_accepts_an_interview_video_with_audio(tmp_path, monkeypatch):
+    source = tmp_path / "interview-original-sound.mp4"
+    source.write_bytes(b"fake")
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 42.0, "has_audio": True}
+
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+
+    tracks = await media_tools._resolve_timeline_audio_tracks(
+        ffprobe="/usr/bin/ffprobe",
+        entity_root=str(tmp_path),
+        entity_id="entity123",
+        timeline={"audio_tracks": [{
+            "id": "interview-original-sound",
+            "type": "dialogue",
+            "path": "interview-original-sound.mp4",
+            "start": 0,
+            "end": 30,
+            "source_start": 8,
+        }]},
+        enabled=True,
+    )
+
+    assert [(track.rel_path, track.source_start, track.duration) for track in tracks] == [
+        ("interview-original-sound.mp4", 8.0, 30.0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_timeline_audio_track_rejects_unknown_source_extension(tmp_path, monkeypatch):
+    source = tmp_path / "interview-notes.txt"
+    source.write_text("not a media source", encoding="utf-8")
+
+    async def unexpected_probe(*_args):
+        raise AssertionError("unsupported source must be rejected before probing")
+
+    monkeypatch.setattr(media_tools, "_probe_media", unexpected_probe)
+
+    with pytest.raises(ValueError, match="Unsupported timeline audio source extension"):
+        await media_tools._resolve_timeline_audio_tracks(
+            ffprobe="/usr/bin/ffprobe",
+            entity_root=str(tmp_path),
+            entity_id="entity123",
+            timeline={"audio_tracks": [{
+                "id": "notes",
+                "type": "dialogue",
+                "path": "interview-notes.txt",
+                "start": 0,
+                "end": 2,
+            }]},
+            enabled=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_timeline_audio_track_rejects_unsupported_source_field(tmp_path):
     with pytest.raises(ValueError, match="path or fs_path is required"):
         await media_tools._resolve_timeline_audio_tracks(
@@ -5793,6 +6377,8 @@ async def test_compose_video_timeline_registers_include_source_audio(tmp_path, m
 
     async def fake_compose_video_file(**kwargs):
         captured["subtitle_style"] = kwargs["subtitle_style"]
+        captured["ducking_config"] = kwargs["ducking_config"]
+        captured["loudness_config"] = kwargs["loudness_config"]
         final.parent.mkdir(parents=True, exist_ok=True)
         final.write_bytes(b"mixed")
         return str(final), "final/mixed.mp4", "mixed.mp4"
@@ -5804,6 +6390,7 @@ async def test_compose_video_timeline_registers_include_source_audio(tmp_path, m
     async def fake_create_video_editor_recipe_sidecar(**kwargs):
         captured["sidecar_final_document_id"] = kwargs["final_document_id"]
         captured["sidecar_final_rel_path"] = kwargs["final_rel_path"]
+        captured["render_settings"] = kwargs["render_settings"]
         return {
             "document_id": "recipe_123",
             "fs_path": "final/mixed.video-edit.json",
@@ -5851,6 +6438,12 @@ async def test_compose_video_timeline_registers_include_source_audio(tmp_path, m
     assert captured["sidecar_final_rel_path"] == "final/mixed.mp4"
     assert captured["attached_final_document_id"] == "doc_123"
     assert captured["attached_recipe_document_id"] == "recipe_123"
+    assert captured["render_settings"] == {
+        "burn_subtitles": False,
+        "subtitle_style": captured["subtitle_style"],
+        "ducking": captured["ducking_config"],
+        "loudness_normalization": captured["loudness_config"],
+    }
 
 
 @pytest.mark.asyncio
@@ -6068,7 +6661,14 @@ async def test_compose_video_timeline_maps_audio_resolution_failures_by_mode(
     assert not final.exists()
 
 
-def test_video_editor_recipe_payload_preserves_ai_composition_layers():
+@pytest.mark.parametrize("ducking_enabled", [False, True])
+def test_video_editor_recipe_payload_preserves_ai_composition_layers(ducking_enabled):
+    render_settings = {
+        "burn_subtitles": True,
+        "subtitle_style": {"font_name": "Arial", "font_size": 44, "margin_v": 180},
+        "ducking": {"enabled": ducking_enabled, "target_types": ["ambience"]},
+        "loudness_normalization": {"enabled": False},
+    }
     payload = media_tools._build_video_editor_recipe_payload(
         entity_id="entity123",
         timeline={
@@ -6193,6 +6793,7 @@ def test_video_editor_recipe_payload_preserves_ai_composition_layers():
         crf=18,
         preset="veryfast",
         include_source_audio=False,
+        render_settings=render_settings,
     )
 
     assert payload["kind"] == "manor.video_edit_recipe"
@@ -6207,6 +6808,9 @@ def test_video_editor_recipe_payload_preserves_ai_composition_layers():
     assert payload["timeline"]["captions"][0]["text"] == "Good morning."
     assert payload["timeline"]["audio_cues"][0]["assetDocumentId"] == "audio_doc_1"
     assert payload["timeline"]["audio_cues"][1]["type"] == "ambience"
+    assert payload["timeline"]["audio_cues"][0]["duckUnderDialogue"] is False
+    assert payload["timeline"]["audio_cues"][1]["duckUnderDialogue"] is ducking_enabled
+    assert payload["generation"]["render_settings"] == render_settings
     assert payload["ai_composition"]["clip_count"] == 2
     assert "source_timeline" in payload
 
@@ -6470,8 +7074,11 @@ async def test_probe_media_uses_packet_timestamps_when_container_duration_is_mis
 
 
 @pytest.mark.asyncio
-async def test_probe_media_report_normalizes_container_video_and_audio(monkeypatch):
+@pytest.mark.parametrize("pass_fds", [(), (3,)])
+async def test_probe_media_report_normalizes_container_video_and_audio(monkeypatch, pass_fds):
     async def fake_run_process(args, **_kwargs):
+        assert _kwargs.get("pass_fds", ()) == pass_fds
+        assert ("-protocol_whitelist" in args) == bool(pass_fds)
         assert "stream=index,codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,display_aspect_ratio,sample_rate,channels,channel_layout,duration" in args
         return json.dumps({
             "format": {
@@ -6507,7 +7114,7 @@ async def test_probe_media_report_normalizes_container_video_and_audio(monkeypat
 
     monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
 
-    report = await media_tools._probe_media_report("/usr/bin/ffprobe", "/tmp/final.mp4")
+    report = await media_tools._probe_media_report("/usr/bin/ffprobe", "/tmp/final.mp4", pass_fds=pass_fds)
 
     assert report == {
         "decodable": True,
@@ -6586,6 +7193,21 @@ async def test_probe_media_handler_resolves_entity_file(monkeypatch, tmp_path):
     assert result["status"] == "completed"
     assert result["fs_path"] == "project/final.mp4"
     assert result["report"]["decodable"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    {},
+    {"input_path": "audio.wav", "document_id": "document-1"},
+])
+async def test_probe_media_handler_requires_exactly_one_source(arguments):
+    result = json.loads(await media_tools._probe_media_handler(
+        entity_id="entity-1",
+        **arguments,
+    ))
+
+    assert result["status"] == "error"
+    assert result["error"].startswith("Both" if arguments else "Neither")
 
 
 @pytest.mark.asyncio
@@ -6756,6 +7378,70 @@ async def test_still_to_video_renders_and_registers_h264_scene(monkeypatch, tmp_
     assert captured["bound_document_id"] == "doc-scene"
 
 
+def _ffmpeg_burns_text() -> bool:
+    """Whether the ffmpeg on PATH can burn subtitles (libass), tried on one tiny frame."""
+    import tempfile
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        return False
+    with tempfile.TemporaryDirectory() as folder:
+        subtitles = Path(folder) / "probe.srt"
+        subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n", encoding="utf-8")
+        return subprocess.run(
+            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:d=0.1", "-vf", f"subtitles={subtitles}",
+             "-f", "null", "-"], capture_output=True, check=False).returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ffmpeg_burns_text(), reason="needs ffmpeg with libass")
+async def test_still_to_video_renders_a_titled_intro_that_moves_in(monkeypatch, tmp_path):
+    """A series intro: the key visual, moving in slowly, with the series title fading in."""
+    from PIL import Image
+
+    source = tmp_path / "project" / "key-art.png"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (640, 640), (180, 150, 110)).save(source)
+    captured: dict = {}
+
+    async def fake_target(**_kwargs):
+        return SimpleNamespace(abs_dir=str(tmp_path / "out"), abs_path=str(tmp_path / "out" / "intro.mp4"),
+                               rel_path="out/intro.mp4", filename="intro.mp4")
+
+    def fake_commit(_entity_id, rel_path, source_path, **_kwargs):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(Path(source_path).read_bytes())
+
+    async def fake_register(**kwargs):
+        captured["generation"] = kwargs["generation"]
+        return "doc-intro"
+
+    async def no_base(**_kwargs):
+        return ""
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", no_base)
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", fake_commit)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", AsyncMock())
+
+    result = json.loads(await media_tools._still_to_video_handler(
+        entity_id="entity-1", user_id="user-1", workspace_id="workspace-1", input_path="project/key-art.png",
+        output_name="out/intro.mp4", duration_seconds=2, resolution="480p", aspect_ratio="9:16",
+        motion="push_in", title="鬼吹灯 · 寻龙诀", fade_seconds=0.4,
+    ))
+
+    assert result["status"] == "completed", result
+    report = await media_tools._probe_media_report(shutil.which("ffprobe"), str(tmp_path / "out" / "intro.mp4"))
+    assert abs(report["duration_seconds"] - 2.0) < 0.15
+    assert (report["video_stream"]["width"], report["video_stream"]["height"]) == (480, 854)
+    assert {key: captured["generation"][key] for key in ("motion", "title", "fade_seconds")} == {
+        "motion": "push_in", "title": "鬼吹灯 · 寻龙诀", "fade_seconds": 0.4}
+    assert "鬼吹灯 · 寻龙诀" in media_tools._still_title_ass("鬼吹灯 · 寻龙诀", 2, width=480, height=854)
+
+
 @pytest.mark.asyncio
 async def test_still_to_video_rejects_non_image_input(monkeypatch, tmp_path):
     source = tmp_path / "project" / "notes.txt"
@@ -6799,6 +7485,15 @@ def test_frame_sample_times_keep_requested_moments_when_capped():
         duration_seconds=100, timestamps=[42, 77], scene_boundaries=[], interval_seconds=5, max_samples=4,
     )
     assert len(samples) == 4 and {42.0, 77.0} <= set(samples) and samples == sorted(samples)
+    # A 30 fps clip's requested closing frame must not be clamped 100 ms early.
+    assert media_tools._frame_sample_times(
+        duration_seconds=27.3, timestamps=[818 / 30], scene_boundaries=[],
+        interval_seconds=10, max_samples=1, frame_rate=30,
+    ) == [27.266666]
+    assert media_tools._frame_sample_times(
+        duration_seconds=5, timestamps=[4.999], scene_boundaries=[],
+        interval_seconds=10, max_samples=1, frame_rate=24,
+    ) == [4.958333]
 
 
 def test_frame_sample_times_preserve_first_last_and_cap():
@@ -6835,7 +7530,7 @@ async def test_render_frame_samples_registers_ordered_durable_frames(monkeypatch
             "duration_seconds": 10.0,
             "has_video": True,
             "has_audio": True,
-            "video_stream": {"duration_seconds": 9.5},
+            "video_stream": {"duration_seconds": 9.5, "frame_rate": 30},
         }
 
     async def fake_target(**kwargs):
@@ -6898,7 +7593,7 @@ async def test_render_frame_samples_registers_ordered_durable_frames(monkeypatch
         workspace_id="workspace-1",
         input_path=(f"/api/v1/fs/entity-1/{source_rel}" if chat_upload else source_rel),
         output_dir=("uploads/chat/video_frame_samples" if chat_upload else "project/qa/frames"),
-        timestamps=[2],
+        timestamps=[2, 9.45],
         interval_seconds=5,
         max_samples=4,
     ))
@@ -6911,7 +7606,7 @@ async def test_render_frame_samples_registers_ordered_durable_frames(monkeypatch
             frame["fs_path"].startswith("Video-Analysis/0123456789abcdef/frames/")
             for frame in result["frames"]
         )
-    assert [frame["timestamp_seconds"] for frame in result["frames"]] == [0.0, 2.0, 5.0, 9.4]
+    assert [frame["timestamp_seconds"] for frame in result["frames"]] == [0.0, 2.0, 5.0, 9.45]
     assert [frame["document_id"] for frame in result["frames"]] == [
         "doc-1",
         "doc-2",
@@ -6922,10 +7617,279 @@ async def test_render_frame_samples_registers_ordered_durable_frames(monkeypatch
     assert len(rendered_args) == 4
     for index, args in enumerate(rendered_args):
         assert args[0] == "/usr/bin/ffmpeg"
-        assert args[args.index("-ss") + 1] == f"{result['frames'][index]['timestamp_seconds']:.3f}"
+        assert args[args.index("-ss") + 1] == f"{result['frames'][index]['timestamp_seconds']:.6f}"
         assert args[args.index("-frames:v") + 1] == "1"
         assert registered[index]["artifact_role"] == "qa_evidence"
         assert registered[index]["generation"]["timestamp_seconds"] == result["frames"][index]["timestamp_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_render_frame_samples_keeps_completed_frame_when_later_decode_fails(monkeypatch, tmp_path):
+    source = tmp_path / "project/final.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"video")
+    registered = []
+
+    async def probe(_ffprobe, _path):
+        return {
+            "duration_seconds": 2.0, "has_video": True,
+            "video_stream": {"duration_seconds": 2.0, "frame_rate": 24},
+        }
+
+    async def target(**kwargs):
+        path = tmp_path / kwargs["output_name"]
+        return SimpleNamespace(
+            abs_dir=str(path.parent), abs_path=str(path), rel_path=kwargs["output_name"], filename=path.name,
+        )
+
+    async def run(args, **_kwargs):
+        if float(args[args.index("-ss") + 1]) == 1.0:
+            raise RuntimeError("second frame decode failed")
+        Path(args[-1]).write_bytes(b"png")
+        return "", ""
+
+    async def register(**kwargs):
+        registered.append(kwargs)
+        return "frame-document"
+
+    def copy(_entity_id, rel_path, source_path, **_kwargs):
+        path = tmp_path / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(Path(source_path).read_bytes())
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", probe)
+    monkeypatch.setattr(media_tools, "_build_media_target", target)
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", lambda **_kwargs: asyncio.sleep(0, result=""))
+    monkeypatch.setattr(media_tools, "_run_process", run)
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", copy)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", lambda **_kwargs: asyncio.sleep(0))
+
+    result = json.loads(await media_tools._render_frame_samples_handler(
+        entity_id="entity-1", user_id="user-1", workspace_id="workspace-1",
+        input_path="project/final.mp4", output_dir="project/qa/frames",
+        timestamps=[0, 1], max_samples=2,
+    ))
+
+    assert result["status"] == "error"
+    assert len(result["completed_frames"]) == 1
+    assert result["completed_frames"][0].items() >= {
+        "index": 1, "timestamp_seconds": 0.0, "document_id": "frame-document",
+        "name": "frame-001-000000000ms.png", "fs_path": "project/qa/frames/frame-001-000000000ms.png",
+        "result_url": "/api/v1/fs/entity-1/project/qa/frames/frame-001-000000000ms.png",
+        "file_size": 3,
+    }.items()
+    assert result["completed_frames"][0]["file"]["document_id"] == "frame-document"
+    assert registered[0]["generation"]["sample_index"] == 1
+    assert (tmp_path / "project/qa/frames/frame-001-000000000ms.png").read_bytes() == b"png"
+
+
+@pytest.mark.asyncio
+async def test_render_frame_samples_reads_workspace_document_snapshot_before_artifact_registration(
+    monkeypatch, tmp_path,
+):
+    from packages.core.services import workspace_document_media
+
+    inspection_complete = False
+    registrations = []
+    snapshot_bytes = tmp_path / "lesson-video.mp4"
+    snapshot_bytes.write_bytes(b"video")
+
+    async def inspect(reference, **kwargs):
+        nonlocal inspection_complete
+        assert reference == {"source_kind": "workspace_document", "document_id": "lesson-video"}
+        assert kwargs["expected_source_sha256"] == "a" * 64
+        with snapshot_bytes.open("rb") as handle:
+            details = await kwargs["inspect_snapshot"](f"/dev/fd/{handle.fileno()}")
+        inspection_complete = True
+        return {
+            "source_kind": "workspace_document", "document_id": "lesson-video",
+            "rel_path": "Courses/week-1.mp4", "source_sha256": "a" * 64,
+            "size_bytes": 123, **details,
+        }
+
+    async def probe(_ffprobe, path, **kwargs):
+        assert path.startswith("/dev/fd/")
+        assert Path(path).read_bytes() == b"video"
+        assert kwargs["pass_fds"] == (int(Path(path).name),)
+        return {
+            "duration_seconds": 2.0, "has_video": True,
+            "video_stream": {"duration_seconds": 2.0, "frame_rate": 24},
+        }
+
+    async def run(args, **kwargs):
+        assert kwargs["pass_fds"] == (int(Path(args[args.index("-i") + 1]).name),)
+        assert "-protocol_whitelist" in args
+        Path(args[-1]).write_bytes(b"png")
+        return "", ""
+
+    async def target(**kwargs):
+        path = tmp_path / kwargs["output_name"]
+        return SimpleNamespace(
+            abs_dir=str(path.parent), abs_path=str(path), rel_path=kwargs["output_name"], filename=path.name,
+        )
+
+    def copy(_entity_id, rel_path, source_path, **_kwargs):
+        path = tmp_path / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(Path(source_path).read_bytes())
+
+    async def register(**kwargs):
+        assert inspection_complete
+        registrations.append(kwargs)
+        return "frame-document"
+
+    monkeypatch.setattr(workspace_document_media, "inspect_workspace_document_media", inspect)
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", probe)
+    monkeypatch.setattr(media_tools, "_run_process", run)
+    monkeypatch.setattr(media_tools, "_build_media_target", target)
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", copy)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", lambda **_kwargs: asyncio.sleep(0))
+
+    result = json.loads(await media_tools._render_frame_samples_handler(
+        entity_id="entity-1", user_id="user-1", document_id="lesson-video",
+        expected_source_sha256="A" * 64, output_dir="Course QA/frames", timestamps=[0], max_samples=1,
+    ))
+
+    assert result["status"] == "completed"
+    assert result["source_document_id"] == "lesson-video"
+    assert result["source_sha256"] == "a" * 64
+    assert registrations[0]["generation"]["source_document_id"] == "lesson-video"
+    assert registrations[0]["generation"]["source_sha256"] == "a" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.media_integration
+async def test_workspace_document_media_tools_read_scheduled_course_video_and_keep_acl_bound(
+    db_session, monkeypatch, tmp_path,
+):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    import packages.core.database as database
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.user import Entity, User, UserMembership
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+    from packages.core.services.ai_file_permissions import guard_ai_file_read_access
+    from packages.core.services.entity_fs import entity_filesystem_mutation_lock
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg and ffprobe are required for the media integration lane")
+    try:
+        subprocess.run([ffmpeg, "-version"], check=True, capture_output=True)
+    except OSError:
+        pytest.skip("the installed ffmpeg is not executable on this host")
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(database, "async_session", factory)
+
+    entity = Entity(id=generate_ulid(), name="Course media entity", slug=f"course-media-{generate_ulid().lower()}")
+    actor = User(
+        id=generate_ulid(), entity_id=entity.id, email=f"course-owner-{generate_ulid()}@test.example",
+        password_hash="unused", role="member", status="active",
+    )
+    outsider = User(
+        id=generate_ulid(), entity_id=entity.id, email=f"course-outsider-{generate_ulid()}@test.example",
+        password_hash="unused", role="member", status="active",
+    )
+    workspace = Workspace(id=generate_ulid(), entity_id=entity.id, name="Course recording QA", status="active")
+    db_session.add_all([entity, actor, outsider, workspace])
+    await db_session.flush()
+    db_session.add_all([
+        UserMembership(user_id=actor.id, entity_id=entity.id, role="member", status="active", is_primary=True),
+        UserMembership(user_id=outsider.id, entity_id=entity.id, role="member", status="active", is_primary=True),
+        WorkspaceStaff(workspace_id=workspace.id, user_id=actor.id, role="contributor", status="active"),
+    ])
+    await ensure_workspace_artifact_folder(db_session, workspace)
+    source_path = "Course recordings/week-01-native-master.mp4"
+    source = tmp_path / entity.id / source_path
+    source.parent.mkdir(parents=True)
+    subprocess.run([
+        ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=2",
+        "-f", "lavfi", "-i", "sine=frequency=431:sample_rate=48000:duration=2",
+        "-shortest", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-c:a", "aac", str(source),
+    ], check=True, capture_output=True)
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    source_document = Document(
+        id=generate_ulid(), entity_id=entity.id, name=source.name, fs_path=source_path,
+        file_size=source.stat().st_size, file_type="mp4", mime_type="video/mp4", source="upload",
+        visibility="workspace", owner_id=actor.id, metadata_={"origin": {"workspace_id": workspace.id}},
+    )
+    db_session.add(source_document)
+    await db_session.commit()
+
+    original_run_process = media_tools._run_process
+    mutation_lock_observed = False
+    media_command_count = 0
+
+    async def run_process_while_observing_lock(*args, **kwargs):
+        nonlocal media_command_count, mutation_lock_observed
+        media_command_count += 1
+        if not mutation_lock_observed:
+            async with entity_filesystem_mutation_lock(str(tmp_path / entity.id), timeout_seconds=0):
+                mutation_lock_observed = True
+        # Frame sampling performs ffprobe plus one decode first. The next command is
+        # audio analysis after its source has already been staged from the snapshot.
+        if media_command_count == 3:
+            source.write_bytes(source.read_bytes() + b"\x00")
+        return await original_run_process(*args, **kwargs)
+
+    monkeypatch.setattr(media_tools, "_run_process", run_process_while_observing_lock)
+
+    frames = json.loads(await media_tools._render_frame_samples_handler(
+        entity_id=entity.id, user_id=actor.id, workspace_id=workspace.id,
+        document_id=source_document.id, expected_source_sha256=source_digest,
+        output_dir="Course QA/frames", timestamps=[0], max_samples=1,
+    ))
+    analysis = json.loads(await media_tools._analyze_audio_handler(
+        entity_id=entity.id, user_id=actor.id, workspace_id=workspace.id,
+        document_id=source_document.id, expected_source_sha256=source_digest,
+    ))
+
+    assert frames["status"] == "completed"
+    assert frames["source_document_id"] == source_document.id
+    assert frames["source_sha256"] == source_digest
+    assert mutation_lock_observed
+    assert analysis["status"] == "completed"
+    assert analysis["source_document_id"] == source_document.id
+    assert analysis["source_sha256"] == source_digest
+    assert hashlib.sha256(source.read_bytes()).hexdigest() != source_digest
+    frame_document = await db_session.scalar(select(Document).where(Document.id == frames["frames"][0]["document_id"]))
+    assert frame_document is not None
+    assert frame_document.metadata_["generation"]["source_document_id"] == source_document.id
+    assert await guard_ai_file_read_access(
+        entity_id=entity.id, user_id=actor.id, workspace_id=workspace.id,
+        tool_name="read_file", paths=[frame_document.fs_path],
+    ) is None
+
+    denied = json.loads(await media_tools._analyze_audio_handler(
+        entity_id=entity.id, user_id=outsider.id, workspace_id=workspace.id,
+        document_id=source_document.id,
+    ))
+    assert denied["code"] == "analyze_audio_failed"
+    assert "no longer readable" in denied["error"]
+
+    stale = json.loads(await media_tools._analyze_audio_handler(
+        entity_id=entity.id, user_id=actor.id, workspace_id=workspace.id,
+        document_id=source_document.id, expected_source_sha256=source_digest,
+    ))
+    assert stale["code"] == "analyze_audio_failed"
+    assert "changed" in stale["error"]
 
 
 @pytest.mark.asyncio
@@ -6958,6 +7922,64 @@ async def test_video_analysis_source_requires_exact_chat_upload_access(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_workspace_media_source_outside_workspace_folder_stays_readable(monkeypatch, tmp_path):
+    # Regression: an entity-level upload was relocated under the running
+    # Workflow's folder, so frame sampling reported it missing.
+    workspace_base = "Workspaces/_by_id/folder-1/runs/run-1"
+    entity_upload = tmp_path / "native-master.mp4"
+    entity_upload.write_bytes(b"entity video")
+    denied: list[list[str]] = []
+
+    async def workspace_base_dir(**_kwargs):
+        return workspace_base
+
+    async def guard(**kwargs):
+        denied.append(kwargs["paths"])
+        return json.dumps({"error": "file_permission_denied"})
+
+    async def document_path(_entity_id, _root, value):
+        assert value == "/viewer/doc-1"
+        return "native-master.mp4", None
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _id: str(tmp_path))
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", workspace_base_dir)
+    monkeypatch.setattr(media_tools, "runtime_guard_file_read_access", guard)
+    monkeypatch.setattr("packages.core.ai.tools.file_tools._file_reference_path", document_path)
+
+    async def resolve(input_path):
+        return await media_tools._resolve_video_analysis_source(
+            entity_id="entity-1", input_path=input_path, workspace_id="workspace-1",
+        )
+
+    for reference in ("native-master.mp4", "/api/v1/fs/entity-1/native-master.mp4", "/viewer/doc-1"):
+        assert await resolve(reference) == ("native-master.mp4", str(entity_upload), False)
+
+    # The Workspace's own file keeps priority for a logical name; an explicit
+    # Document address still names the Document's bytes.
+    scoped_rel = media_tools._workspace_media_reference(
+        "native-master.mp4", entity_id="entity-1", workspace_base_dir=workspace_base,
+    )
+    scoped = tmp_path / scoped_rel
+    scoped.parent.mkdir(parents=True)
+    scoped.write_bytes(b"workspace video")
+    assert await resolve("native-master.mp4") == (scoped_rel, str(scoped), False)
+    assert await resolve("/viewer/doc-1") == ("native-master.mp4", str(entity_upload), False)
+
+    # The fallback is subject to the same runtime read ACL.
+    token = media_tools._CURRENT_MEDIA_FILE_ACCESS.set(media_tools._MediaFileAccessContext(
+        entity_id="entity-1", user_id="user-1", workspace_id="workspace-1",
+        conversation_id=None, runtime_envelope=None, tool_name="render_frame_samples",
+        enforce_acl=True,
+    ))
+    try:
+        with pytest.raises(ValueError, match="access denied"):
+            await resolve("/viewer/doc-1")
+    finally:
+        media_tools._CURRENT_MEDIA_FILE_ACCESS.reset(token)
+    assert denied == [["native-master.mp4"]]
+
+
+@pytest.mark.asyncio
 async def test_transcribe_video_extracts_audio_and_offsets_measured_segments(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     source.write_bytes(b"video")
@@ -6976,7 +7998,9 @@ async def test_transcribe_video_extracts_audio_and_offsets_measured_segments(mon
 
     async def transcribe(**kwargs):
         assert Path(kwargs["audio_path"]).read_bytes() == b"mp3"
-        assert kwargs["require_timestamps"] is False
+        # Timestamps are asked for, anchored to the scripted line.
+        assert kwargs["require_timestamps"] is True
+        assert kwargs["reference_transcript"] == "Hello"
         return SimpleNamespace(
             text="Hello", model="openai/whisper-1",
             segments=[{"start": 1.0, "end": 2.0, "text": "Hello"}],
@@ -6990,7 +8014,7 @@ async def test_transcribe_video_extracts_audio_and_offsets_measured_segments(mon
 
     result = json.loads(await media_tools._transcribe_video_handler(
         entity_id="entity-1", user_id="user-1", input_path="Videos/source.mp4",
-        start_seconds=30, end_seconds=60,
+        start_seconds=30, end_seconds=60, reference_transcript=" Hello ",
     ))
     assert result["status"] == "completed"
     assert result["segments"] == [{"start": 31.0, "end": 32.0, "text": "Hello"}]
@@ -7013,8 +8037,14 @@ async def test_transcribe_video_returns_text_when_stt_has_no_timestamps(monkeypa
         Path(args[-1]).write_bytes(b"mp3")
         return "", ""
 
+    from packages.core.services.voice.whisper import WhisperTimestampError
+
+    calls = []
+
     async def transcribe(**kwargs):
-        assert kwargs["require_timestamps"] is False
+        calls.append(kwargs["require_timestamps"])
+        if kwargs["require_timestamps"]:
+            raise WhisperTimestampError("no timestamp-capable route")
         return SimpleNamespace(text="The secret word is comet.", model="chat-audio", segments=None)
 
     monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -7030,6 +8060,32 @@ async def test_transcribe_video_returns_text_when_stt_has_no_timestamps(monkeypa
     assert result["text"] == "The secret word is comet."
     assert result["segments"] == []
     assert result["timestamps_available"] is False
+    assert calls == [True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "matches"),
+    [
+        ("Speak exactly this Mandarin narration, with no added words: 「AYCE 的 Waste，至少要拆成四类。」", True),
+        ("AYCE 的 Waste，至少要拆成四类。", True),
+        ("Speak exactly this: 「AYCE 的 Waste，至少要拆成三类。」", False),
+        ("Say 「AYCE 的 Waste，」 then 「至少要拆成四类。」", False),
+    ],
+)
+async def test_audio_provenance_compares_the_quoted_line_of_a_directed_tts_prompt(
+    monkeypatch, prompt, matches
+):
+    async def provenance(**_kwargs):
+        return prompt, "Workspaces/n1.mp3"
+
+    monkeypatch.setattr(media_tools, "_audio_prompt_provenance", provenance)
+
+    assert await media_tools._audio_prompt_matches_transcript(
+        entity_id="entity-1",
+        audio_rel_path="Workspaces/n1-normalized.wav",
+        transcript="AYCE 的 Waste，至少要拆成四类。",
+    ) is matches
 
 
 def test_parse_ebur128_uses_final_summary_values():
@@ -7138,6 +8194,78 @@ async def test_analyze_audio_applies_explicit_loudness_tolerance(
 
 
 @pytest.mark.asyncio
+async def test_analyze_audio_reads_workspace_document_through_snapshot(monkeypatch, tmp_path):
+    from packages.core.services import workspace_document_media
+
+    async def inspect(reference, **kwargs):
+        assert reference == {"source_kind": "workspace_document", "document_id": "lecture-audio"}
+        assert kwargs["expected_source_sha256"] == "b" * 64
+        snapshot_bytes = tmp_path / "lecture.wav"
+        snapshot_bytes.write_bytes(b"audio")
+        with snapshot_bytes.open("rb") as handle:
+            details = await kwargs["inspect_snapshot"](f"/dev/fd/{handle.fileno()}")
+        return {
+            "source_kind": "workspace_document", "document_id": "lecture-audio",
+            "rel_path": "Courses/lecture.wav", "source_sha256": "b" * 64,
+            "size_bytes": 456, **details,
+        }
+
+    async def probe(_ffprobe, path, **kwargs):
+        assert path.startswith("/dev/fd/")
+        assert Path(path).read_bytes() == b"audio"
+        assert kwargs["pass_fds"] == (int(Path(path).name),)
+        return {"duration_seconds": 3.0, "has_audio": True}
+
+    async def run(args, **kwargs):
+        assert kwargs["pass_fds"] == (int(Path(args[args.index("-i") + 1]).name),)
+        assert "-protocol_whitelist" in args
+        if "ebur128" in " ".join(args):
+            return "", "Summary:\n I: -16.0 LUFS\n LRA: 2.0 LU\n Peak: -3.0 dBFS\n"
+        return "", ""
+
+    monkeypatch.setattr(workspace_document_media, "inspect_workspace_document_media", inspect)
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", probe)
+    monkeypatch.setattr(media_tools, "_run_process", run)
+
+    result = json.loads(await media_tools._analyze_audio_handler(
+        entity_id="entity-1", document_id="lecture-audio", expected_source_sha256="B" * 64,
+    ))
+
+    assert result["status"] == "completed"
+    assert result["source_document_id"] == "lecture-audio"
+    assert result["source_sha256"] == "b" * 64
+
+
+@pytest.mark.asyncio
+async def test_staging_workspace_snapshot_waits_for_copy_before_cancellation_releases_fd(monkeypatch, tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_to_thread(function):
+        started.set()
+        await release.wait()
+        return function()
+
+    monkeypatch.setattr(media_tools.asyncio, "to_thread", blocked_to_thread)
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "staged.mp4"
+    source.write_bytes(b"fixed bytes")
+    with source.open("rb") as handle:
+        task = asyncio.create_task(media_tools._stage_media_snapshot(
+            f"/dev/fd/{handle.fileno()}", str(destination), max_bytes=1024,
+        ))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert destination.read_bytes() == b"fixed bytes"
+
+
+@pytest.mark.asyncio
 async def test_analyze_audio_reports_loudness_clipping_and_silence_findings(monkeypatch, tmp_path):
     source = tmp_path / "project" / "final.mp4"
     source.parent.mkdir(parents=True)
@@ -7211,6 +8339,351 @@ async def test_analyze_audio_rejects_media_without_audio_stream(monkeypatch, tmp
     assert result["status"] == "error"
     assert result["code"] == "analyze_audio_failed"
     assert "no audio stream" in result["error"]
+
+
+def _synthetic_beat_levels(seconds=40.0, bpm=120.0, loud_from=20.0):
+    """Frame RMS levels for a click track: accented bar starts, a louder second half."""
+    fps = media_tools._MUSIC_SAMPLE_RATE / media_tools._MUSIC_HOP_SAMPLES
+    frames = int(seconds * fps)
+    beat = 60.0 / bpm
+    full, high = [], []
+    for index in range(frames):
+        time = index / fps
+        since = time % beat
+        accent = 6.0 if (time % (beat * 4)) < beat else 0.0
+        boost = 10.0 if time >= loud_from else 0.0
+        level = max(-60.0, -20.0 + accent + boost - since * 120.0)
+        full.append(level)
+        high.append(level - 6.0)
+    return full, high, fps
+
+
+def test_music_structure_finds_tempo_downbeats_sections_and_loudest_window():
+    full, high, fps = _synthetic_beat_levels()
+
+    structure = media_tools._music_structure_from_levels(
+        full, high, frames_per_second=fps, window_seconds=10.0,
+    )
+
+    assert structure["tempo_bpm"] == pytest.approx(120.0, rel=0.02)
+    downbeats = structure["downbeat_seconds"]
+    assert all(abs((later - earlier) - 2.0) < 0.05 for earlier, later in itertools.pairwise(downbeats))
+    assert [section["energy_level"] for section in structure["sections"]] == ["low", "high"]
+    assert structure["sections"][1]["start_seconds"] == pytest.approx(20.0, abs=0.1)
+    best = structure["best_windows"][0]
+    assert best["start_seconds"] >= 19.9 and best["end_seconds"] - best["start_seconds"] == pytest.approx(10.0)
+    assert best["downbeats_in_window"][0] == 0.0
+    assert len(structure["energy_per_second"]) == 40
+
+
+@pytest.mark.asyncio
+async def test_analyze_music_structure_measures_full_and_high_band_levels(monkeypatch, tmp_path):
+    source = tmp_path / "project" / "song.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    full, high, _fps = _synthetic_beat_levels()
+    filters = []
+
+    async def fake_probe(_ffprobe, _path, **_kwargs):
+        return {"decodable": True, "duration_seconds": 40.0, "has_audio": True}
+
+    async def fake_run_process(args, **_kwargs):
+        chain = args[args.index("-af") + 1]
+        filters.append(chain)
+        levels = high if "highpass" in chain else full
+        return "".join(
+            f"frame:{index} pts:{index * 256} pts_time:{index / 86.13:.6f}\n"
+            f"lavfi.astats.Overall.RMS_level={value:.2f}\n"
+            for index, value in enumerate(levels)
+        ), ""
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+
+    result = json.loads(await media_tools._analyze_music_structure_handler(
+        entity_id="entity-1", input_path="project/song.mp3", window_seconds=10,
+    ))
+
+    assert result["status"] == "completed"
+    assert result["tempo_bpm"] == pytest.approx(120.0, rel=0.02)
+    assert result["best_windows"][0]["start_seconds"] >= 19.9
+    # Resampling precedes framing so the frame rate is fixed; one pass is high-passed.
+    assert all(chain.startswith("aresample=22050,aformat=channel_layouts=mono,") for chain in filters)
+    assert ["highpass" in chain for chain in filters] == [False, True]
+
+    # Knowledge documents resolve with the runtime caller's scope, as workflow tool nodes call it.
+    from packages.core.services import workspace_document_media
+
+    async def inspect(reference, **kwargs):
+        assert reference == {"source_kind": "workspace_document", "document_id": "song-doc"}
+        assert kwargs["user_id"] == "user-1"
+        with source.open("rb") as handle:
+            await kwargs["inspect_snapshot"](f"/dev/fd/{handle.fileno()}")
+        return {"document_id": "song-doc", "rel_path": "project/song.mp3", "source_sha256": "c" * 64}
+
+    monkeypatch.setattr(workspace_document_media, "inspect_workspace_document_media", inspect)
+    from_document = json.loads(await media_tools._analyze_music_structure_handler(
+        entity_id="entity-1", document_id="song-doc", _user_id_from_context="user-1",
+    ))
+    assert (from_document["status"], from_document["source_document_id"]) == ("completed", "song-doc")
+
+    # Too little audio is reported, never guessed into a tempo.
+    full, high = full[:200], high[:200]
+    short = json.loads(await media_tools._analyze_music_structure_handler(
+        entity_id="entity-1", input_path="project/song.mp3",
+    ))
+    assert (short["status"], short["code"]) == ("error", "analyze_music_structure_failed")
+    assert "four seconds" in short["error"]
+
+
+@pytest.mark.asyncio
+async def test_listen_to_audio_sends_the_audio_with_measured_facts(monkeypatch, tmp_path):
+    source = tmp_path / "project" / "song.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    calls = []
+
+    async def fake_probe(_ffprobe, _path, **_kwargs):
+        return {"decodable": True, "duration_seconds": 171.6, "has_audio": True}
+
+    async def fake_run_process(args, **_kwargs):
+        # Mono, 16 kHz: what the listening model hears at, small enough for a long song.
+        assert args[args.index("-ac") + 1] == "1" and args[args.index("-ar") + 1] == "16000"
+        Path(args[-1]).write_bytes(b"heard-mp3")
+        return "", ""
+
+    async def fake_completion(messages, **kwargs):
+        calls.append((messages, kwargs))
+        return SimpleNamespace(content='```json\n{"vocals": {"lead_gender": "female"}}\n```',
+                               usage={"model": "google/gemini-2.5-pro"})
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media_report", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    monkeypatch.setattr("packages.core.ai.runtime.completions.runtime_execute_text_completion", fake_completion)
+
+    result = json.loads(await media_tools._listen_to_audio_handler(
+        entity_id="entity-1", agent_id="agent-1", input_path="project/song.mp3", output_format="json",
+        instructions="Who is singing?", context="sections: verse 13.1-39.1",
+    ))
+
+    assert result["status"] == "completed"
+    assert result["answer"] == {"vocals": {"lead_gender": "female"}}
+    assert result["duration_seconds"] == 171.6
+    (messages, kwargs), = calls
+    prompt, heard = messages[0]["content"]
+    # Times stay inside the song; measured facts outrank the model's own estimates.
+    assert "0-171.6 s" in prompt["text"]
+    assert "sections: verse 13.1-39.1" in prompt["text"] and prompt["text"].rstrip().endswith("JSON object only.")
+    assert heard == {"type": "input_audio", "input_audio": {"data": "aGVhcmQtbXAz", "format": "mp3"}}
+    assert (kwargs["model"], kwargs["source"], kwargs["agent_id"]) == (
+        media_tools.LISTEN_TO_AUDIO_MODEL, "listen_to_audio_tool", "agent-1",
+    )
+
+    missing = json.loads(await media_tools._listen_to_audio_handler(
+        entity_id="entity-1", input_path="project/song.mp3", instructions=" ",
+    ))
+    assert (missing["status"], missing["error"]) == ("error", "instructions are required")
+
+    # One part of the track: only that part is cut and sent, and times are counted within it.
+    commands = []
+
+    async def cutting_run_process(args, **_kwargs):
+        commands.append(args)
+        Path(args[-1]).write_bytes(b"part-mp3")
+        return "", ""
+
+    monkeypatch.setattr(media_tools, "_run_process", cutting_run_process)
+    part = json.loads(await media_tools._listen_to_audio_handler(
+        entity_id="entity-1", input_path="project/song.mp3", instructions="What happens here?",
+        start_seconds=45, end_seconds=75,
+    ))
+    (command,) = commands
+    assert command[command.index("-ss") + 1] == "45.000" and command[command.index("-t") + 1] == "30.000"
+    assert command.index("-t") < command.index("-i")
+    assert (part["start_seconds"], part["end_seconds"], part["duration_seconds"]) == (45, 75, 30)
+    assert "0-30.0 s, counted from the start of this part (the part runs 45.0-75.0 s of a 171.6 s track)" in (
+        calls[-1][0][0]["content"][0]["text"])
+    backwards = json.loads(await media_tools._listen_to_audio_handler(
+        entity_id="entity-1", input_path="project/song.mp3", instructions="x", start_seconds=30, end_seconds=10,
+    ))
+    assert backwards["error"] == "end_seconds must be after start_seconds"
+
+
+def test_every_media_tool_that_reads_a_document_runs_in_the_callers_scope():
+    # A Knowledge document is opened as the user and Workspace the tool runs for; a handler without
+    # the scope binding fails in Workflow steps with "Workspace media requires an active Workspace".
+    unscoped = [
+        schema["function"]["name"]
+        for schema, handler in media_tools.get_tools()
+        if "document_id" in schema["function"]["parameters"].get("properties", {})
+        and getattr(handler, "__wrapped__", None) is None
+    ]
+    assert unscoped == []
+
+
+def test_lyric_words_take_the_sung_times_and_keep_every_word():
+    cues = [
+        media_tools.SubtitleCue(1, 24.0, 28.0, "Another bill beneath the door", "dialogue"),
+        media_tools.SubtitleCue(2, 28.0, 31.0, "我把眼泪藏起来", "dialogue"),
+    ]
+    # Song time = picture time + 100 s; "beneath" was misheard and CJK came back as a two-character word.
+    heard = [
+        {"text": "another", "start": 124.2, "end": 124.6}, {"text": "bill", "start": 124.6, "end": 125.0},
+        {"text": "between", "start": 125.1, "end": 125.6}, {"text": "the", "start": 125.6, "end": 125.8},
+        {"text": "door", "start": 125.8, "end": 127.0},
+        {"text": "我", "start": 128.2, "end": 128.4}, {"text": "眼泪", "start": 128.6, "end": 129.2},
+    ]
+
+    english, chinese = media_tools._time_cue_words(cues, heard, 100.0)
+
+    assert [(word.text, word.start) for word in english.words] == [
+        ("Another", 24.2), ("bill", 24.6), ("beneath", 25.0), ("the", 25.6), ("door", 25.8),
+    ]
+    assert english.timing_source == "measured_stt_words"
+    assert [word.text for word in chinese.words] == list("我把眼泪藏起来")
+    assert [word.start for word in chinese.words][:4] == [28.2, 28.4, 28.6, 28.9]
+    assert all(later.start >= earlier.start for earlier, later in zip(chinese.words, chinese.words[1:]))
+    assert chinese.words[-1].end <= 31.0
+
+
+def test_animated_lyrics_move_each_word_in_on_its_sung_time(monkeypatch):
+    # Widths as if every character were half the font size wide.
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: lambda text, size: len(text) * size / 2)
+    words = (media_tools.SubtitleWord(1.0, 1.4, "We"), media_tools.SubtitleWord(1.4, 2.0, "light"),
+             media_tools.SubtitleWord(2.0, 2.3, "the"), media_tools.SubtitleWord(2.3, 3.0, "night,"))
+    cue = media_tools.SubtitleCue(1, 0.8, 3.5, "We light the night,", "dialogue", words=words, emphasis=("night",))
+
+    popped = media_tools._render_animated_lyrics_ass(
+        [cue], {"reveal": "word", "entrance": "rise", "emphasis_entrance": "zoom", "exit": "fall", "exit_ms": 200,
+                "layout": "stack", "uppercase": True, "font_size": 100, "emphasis_scale": 1.5,
+                "accent_color": "#FFD54A", "font_name": "Bebas Neue", "position": "middle"},
+        canvas_width=1080, canvas_height=1920,
+    )
+    styles = [line for line in popped.splitlines() if line.startswith("Style:")]
+    # Two styles, so a burn-in never forces one style over the file; sizes are picture pixels.
+    assert len(styles) == 2 and "PlayResY: 1920" in popped and styles[0].startswith("Style: Lyric,Bebas Neue,100,")
+    events = [line.split(",", 9) for line in popped.splitlines() if line.startswith("Dialogue:")]
+    # Every word enters when it is sung and leaves with the line: one entry and one exit event each.
+    assert [(event[1], event[2], event[9].rsplit("}", 1)[1]) for event in events] == [
+        ("0:00:01.00", "0:00:03.30", "WE"), ("0:00:03.30", "0:00:03.50", "WE"),
+        ("0:00:01.40", "0:00:03.30", "LIGHT"), ("0:00:03.30", "0:00:03.50", "LIGHT"),
+        ("0:00:02.00", "0:00:03.30", "THE"), ("0:00:03.30", "0:00:03.50", "THE"),
+        ("0:00:02.30", "0:00:03.30", "NIGHT,"), ("0:00:03.30", "0:00:03.50", "NIGHT,"),
+    ]
+    # "WE LIGHT THE" (100 + 250 + 150 wide plus two 50 spaces = 600) is centred on its own row above
+    # the key word; each word rises 55 px into place from below.
+    assert "\\move(290,984,290,929,0,220)" in events[0][9]
+    assert "\\move(515,984,515,929,0,220)" in events[2][9]
+    # The key word gets its own larger accent row and zooms in; then everything falls away.
+    assert "\\fs150\\1c&H4AD5FF&" in events[6][9] and "\\fscx0\\fscy0" in events[6][9]
+    assert "\\move(540,1091,540,1173,0,200)" in events[7][9]
+
+
+def test_follow_camera_zooms_out_as_the_line_grows(monkeypatch):
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: lambda text, size: len(text) * size / 2)
+    words = (media_tools.SubtitleWord(1.0, 1.3, "Every"), media_tools.SubtitleWord(1.3, 1.6, "mile"),
+             media_tools.SubtitleWord(1.6, 2.2, "belongs"))
+    cue = media_tools.SubtitleCue(1, 1.0, 2.6, "Every mile belongs", "dialogue", words=words)
+
+    ass = media_tools._render_animated_lyrics_ass(
+        [cue], {"reveal": "word", "camera": "follow", "camera_tilts": [-6, 4], "font_size": 100, "exit_ms": 200,
+                "uppercase": True}, canvas_width=1920, canvas_height=1080,
+    )
+    events = [line.split(",", 9) for line in ass.splitlines() if line.startswith("Dialogue: 1")]
+    every = [event[9] for event in events if event[9].endswith("}EVERY")]
+    zooms = [int(re.findall(r"\\fscx(\d+)", text)[-1]) for text in every[:-1]]
+    # The first word fills the frame alone; each sung word makes the camera pull back.
+    assert zooms[0] == 500 and zooms[0] > zooms[1] > zooms[2]
+    # One tilt for the whole line (the cue's place in the tilts), about a point above the middle.
+    assert all("\\frz4" in text for text in every) and all("\\org(960,454)" in text for text in every)
+    # A new word starts where it sits under the previous framing, so it moves with the line.
+    mile = next(event[9] for event in events if event[9].endswith("}MILE") and "\\alpha&HB0&" in event[9])
+    assert "\\fscx500\\fscy500" in mile
+    # The line blurs away at its end.
+    assert every[-1].count("\\blur10\\alpha&HFF&") == 1
+
+
+def test_line_lyrics_fill_or_glitch_as_one_line():
+    words = (media_tools.SubtitleWord(1.0, 1.4, "We"), media_tools.SubtitleWord(1.4, 2.0, "light"),
+             media_tools.SubtitleWord(2.0, 2.3, "the"), media_tools.SubtitleWord(2.3, 3.0, "night,"))
+    cue = media_tools.SubtitleCue(1, 0.8, 3.5, "We light the night,", "dialogue", words=words, emphasis=("night",))
+    karaoke = media_tools._render_animated_lyrics_ass(
+        [cue], {"reveal": "karaoke", "glow_color": "#FF2BD6"}, canvas_width=1920, canvas_height=1080,
+    )
+    glow, line = [event for event in karaoke.splitlines() if event.startswith("Dialogue:")]
+    assert glow.startswith("Dialogue: 0,") and ",LyricFx," in glow and "\\blur12" in glow
+    assert "{\\k20\\kf40}We " in line and "{\\kf60}light " in line
+
+    glitched = media_tools._render_animated_lyrics_ass(
+        [cue], {"reveal": "line", "entrance": "glitch"}, canvas_width=1920, canvas_height=1080,
+    )
+    ghosts = [event for event in glitched.splitlines() if ",LyricFx," in event]
+    assert len(ghosts) == 2 and all(ghost.split(",")[2] == "0:00:01.15" for ghost in ghosts)
+
+
+@pytest.mark.asyncio
+async def test_align_subtitles_animates_lyrics_timed_from_the_song(monkeypatch, tmp_path):
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: None)
+    (tmp_path / "lyric-cues.json").write_text(json.dumps({"cues": [
+        {"start": 1.0, "end": 4.0, "text": "We light the night, we don't look back and we never stop",
+         "emphasis": ["night"], "type": "dialogue", "timing_source": "whisper_segments"},
+    ]}), encoding="utf-8")
+    (tmp_path / "song.mp3").write_bytes(b"audio")
+    output_path = tmp_path / "lyrics.ass"
+    transcribed = []
+
+    async def fake_stt(**kwargs):
+        transcribed.append(kwargs["audio_path"])
+        # Song clock: the video starts 120 s into the song.
+        return SimpleNamespace(words=[{"text": "we", "start": 121.2, "end": 121.4},
+                                      {"text": "light", "start": 121.4, "end": 121.9}], segments=[], model="whisper-1")
+
+    async def fake_target(**kwargs):
+        assert kwargs["ext"] == ".ass"
+        return SimpleNamespace(abs_dir=str(tmp_path), abs_path=str(output_path), rel_path="lyrics.ass",
+                               filename="lyrics.ass")
+
+    def fake_write(_entity_id, _rel_path, data, **_kwargs):
+        output_path.write_bytes(data)
+        return str(output_path)
+
+    async def fake_register(**_kwargs):
+        return "doc-1"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr("packages.core.services.entity_fs.write_entity_file_atomic", fake_write)
+    monkeypatch.setattr(media_tools, "_assert_audio_path", lambda _path: None)
+    monkeypatch.setattr(media_tools, "_transcribe_narration_audio", fake_stt)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(await media_tools._align_subtitles_handler(
+        entity_id="entity-1", cues_path="lyric-cues.json", output_name="lyrics.srt", format="srt",
+        aspect_ratio="9:16", animation={"reveal": "word", "entrance": "rise", "font_size": 90},
+        word_timing={"audio_path": "song.mp3", "offset_seconds": 120},
+    ))
+
+    assert (result["status"], result["format"], result["cue_count"]) == ("completed", "ass", 1)
+    assert transcribed == [str(tmp_path / "song.mp3")]
+    written = output_path.read_text(encoding="utf-8")
+    # A vertical picture; one long sung line stays one event laid out on several lines.
+    assert "PlayResX: 1080" in written and "PlayResY: 1920" in written
+    events = [line for line in written.splitlines() if line.startswith("Dialogue:")]
+    # A vertical picture is narrow: the long line is laid out on several rows.
+    rows = {line.split("\\move(", 1)[1].split(",")[3] for line in events if "\\move(" in line}
+    assert len(rows) >= 2
+    event, second = events[0], events[2]
+    assert second.startswith("Dialogue: 1,0:00:01.40,") and second.endswith("}light")
+    # Each word's own event starts on its measured time: 121.2 s and 121.4 s in the song.
+    assert event.startswith("Dialogue: 1,0:00:01.20,") and event.endswith("}We")
 
 
 @pytest.mark.parametrize(
@@ -7692,3 +9165,94 @@ async def test_composed_narration_rejects_invalid_source_windows(tmp_path, monke
                 'start': 0, 'end': 1, 'source_start': offset, **extra,
             }]}, enabled=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_loudness_normalization_of_a_non_audio_input_is_settled_as_no_effect(tmp_path, monkeypatch):
+    """The input check runs before the output directory exists: the handler
+    proves the failed call changed nothing, instead of an uncertain effect."""
+    from packages.core.ai.runtime.receipts import runtime_tool_effect_state
+    from packages.core.services import entity_fs
+
+    async def resolve(_root, rel):
+        return str(tmp_path / rel)
+
+    async def base_dir(**_kwargs):
+        return ''
+
+    monkeypatch.setattr(media_tools.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(entity_fs, 'get_entity_root', lambda _entity: str(tmp_path))
+    monkeypatch.setattr(media_tools, '_workspace_media_base_dir', base_dir)
+    monkeypatch.setattr(media_tools, '_resolve_entity_file', resolve)
+    arguments = {'input_path': 'renders/final-en.srt', 'output_name': 'audio/mix.wav'}
+    result = await media_tools._normalize_audio_loudness_handler(entity_id='entity123', **arguments)
+
+    assert 'Unsupported audio extension' in json.loads(result)['error']
+    assert not (tmp_path / 'audio').exists()
+    assert runtime_tool_effect_state('normalize_audio_loudness', arguments, result).value == 'none'
+
+
+def _with_reference(fake_profile):
+    """A narrator-profile fake as provenance: the profile, from an unpinned (random) voice."""
+    async def provenance(**kwargs):
+        return await fake_profile(**kwargs), None
+    return provenance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target, frames", [(None, 30), (1.5, 45), (0.6, 18)])
+async def test_a_merged_master_is_exactly_its_length(tmp_path, target, frames):
+    """Joined clips start their picture late and carry longer audio: the master ends as one length."""
+    from packages.core.ai.tools.media_tools import _conform_merged_video, _count_video_frames
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg is not installed")
+    for name, seconds in (("a.mp4", 0.47), ("b.mp4", 0.5)):
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                        f"testsrc=size=160x120:rate=30:duration={seconds}", "-f", "lavfi", "-i",
+                        "anullsrc=r=48000:cl=stereo", "-c:v", "libx264", "-c:a", "aac", "-t", str(seconds + 0.05),
+                        str(tmp_path / name)], check=True)
+    (tmp_path / "list.txt").write_text(f"file '{tmp_path / 'a.mp4'}'\nfile '{tmp_path / 'b.mp4'}'\n")
+    joined, master = tmp_path / "joined.mp4", tmp_path / "master.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(tmp_path / "list.txt"),
+                    "-c", "copy", str(joined)], check=True)
+
+    seconds = await _conform_merged_video(
+        ffmpeg="ffmpeg", ffprobe="ffprobe", source=str(joined), output=str(master), fps=30, crf=28,
+        preset="ultrafast", target_seconds=target, has_audio=True, timeout_seconds=60,
+    )
+
+    probed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=duration", "-of", "json", str(master)],
+        capture_output=True, text=True, check=True).stdout)
+    assert seconds == frames / 30
+    assert await _count_video_frames("ffprobe", str(master)) == frames
+    # The picture, the audio and the file all end at the same moment.
+    assert {round(float(s["duration"]), 3) for s in probed["streams"]} == {round(seconds, 3)}
+    assert round(float(probed["format"]["duration"]), 3) == round(seconds, 3)
+
+
+@pytest.mark.asyncio
+async def test_a_rendered_mix_never_clips_even_without_normalization(tmp_path):
+    """Tracks summed at full level can clip; the final mix is capped below it all the same."""
+    from packages.core.ai.tools.media_tools import (
+        FINAL_MIX_TRUE_PEAK_DBTP, _apply_two_pass_loudnorm, _measure_encoded_true_peak,
+    )
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg is not installed")
+    loud, silent_picture = tmp_path / "loud.mp4", tmp_path / "picture.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30:duration=2",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-af", "aformat=sample_fmts=fltp,volume=12dB",
+                    "-c:v", "libx264", "-c:a", "aac", "-shortest", str(loud)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30:duration=1",
+                    "-c:v", "libx264", str(silent_picture)], check=True)
+    assert await _measure_encoded_true_peak(
+        ffmpeg="ffmpeg", input_path=str(loud), total_duration=2) > FINAL_MIX_TRUE_PEAK_DBTP
+
+    await _apply_two_pass_loudnorm(ffmpeg="ffmpeg", input_path=str(loud), config={}, total_duration=2)
+    await _apply_two_pass_loudnorm(ffmpeg="ffmpeg", input_path=str(silent_picture), config={}, total_duration=1)
+
+    assert await _measure_encoded_true_peak(
+        ffmpeg="ffmpeg", input_path=str(loud), total_duration=2) <= FINAL_MIX_TRUE_PEAK_DBTP
+    assert silent_picture.stat().st_size > 0

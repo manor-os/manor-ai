@@ -28,8 +28,10 @@ Step state transitions managed here:
   running          → pending         (fail_lease, retry remaining;
                                        fail_lease puts step back in queue)
   running          → waiting_human   (lease_needs_human)
+  running          → failed          (lease_needs_human / fail_lease /
+                                       expire_leases, unconfirmed external
+                                       effect: never replayed)
   running          → pending         (expire_leases, retry remaining)
-  running          → waiting_human   (expire_leases, captured external effect)
   running          → failed          (expire_leases, attempts exhausted)
 """
 
@@ -47,24 +49,10 @@ from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import TaskLogType
-from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.i18n import t
-from packages.core.plans.response_language import resolve_plan_response_locale
+from packages.core.services.task_response_language import resolve_plan_response_locale
 from packages.core.constants.execution import (
     ACTION_EFFECT_GENERATION_PARAM_KEY,
-    COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY,
-    COORDINATOR_CHILD_ITEM_PARAM_KEY,
-    COORDINATOR_CHILD_PARAM_KEY,
-    COORDINATOR_CHILD_RELEASED_PARAM_KEY,
-    COORDINATOR_TYPED_CHILD_PARAM_KEY,
-    COORDINATOR_TYPED_VERSION,
-    COORDINATOR_VERSION_PARAM_KEY,
-    COORDINATOR_WAITING_CHILD_PARAM_KEY,
-    COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
-    COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-    COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY,
-    COORDINATOR_PARAM_KEY,
-    COORDINATOR_PARENT_STEP_PARAM_KEY,
     DISPATCH_SKIP_KEY,
     DISPATCH_SKIPPED_ERROR_TYPE,
     LEASE_REVOKED_ERROR_TYPE,
@@ -113,35 +101,194 @@ from packages.core.models.worker import (
 )
 from packages.core.models.workspace import Workspace
 from packages.core.contracts.tool_effects import (
-    EffectReconciliationDecisionFactory,
     ToolEffectEvidenceFactory,
 )
-from packages.core.plans.refs import ReferenceError as PlanReferenceError
-from packages.core.plans.refs import resolve_refs
 from packages.core.services.integration_account_service import (
     IntegrationAccountFanoutResultFactory,
 )
-from packages.core.workers.registry import INTERNAL_WORKER_KIND
 
 logger = logging.getLogger(__name__)
 
 INTERNAL_FILE_RECOVERY_FAILED = "InternalFileRecoveryFailed"
+#: A worker job crossed an external-action boundary without a confirmed
+#: outcome. The Step fails without replay; a person checks the provider.
+EXTERNAL_EFFECT_UNCONFIRMED = "ExternalEffectUnconfirmed"
+
+
+def _external_effect_unconfirmed_failure(step_key: str) -> dict[str, Any]:
+    """The non-retryable failure for an external action with no confirmed outcome."""
+    return {
+        "reason": (
+            f"Step '{step_key}' started an external action whose outcome was not confirmed. "
+            "The action may or may not have happened, so Manor will not run it again. "
+            "Check the result with the provider before repeating it."
+        ),
+        "retryable": False,
+        "requires_human": True,
+        "blockers": [],
+    }
+
+
+def _step_policy_subject(
+    step: Any, *, capability_id: str | None = None, requires_approval: bool = False, user_id: str | None = None,
+):
+    """The canonical approval subject of one step (gate, review lookup, card, denial).
+
+    A step naming a raw tool is canonicalised to its classified action, so
+    every place that names the step's action names the same key. ``user_id``
+    is the owner of an ad-hoc step (``_adhoc_step_owner``): it is judged under
+    that user's own rules.
+    """
+    from packages.core.governance.approvals import ApprovalSubject, canonical_step_subject
+
+    return canonical_step_subject(ApprovalSubject(
+        entity_id=step.entity_id,
+        workspace_id=step.workspace_id,
+        user_id=user_id,
+        action_key=step.action_key,
+        capability_id=capability_id,
+        risk_level=getattr(step, "risk_level", None) or "low",
+        kind=getattr(step, "kind", None) or "action",
+        requires_approval=requires_approval,
+        provider=getattr(step, "provider", None),
+        arguments=dict(getattr(step, "params", None) or {}),
+    ))
+
+
+#: Per step provider, an async filter that may rewrite a completed lease's
+#: result before it is stored: e.g. a screenshot moved out of the step row
+#: into short-lived storage (packages/core/services/computer/results.py).
+LEASE_RESULT_FILTERS: dict[str, Any] = {}
+
+
+def register_lease_result_filter(provider: str, result_filter: Any) -> None:
+    LEASE_RESULT_FILTERS[provider] = result_filter
+
+
+def _load_lease_result_filters() -> None:
+    return None
+
+
+async def _filter_lease_result(step: Any, result: Any) -> Any:
+    """The result as stored: a provider's filter applied; the raw result if it fails."""
+    if result is MISSING_RESULT:
+        return result
+    _load_lease_result_filters()
+    result_filter = LEASE_RESULT_FILTERS.get(str(getattr(step, "provider", "") or ""))
+    if result_filter is None:
+        return result
+    try:
+        return await result_filter(step, result)
+    except Exception:  # noqa: BLE001 - storing the raw result beats losing it
+        logger.warning("dispatcher: result filter for %s failed", step.provider, exc_info=True)
+        return result
+
+
+def _adhoc_step_owner(plan: Any, step: Any) -> str | None:
+    """The user an ad-hoc step (no Workspace) was sent for, from server-written plan state.
+
+    ``submit_local_action`` records it; a worker can never write it. Such a
+    step is judged under that user's rules and its approval belongs to them.
+    """
+    if getattr(step, "workspace_id", None) or getattr(plan, "workspace_id", None):
+        return None
+    state = plan.dispatcher_state if isinstance(getattr(plan, "dispatcher_state", None), dict) else {}
+    owner = str(state.get("owner_user_id") or "").strip()
+    return owner or None
+
+
+def _owner_acted_in_person(plan: Any, owner_user_id: str | None) -> bool:
+    """The step is its owner's own action, taken at a signed-in session.
+
+    Approval asks a person about what an agent does for them; a person's own
+    click is not asked about. Only server code that authenticated the person
+    (not an agent token) writes this consent, and only for themselves.
+    """
+    state = plan.dispatcher_state if isinstance(getattr(plan, "dispatcher_state", None), dict) else {}
+    consent = state.get("consent")
+    return bool(
+        owner_user_id
+        and isinstance(consent, dict)
+        and consent.get("kind") == "human"
+        and consent.get("user_id") == owner_user_id
+    )
+
+
+async def _carried_tool_call_grant(db: AsyncSession, *, plan: Any, step: Any, subject: Any, owner_user_id: str | None):
+    """The approved tool call this step was dispatched for, verified and spent on this step only.
+
+    An in-run agent's tool call already crossed the runtime gate; when a person
+    approved it, the step it dispatches must not ask again. The plan's
+    server-written ``consent`` names that decision and the tool call's
+    arguments; it counts only for the same user's approved tool call of
+    exactly this action and these arguments, and only for one step.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+    from packages.core.models.hitl_request import HitlRequest
+
+    state = plan.dispatcher_state if isinstance(getattr(plan, "dispatcher_state", None), dict) else {}
+    consent = state.get("consent")
+    if not owner_user_id or not isinstance(consent, dict) or consent.get("kind") != "granted":
+        return None
+    request = (
+        await db.execute(
+            select(HitlRequest)
+            .where(HitlRequest.id == str(consent.get("request_id") or ""))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        request is None
+        or request.entity_id != step.entity_id
+        or request.origin_kind != ApprovalOriginKind.TOOL_CALL.value
+        or request.status not in (ApprovalStatus.GRANTED.value, ApprovalStatus.CONSUMED.value)
+        or request.action_key not in {subject.action_key, step.action_key}
+    ):
+        return None
+    context = dict(request.context or {})
+    if owner_user_id not in {context.get("requested_by"), request.decided_by_user_id}:
+        return None
+    # The step must be built from exactly the arguments the person approved:
+    # the consent carries the tool call's arguments, which must hash to the
+    # request's own.
+    approved_hash = str(context.get("args_hash") or "")
+    arguments = consent.get("arguments")
+    if approved_hash:
+        from packages.core.ai.runtime.approval_messages import approval_args_hash
+
+        if not isinstance(arguments, dict) or approval_args_hash(
+            arguments, tool_name=str(consent.get("tool_name") or ""),
+        ) != approved_hash:
+            return None
+    carried_to = context.get("carried_to_step")
+    if carried_to and carried_to != step.id:
+        return None
+    if carried_to != step.id:
+        request.context = {**context, "carried_to_step": step.id}
+        flag_modified(request, "context")
+    return request
 
 
 async def _failed_step_review_operation_id(db: AsyncSession, step: ExecutionStep) -> str | None:
     """A recovery decision belongs to a failed lease, never its spent execution grant."""
     from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
     from packages.core.models.hitl_request import HitlRequest
-    from packages.core.plans.step_reset import step_approval_operation_id
+    from packages.core.dispatcher.step_state import step_approval_operation_id
 
     operation_id = step_approval_operation_id(step)
+    # Grants are minted under the canonical key; rows minted before
+    # canonicalisation keep the step's raw key.
+    action_keys = {step.action_key, _step_policy_subject(step).action_key} - {None}
     prior = await db.scalar(select(HitlRequest.id).where(
         HitlRequest.entity_id == step.entity_id,
         HitlRequest.workspace_id == step.workspace_id,
         HitlRequest.origin_kind == ApprovalOriginKind.STEP.value,
         HitlRequest.origin_step_id == step.id,
         HitlRequest.origin_plan_id == step.plan_id,
-        HitlRequest.action_key == step.action_key,
+        (HitlRequest.action_key.in_(action_keys) if action_keys else HitlRequest.action_key.is_(None)),
         HitlRequest.dedup_key == f"operation:{operation_id}",
         HitlRequest.status.in_([ApprovalStatus.CONSUMED.value, ApprovalStatus.EXPIRED.value]),
     ).order_by(HitlRequest.created_at.desc(), HitlRequest.id.desc()).limit(1))
@@ -196,34 +343,6 @@ def _failure_checkpoint(
         if not isinstance(fields, dict):
             return copy.deepcopy(current) if isinstance(current, dict) else None
         call_id = fields.get("tool_call_id")
-        if (
-            effect.get("effect") == "pending"
-            and fields.get("intent_state") == "started"
-            and ToolEffectEvidenceFactory.has_valid_effect_id(effect)
-        ):
-            # A first pause may carry its exact pre-I/O checkpoint alongside
-            # the pending intent. This preserves where to resume after the
-            # human reconciles it, without accepting a claimed tool result.
-            from packages.core.services.effect_reconciliation import (
-                EffectReconciliationError,
-                _pending_effect_checkpoint,
-            )
-
-            try:
-                _pending_effect_checkpoint(
-                    SimpleNamespace(
-                        id=step.id,
-                        plan_id=step.plan_id,
-                        params=step.params,
-                        runtime_checkpoint=supplied,
-                    ),
-                    effect,
-                )
-            except (AttributeError, EffectReconciliationError):
-                pass
-            else:
-                if not _checkpoint_contains_tool_result(supplied, call_id):
-                    continue
         proven = [ref for ref in authoritative if (
             isinstance(ref, dict) and ref.get("kind") == "tool_effect"
             and ref.get("effect") in ("action", "publish")
@@ -399,7 +518,7 @@ def _internal_file_recovery_error(
                 kinds = ", ".join(context["patch_operation_types"])
                 operation += f" ({len(patches)} operations{': ' + kinds if kinds else ''})"
             elif tool == "video_edit" and arguments.get("operation") in (
-                "start", "prepare", "push_assets", "write_files", "sync", "review", "render", "close",
+                "start", "prepare", "push_assets", "write_files", "patch_files", "sync", "review", "render", "close",
             ):
                 context["operation"] = operation = f"video edit: {arguments['operation']}"
         paths: list[str] = []
@@ -500,8 +619,8 @@ def _expired_external_action_attempt_evidence(
     The tokenized WorkLease is committed before its DTO is returned, so it is
     the durable pre-handler intent for an external process. If that process
     outlives the lease without reporting a receipt, the provider outcome is
-    unknown; convert the attempt identity into the normal reconciliation
-    contract instead of silently replaying it.
+    unknown; record the attempt identity as an unconfirmed effect instead of
+    silently replaying it.
     """
 
     raw_params = step.params if isinstance(step.params, dict) else {}
@@ -562,351 +681,6 @@ async def _has_ambiguous_external_effect(
         evidence_refs,
         owner_step=owner_step,
     )
-
-
-def _coordinator_reverse_placeholder(
-    binding: dict[str, Any],
-) -> dict[str, Any]:
-    """Reverse link persisted before the canonical outer request exists."""
-
-    return {
-        **binding,
-        "request_id": None,
-        "nested_request_id": binding.get("request_id"),
-    }
-
-
-def _matches_coordinator_reverse_placeholder(
-    value: Any,
-    binding: dict[str, Any],
-) -> bool:
-    if not isinstance(value, dict):
-        return False
-    expected = _coordinator_reverse_placeholder(binding)
-    return all(value.get(key) == expected_value for key, expected_value in expected.items())
-
-
-async def _typed_coordinator_nested_approval_binding(
-    db: AsyncSession,
-    *,
-    step: ExecutionStep,
-    lease: WorkLease,
-    task_id: str | None,
-    token: str,
-    pending_action: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Bind a typed V2 child pause to its own exact Runtime approval."""
-
-    from packages.core.ai.runtime.approval_messages import approval_args_hash
-    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
-    from packages.core.models.hitl_request import HitlRequest
-
-    params = step.params if isinstance(step.params, dict) else {}
-    parent_step_key = str(
-        params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) or ""
-    ).strip()
-    item_key = str(params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "").strip()
-    idempotency_key = str(
-        params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY) or ""
-    ).strip()
-    if (
-        params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
-        or not parent_step_key
-        or not item_key
-        or not idempotency_key
-        or step.current_lease_id != lease.id
-    ):
-        return None
-
-    # ``_lock_active_execution`` already owns the child lock.  Taking the
-    # coordinator root lock here would invert the normal root -> child order
-    # used by materialization/handoff and can deadlock concurrent completion.
-    # Read and freeze the unique root identity instead; the approval mirror
-    # revalidates it later while holding its canonical Task/Plan locks.
-    coordinator_parent = (await db.execute(
-        select(ExecutionStep).where(
-            ExecutionStep.plan_id == step.plan_id,
-            ExecutionStep.entity_id == step.entity_id,
-            ExecutionStep.workspace_id == step.workspace_id,
-            ExecutionStep.step_key == parent_step_key,
-        )
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    coordinator_parent_params = (
-        coordinator_parent.params
-        if coordinator_parent is not None
-        and isinstance(coordinator_parent.params, dict)
-        else {}
-    )
-    waiting_child = coordinator_parent_params.get(
-        COORDINATOR_WAITING_CHILD_PARAM_KEY
-    )
-    if (
-        coordinator_parent is None
-        or coordinator_parent.id == step.id
-        or coordinator_parent.step_status != ExecutionStepStatus.PAUSED.value
-        or coordinator_parent_params.get(COORDINATOR_PARAM_KEY) is not True
-        or coordinator_parent_params.get(COORDINATOR_VERSION_PARAM_KEY)
-        != COORDINATOR_TYPED_VERSION
-        or not isinstance(waiting_child, dict)
-        or waiting_child.get("version") != 1
-        or str(waiting_child.get("child_step_id") or "") != step.id
-        or str(waiting_child.get("child_step_key") or "") != step.step_key
-        or str(waiting_child.get("checklist_item_key") or "") != item_key
-    ):
-        logger.warning(
-            "typed coordinator child %s has no exact V2 coordinator root",
-            step.id,
-        )
-        return None
-
-    nested = (await db.execute(
-        select(HitlRequest).where(
-            HitlRequest.id == token,
-            HitlRequest.entity_id == step.entity_id,
-            HitlRequest.workspace_id == step.workspace_id,
-            HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
-            HitlRequest.origin_step_id == step.id,
-            HitlRequest.origin_task_id == task_id,
-            HitlRequest.status == ApprovalStatus.PENDING.value,
-            HitlRequest.consumed_at.is_(None),
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if nested is None:
-        logger.warning(
-            "typed coordinator child %s returned an unbound approval token",
-            step.id,
-        )
-        return None
-
-    context = dict(nested.context or {})
-    nested_tool = str(context.get("tool") or "").strip()
-    nested_args_hash = str(context.get("args_hash") or "").strip()
-    continuation = context.get("continuation")
-    continuation_arguments = (
-        continuation.get("arguments") if isinstance(continuation, dict) else None
-    )
-    pending_tool = str(pending_action.get("tool") or "").strip()
-    if (
-        not nested_tool
-        or not nested_args_hash
-        or pending_tool != nested_tool
-        or not isinstance(continuation, dict)
-        or continuation.get("version") != 1
-        or str(continuation.get("tool") or "").strip() != nested_tool
-        or not isinstance(continuation_arguments, dict)
-        or approval_args_hash(continuation_arguments) != nested_args_hash
-    ):
-        logger.warning(
-            "typed coordinator child %s Runtime approval context was not exact",
-            step.id,
-        )
-        return None
-
-    binding = {
-        "version": COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-        "request_id": nested.id,
-        "child_step_id": step.id,
-        "parent_step_id": step.id,
-        "coordinator_parent_step_key": parent_step_key,
-        "coordinator_parent_step_id": coordinator_parent.id,
-        "parent_lease_id": lease.id,
-        "parent_execution_claim_id": lease.execution_claim_id,
-        "plan_id": step.plan_id,
-        "task_id": task_id,
-        "child_step_key": step.step_key,
-        "service_key": step.service_key,
-        "idempotency_key": idempotency_key,
-        "typed_child": True,
-        "nested_tool": nested_tool,
-        "nested_args_hash": nested_args_hash,
-    }
-    placeholder = _coordinator_reverse_placeholder(binding)
-    existing = context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY)
-    if existing is not None and existing != placeholder:
-        logger.warning(
-            "typed coordinator child %s Runtime approval already has a different outer binding",
-            step.id,
-        )
-        return None
-    # The nested request exists before its lease-scoped UI mirror.  Mark it as
-    # coordinator-owned in this locked transaction before minting the outer
-    # request, closing the generic-approval race window.
-    context[COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY] = placeholder
-    nested.context = context
-    return binding
-
-
-async def _coordinator_nested_approval_binding(
-    db: AsyncSession,
-    *,
-    step: ExecutionStep,
-    lease: WorkLease,
-    task_id: str | None,
-    pending_action: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Bind a coordinator pause to its exact nested Runtime approval.
-
-    A delegated tool first creates a ``tool_call`` HitlRequest.  Promoting its
-    envelope to the parent worker pause also creates the ordinary lease request
-    used by Task UI.  Without a server-validated link, approving that outer
-    card only sets generic confirmation flags and leaves the exact nested call
-    unapproved.  The next coordinator attempt can then re-plan/replay it.
-
-    The link below is derived only from durable rows: a model-supplied token is
-    accepted only when it names a pending Runtime request whose saved
-    ``delegation_resume`` matches this tenant/workspace and whose one waiting
-    child belongs to this coordinator parent.  The approval service revalidates
-    the same binding before mirroring any verdict.
-    """
-
-    params = step.params if isinstance(step.params, dict) else {}
-    if not isinstance(pending_action, dict):
-        return None
-    is_legacy_root = params.get(COORDINATOR_PARAM_KEY) is True
-    is_typed_child = params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
-    if not is_legacy_root and not is_typed_child:
-        return None
-    token = str(pending_action.get("approval_token") or "").strip()
-    if not token:
-        return None
-    if (
-        not str(lease.execution_claim_id or "").strip()
-        or lease.lease_until is None
-        or lease.lease_until <= datetime.now(timezone.utc)
-    ):
-        logger.warning(
-            "coordinator step %s returned nested approval from a stale execution claim",
-            step.id,
-        )
-        return None
-
-    if is_typed_child:
-        return await _typed_coordinator_nested_approval_binding(
-            db,
-            step=step,
-            lease=lease,
-            task_id=task_id,
-            token=token,
-            pending_action=pending_action,
-        )
-
-    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
-    from packages.core.models.hitl_request import HitlRequest
-
-    candidates = (await db.execute(
-        select(ExecutionStep).where(
-            ExecutionStep.plan_id == step.plan_id,
-            ExecutionStep.workspace_id == step.workspace_id,
-            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN.value,
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalars().all()
-    children: list[ExecutionStep] = []
-    for child in candidates:
-        child_params = child.params if isinstance(child.params, dict) else {}
-        child_result = child.result if isinstance(child.result, dict) else {}
-        if (
-            child_params.get(COORDINATOR_CHILD_PARAM_KEY) is True
-            and child_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) == step.step_key
-            and str(child_result.get("approval_token") or "") == token
-        ):
-            children.append(child)
-    if len(children) != 1:
-        logger.warning(
-            "coordinator step %s nested approval matched %d waiting children",
-            step.id,
-            len(children),
-        )
-        return None
-    child = children[0]
-    child_params = child.params if isinstance(child.params, dict) else {}
-    child_idempotency_key = str(
-        child_params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY) or ""
-    ).strip()
-    # Lock ordering is shared with coordinator child persistence:
-    # lease -> parent -> child -> nested approval.  Reversing the final two
-    # lets the dispatcher and the last nested Chat round deadlock each other.
-    nested = (await db.execute(
-        select(HitlRequest).where(
-            HitlRequest.id == token,
-            HitlRequest.entity_id == step.entity_id,
-            HitlRequest.workspace_id == step.workspace_id,
-            HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
-            HitlRequest.status == ApprovalStatus.PENDING.value,
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if nested is None:
-        logger.warning(
-            "coordinator step %s returned an unbound nested approval token",
-            step.id,
-        )
-        return None
-    if str(nested.origin_task_id or "") != str(task_id or ""):
-        logger.warning(
-            "coordinator step %s nested approval task origin mismatched",
-            step.id,
-        )
-        return None
-    context = nested.context if isinstance(nested.context, dict) else {}
-    resume = context.get("delegation_resume")
-    if (
-        not isinstance(resume, dict)
-        or resume.get("version") != 1
-        or str(resume.get("approval_token") or "") != token
-        or str(resume.get("entity_id") or "") != str(step.entity_id or "")
-        or str(resume.get("workspace_id") or "") != str(step.workspace_id or "")
-        or str(resume.get("conversation_id") or "")
-        != str(nested.origin_conversation_id or "")
-    ):
-        logger.warning(
-            "coordinator step %s nested approval continuation was not exact",
-            step.id,
-        )
-        return None
-    if (
-        str(nested.origin_step_id or "") != child.id
-        or str(resume.get("task_id") or "") != str(task_id or "")
-        or str(resume.get("step_id") or "") != child.id
-        or str(resume.get("service_key") or "") != str(child.service_key or "")
-        or not child_idempotency_key
-        or str(resume.get("delegation_idempotency_key") or "")
-        != child_idempotency_key
-        or not str(child_params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "").strip()
-    ):
-        logger.warning(
-            "coordinator step %s nested approval did not match its child run",
-            step.id,
-        )
-        return None
-    binding = {
-        "version": COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-        "request_id": nested.id,
-        "child_step_id": child.id,
-        "parent_step_id": step.id,
-        "parent_lease_id": lease.id,
-        "parent_execution_claim_id": lease.execution_claim_id,
-        "plan_id": step.plan_id,
-        "task_id": task_id,
-        "child_step_key": child.step_key,
-        "service_key": child.service_key,
-        "idempotency_key": child_idempotency_key,
-    }
-    if not _matches_coordinator_reverse_placeholder(
-        context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY),
-        binding,
-    ):
-        logger.warning(
-            "coordinator step %s nested approval has no exact pre-link placeholder",
-            step.id,
-        )
-        return None
-    return binding
 
 
 class _MissingResult:
@@ -981,10 +755,6 @@ class NoMatchingSteps(DispatchError):
 
 class LeaseNotActive(DispatchError):
     """The lease being completed/failed/extended isn't in 'active' state."""
-
-
-class CoordinatorCompletionRejected(LeaseNotActive):
-    """A coordinator root attempted DONE before its durable handoff gate."""
 
 
 class RuntimeActionSchemaUnavailable(DispatchError):
@@ -1551,41 +1321,19 @@ class Dispatcher:
             .order_by(ExecutionStep.created_at.asc())
             .limit(max_n * 4)  # room to skip un-mappable rows
         )
-        typed_child_marker = ExecutionStep.params[
-            COORDINATOR_TYPED_CHILD_PARAM_KEY
-        ].astext
-        typed_child_release = ExecutionStep.params[
-            COORDINATOR_CHILD_RELEASED_PARAM_KEY
-        ].astext
-        # Typed coordinator children are durable, pre-created work records.
-        # They are not runnable merely because some stale/bypassing writer put
-        # them in PENDING: only the coordinator's locked release transition may
-        # expose one to the dispatcher.
-        stmt = stmt.where(
-            or_(
-                typed_child_marker.is_(None),
-                typed_child_marker != "true",
-                typed_child_release == "true",
-            )
-        )
-        if worker.kind != INTERNAL_WORKER_KIND:
-            coordinator_marker = ExecutionStep.params[COORDINATOR_PARAM_KEY].astext
-            # The coordinator root runs AgenticLoop and owns server-side child
-            # handoffs.  That protocol exists only in the in-process worker;
-            # external workers may execute released typed children, never the
-            # root control plane.
-            stmt = stmt.where(
-                or_(
-                    coordinator_marker.is_(None),
-                    coordinator_marker != "true",
-                )
-            )
         dispatcher_target_worker_id = ExecutionPlan.dispatcher_state["target_worker_id"].astext
         plan_target_worker_id = ExecutionPlan.plan_dag["target_worker_id"].astext
-        stmt = stmt.where(
-            or_(dispatcher_target_worker_id.is_(None), dispatcher_target_worker_id == worker.id),
-            or_(plan_target_worker_id.is_(None), plan_target_worker_id == worker.id),
-        )
+        if (getattr(worker, "capabilities", None) or {}).get("targeted_only"):
+            # A dedicated worker (a machine that is not the user's own, e.g.
+            # a cloud desktop) takes only work addressed to it.
+            stmt = stmt.where(
+                or_(dispatcher_target_worker_id == worker.id, plan_target_worker_id == worker.id)
+            )
+        else:
+            stmt = stmt.where(
+                or_(dispatcher_target_worker_id.is_(None), dispatcher_target_worker_id == worker.id),
+                or_(plan_target_worker_id.is_(None), plan_target_worker_id == worker.id),
+            )
         if supported_providers is not None:
             provider_filters = [
                 ExecutionStep.provider == "browser_setup",
@@ -1633,28 +1381,11 @@ class Dispatcher:
         bound_sub_ids = set((await db.execute(bound_subs)).scalars().all())
 
         leased: list[tuple[WorkLease, ExecutionStep]] = []
-        workspace_setup_cache: dict[str, Any] = {}
         for step, plan in rows:
             if len(leased) >= max_n:
                 break
             now = datetime.now(timezone.utc)
             local_worker_plan = _plan_source(plan) == "local_worker"
-            step_params = step.params if isinstance(step.params, dict) else {}
-
-            if (
-                step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
-                and step_params.get(COORDINATOR_CHILD_RELEASED_PARAM_KEY) is not True
-            ):
-                # Defense in depth for dialect/cached-query differences and
-                # rows made PENDING by an older process during rolling upgrade.
-                step.step_status = ExecutionStepStatus.PAUSED.value
-                step.current_lease_id = None
-                continue
-            if (
-                step_params.get(COORDINATOR_PARAM_KEY) is True
-                and worker.kind != INTERNAL_WORKER_KIND
-            ):
-                continue
 
             # Materialize the canonical Runtime capability as soon as a
             # candidate is inspected.  Some cloud-only provider/connection
@@ -1665,14 +1396,11 @@ class Dispatcher:
             if step_capability_id and not getattr(step, "capability_id", None):
                 step.capability_id = step_capability_id
 
-            if worker.kind == "internal" and (local_worker_plan or step.provider == "browser_setup"):
-                continue
-
             target_worker_id = _target_worker_id_for_plan(plan)
             if target_worker_id and target_worker_id != worker.id:
                 continue
 
-            from packages.core.services.retry_policy import (
+            from packages.core.dispatcher.retry_policy import (
                 apply_retry_policy_to_step,
                 resolve_retry_policy_for_step,
                 step_retry_ready,
@@ -1710,41 +1438,6 @@ class Dispatcher:
                     now=now,
                 )
                 continue
-
-            # ── Workspace lifecycle + Blueprint setup admission ──
-            setup_status = None
-            if step.workspace_id:
-                from packages.core.models.task import Task
-                from packages.core.services.workspace_readiness import (
-                    evaluate_current_workspace_blocking_setup,
-                    task_is_authorized_workspace_setup,
-                )
-
-                if step.workspace_id not in workspace_setup_cache:
-                    workspace_setup_cache[step.workspace_id] = (
-                        await evaluate_current_workspace_blocking_setup(
-                            db,
-                            workspace_id=str(step.workspace_id),
-                            entity_id=str(step.entity_id),
-                        )
-                    )
-                setup_status = workspace_setup_cache[step.workspace_id]
-                setup_task = await db.get(Task, plan.task_id) if (
-                    setup_status is not None and setup_status.blocks_work and plan.task_id
-                ) else None
-                authorized_setup = bool(
-                    setup_task is not None
-                    and plan.workspace_id == step.workspace_id == setup_task.workspace_id
-                    and plan.entity_id == step.entity_id == setup_task.entity_id
-                    and await task_is_authorized_workspace_setup(db, setup_task)
-                )
-                if setup_status is not None and setup_status.blocks_work and not authorized_setup:
-                    logger.info(
-                        "dispatcher: skipping step %s — %s",
-                        step.step_key,
-                        setup_status.summary,
-                    )
-                    continue
 
             # ── Workspace-level budget gate ──
             # Re-checked per step because one checkout can cross many
@@ -1801,7 +1494,6 @@ class Dispatcher:
             )
             from packages.core.governance.approvals import (
                 ApprovalOrigin,
-                ApprovalSubject,
                 resolve_approval,
             )
             from packages.core.governance.error_signatures import (
@@ -1883,28 +1575,35 @@ class Dispatcher:
                 principal_kind=RuntimePrincipalKind.SYSTEM_WORKER,
                 task_id=plan.task_id,
             )
-            from packages.core.plans.step_reset import step_approval_operation_id
+            from packages.core.dispatcher.step_state import step_approval_operation_id
+            adhoc_owner_id = _adhoc_step_owner(plan, step)
+            step_subject = _step_policy_subject(
+                step, capability_id=approval_capability_id,
+                requires_approval=bool(getattr(step, "requires_approval", False)),
+                user_id=adhoc_owner_id,
+            )
+            step_origin = ApprovalOrigin(
+                kind=ApprovalOriginKind.STEP.value,
+                step_id=step.id,
+                plan_id=step.plan_id,
+                task_id=plan.task_id,
+                operation_id=failure_review_operation_id or step_approval_operation_id(step),
+                args_hash=hashlib.sha256(json.dumps(step.params or {}, sort_keys=True, default=str).encode()).hexdigest(),
+                # An ad-hoc step's approval is its owner's to give (no Workspace chat).
+                context={"requested_by": adhoc_owner_id} if adhoc_owner_id else {},
+            )
+            carried_grant = await _carried_tool_call_grant(
+                db, plan=plan, step=step, subject=step_subject, owner_user_id=adhoc_owner_id,
+            )
+            in_person = _owner_acted_in_person(plan, adhoc_owner_id)
             decision = await resolve_approval(
                 db,
-                subject=ApprovalSubject(
-                    entity_id=step.entity_id,
-                    workspace_id=step.workspace_id,
-                    action_key=step.action_key,
-                    capability_id=approval_capability_id,
-                    risk_level=step.risk_level or "low",
-                    kind=step.kind,
-                    requires_approval=bool(
-                        getattr(step, "requires_approval", False)
-                    ),
-                ),
-                origin=ApprovalOrigin(
-                    kind=ApprovalOriginKind.STEP.value,
-                    step_id=step.id,
-                    plan_id=step.plan_id,
-                    task_id=plan.task_id,
-                    operation_id=failure_review_operation_id or step_approval_operation_id(step),
-                    args_hash=hashlib.sha256(json.dumps(step.params or {}, sort_keys=True, default=str).encode()).hexdigest(),
-                ),
+                subject=step_subject,
+                origin=step_origin,
+                # A person already approved the tool call that dispatched this
+                # step: ask nothing more. Hard blocks (deny, ceilings) still
+                # apply, so only the decision is previewed, never minted.
+                preview=carried_grant is not None or in_person,
                 spent_credits=spent_credits_per_kind,
                 permission_decision=permission_decision,
                 intrinsic_high_risk_approved=proposal_high_risk_approved,
@@ -1913,6 +1612,19 @@ class Dispatcher:
                 hitl_type=_hitl_type,
                 payload=_payload,
             )
+            if (carried_grant is not None or in_person) and decision.outcome == "needs_human":
+                from packages.core.constants.approvals import ApprovalOutcome
+                from packages.core.governance.approvals import ApprovalDecision
+
+                decision = (
+                    ApprovalDecision(
+                        ApprovalOutcome.ALLOW,
+                        f"Approved with its tool call ({carried_grant.id}).",
+                        "approved_tool_call",
+                    )
+                    if carried_grant is not None
+                    else ApprovalDecision(ApprovalOutcome.ALLOW, "The owner's own action.", "owner_in_person")
+                )
             if decision.outcome == "needs_human":
                 request_id = decision.request.id if decision.request else None
                 # The card renders what the ROW says, not what this pass
@@ -1954,7 +1666,7 @@ class Dispatcher:
                         step_id=step.id,
                         step_key=step.step_key,
                         kind=step.kind,
-                        action_key=step.action_key,
+                        action_key=step_subject.action_key,
                         capability_id=approval_capability_id,
                         matched_rule=decision.matched_rule,
                         reason=decision.reason,
@@ -1971,9 +1683,33 @@ class Dispatcher:
                         # strand a card pointing at a never-committed request.
                         db=db,
                     )
+                elif adhoc_owner_id and request_id:
+                    # An ad-hoc step waits on a request its owner decides
+                    # (/approvals/<id>), reached on every channel the owner
+                    # chose for approvals, not only the bell.
+                    from packages.core.services.notify import stage_routed_notification
+
+                    step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
+                    step.human_input_prompt = decision.reason
+                    step.current_lease_id = None
+                    step.error = {
+                        "type": approval_error_type,
+                        "message": decision.reason,
+                        "matched_rule": decision.matched_rule,
+                        "capability_id": approval_capability_id,
+                        "approval_request_id": request_id,
+                    }
+                    await stage_routed_notification(
+                        db, entity_id=step.entity_id, user_id=adhoc_owner_id, type="task_hitl_requested",
+                        title="Approval needed",
+                        body=decision.reason or f"Approve {step_subject.action_key}?",
+                        link=f"/approvals/{request_id}",
+                        meta={"approval_request_id": request_id, "action_key": step_subject.action_key},
+                        idempotency_key=f"adhoc-step-approval:{request_id}",
+                    )
                 else:
-                    # No workspace to render an approval card in — fail
-                    # closed rather than dispatch an unapproved step.
+                    # No workspace to render an approval card in and no owner
+                    # to ask — fail closed rather than dispatch an unapproved step.
                     step.step_status = ExecutionStepStatus.FAILED.value
                     step.error = {
                         "type": "StepApprovalUnavailable",
@@ -2000,10 +1736,11 @@ class Dispatcher:
                 step.error = await governance_denial_step_error(
                     db,
                     workspace_id=step.workspace_id,
-                    action_key=step.action_key,
+                    action_key=step_subject.action_key,
                     capability_id=approval_capability_id,
                     matched_rule=decision.matched_rule,
                     reason=decision.reason,
+                    category=step_subject.category,
                 )
                 step.finished_at = now
                 logger.info(
@@ -2076,36 +1813,6 @@ class Dispatcher:
                 continue
             if dep_status == "waiting":
                 continue
-
-            # Make the leased payload self-contained. PlanExecutor also
-            # resolves refs, but worker heartbeat can reach the dispatcher
-            # before the next executor cycle. Resolve here too so downstream
-            # workers never receive raw `${{ steps.* }}` placeholders.
-            if (
-                _contains_step_ref(step_params)
-                and step_params.get(COORDINATOR_PARAM_KEY) is not True
-                and step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is not True
-            ):
-                # A consumer that commits to an external publish never gets a
-                # degraded ref value (a sibling field or a JSON dump of the
-                # producer's result): that would go to a real audience.
-                from packages.core.plans.executor import _step_expects_external_publish
-
-                try:
-                    prior_results = await _collect_done_step_results(db, step)
-                    step.params = resolve_refs(
-                        step.params or {},
-                        prior_results,
-                        strict=_step_expects_external_publish(step, plan.plan_dag),
-                    )
-                except PlanReferenceError as exc:
-                    step.step_status = ExecutionStepStatus.FAILED.value
-                    step.error = {
-                        "type": "ReferenceError",
-                        "message": str(exc),
-                    }
-                    step.finished_at = now
-                    continue
 
             try:
                 await _hydrate_runtime_action_binding_schemas(db, step)
@@ -2197,11 +1904,6 @@ class Dispatcher:
                         "kind": step.kind,
                         "capability_id": _step_runtime_capability_id(step),
                         "plan_id": step.plan_id,
-                        "workspace_setup_admission": (
-                            setup_status.status
-                            if setup_status is not None
-                            else "not_required"
-                        ),
                         "max_runtime_seconds": step_deadline.max_runtime_seconds,
                         "max_runtime_source": step_deadline.source,
                     },
@@ -2271,13 +1973,6 @@ class Dispatcher:
                     require_execution_claim_id_if_present
                 ),
             )
-            from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-            await stage_plan_cycle_wake(
-                db,
-                lease.plan_id,
-                reason="lease_completed",
-            )
             return lease
 
     async def _complete_lease_inner(
@@ -2306,6 +2001,7 @@ class Dispatcher:
             lock_workspace=True,
         )
         now = datetime.now(timezone.utc)
+        result = await _filter_lease_result(step, result)
 
         if not self._lease_owns_step(lease, step):
             if result is not MISSING_RESULT:
@@ -2319,29 +2015,6 @@ class Dispatcher:
             return await self._supersede_lease(
                 db, lease, step, surface="complete_lease", now=now,
             )
-
-        step_params = step.params if isinstance(step.params, dict) else {}
-        if step_params.get(COORDINATOR_PARAM_KEY) is True:
-            worker_kind = (await db.execute(
-                select(Worker.kind).where(Worker.id == lease.worker_id)
-            )).scalar_one_or_none()
-            if worker_kind != INTERNAL_WORKER_KIND:
-                raise CoordinatorCompletionRejected(
-                    "coordinator root completion is reserved for the internal worker"
-                )
-            # AgenticLoop's submit handler is a cooperative guard.  The
-            # dispatcher is the authoritative DONE boundary and re-checks the
-            # durable child states plus exact parent-transcript handoff ACKs so
-            # no alternate caller or old worker can bypass the checklist.
-            from packages.core.workers.coordinator_tools import (
-                coordinator_completion_error,
-            )
-
-            completion_error = await coordinator_completion_error(db, step)
-            if completion_error:
-                raise CoordinatorCompletionRejected(
-                    f"coordinator root cannot complete: {completion_error}"
-                )
 
         output_contract = output_contract_for_schema(step.expected_output_schema)
         # Execution evidence survives a later output-contract failure. Losing
@@ -2610,59 +2283,6 @@ class Dispatcher:
             lease.evidence_refs = _merge_durable_evidence_refs(
                 [*(lease.evidence_refs or []), *verified_refs], [],
             )
-        elif isinstance(result, dict):
-            from packages.core.plans.executor import _artifact_refs_from_result
-            from packages.core.services.artifact_knowledge import (
-                project_artifact_refs_to_knowledge,
-            )
-
-            artifact_refs = _artifact_refs_from_result(result, step_key=step.step_key)
-            if artifact_refs:
-                task_id = (await db.execute(
-                    select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
-                )).scalar_one_or_none()
-                projection = await project_artifact_refs_to_knowledge(
-                    entity_id=step.entity_id,
-                    refs=artifact_refs,
-                    workspace_id=step.workspace_id,
-                    task_id=task_id,
-                    agent_id=step.resolved_agent_id,
-                    tool_name="dispatcher.complete_lease",
-                    db=db,
-                )
-                if projection.failures:
-                    lease.result = result
-                    if cost:
-                        lease.cost = cost
-                    details = "; ".join(
-                        f"{item['fs_path']}: {item['reason']}"
-                        for item in projection.failures[:4]
-                    )
-                    return await self.fail_lease(
-                        db,
-                        lease_id,
-                        error={
-                            "type": "ArtifactKnowledgeSyncError",
-                            "message": (
-                                "The step produced a local artifact but it could not be "
-                                f"registered in Knowledge ({details})."
-                            ),
-                            "artifacts": projection.failures,
-                        },
-                        will_retry=False,
-                        runtime_checkpoint=runtime_checkpoint,
-                        expected_worker_id=expected_worker_id,
-                        expected_execution_claim_id=expected_execution_claim_id,
-                        require_execution_claim_id_if_present=(
-                            require_execution_claim_id_if_present
-                        ),
-                    )
-                result = _attach_knowledge_artifacts_for_contract(
-                    result,
-                    projection,
-                    output_contract=output_contract,
-                    step_kind=step.kind,
-                )
 
         # Lease side
         lease.status = WorkLeaseStatus.COMPLETED.value
@@ -2790,8 +2410,8 @@ class Dispatcher:
         failure human-required: the action must not be repeated blindly.
 
         ``runtime_checkpoint`` is the attempt's transcript. It is kept on the
-        step when the step goes back to PENDING (retry), or when an unresolved
-        effect needs reconciliation; an ordinary terminal failure clears it.
+        step when the step goes back to PENDING (retry), or as evidence when an
+        unconfirmed effect fails it; an ordinary terminal failure clears it.
         """
         lease, step = await self._lock_active_execution(
             db,
@@ -2827,7 +2447,7 @@ class Dispatcher:
             )
 
         from packages.core.governance.error_signatures import classify_execution_error
-        from packages.core.services.retry_policy import (
+        from packages.core.dispatcher.retry_policy import (
             advance_transient_retry,
             apply_retry_policy_to_step,
             apply_transient_backoff,
@@ -2864,13 +2484,7 @@ class Dispatcher:
             will_retry = False
         elif captured_effect:
             step.result = lease.result
-            error = {**error, "failure": {
-                "reason": (
-                    "An external action receipt was recorded, but result validation failed. "
-                    "Reconcile the recorded outcome before repeating the action."
-                ),
-                "retryable": False, "requires_human": True, "blockers": [],
-            }}
+            error = {**error, "failure": _external_effect_unconfirmed_failure(step.step_key)}
             will_retry = False
         elif file_recovered or file_contract_failure:
             # Continue the existing model frame after its proven observation;
@@ -2927,16 +2541,9 @@ class Dispatcher:
             # The attempt never executed — give the budget back.
             step.attempt_count = max(0, (step.attempt_count or 0) - 1)
 
-        # Once the handler has returned into fail_lease, its provider call is
-        # no longer in flight. Keep an ambiguous external-effect lease at the
-        # explicit reconciliation boundary instead of labelling it FAILED;
-        # the latter made the recovery card's "not applied" choice
-        # impossible and discarded the only exact retry checkpoint.
-        lease.status = (
-            WorkLeaseStatus.NEEDS_HUMAN.value
-            if captured_effect and not internal_recovery_failed
-            else WorkLeaseStatus.FAILED.value
-        )
+        # The report ends this attempt. An ambiguous external effect fails the
+        # Step without replay (see above); its checkpoint is retained below.
+        lease.status = WorkLeaseStatus.FAILED.value
         lease.execution_claim_id = None
         lease.execution_claimed_at = None
         lease.error = stored_error
@@ -2956,8 +2563,8 @@ class Dispatcher:
                 step.runtime_checkpoint = dict(runtime_checkpoint)
         else:
             # Running out of attempts is an execution outcome, not a user
-            # question. Real input/approval and unknown-effect reconciliation
-            # have their own durable HITL paths above and in lease_needs_human.
+            # question. Real input/approval has its own durable HITL path in
+            # lease_needs_human.
             step.step_status = ExecutionStepStatus.FAILED.value
             step.error = stored_error
             step.finished_at = now
@@ -3034,13 +2641,6 @@ class Dispatcher:
                 )
 
         await db.flush()
-        from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-        await stage_plan_cycle_wake(
-            db,
-            lease.plan_id,
-            reason="lease_failed",
-        )
         return lease
 
     async def extend_lease(
@@ -3096,11 +2696,14 @@ class Dispatcher:
         expected_worker_id: str | None = None,
         expected_execution_claim_id: str | None = None,
         require_execution_claim_id_if_present: bool = False,
-        effect_not_applied_allowed: bool = True,
-        retain_execution_claim: bool = False,
     ) -> WorkLease:
         """Worker hit a CAPTCHA / approval / 2FA wall. Lease pauses;
         step → waiting_human; chat surfaces an interactive prompt.
+
+        A pause reported after an external action whose outcome was not
+        confirmed fails the Step instead (``ExternalEffectUnconfirmed``):
+        nothing can settle that question for a worker job, and replaying the
+        action could repeat it.
 
         ``pending_action`` is the optional generic structured payload
         (``{kind, options, …}``) defined in
@@ -3128,10 +2731,6 @@ class Dispatcher:
             step.evidence_refs,
             evidence_refs,
         )
-        from packages.core.dispatcher.effect_safety import (
-            ambiguous_effect_reconciliation_snapshot,
-        )
-
         selected_checkpoint = _failure_checkpoint(
             SimpleNamespace(id=step.id, plan_id=step.plan_id, params=step.params, runtime_checkpoint=step.runtime_checkpoint, evidence_refs=merged_step_evidence),
             runtime_checkpoint,
@@ -3168,45 +2767,27 @@ class Dispatcher:
                     expected_execution_claim_id=expected_execution_claim_id,
                     require_execution_claim_id_if_present=require_execution_claim_id_if_present,
                 )
-        reconciliation = await ambiguous_effect_reconciliation_snapshot(
-            db,
-            [
-                effect_owner,
-            ],
-            plan_id=step.plan_id,
-        )
-        if reconciliation is not None:
-            reconciliation = {
-                **reconciliation,
-                "not_applied_allowed": effect_not_applied_allowed,
-            }
-            prompt = (
-                f"Reconcile step '{step.step_key}': an external action may already "
-                "have happened. Verify it with the provider before continuing."
-            )
-            pending_action = {
-                "kind": PendingActionKind.EFFECT_RECONCILIATION.value,
-                "hitl_type": "error",
-                "prompt": "External action outcome needs verification",
-                "options": (
-                    EffectReconciliationDecisionFactory.card_options(
-                        reconciliation
-                    )
-                ),
-                "payload": {
-                    "what_happened": (
-                        "The worker crossed an external-action boundary but the "
-                        "final result was not durably confirmed."
+        # An external action crossed its boundary without a confirmed outcome.
+        # Nothing can settle that question for a worker job, so a pause would
+        # wait forever. Fail the Step without replay and say what to check.
+        if await _has_ambiguous_external_effect(db, merged_step_evidence, owner_step=effect_owner):
+            return await self.fail_lease(
+                db, lease_id,
+                error={
+                    "type": EXTERNAL_EFFECT_UNCONFIRMED,
+                    "message": (
+                        f"Step '{step.step_key}' stopped after starting an external action whose "
+                        "outcome was not confirmed. The action may or may not have happened; "
+                        "check it with the provider before running it again."
                     ),
-                    "why": prompt,
-                    "action_to_take": (
-                        EffectReconciliationDecisionFactory.action_to_take(
-                            reconciliation
-                        )
-                    ),
-                    "reconciliation": reconciliation,
+                    "worker_prompt": prompt,
                 },
-            }
+                will_retry=False,
+                evidence_refs=evidence_refs, runtime_checkpoint=runtime_checkpoint,
+                expected_worker_id=expected_worker_id,
+                expected_execution_claim_id=expected_execution_claim_id,
+                require_execution_claim_id_if_present=require_execution_claim_id_if_present,
+            )
         plan_task_id = (await db.execute(
             select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
         )).scalar_one_or_none()
@@ -3231,31 +2812,7 @@ class Dispatcher:
         # No policy evaluation here: the human is being asked for information,
         # not permission — that decision belongs to resolve_approval.
         pending_kind = str((pending_action or {}).get("kind") or KIND_HUMAN_INPUT.value)
-        step_params = step.params if isinstance(step.params, dict) else {}
         approval_context: dict[str, Any] = {"pending_kind": pending_kind}
-        if reconciliation is not None:
-            approval_context["effect_reconciliation"] = reconciliation
-        nested_approval = await _coordinator_nested_approval_binding(
-            db,
-            step=step,
-            lease=lease,
-            task_id=plan_task_id,
-            pending_action=pending_action,
-        )
-        if (
-            (
-                step_params.get(COORDINATOR_PARAM_KEY) is True
-                or step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
-            )
-            and isinstance(pending_action, dict)
-            and str(pending_action.get("approval_token") or "").strip()
-            and nested_approval is None
-        ):
-            raise RuntimeError(
-                "Coordinator nested approval is not bound to its exact child continuation."
-            )
-        if nested_approval is not None:
-            approval_context[COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY] = nested_approval
         # Bound on every path: the notifier call below reads it outside the
         # branches that assign it.
         approval_request = None
@@ -3270,7 +2827,6 @@ class Dispatcher:
             from packages.core.constants.approvals import (
                 LEASE_KIND_HITL_TYPES,
                 ApprovalOriginKind,
-                ApprovalStatus,
                 HitlType,
             )
             from packages.core.governance.approvals import (
@@ -3278,7 +2834,6 @@ class Dispatcher:
                 ApprovalSubject,
                 mint_approval_request,
             )
-            from packages.core.models.hitl_request import HitlRequest
 
             approval_request = await mint_approval_request(
                 db,
@@ -3309,60 +2864,7 @@ class Dispatcher:
                 hitl_type=LEASE_KIND_HITL_TYPES.get(
                     pending_kind, HitlType.AUTHORIZE.value,
                 ),
-                payload=(
-                    dict((pending_action or {}).get("payload") or {})
-                    if reconciliation is not None
-                    else None
-                ),
             )
-            if reconciliation is not None:
-                # ``mint_approval_request`` intentionally reuses an open
-                # dedup row. Its effect snapshot is not immutable, though: a
-                # late provider receipt can replace the pending identity.
-                # Refresh the reused request before the notifier projects it.
-                request_context = dict(approval_request.context or {})
-                request_context["effect_reconciliation"] = dict(reconciliation)
-                approval_request.context = request_context
-                request_payload = dict(approval_request.payload or {})
-                request_payload["reconciliation"] = dict(reconciliation)
-                approval_request.payload = request_payload
-            if nested_approval is not None:
-                # ``mint_approval_request`` may roll the transaction back when
-                # it loses a dedup race.  Re-lock and revalidate the durable
-                # placeholder after minting instead of relying on the earlier
-                # identity-map snapshot or row lock surviving that rollback.
-                nested_request = (await db.execute(
-                    select(HitlRequest)
-                    .where(
-                        HitlRequest.id == nested_approval["request_id"],
-                        HitlRequest.entity_id == step.entity_id,
-                        HitlRequest.workspace_id == step.workspace_id,
-                        HitlRequest.status == ApprovalStatus.PENDING.value,
-                    )
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )).scalar_one_or_none()
-                nested_context = (
-                    dict(nested_request.context or {})
-                    if nested_request is not None
-                    else {}
-                )
-                if (
-                    nested_request is None
-                    or not _matches_coordinator_reverse_placeholder(
-                        nested_context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY),
-                        nested_approval,
-                    )
-                ):
-                    raise RuntimeError(
-                        "Coordinator nested approval changed before it was linked."
-                    )
-                nested_context[COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY] = {
-                    **nested_approval,
-                    "request_id": approval_request.id,
-                    "nested_request_id": nested_request.id,
-                }
-                nested_request.context = nested_context
 
         # Apply worker evidence only after minting: mint can recover a dedup
         # race with rollback, so writes made before it are not durable.
@@ -3376,13 +2878,9 @@ class Dispatcher:
         )
         lease.status = WorkLeaseStatus.NEEDS_HUMAN.value
         # A worker-originated need-human report is a terminal reporting
-        # boundary, so its valid token can be released atomically.  Expiry is
-        # different: the server has not heard from the token holder and cannot
-        # infer that provider I/O stopped.  The expiry reconciliation caller
-        # therefore retains the claim until quiescence is proved explicitly.
-        if not retain_execution_claim:
-            lease.execution_claim_id = None
-            lease.execution_claimed_at = None
+        # boundary, so its valid token can be released atomically.
+        lease.execution_claim_id = None
+        lease.execution_claimed_at = None
         lease.credential_leases = []  # release while waiting
 
         step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
@@ -3464,8 +2962,9 @@ class Dispatcher:
 
         Requeue within the attempt budget only when replay is proven safe.
         Recover exact internal file observations or retain a system failure;
-        unresolved provider effects keep their reconciliation boundary.
-        Expiry alone never proves that an action can repeat. Returns count expired.
+        an unconfirmed provider effect fails the Step without replay
+        (``ExternalEffectUnconfirmed``). Expiry alone never proves that an
+        action can repeat. Returns count expired.
         """
         now = now or datetime.now(timezone.utc)
         candidate_ids = list(
@@ -3500,7 +2999,7 @@ class Dispatcher:
             if lease.plan_id:
                 expired_plan_ids.add(lease.plan_id)
 
-            from packages.core.services.retry_policy import (
+            from packages.core.dispatcher.retry_policy import (
                 apply_retry_policy_to_step,
                 error_with_retry_policy,
                 resolve_retry_policy_for_step,
@@ -3545,7 +3044,7 @@ class Dispatcher:
                 # The committed tokenized lease is the server's pre-handler
                 # intent. Expiry fences DB settlement, but it cannot prove the
                 # external process stopped provider I/O. Persist that exact
-                # ambiguity before entering the ordinary reconciliation path.
+                # ambiguity as evidence on the failed Step.
                 unknown_effect = _expired_external_action_attempt_evidence(
                     lease,
                     step,
@@ -3562,11 +3061,8 @@ class Dispatcher:
             if captured_effect:
                 # A per-round checkpoint can persist the receipt on the Step,
                 # while a worker report can persist it on the Lease.  Keep
-                # both sources and project their union onto both rows.  The
-                # reconciliation service proves quiescence from the exact
-                # failed/expired Lease, so leaving a Step-only intent detached
-                # from that Lease would strand NOT_APPLIED even after its
-                # execution claim is durably released.
+                # both sources and project their union onto both rows so the
+                # failed attempt's record names every unconfirmed effect.
                 for ref in lease_evidence:
                     if ref not in step_evidence:
                         step_evidence.append(ref)
@@ -3577,25 +3073,17 @@ class Dispatcher:
                 )
             expired_error, next_retry_at = error_with_retry_policy(
                 {
-                    "type": "lease_expired",
-                    "message": "lease expired before completion",
-                    **(
-                        {
-                            "failure": {
-                                "reason": (
-                                    "The external action lease expired after dispatch, so its "
-                                    "provider outcome is not safely replayable. Reconcile the "
-                                    "recorded attempt before repeating the action."
-                                ),
-                                "retryable": False,
-                                "requires_human": True,
-                                "blockers": [],
-                            }
-                        }
-                        if captured_effect
-                        else {}
+                    "type": EXTERNAL_EFFECT_UNCONFIRMED,
+                    "message": (
+                        f"The worker lease for step '{step.step_key}' expired after an external "
+                        "action started, so its outcome is unknown. The action may or may not "
+                        "have happened; check it with the provider before running it again."
                     ),
-                },
+                    "cause": {"type": "lease_expired", "message": "lease expired before completion"},
+                    "failure": _external_effect_unconfirmed_failure(step.step_key),
+                }
+                if captured_effect
+                else {"type": "lease_expired", "message": "lease expired before completion"},
                 policy=retry_policy,
                 now=now,
                 attempt_count=step.attempt_count,
@@ -3627,37 +3115,16 @@ class Dispatcher:
                 # Its expired lease cannot settle the Step or repeat the call;
                 # preserve the claim as evidence until that worker exits.
             elif captured_effect:
-                reconciliation_prompt = (
-                    f"Reconcile step '{step.step_key}': it may have completed an external action before its "
-                    "worker lease expired. Review the recorded receipts with the provider. "
-                    "Only answer to retry after you have verified the action did not occur; "
-                    "otherwise decline/cancel so Manor cannot repeat it."
-                )
-                # Reuse the normal path-C request/card writer while this row is
-                # still ACTIVE. It atomically mints a closeable HitlRequest,
-                # posts the visible Workspace card, and parks the transcript.
-                # We then retain EXPIRED as the lease's terminal audit state.
-                await self.lease_needs_human(
-                    db,
-                    lease.id,
-                    prompt=reconciliation_prompt,
-                    runtime_checkpoint=(
-                        dict(step.runtime_checkpoint)
-                        if isinstance(step.runtime_checkpoint, dict)
-                        else None
-                    ),
-                    # Expiry fences the lease but cannot prove that a process
-                    # holding its execution claim has stopped provider I/O.
-                    # Keep retry off the card until quiescence is durable; do
-                    # not clear the claim here because a live holder may still
-                    # complete the external action.
-                    effect_not_applied_allowed=(
-                        lease.execution_claim_id is None
-                    ),
-                    retain_execution_claim=True,
-                )
+                # Nothing can settle an unconfirmed external effect for a
+                # worker job, so the Step fails without replay. The checkpoint
+                # and claim stay as evidence; the expired lease cannot settle
+                # the Step even if a live holder later reports.
                 lease.status = WorkLeaseStatus.EXPIRED.value
+                step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = expired_error
+                step.finished_at = now
+                step.current_lease_id = None
+                step.human_input_prompt = None
             elif step.attempt_count < step.max_attempts:
                 lease.status = WorkLeaseStatus.EXPIRED.value
                 step.step_status = ExecutionStepStatus.PENDING.value
@@ -3688,14 +3155,6 @@ class Dispatcher:
                 )
             )
 
-        from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-        for expired_plan_id in sorted(expired_plan_ids):
-            await stage_plan_cycle_wake(
-                db,
-                expired_plan_id,
-                reason="lease_expired",
-            )
         await db.flush()
         return expired_count
 
@@ -3989,34 +3448,6 @@ class Dispatcher:
 async def _step_response_locale(db: AsyncSession, step: ExecutionStep) -> str:
     plan = await db.get(ExecutionPlan, step.plan_id)
     return await resolve_plan_response_locale(db, plan) if plan is not None else "en"
-
-
-def _contains_step_ref(value: Any) -> bool:
-    if isinstance(value, str):
-        return "${{" in value and "steps." in value
-    if isinstance(value, dict):
-        return any(_contains_step_ref(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_contains_step_ref(v) for v in value)
-    return False
-
-
-async def _collect_done_step_results(
-    db: AsyncSession,
-    step: ExecutionStep,
-) -> dict[str, Any]:
-    rows = list(
-        (
-            await db.execute(
-                select(ExecutionStep.step_key, ExecutionStep.result).where(
-                    ExecutionStep.plan_id == step.plan_id,
-                    ExecutionStep.step_status == ExecutionStepStatus.DONE,
-                    ExecutionStep.result.is_not(None),
-                )
-            )
-        ).all()
-    )
-    return {step_key: result for step_key, result in rows}
 
 
 async def _resolve_subscription_for_step(

@@ -22,6 +22,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.sandbox_exec_fakes import ExecViaStart  # noqa: E402
+
 
 class FakeCache:
     def __init__(self) -> None:
@@ -116,11 +118,12 @@ def test_tool_context_synthesizes_task_binding_key_when_no_conversation() -> Non
     assert neither.conversation_id is None
     assert neither.sandbox_binding_key is None
 
-    # No actor is the identity-free trusted-internal path, which every owner
-    # check deliberately skips; minting a key there would only start denying it.
+    # A user-less task (Strategist/scheduler) is bound by its task too: there
+    # is no identity-free path that skips the owner check any more.
     no_actor = runtime_tool_call_context_from_kwargs({"task_id": "01ABC"})
     assert no_actor.conversation_id is None
-    assert no_actor.sandbox_binding_key is None
+    assert no_actor.sandbox_binding_key == "U01ABC"
+    assert runtime_tool_call_context_from_kwargs({}).sandbox_binding_key is None
 
     envelope = SimpleNamespace(
         entity_id="ent1",
@@ -136,6 +139,51 @@ def test_tool_context_synthesizes_task_binding_key_when_no_conversation() -> Non
     # The envelope keeps a null conversation so nothing persisted from it
     # (runtime_event_logs, token_usage_logs, billing_logs) sees the key.
     assert envelope.conversation_id is None
+
+
+def test_workflow_sandbox_binding_preserves_identity_and_isolates_work() -> None:
+    from packages.core.ai.runtime.sandbox import (
+        primary_sandbox_scope_for,
+        runtime_is_room_binding_key,
+        runtime_task_id_from_binding_key,
+    )
+    from packages.core.ai.runtime.tool_context import (
+        runtime_authorization_sandbox_binding_key,
+        runtime_injected_tool_context_args,
+        runtime_tool_call_context_from_kwargs,
+    )
+
+    def context(run_id="01M51P1YJSCBPQ2EYY261CJDMY", **kwargs):
+        return runtime_tool_call_context_from_kwargs(
+            {"_workflow_run_id_from_context": run_id, **kwargs}, entity_id="ent1",
+        )
+
+    workflow = context(_user_id_from_context="user1")
+    key = workflow.sandbox_binding_key
+    assert key and len(key) == 26
+    assert workflow.conversation_id is None and workflow.task_id is None
+    assert runtime_task_id_from_binding_key(key) is None
+    assert not runtime_is_room_binding_key(key)
+    assert context(_user_id_from_context="user1").sandbox_binding_key == key
+    assert context("01M51P1YJSCBPQ2EYY261CJDMZ").sandbox_binding_key != key
+    scope = primary_sandbox_scope_for(workflow)
+    assert scope is not None and scope.user_id == "user1"
+    assert runtime_authorization_sandbox_binding_key(workflow, "sandbox") == key
+    assert runtime_authorization_sandbox_binding_key(workflow, "generate_file") is None
+    injected = runtime_injected_tool_context_args(
+        user_id=workflow.user_id, conversation_id=workflow.conversation_id, task_id=workflow.task_id,
+    )
+    assert key not in str(injected)
+
+    # Chat and Task retain their established binding; a user-less workflow
+    # owns its run even if its trigger has a chat reference.
+    assert context(_user_id_from_context="user1", conversation_id="conv").sandbox_binding_key == "conv"
+    assert context(task_id="01ABC").sandbox_binding_key == "U01ABC"
+    assert context(conversation_id="conv").sandbox_binding_key == key
+    other = context("01M51P1YJSCBPQ2EYY261CJDMZ")
+    assert primary_sandbox_scope_for(context()).key("sbx", "one") != primary_sandbox_scope_for(other).key("sbx", "one")
+    assert context("").sandbox_binding_key is None
+    assert runtime_tool_call_context_from_kwargs({"workflow_run_id": "untrusted"}).sandbox_binding_key is None
 
 
 def test_injected_handler_kwargs_never_carry_the_binding_key() -> None:
@@ -186,11 +234,16 @@ def test_injected_handler_kwargs_never_carry_the_binding_key() -> None:
 
 
 def test_sandbox_authorization_request_carries_the_binding_key() -> None:
-    """Only the sandbox tool's authorization request presents the key."""
+    """Only the sandbox tool's authorization request presents the key.
 
+    It travels beside the real conversation, never in its place: approvals use
+    the key as their scope, receipts and inner file guards the conversation.
+    """
+
+    from packages.core.ai.runtime.approvals import RuntimeApprovalRequest
     from packages.core.ai.runtime.tool_context import (
         RUNTIME_SANDBOX_BOUND_TOOL_NAMES,
-        runtime_authorization_conversation_id,
+        runtime_authorization_sandbox_binding_key,
         runtime_tool_call_context_from_kwargs,
     )
 
@@ -202,12 +255,20 @@ def test_sandbox_authorization_request_carries_the_binding_key() -> None:
         }
     )
 
-    assert runtime_authorization_conversation_id(worker, "sandbox") == "U01ABC"
-    assert runtime_authorization_conversation_id(worker, "sandbox_exec") == "U01ABC"
-    # Everything else keeps the run's real (absent) conversation.
-    assert runtime_authorization_conversation_id(worker, "generate_file") is None
-    assert runtime_authorization_conversation_id(worker, "workspace_create_task") is None
-    assert runtime_authorization_conversation_id(worker, None) is None
+    assert runtime_authorization_sandbox_binding_key(worker, "sandbox") == "U01ABC"
+    assert runtime_authorization_sandbox_binding_key(worker, "sandbox_exec") == "U01ABC"
+    # Everything else carries no binding.
+    assert runtime_authorization_sandbox_binding_key(worker, "generate_file") is None
+    assert runtime_authorization_sandbox_binding_key(worker, "workspace_create_task") is None
+    assert runtime_authorization_sandbox_binding_key(worker, None) is None
+
+    request = RuntimeApprovalRequest(
+        tool_name="sandbox", arguments={}, entity_id="ent1", user_id="user1",
+        conversation_id=worker.conversation_id,
+        sandbox_binding_key=runtime_authorization_sandbox_binding_key(worker, "sandbox"),
+    )
+    assert request.conversation_id is None
+    assert request.approval_scope_id == "U01ABC"
 
     # Every sandbox alias is covered, so a new one cannot fall out of the set.
     from packages.core.ai.runtime.capabilities import _TOOL_CAPABILITY_ALIAS_TARGETS
@@ -219,8 +280,8 @@ def test_sandbox_authorization_request_carries_the_binding_key() -> None:
     real = runtime_tool_call_context_from_kwargs(
         {"_user_id_from_context": "user1", "task_id": "01ABC", "conversation_id": "conv-1"}
     )
-    assert runtime_authorization_conversation_id(real, "sandbox") == "conv-1"
-    assert runtime_authorization_conversation_id(real, "generate_file") == "conv-1"
+    assert runtime_authorization_sandbox_binding_key(real, "sandbox") == "conv-1"
+    assert runtime_authorization_sandbox_binding_key(real, "generate_file") is None
 
 
 def test_task_binding_key_helpers_round_trip() -> None:
@@ -331,11 +392,17 @@ def _office_skill_ready(monkeypatch, captured: dict) -> None:
     monkeypatch.setattr(generate_file_tool, "_scope_workspace_output_name", fake_scope)
 
 
+@pytest.mark.parametrize(
+    "run_context",
+    [{"task_id": "01ABC"}, {"_workflow_run_id_from_context": "01M51P1YJSCBPQ2EYY261CJDMY"}],
+    ids=["task", "workflow"],
+)
 @pytest.mark.asyncio
 async def test_generate_file_office_kind_binds_sandbox_for_worker_run(
-    monkeypatch,
+    monkeypatch, run_context,
 ) -> None:
     from packages.core.ai.runtime.envelope import RuntimeDiscoveredToolGrants
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
     from packages.core.ai.tools import generate_file_tool
 
     captured: dict = {}
@@ -348,7 +415,7 @@ async def test_generate_file_office_kind_binds_sandbox_for_worker_run(
         kind="spreadsheet",
         name="crm.xlsx",
         prompt="Consolidate partner leads into a CRM workbook",
-        task_id="01ABC",
+        **run_context,
         _runtime_envelope_from_context=envelope,
         _agent_id_from_context="agent1",
     )
@@ -361,9 +428,10 @@ async def test_generate_file_office_kind_binds_sandbox_for_worker_run(
     # invoke_skill (stubbed here); what matters is the key that reaches it.
     # It travels on its own keyword: the plain conversation stays absent so a
     # nested prompt-skill loop cannot forward the key into other tool calls.
-    assert captured["kwargs"]["sandbox_binding_key"] == "U01ABC"
+    expected = runtime_tool_call_context_from_kwargs(run_context).sandbox_binding_key
+    assert expected and captured["kwargs"]["sandbox_binding_key"] == expected
     assert captured["kwargs"]["conversation_id"] is None
-    assert captured["kwargs"]["task_id"] == "01ABC"
+    assert captured["kwargs"]["task_id"] == run_context.get("task_id")
 
 
 # ── 3. the session service binds and scopes by the key ──────────
@@ -423,6 +491,20 @@ class ScriptedSandboxClient:
         type(self).calls.append({"handler": "close"})
 
 
+def _task_skill_scope(*, user_id="user1"):
+    from packages.core.ai.runtime.sandbox import RuntimeSandboxScope
+
+    return RuntimeSandboxScope("ent1", user_id, "U01ABC")
+
+
+async def _bind_task_skill_sandbox(sandbox_id="sbx-1", *, agent_id="agent1", **scope_kwargs):
+    from packages.core.ai.runtime import runtime_init_sandbox_binding
+
+    scope = _task_skill_scope(**scope_kwargs)
+    await runtime_init_sandbox_binding(scope, sandbox_id, "skill_xlsx", agent_id=agent_id)
+    return scope
+
+
 @pytest.fixture
 def scripted_client(monkeypatch):
     import packages.core.services.sandbox_sdk as sandbox_sdk
@@ -448,7 +530,7 @@ def local_sandbox_settings(monkeypatch):
 async def test_session_service_binds_task_key_and_scopes_by_it(
     fake_cache, scripted_client, local_sandbox_settings
 ) -> None:
-    from packages.core.ai.runtime import runtime_load_sandbox_context
+    from packages.core.ai.runtime import runtime_load_sandbox_binding
     from packages.core.services.sandbox_session_service import (
         SandboxBinding,
         SandboxBundle,
@@ -478,14 +560,15 @@ async def test_session_service_binds_task_key_and_scopes_by_it(
     assert isinstance(session, SandboxSession)
     assert session.sandbox_id == "sbx-1"
     # ``:`` is percent-encoded, so the key cannot forge another scope.
-    assert fake_cache.store["sandbox:owner:ent1:user1:conversation:U01ABC:agent:agent1"]["sandbox_id"] == "sbx-1"
+    # A task of a human user uses the user's one general sandbox.
+    assert fake_cache.store["sandbox:owner:ent1:user1:user"]["sandbox_id"] == "sbx-1"
 
-    ctx = await runtime_load_sandbox_context("U01ABC")
+    ctx = await runtime_load_sandbox_binding(_task_skill_scope(), "sbx-1")
     assert ctx is not None
     assert ctx["sandbox_id"] == "sbx-1"
     assert ctx["entity_id"] == "ent1"
     assert ctx["user_id"] == "user1"
-    assert ctx["agent_id"] == "agent1"
+    assert ctx["created_by_agent"] == "agent1"
 
 
 # ── 4. the per-call owner check accepts the key ─────────────────
@@ -493,48 +576,39 @@ async def test_session_service_binds_task_key_and_scopes_by_it(
 
 @pytest.mark.asyncio
 async def test_sandbox_exec_access_check_accepts_task_binding(fake_cache) -> None:
-    from packages.core.ai.runtime import runtime_save_sandbox_context
+    from packages.core.ai.runtime import runtime_sandbox_scope
     from packages.core.ai.tools import sandbox_tools
 
-    await runtime_save_sandbox_context(
-        "U01ABC",
-        {
-            "sandbox_id": "sbx-1",
-            "skill_id": "skill_xlsx",
-            "entity_id": "ent1",
-            "user_id": "user1",
-            "agent_id": "agent1",
-        },
-    )
-    assert "sandbox:ctx:U01ABC" in fake_cache.store
+    scope = await _bind_task_skill_sandbox()
+    assert scope.key("sbx", "sbx-1") in fake_cache.store
 
-    assert (
-        await sandbox_tools._sandbox_instance_access_error(
-            sandbox_id="sbx-1",
-            entity_id="ent1",
-            user_id="user1",
-            agent_id="agent1",
-            conversation_id="U01ABC",
-        )
-        is None
-    )
-
-    for wrong in (
-        {"agent_id": "agent2"},
-        {"sandbox_id": "sbx-other"},
-        {"user_id": "user2"},
-    ):
-        error = await sandbox_tools._sandbox_instance_access_error(
+    def _scope(**overrides):
+        return runtime_sandbox_scope(
             **{
-                "sandbox_id": "sbx-1",
                 "entity_id": "ent1",
                 "user_id": "user1",
-                "agent_id": "agent1",
-                "conversation_id": "U01ABC",
-                **wrong,
+                "binding_key": "U01ABC",
+                **overrides,
             }
         )
-        assert isinstance(error, str) and error, wrong
+
+    assert await sandbox_tools._sandbox_instance_access_error(sandbox_id="sbx-1", scope=_scope()) is None
+    # Another task (or conversation) of the same user shares the user's sandbox.
+    assert await sandbox_tools._sandbox_instance_access_error(
+        sandbox_id="sbx-1", scope=_scope(binding_key="U01OTHER"),
+    ) is None
+
+    for wrong_scope, wrong_sandbox in (
+        ({"user_id": "user2"}, "sbx-1"),
+        ({"user_id": ""}, "sbx-1"),
+        ({"user_id": "", "binding_key": "U01OTHER"}, "sbx-1"),
+        ({"entity_id": "ent2"}, "sbx-1"),
+        ({}, "sbx-other"),
+    ):
+        error = await sandbox_tools._sandbox_instance_access_error(
+            sandbox_id=wrong_sandbox, scope=_scope(**wrong_scope),
+        )
+        assert isinstance(error, str) and error, (wrong_scope, wrong_sandbox)
 
 
 @pytest.mark.asyncio
@@ -546,23 +620,13 @@ async def test_sandbox_handlers_use_binding_key_for_access(fake_cache, local_san
     owner check would find no context and deny every call.
     """
 
-    from packages.core.ai.runtime import runtime_save_sandbox_context
     from packages.core.ai.tools import sandbox_tools
     from packages.core.services.sandbox_session_service import SandboxSession
 
-    await runtime_save_sandbox_context(
-        "U01ABC",
-        {
-            "sandbox_id": "sbx-1",
-            "skill_id": "skill_xlsx",
-            "entity_id": "ent1",
-            "user_id": "user1",
-            "agent_id": "agent1",
-        },
-    )
+    skill_scope = await _bind_task_skill_sandbox()
 
-    class _StubClient:
-        async def exec(self, *, sandbox_id, command, timeout, execution_id=None):
+    class _StubClient(ExecViaStart):
+        async def exec(self, *, sandbox_id, command, timeout, execution_id=None, **_placement):
             return SimpleNamespace(stdout="hi", stderr="", exit_code=0)
 
         async def close(self):
@@ -587,9 +651,9 @@ async def test_sandbox_handlers_use_binding_key_for_access(fake_cache, local_san
     # Creation binds by the key too, and its owner-context guard accepts the
     # run instead of refusing it for want of a conversation. A generic create
     # refuses to run over a bound Skill sandbox, so retire the one above first.
-    from packages.core.ai.runtime import runtime_delete_sandbox_context
+    from packages.core.ai.runtime import runtime_delete_sandbox_binding
 
-    await runtime_delete_sandbox_context("U01ABC")
+    assert await runtime_delete_sandbox_binding(skill_scope, "sbx-1")
     captured: dict = {}
 
     async def fake_acquire(*, owner, bundle, binding, **kwargs):
@@ -620,7 +684,6 @@ async def test_sandbox_handlers_use_binding_key_for_access(fake_cache, local_san
 
 @pytest.mark.asyncio
 async def test_binding_verifier_accepts_task_binding_key(fake_cache, monkeypatch) -> None:
-    from packages.core.ai.runtime import runtime_save_sandbox_context
     from packages.core.services import skill_service
     from packages.core.services.runtime_authorization.binding_verifier import (
         CurrentRuntimeToolBindingVerifier,
@@ -630,16 +693,7 @@ async def test_binding_verifier_accepts_task_binding_key(fake_cache, monkeypatch
         RuntimeToolBindingSource,
     )
 
-    await runtime_save_sandbox_context(
-        "U01ABC",
-        {
-            "sandbox_id": "sbx-1",
-            "skill_id": "skill_xlsx",
-            "entity_id": "ent1",
-            "user_id": "user1",
-            "agent_id": "agent1",
-        },
-    )
+    await _bind_task_skill_sandbox()
 
     async def fake_list_skills_for_agent(_db, _entity_id, _agent_id, **_kwargs):
         return [SimpleNamespace(id="skill_xlsx")]
@@ -665,8 +719,22 @@ async def test_binding_verifier_accepts_task_binding_key(fake_cache, monkeypatch
     decision = await CurrentRuntimeToolBindingVerifier().verify(db, _request("agent1"))
     assert decision.source is RuntimeToolBindingSource.CONTEXTUAL
 
-    # A different agent is not the actor that was handed the sandbox.
-    assert await CurrentRuntimeToolBindingVerifier._has_active_sandbox_skill_binding(db, _request("agent2")) is False
+    # The Sandbox handler owns the per-instance check: the sandbox belongs to
+    # the user x binding key, so every agent of that scope may use it, and
+    # another user or another binding key may not.
+    from packages.core.ai.runtime.sandbox import runtime_sandbox_scope
+    from packages.core.ai.tools.sandbox_tools import _sandbox_instance_access_error
+
+    def _scope(user_id: str = "user1", binding_key: str = "U01ABC"):
+        return runtime_sandbox_scope(entity_id="ent1", user_id=user_id, binding_key=binding_key)
+
+    assert await _sandbox_instance_access_error(sandbox_id="sbx-1", scope=_scope()) is None
+    assert await _sandbox_instance_access_error(sandbox_id="sbx-1", scope=_scope(user_id="user2")) is not None
+    # The same user's other task shares it (one sandbox per user).
+    assert await _sandbox_instance_access_error(sandbox_id="sbx-1", scope=_scope(binding_key="U01OTHER")) is None
+    assert await _sandbox_instance_access_error(
+        sandbox_id="sbx-1", scope=_scope(user_id="", binding_key="U01OTHER"),
+    ) is not None
 
 
 # ── 6 & 7. the shield, and the approval round trip ──────────────
@@ -833,6 +901,7 @@ async def _guard_sandbox_exec_for_task_origin(
     from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
     from packages.core.governance import approvals as governance_approvals
     from packages.core.services import runtime_authorization
+    from packages.core.services.runtime_authorization import PermissionDecision
 
     # A worker task (not a general chat-comment task). A task created through
     # the API has no conversation row at all; its sandbox tools present the
@@ -865,7 +934,8 @@ async def _guard_sandbox_exec_for_task_origin(
     monkeypatch.setattr(task_runtime_approvals, "lock_task_runtime_approval_boundary", no_lock)
 
     async def allow(*_args, **_kwargs):
-        return SimpleNamespace(allowed=True, reason=None, matched_rule="allowed")
+        # The real decision type: the guard reads its collaborator scope too.
+        return PermissionDecision.allow("allowed")
 
     origins: list = []
 
@@ -882,7 +952,7 @@ async def _guard_sandbox_exec_for_task_origin(
 
     arguments = (
         {"action": "exec", "sandbox_id": "sbx-1", "command": "ls"}
-        if tool_name == "sandbox" else {"result": {"status": "blocked"}}
+        if tool_name == "sandbox" else {"outcome": "blocked", "summary": "blocked"}
     )
     classification = classify_runtime_tool(tool_name, arguments, entity_id="ent1", workspace_id=None, task_id="01ABC")
 
@@ -910,7 +980,7 @@ async def test_worker_result_remains_executable_after_task_thread_is_created(mon
         monkeypatch,
         origin_conversation_id="conv-1",
         presented_conversation_id=None,
-        tool_name="submit_result",
+        tool_name="complete_task",
         runtime_envelope=worker,
     )
     assert result is None
@@ -928,7 +998,7 @@ async def test_only_same_task_worker_can_submit_without_conversation(monkeypatch
             monkeypatch,
             origin_conversation_id="conv-1",
             presented_conversation_id=None,
-            tool_name="submit_result",
+            tool_name="complete_task",
             runtime_envelope=envelope,
         )
         assert json.loads(result)["error"] == "approval_origin_not_executable"

@@ -21,16 +21,12 @@ was the one that could never be opened.
 from __future__ import annotations
 
 import re
-from urllib.parse import quote
 
 import pytest
 
 from packages.core.workspace_chat.notifiers import (
     _artifacts_as_attachments,
     _format_artifact,
-    _render_dag,
-    _render_plan_completion_summary,
-    _render_step_completion_summary,
     _unique_artifacts,
     extract_artifacts_for_chat,
 )
@@ -116,21 +112,6 @@ def test_genuinely_different_files_both_survive():
     assert len([a for a in found if a["kind"] == "file"]) == 2
 
 
-def test_one_result_with_full_and_relative_paths_has_one_completion_file():
-    name = "AI_SDE_20小时课程_学生教材版.md"
-    path = f"Workspaces/W/final/{name}"
-    artifacts = extract_artifacts_for_chat({
-        "files": [{"name": name, "fs_path": path, "path": name}],
-    })
-    assert artifacts == [{"kind": "file", "value": path, "name": name}]
-    summary = _render_plan_completion_summary(
-        plan_id="plan_1", task_title="Write textbook", duration_seconds=1,
-        cost_usd=None, steps=[_step(artifacts)], entity_id=ENTITY,
-    )
-    assert summary.count("File:") == 1
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 1
-
-
 def test_completion_preserves_same_named_files_at_distinct_paths():
     artifacts = extract_artifacts_for_chat({"files": [
         {"fs_path": "Workspaces/W/a/report.md"},
@@ -141,32 +122,6 @@ def test_completion_preserves_same_named_files_at_distinct_paths():
     attachments = _artifacts_as_attachments(artifacts, entity_id=ENTITY)
     assert len(attachments) == 3
     assert len({item["previewUrl"] for item in attachments}) == 3
-
-
-def test_completion_preserves_literal_path_characters_through_all_projections():
-    paths = [f"Workspaces/W/{name}" for name in ["report#1.md", "report#2.md", "report%2520.md", "report?2.md"]]
-    artifacts = extract_artifacts_for_chat({"files": [{"fs_path": path} for path in paths]})
-    assert [item["value"] for item in artifacts] == paths
-    attachments = _artifacts_as_attachments(artifacts, entity_id=ENTITY)
-    assert [item["fsPath"] for item in attachments] == paths
-    summary = _render_plan_completion_summary(
-        plan_id="plan_1", task_title="Save reports", duration_seconds=1,
-        cost_usd=None, steps=[_step(artifacts)], entity_id=ENTITY,
-    )
-    assert summary.count("File:") == len(paths)
-    for path, attachment in zip(paths, attachments):
-        address = f"/api/v1/fs/{ENTITY}/{quote(path)}"
-        assert attachment["openUrl"] == address
-        assert f"]({address})" in summary
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-def test_completion_merges_viewer_url_with_known_document(reverse):
-    files = [{"document_id": "doc_1", "name": "report.md"}, {"open_url": "/viewer/doc_1", "name": "report.md"}]
-    artifacts = extract_artifacts_for_chat({"files": list(reversed(files)) if reverse else files})
-    assert artifacts == [{"kind": "document", "value": "doc_1", "name": "report.md"}]
-    assert len(_artifacts_as_attachments(artifacts)) == 1
-    assert _render_dag([_step(artifacts)]).count("/viewer/doc_1") == 1
 
 
 @pytest.mark.parametrize("field", ["previewUrl", "preview_url"])
@@ -183,22 +138,6 @@ def test_document_only_reference_does_not_hide_an_unrelated_same_named_file():
     })
     assert len(artifacts) == 2
     assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 2
-
-
-def test_plan_summary_and_attachments_share_canonical_path_identity():
-    artifacts = [
-        {"kind": "file", "value": "Workspaces/W/final/report.md", "name": "report.md"},
-        {"kind": "file", "value": "/Workspaces/W/final/./report.md", "name": "report.md"},
-        {"kind": "url", "value": f"/api/v1/fs/{ENTITY}/Workspaces/W/final/report.md", "name": "report.md"},
-    ]
-    assert len(_unique_artifacts(artifacts)) == 1
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 1
-    summary = _render_step_completion_summary(
-        label="Write report", agent_part="", time_part="", summary=None,
-        artifacts=artifacts, max_summary_chars=1000, entity_id=ENTITY,
-    )
-    assert summary.count("File:") == 1
-    assert _render_dag([_step(artifacts)], entity_id=ENTITY).count("File:") == 1
 
 
 @pytest.mark.parametrize("key", ["url", "previewUrl", "preview_url"])
@@ -360,48 +299,6 @@ def test_a_file_without_a_name_is_labelled_by_its_basename():
 # ── End to end ────────────────────────────────────────────────────────
 
 
-def test_the_rendered_plan_log_carries_openable_files():
-    artifacts = extract_artifacts_for_chat(
-        {"files": [
-            {"fs_path": "Workspaces/W/final/clip.mp4", "name": "clip.mp4"},
-            {"path": "/Workspaces/W/final/clip.mp4", "name": "clip.mp4"},
-        ]}
-    )
-    rendered = _render_dag([_step(artifacts)], entity_id=ENTITY)
-    assert rendered.count("File:") == 1, f"still duplicated:\n{rendered}"
-    assert f"/api/v1/fs/{ENTITY}/" in rendered
-
-
-def test_completion_summaries_carry_openable_file_addresses():
-    artifacts = [
-        {
-            "kind": "file",
-            "value": "Workspaces/W/final/clip.mp4",
-            "name": "clip.mp4",
-        }
-    ]
-    step_summary = _render_step_completion_summary(
-        label="Render final clip",
-        agent_part="",
-        time_part="",
-        summary="Rendered the final video.",
-        artifacts=artifacts,
-        max_summary_chars=1000,
-        entity_id=ENTITY,
-    )
-    plan_summary = _render_plan_completion_summary(
-        plan_id="plan_1",
-        task_title="Render final clip",
-        duration_seconds=12,
-        cost_usd=None,
-        steps=[_step(artifacts)],
-        entity_id=ENTITY,
-    )
-
-    assert f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4" in step_summary
-    assert f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4" in plan_summary
-
-
 def test_completed_artifacts_share_the_structured_chat_attachment_contract():
     attachments = _artifacts_as_attachments(
         [
@@ -431,8 +328,3 @@ def test_completed_artifacts_share_the_structured_chat_attachment_contract():
             "openUrl": "/viewer/01KYNERQ91YH35G3V7FA1M0J8F",
         }
     ]
-
-
-def test_the_renderer_still_works_without_an_entity():
-    rendered = _render_dag([_step([{"kind": "file", "value": "a/b.mp4"}])])
-    assert "b.mp4" in rendered

@@ -17,7 +17,7 @@ from packages.core.ai.runtime.workspace_delegation_actions import (
     _tool_result_canonical_sha256,
 )
 from packages.core.constants.tool_effects import ToolEffectSettlementOutcome
-from packages.core.constants.execution import ACTION_EFFECT_GENERATION_PARAM_KEY, WORKER_TRANSCRIPT_CHECKPOINT_SCHEMA
+from packages.core.constants.execution import ACTION_EFFECT_GENERATION_PARAM_KEY
 from packages.core.contracts.tool_effects import ToolEffectEvidenceFactory
 from packages.core.dispatcher.effect_safety import (
     _checkpoint_contains_tool_result,
@@ -59,11 +59,19 @@ def _receipt(checkpoint, *, call_id="write", content=RESULT):
     })
 
 
+def _after(messages):
+    """A Runtime checkpoint whose loop already moved past these messages."""
+    return RuntimeAgentCheckpoint(
+        messages=messages, usage={}, rounds=2, tool_calls_made=[],
+        pending_tool_call={"id": "next", "name": "read_file", "arguments": {"path": "notes.md"}},
+    ).to_dict()
+
+
 def _transcript(checkpoint):
-    return {"schema_version": WORKER_TRANSCRIPT_CHECKPOINT_SCHEMA, "messages": [
+    return _after([
         *copy.deepcopy(checkpoint["messages"]),
         {"role": "tool", "tool_call_id": "write", "content": RESULT},
-    ]}
+    ])
 
 
 @pytest.mark.parametrize("mismatch", [None, "plan", "step", "generation", "invalid_generation"])
@@ -209,7 +217,7 @@ def test_host_canonical_receipt_survives_json_normalization_and_dedupes_rescan()
     assert receipt["fields"]["result_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
     normalized = json.dumps(json.loads(raw), sort_keys=True, indent=2)
     messages[-1]["content"] = normalized
-    transcript = {"schema_version": WORKER_TRANSCRIPT_CHECKPOINT_SCHEMA, "messages": messages}
+    transcript = _after(messages)
     assert _checkpoint_contains_tool_result(transcript, "write", effect_ref=receipt)
     rescanned, _, _ = _delegation_receipts(
         messages, entity_id="entity", workspace_id="workspace", task_id=None,
@@ -219,7 +227,7 @@ def test_host_canonical_receipt_survives_json_normalization_and_dedupes_rescan()
     messages[-1]["content"] = json.dumps({
         "status": "completed", "_tool_result_truncated": {"sha256": receipt["fields"]["result_sha256"]},
     })
-    assert not _checkpoint_contains_tool_result(transcript, "write", effect_ref=receipt)
+    assert not _checkpoint_contains_tool_result(_after(messages), "write", effect_ref=receipt)
 
 
 @pytest.mark.parametrize("pending_kind", ["pending_tool_call", "remaining_tool_calls"])
@@ -331,9 +339,9 @@ def test_handoff_proves_only_exact_host_parent_continuation(mismatch):
 
 def test_handoff_survives_parent_transcript_without_claiming_parent_prose_is_success():
     _, parent, effect, witness, owner = _nested_handoff_fixture()
-    transcript = {"schema_version": WORKER_TRANSCRIPT_CHECKPOINT_SCHEMA, "messages": [
+    transcript = _after([
         *parent["messages"], {"role": "tool", "tool_call_id": "skill", "content": "The child returned."},
-    ]}
+    ])
     assert _checkpoint_proves_tool_effect(transcript, effect, evidence_refs=[effect, witness], owner_step=owner)
     assert not _checkpoint_contains_tool_result(transcript, effect["fields"]["tool_call_id"], effect_ref=effect)
     failed = copy.deepcopy(effect)

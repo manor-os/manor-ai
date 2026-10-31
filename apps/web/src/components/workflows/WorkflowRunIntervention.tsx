@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
 import { IconChevronDown, IconError, IconList, IconPause } from "../icons";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
@@ -6,6 +6,11 @@ import Button from "../ui/Button";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Textarea from "../ui/Textarea";
 import Modal from "../ui/Modal";
+import WorkflowErrorText from "./WorkflowErrorText";
+import { workflowRunInputPageSchema, workflowRunInputPages } from "./workflowRunInputPages";
+
+const ChatMarkdown = lazy(() => import("../ChatMarkdown"));
+import TikTokPublishReview, { isTikTokPublishApproval } from "./TikTokPublishReview";
 import WorkflowApprovalReview, {
   EditableWorkflowApprovalReview,
   workflowReviewIsEditable,
@@ -46,6 +51,7 @@ function schemaForStarterInput(input: WorkflowRunActionInput): WorkflowInputSche
     "x-ui": {
       ...(base["x-ui"] || {}),
       ...(input.hidden ? { hidden: true } : {}),
+      ...(input.suggestions?.length ? { suggestions: input.suggestions } : {}),
     },
   };
 }
@@ -95,7 +101,8 @@ function compactReasonPreview(value: unknown, fallback: string, truncationText: 
   const candidates = Array.isArray(value) ? value : [value];
   for (const candidate of candidates) {
     const formatted = formatWorkflowError(candidate, truncationText);
-    const lines = formatted.split(/\r?\n/).map((part) => part.trim()).filter(Boolean);
+    // A listed stop message ("- item" lines) previews its first item without the list marker.
+    const lines = formatted.split(/\r?\n/).map((part) => part.trim().replace(/^-\s+/, "")).filter(Boolean);
     const line = lines.find((line) => !isPreviewScaffold(line)) || lines[0];
     if (line) return line;
   }
@@ -149,6 +156,32 @@ export default function WorkflowRunIntervention({
   );
   const [values, setValues] = useState<unknown>(() => workflowSchemaDraft(schema, initialValues));
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // A starter whose inputs name steps is asked one step at a time; the run still
+  // takes every input in one submission, checked in full on the last step.
+  const inputPages = useMemo(
+    () => (action.kind === "workflow_starter_input" ? workflowRunInputPages(action.inputs || []) : null),
+    [stableActionIdentity],
+  );
+  const [pageIndex, setPageIndex] = useState(0);
+  const activePageIndex = inputPages ? Math.min(pageIndex, inputPages.length - 1) : 0;
+  const activePage = inputPages?.[activePageIndex];
+  const isLastPage = !inputPages || activePageIndex === inputPages.length - 1;
+  const pageSchema = useMemo(
+    () => (activePage ? workflowRunInputPageSchema(schema, activePage.keys) : schema),
+    [schema, activePage],
+  );
+  // Moving on checks only this step's fields, so a mistake is fixed where it is made.
+  const advancePage = () => {
+    const pageErrors: Record<string, string> = {};
+    parseWorkflowSchemaDraft(pageSchema, values, rootKey, false, pageErrors);
+    setErrors(pageErrors);
+    if (Object.keys(pageErrors).length) {
+      setExpanded(true);
+      setValidationFocusRequest((current) => current + 1);
+      return;
+    }
+    setPageIndex(activePageIndex + 1);
+  };
   const [submittingOption, setSubmittingOption] = useState("");
   const [submissionError, setSubmissionError] = useState<unknown>();
   const [fileBusy, setFileBusy] = useState(false);
@@ -162,6 +195,10 @@ export default function WorkflowRunIntervention({
   const dialogReview = presentation === "dialog" && action.kind === "workflow_approval";
   const reviewPrompt = typeof action.prompt === "string" ? action.prompt : action.description;
   const hasFields = Boolean(Object.keys(schema.properties || {}).length);
+  // Continuing a run that needs input with exactly what it already had stops it at
+  // the same question; something has to be added, attached or allowed first.
+  const unchangedInput = dialogInput && hasFields
+    && JSON.stringify(values) === JSON.stringify(workflowSchemaDraft(schema, initialValues));
   const startsExpanded = dialogInput || dialogReview || (presentation === "dialog" && action.kind === "workflow_retry" && hasFields)
     || action.kind === "workflow_starter_input" || action.kind === "workflow_input";
   const [expanded, setExpanded] = useState(startsExpanded);
@@ -171,6 +208,13 @@ export default function WorkflowRunIntervention({
   const [revisionOption, setRevisionOption] = useState("");
   const [revisionNote, setRevisionNote] = useState("");
   const [revisionNoteError, setRevisionNoteError] = useState("");
+  const revisionRef = useRef<HTMLDivElement>(null);
+  // The request box sits below the reviewed work, so opening it brings it into view.
+  useEffect(() => {
+    if (!revisionOption) return;
+    revisionRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    revisionRef.current?.querySelector("textarea")?.focus({ preventScroll: true });
+  }, [revisionOption]);
   const detailsId = useId();
   const detailsBodyRef = useRef<HTMLDivElement>(null);
   const attentionNode = run.nodes[interventionNodeIndex(run, action)];
@@ -200,10 +244,17 @@ export default function WorkflowRunIntervention({
     problem,
     truncationText,
   );
-  const visibleReason = dialogReview && displayedReview != null && reviewPrompt && reason.trim() === formatWorkflowError(reviewPrompt, truncationText).trim()
+  // A review shows its own instructions; repeating them as a reason adds noise.
+  const visibleReason = action.kind === "workflow_approval" && displayedReview != null && reviewPrompt
+    && reason.trim() === formatWorkflowError(reviewPrompt, truncationText).trim()
     ? ""
     : reason;
   const requiredChange = formatWorkflowError(action.required_change, truncationText);
+  // An input request's prompt is instructions, not a failure reason: show it as text with working links.
+  const inputRequest = action.kind === "workflow_input" || action.kind === "workflow_starter_input";
+  const inputInstructions = inputRequest
+    ? (typeof action.prompt === "string" ? action.prompt.trim() : visibleReason)
+    : "";
   const reasonPreview = compactReasonPreview(
     problem,
     reason || requiredChange,
@@ -211,9 +262,15 @@ export default function WorkflowRunIntervention({
   );
   const shownError = formatWorkflowError(submissionError ?? error, truncationText);
   const validationErrorCount = Object.values(errors).filter(Boolean).length;
+  const reviewName = action.kind === "workflow_approval"
+    ? String(action.title || action.review_title || "").trim()
+    : "";
   const previewText = validationErrorCount > 0
     ? t("component.workflow_run.input_validation_error", { count: validationErrorCount })
-    : needsInput ? inputGuidance.join(" ") || t("component.workflow_run.input_guidance") : reasonPreview;
+    : needsInput ? inputGuidance.join(" ") || t("component.workflow_run.input_guidance") : reviewName || reasonPreview;
+  // Open details already show the reason in full; its one-line preview would repeat it.
+  const previewRepeatsReason = expanded && !needsInput && Boolean(visibleReason)
+    && validationErrorCount === 0 && previewText === reasonPreview;
   const rootKey = action.kind === "workflow_retry" ? "variables" : "inputs";
   const reviewFromHistory = action.kind === "workflow_approval"
     && action.review_location === "workflow_history";
@@ -228,6 +285,11 @@ export default function WorkflowRunIntervention({
     return normalized !== "cancel" && normalized !== "revise";
   });
   const secondaryOptions = allowedOptions.filter((option) => option !== primaryOption);
+  const isRevisionOption = (option: string) => WORKFLOW_REVISION_CHOICES.has(option.toLowerCase().replace(/[-\s]+/g, "_"));
+  const reviewChangeOptions = action.kind === "workflow_approval" && !dialogReview
+    ? secondaryOptions.filter(isRevisionOption)
+    : [];
+  const bodySecondaryOptions = secondaryOptions.filter((option) => !reviewChangeOptions.includes(option));
   const hasDetails = Boolean(
     hasReview
     || visibleReason
@@ -251,21 +313,45 @@ export default function WorkflowRunIntervention({
       )}
       {hasDetails && !dialogReview && !needsInput && (
         <Button size="sm" variant="outline" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setExpanded((current) => !current)}>
-          {t(expanded ? "component.workflow_run.hide_details" : "component.workflow_run.details")}
+          {t(expanded ? "component.workflow_run.hide_details"
+            : action.kind === "workflow_approval" ? "component.workflow_review.open" : "component.workflow_run.details")}
           <IconChevronDown size={13} className="workflow-run-intervention-chevron" aria-hidden="true" />
         </Button>
       )}
-      {primaryOption && (
-        <Button size={dialogReview || dialogInput ? "md" : "sm"} variant="primary" disabled={disabled || busy} loading={submittingOption === primaryOption} ariaBusy={submittingOption === primaryOption} aria-haspopup={needsInput && !dialogInput ? "dialog" : undefined} onClick={() => needsInput && !dialogInput ? setInputDialogOpen(true) : void resolve(primaryOption)}>
+      {reviewChangeOptions.map((option) => (
+        <Button key={option} size="sm" variant="outline" disabled={disabled || busy}
+          aria-expanded={revisionOption === option} onClick={() => void resolve(option)}>
+          {t("component.workflow_review.request_changes")}
+        </Button>
+      ))}
+      {inputPages && activePageIndex > 0 && (
+        <Button size={dialogReview || dialogInput ? "md" : "sm"} variant="outline" disabled={disabled || busy}
+          onClick={() => { setErrors({}); setPageIndex(activePageIndex - 1); }}>
+          {t("component.workflow_run.action.previous_step")}
+        </Button>
+      )}
+      {inputPages && !isLastPage && (
+        <Button size={dialogReview || dialogInput ? "md" : "sm"} variant="primary" disabled={disabled || busy}
+          onClick={advancePage}>
+          {t("component.workflow_run.action.next_step")}
+        </Button>
+      )}
+      {primaryOption && (!inputPages || isLastPage) && (
+        <Button size={dialogReview || dialogInput ? "md" : "sm"} variant="primary" disabled={disabled || busy || unchangedInput} loading={submittingOption === primaryOption} ariaBusy={submittingOption === primaryOption} aria-haspopup={needsInput && !dialogInput ? "dialog" : undefined} onClick={() => needsInput && !dialogInput ? setInputDialogOpen(true) : void resolve(primaryOption)}>
           {needsInput ? t(dialogInput ? "component.workflow_run.action.continue" : "component.workflow_run.action.provide_input") : actionOptionLabel(run, primaryOption)}
         </Button>
       )}
     </div>
   );
 
-  const secondaryActions = secondaryOptions.map((option) => (
+  const optionLabel = (option: string) => (
+    action.kind === "workflow_approval" && WORKFLOW_REVISION_CHOICES.has(option.toLowerCase().replace(/[-\s]+/g, "_"))
+      ? t("component.workflow_review.request_changes")
+      : actionOptionLabel(run, option)
+  );
+  const secondaryActions = bodySecondaryOptions.map((option) => (
     <Button key={option} size={dialogReview ? "md" : "sm"} variant="outline" disabled={disabled || busy} loading={submittingOption === option} ariaBusy={submittingOption === option} onClick={() => void resolve(option)}>
-      {actionOptionLabel(run, option)}
+      {optionLabel(option)}
     </Button>
   ));
 
@@ -285,6 +371,11 @@ export default function WorkflowRunIntervention({
     setInputDialogOpen(false);
     setInputDialogBusy(false);
   }, [stableActionIdentity]);
+
+  useEffect(() => {
+    // The change request opens above the material it is about.
+    if (revisionOption) detailsBodyRef.current?.scrollTo({ top: 0 });
+  }, [revisionOption]);
 
   useEffect(() => {
     if (!expanded || validationFocusRequest === 0) return;
@@ -343,7 +434,7 @@ export default function WorkflowRunIntervention({
       }
       payload = action.kind === "workflow_retry"
         ? { variables: parsed }
-        : action.kind === "workflow_input"
+        : action.kind === "workflow_input" && action.input_schema
           ? { [String(action.response_variable || "inputs")]: parsed }
           : { inputs: parsed };
     } else if (
@@ -371,9 +462,24 @@ export default function WorkflowRunIntervention({
 
   if (!retrySchemaCompatible) return null;
 
+  if (action.kind === "workflow_approval"
+    && typeof action.runtime_approval_id === "string" && action.runtime_approval_id
+    && isTikTokPublishApproval({ tool: typeof action.tool === "string" ? action.tool : undefined, review: action.review })) {
+    return <section className="workflow-run-intervention workflow-run-intervention--dialog-review" aria-label={t("component.workflow_run.intervention")} aria-busy={busy}>
+      {shownError && <p role="alert">{shownError}</p>}
+      <TikTokPublishReview
+        key={action.runtime_approval_id}
+        hitlId={action.runtime_approval_id}
+        disabled={disabled || busy}
+        onApprove={(review) => onResolve("approve", undefined, { review })}
+        onReject={() => onResolve("reject")}
+      />
+    </section>;
+  }
+
   return (
     <section
-      className={`workflow-run-intervention${dialogReview ? " workflow-run-intervention--dialog-review" : ""}${needsInput ? " workflow-run-intervention--needs-input" : ""}`}
+      className={`workflow-run-intervention${dialogReview ? " workflow-run-intervention--dialog-review" : ""}${needsInput ? " workflow-run-intervention--needs-input" : ""}${inputRequest ? " workflow-run-intervention--input-request" : ""}`}
       aria-label={t("component.workflow_run.intervention")}
       aria-busy={busy}
     >
@@ -387,7 +493,7 @@ export default function WorkflowRunIntervention({
             : t("component.workflow_run.attention_required")}
         </span>
 
-        {!dialogReview && !dialogInput && previewText && (
+        {!dialogReview && !dialogInput && previewText && !previewRepeatsReason && (
           <p
             className={`workflow-run-intervention-preview${validationErrorCount > 0 ? " is-error" : ""}`}
             role={validationErrorCount > 0 ? "alert" : undefined}
@@ -444,12 +550,18 @@ export default function WorkflowRunIntervention({
             {inputGuidance.length > 0 ? inputGuidance.map((line, index) => <p key={index}>{line}</p>) : <p>{t("component.workflow_run.input_guidance")}</p>}
           </div>}
 
-          {!needsInput && (visibleReason || requiredChange || preservedCount > 0) && (
+          {inputRequest && inputInstructions && <div className="workflow-run-input-guidance">
+            <Suspense fallback={<p>{inputInstructions}</p>}>
+              <ChatMarkdown content={inputInstructions} enableFileCards={false} />
+            </Suspense>
+          </div>}
+
+          {!needsInput && ((visibleReason && !inputRequest) || requiredChange || preservedCount > 0) && (
             <dl className="workflow-run-intervention-details">
-              {visibleReason && (
+              {visibleReason && !inputRequest && (
                 <div>
                   <dt>{t("component.workflow_run.reason")}</dt>
-                  <dd>{visibleReason}</dd>
+                  <dd><WorkflowErrorText text={visibleReason} /></dd>
                 </div>
               )}
               {requiredChange && (
@@ -474,9 +586,13 @@ export default function WorkflowRunIntervention({
                   ? t(workflowRunInputFieldsLabelKey(action))
                   : t("component.workflow_run.input_fields")}
               </h3>
+              {inputPages && <p className="workflow-run-intervention-step">
+                {t("component.workflow_run.step_progress", { current: activePageIndex + 1, total: inputPages.length })}
+                {activePage?.title ? `: ${activePage.title}` : ""}
+              </p>}
               <WorkflowSchemaFields
                 rootKey={rootKey}
-                schema={schema}
+                schema={pageSchema}
                 value={values}
                 errors={errors}
                 disabled={disabled || busy}
@@ -490,22 +606,22 @@ export default function WorkflowRunIntervention({
                   }));
                 }}
               />
+              {unchangedInput && <p className="workflow-run-intervention-unchanged" role="status">
+                {t("component.workflow_run.input_unchanged")}
+              </p>}
             </div>
           )}
 
-          {shownError && (
-            <p className="workflow-run-intervention-error" role="alert">{shownError}</p>
-          )}
-
+          {/* Asked after the work is seen: the request sits below what was reviewed. */}
           {revisionOption && (
-            <div className="workflow-run-intervention-revision">
+            <div ref={revisionRef} className="workflow-run-intervention-revision">
               <Textarea
-                label="What should change?"
+                label={t("component.workflow_review.what_should_change")}
                 value={revisionNote}
                 rows={3}
                 required
                 disabled={disabled || busy}
-                placeholder="For example: make the video brighter and show the product in the first second."
+                placeholder={t("component.workflow_review.change_placeholder")}
                 error={revisionNoteError || undefined}
                 onChange={(event) => {
                   setRevisionNote(event.target.value);
@@ -520,13 +636,13 @@ export default function WorkflowRunIntervention({
                   onClick={() => {
                     const note = revisionNote.trim();
                     if (!note) {
-                      setRevisionNoteError("Describe what should change before sending it back.");
+                      setRevisionNoteError(t("component.workflow_review.change_required"));
                       return;
                     }
                     void resolve(revisionOption, note);
                   }}
                 >
-                  Send for revision
+                  {t("component.workflow_review.send_changes")}
                 </Button>
                 <Button
                   size="sm"
@@ -534,13 +650,17 @@ export default function WorkflowRunIntervention({
                   disabled={disabled || busy}
                   onClick={() => setRevisionOption("")}
                 >
-                  Back
+                  {t("component.workflow_review.back")}
                 </Button>
               </div>
             </div>
           )}
 
-          {!dialogReview && !dialogInput && !revisionOption && secondaryOptions.length > 0 && (
+          {shownError && (
+            <p className="workflow-run-intervention-error" role="alert">{shownError}</p>
+          )}
+
+          {!dialogReview && !dialogInput && !revisionOption && bodySecondaryOptions.length > 0 && (
             <div className="workflow-run-intervention-actions">
               {secondaryActions}
             </div>

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +14,6 @@ from packages.core.dispatcher.output_coercion import coerce_step_output_for_sche
 from packages.core.dispatcher.service import _attach_knowledge_artifacts_for_contract
 from packages.core.models.execution import ExecutionStep
 from packages.core.models.worker import WorkLease, Worker
-from packages.core.workers import internal
-from packages.core.plans.executor import PlanExecutor
-from packages.core.plans.schema import Plan, PlanStep
-from packages.core.plans.service import persisted_plan_contract_gaps
 from packages.core.contracts.task_output import (
     TaskOutputProtocolError,
     TaskOutputValueKind,
@@ -34,29 +29,6 @@ from packages.worker_sdk.types import (
     LeaseResultFactory,
     TaskOutputValueKind as WorkerTaskOutputValueKind,
 )
-
-
-@pytest.mark.parametrize("value", [[1, 2], "ready", None])
-async def test_action_worker_keeps_native_provider_payload(monkeypatch, value) -> None:
-    """MCP action results must not be rewritten to the legacy value envelope."""
-    class _Adapter:
-        async def simulate_tool(self, _action_key, _params):
-            return {
-                "isError": False,
-                "content": [{"type": "text", "text": json.dumps(value)}],
-            }
-
-    monkeypatch.setattr(
-        "packages.core.workers.internal.importlib.import_module",
-        lambda _name: _Adapter(),
-    )
-    out = await internal._call_action_adapter({
-        "provider": "fake_provider",
-        "action_key": "return_value",
-        "execution_mode": "dry_run",
-        "params": {},
-    })
-    assert out["result"] == value
 
 
 def test_python_worker_coercion_keeps_native_json_values_and_presence() -> None:
@@ -451,43 +423,6 @@ def test_heartbeat_commits_each_completion_before_processing_the_next(
     assert db.commit_count == 4
 
 
-def test_plan_executor_keeps_nullable_bare_null_for_downstream_refs() -> None:
-    schema = plan_output_contract_schema({"type": "null"})
-    step = SimpleNamespace(
-        step_key="nullable",
-        step_status="done",
-        expected_output_schema=schema,
-        result=None,
-    )
-    assert PlanExecutor._collect_prior_results([step]) == {"nullable": None}
-
-    PlanExecutor._mark_done(step, None, None)
-    assert step.result is None
-
-
-def test_plan_executor_keeps_nullable_unmarked_action_null_for_downstream_refs() -> None:
-    """Hydrated provider schemas can predate provenance markers.
-
-    They are still native action payloads, so a valid JSON ``null`` must stay
-    present in the prior-result map instead of disappearing as a legacy empty
-    envelope.
-    """
-    schema = {"type": "null"}
-    step = SimpleNamespace(
-        step_key="action_nullable",
-        kind="action",
-        step_status="done",
-        expected_output_schema=schema,
-        result=None,
-    )
-    contract = output_contract_for_schema(schema)
-    assert contract.preserves_native_payload is True
-    assert PlanExecutor._collect_prior_results([step]) == {"action_nullable": None}
-
-    PlanExecutor._mark_done(step, None, None)
-    assert step.result is None
-
-
 def test_native_contract_knowledge_projection_only_adds_declared_fields() -> None:
     """Knowledge indexing must not widen a strict bare payload after validation."""
     projection = ArtifactKnowledgeProjection(
@@ -589,53 +524,3 @@ def test_dispatcher_turns_hard_result_omission_into_controlled_schema_failure() 
     )
     assert failed["type"] == "OutputSchemaError"
     assert "omitted" in failed["message"]
-
-
-def test_persisted_legacy_plan_with_new_task_schema_is_replanned() -> None:
-    plan = Plan(
-        steps=[
-            PlanStep(
-                key="deliver",
-                kind="subagent",
-                service_key="content_creation",
-                params={"prompt": "Return the deliverable."},
-            )
-        ]
-    )
-    gaps = persisted_plan_contract_gaps(
-        plan.model_dump(mode="json"),
-        task_expected_output={
-            "type": "object",
-            "required": ["packet"],
-            "properties": {"packet": {"type": "string"}},
-        },
-    )
-    assert any(gap.kind == "task_output_contract" for gap in gaps)
-
-
-def test_persisted_task_contract_must_bind_the_terminal_agent_step() -> None:
-    """A marker on an upstream agent must not satisfy the task deliverable gate."""
-    envelope = task_output_envelope_schema({"type": "string"})
-    plan = Plan(
-        steps=[
-            PlanStep(
-                key="research",
-                kind="subagent",
-                service_key="content_creation",
-                expected_output_schema=envelope,
-                params={"prompt": "Research."},
-            ),
-            PlanStep(
-                key="deliver",
-                kind="llm",
-                service_key="content_creation",
-                depends_on=["research"],
-                params={"prompt": "Return the final deliverable."},
-            ),
-        ]
-    )
-    gaps = persisted_plan_contract_gaps(
-        plan.model_dump(mode="json"),
-        task_expected_output={"type": "string"},
-    )
-    assert any(gap.kind == "task_output_contract" for gap in gaps)

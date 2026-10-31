@@ -1,6 +1,5 @@
 """Workspace HITL attachments survive API resolution and runtime resumption."""
 import asyncio
-import json
 
 import pytest
 from sqlalchemy import select
@@ -12,8 +11,8 @@ from packages.core.models.document import Document, DocumentFolder, DocumentGrou
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.participant import HumanCommitment
 from packages.core.models.task import Conversation, Message, Task
+from packages.core.services.task_agent_loop_hitl import TASK_AGENT_LOOP_INPUT_DISPATCH
 from packages.core.services.task_input_resume import TASK_INPUT_QUESTION_KEY
-from packages.core.workers.internal import _resume_checkpoint_with_answer
 
 pytestmark = pytest.mark.asyncio
 
@@ -55,7 +54,6 @@ async def _fixture(client, db, monkeypatch, kind):
         db.add(origin)
         await db.flush()
         action.update(step_id=origin.id, plan_id=plan.id)
-        monkeypatch.setattr("packages.core.tasks.ai_tasks.run_plan.delay", lambda *_: None)
     elif kind == "task":
         origin = Task(entity_id=entity_id, workspace_id=workspace_id,
                       title="Produce audio", status="waiting_on_customer",
@@ -65,10 +63,16 @@ async def _fixture(client, db, monkeypatch, kind):
         await db.flush()
         action["task_id"] = origin.id
 
-        async def legacy_allowed(*_args, **_kwargs):
-            return True
+        # The Task's run is parked on this question: the answer (with its
+        # canonical attachments) is handed to that run.
+        async def parked_run_takes_answer(_db, *, task, payload, **kwargs):
+            task.details = {**(task.details or {}), "_hitl_payload": dict(payload)}
+            return {"resumed": True, "dispatch_agent_id": TASK_AGENT_LOOP_INPUT_DISPATCH}
 
-        monkeypatch.setattr("packages.core.services.task_input_resume.legacy_task_can_resume_input", legacy_allowed)
+        monkeypatch.setattr(
+            "packages.core.services.task_agent_loop_hitl.apply_task_agent_loop_input_answer",
+            parked_run_takes_answer,
+        )
         monkeypatch.setattr("packages.core.services.task_input_resume.dispatch_task_input_resume", lambda *_: True)
         from packages.core.services.task_chat_hitl import ensure_task_input_hitl
 
@@ -125,13 +129,10 @@ async def test_attachment_only_answer_is_canonical_and_preserves_existing_docume
     await db_session.refresh(origin)
     if kind == "step":
         assert origin.step_status == "pending"
-        result = RuntimeAgentCheckpoint.from_dict(_resume_checkpoint_with_answer({
-            "runtime_checkpoint": origin.runtime_checkpoint,
-            "params": {"human_input_response": origin.human_input_response},
-        }))
-        assert json.loads(result.pending_tool_result["content"])["attachments"] == canonical
+        # The worker resumes the parked call from the kept checkpoint with this answer.
+        assert origin.human_input_response["attachments"] == canonical
+        assert RuntimeAgentCheckpoint.from_dict(origin.runtime_checkpoint).pending_tool_call["id"] == "ask"
     elif kind == "task":
-        assert origin.status == "pending"
         assert origin.details["_hitl_payload"]["attachments"] == canonical
     else:
         assert isinstance(origin, HumanCommitment)

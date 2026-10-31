@@ -262,7 +262,11 @@ async def create_notification_once(
                 and notif.content == body
                 and notif.workspace_id == resolved_workspace_id
                 and notif.deliver_at == deliver_at
-                and dict(notif.meta or {}) == merged_meta
+                # A retried Workflow can have a new run identity for the same
+                # report. Keep the original producer receipt and compare the
+                # notification content, rather than its execution provenance.
+                and {key: value for key, value in (notif.meta or {}).items() if key != "workflow_origin"}
+                == {key: value for key, value in merged_meta.items() if key != "workflow_origin"}
             )
             if not same_payload:
                 raise ValueError(

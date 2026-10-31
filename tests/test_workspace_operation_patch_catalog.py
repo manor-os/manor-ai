@@ -119,6 +119,16 @@ def test_describe_ops_is_compact_and_mentions_rule_derived_guardrails():
     assert "rule.remove" in text and "rule.update" in text
 
 
+def test_only_the_in_product_vocabulary_names_the_create_draft_call_shape():
+    from packages.core.ai.runtime.workspace_operation_actions import (
+        describe_operation_patch_ops as in_product_describe,
+    )
+
+    # The service text is shared with the MCP endpoint, whose call shape differs.
+    assert "create_draft" not in describe_operation_patch_ops()
+    assert '{"action":"create_draft","patches":' in in_product_describe()
+
+
 # ── rule.remove / rule.update ────────────────────────────────────────────
 
 

@@ -1584,4 +1584,6 @@ async def test_workspace_runtime_switch_controls_goal_measurement_schedule(
         headers=headers,
     )
     assert disabled.status_code == 200
-    assert await goal_job() is None
+    paused_job = await goal_job()
+    assert paused_job is not None
+    assert paused_job.enabled is False

@@ -38,25 +38,44 @@ from .word_document import handle_word_document
 
 
 async def _active_document_skill_media_guard(
-    conversation_id: str | None, kind: str
+    *,
+    entity_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    binding_key: str | None,
+    kind: str,
 ) -> str | None:
     """Block video/audio generation while a document/office sandbox skill drives.
 
     A pptx/docx/xlsx skill is driven by the parent agent through the sandbox; if
     it gets stuck it can call generate_file(kind="video") with a prompt bled from
     earlier in the conversation, ending a deck request in an unrelated clip. The
-    active sandbox conversation context records the driving skill (its slug is
-    stored as skill_id for built-ins), so refuse the media kind when that skill
-    is a document one. Best-effort: any lookup failure allows the call.
+    calling agent's view of the conversation sandbox records the Skill it drives
+    (its slug is stored as skill_id for built-ins), so refuse the media kind when
+    that skill is a document one. A Skill another agent drives in the shared
+    sandbox does not constrain this agent. Best-effort: any lookup failure
+    allows the call.
     """
-    if not conversation_id:
-        return None
     try:
-        from packages.core.ai.runtime import runtime_load_sandbox_context
+        from packages.core.ai.runtime import (
+            RuntimeSandboxKind,
+            runtime_agent_sandbox,
+            runtime_agent_skill_in,
+            runtime_sandbox_scope,
+        )
         from packages.core.ai.runtime.skills import document_skill_media_guard
 
-        ctx = await runtime_load_sandbox_context(conversation_id)
-        skill_slug = (ctx or {}).get("skill_id") if isinstance(ctx, dict) else None
+        scope = runtime_sandbox_scope(
+            entity_id=entity_id,
+            user_id=user_id,
+            binding_key=binding_key,
+        )
+        if scope is None:
+            return None
+        driving = await runtime_agent_sandbox(scope, agent_id, RuntimeSandboxKind.SKILL)
+        # The Skill THIS agent drives there (others may load beside it).
+        held = await runtime_agent_skill_in(scope, agent_id, driving[0]) if driving is not None else None
+        skill_slug = (held or {}).get("skill_id")
         return document_skill_media_guard(skill_slug, "generate_file", {"kind": kind})
     except Exception:
         return None
@@ -99,6 +118,23 @@ async def _generate_file_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
+    from packages.core.services.document_service import StorageLimitExceeded
+
+    try:
+        return await _generate_file(entity_id=entity_id, user_id=user_id, conversation_id=conversation_id, **kwargs)
+    except StorageLimitExceeded as exc:
+        # A full Knowledge store is the person's to resolve (free space or a
+        # larger plan); retrying or repairing the file would only fail again.
+        return json.dumps({"status": "blocked", "code": "knowledge_storage_limit", "error": str(exc),
+                           "plan": exc.plan, "limit": exc.limit, "current": exc.current}, ensure_ascii=False)
+
+
+async def _generate_file(
+    entity_id: str = "",
+    user_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
     runtime_context = runtime_tool_call_context_from_kwargs(
         kwargs,
         user_id=user_id,
@@ -132,6 +168,8 @@ async def _generate_file_handler(
                 workspace_id=runtime_context.workspace_id,
                 conversation_id=runtime_context.conversation_id,
                 narration_voice_mode=search_params.get("narration_voice_mode") or kwargs.get("narration_voice_mode"),
+                project_id=runtime_context.workflow_project_id,
+                voice_role=search_params.get("voice_role") or kwargs.get("voice_role"),
             )
             return json.dumps({"selected_model": selected_model}, ensure_ascii=False)
         result = {
@@ -203,8 +241,11 @@ async def _generate_file_handler(
         return json.dumps(result, ensure_ascii=False)
     if kind in {GenerateFileKind.VIDEO, GenerateFileKind.AUDIO}:
         guard = await _active_document_skill_media_guard(
-            runtime_context.sandbox_binding_key or runtime_context.conversation_id,
-            kind,
+            entity_id=entity_id,
+            user_id=runtime_context.user_id,
+            agent_id=runtime_context.agent_id,
+            binding_key=runtime_context.sandbox_binding_key or runtime_context.conversation_id,
+            kind=kind,
         )
         if guard is not None:
             return guard

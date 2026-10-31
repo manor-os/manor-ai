@@ -173,6 +173,16 @@ def workspace_ledger_runtime_tools(
     return names
 
 
+def workspace_ledger_read_tool(settings: object, contract: object) -> str | None:
+    """Return the read tool of one Ledger contract installed in the Workspace."""
+
+    text = str(contract or "").strip()
+    contract_id = _LEDGER_ALIASES.get(text.casefold(), text)
+    if contract_id not in workspace_queryable_ledger_configs(settings):
+        return None
+    return _LEDGER_RUNTIME_TOOLS[contract_id][0]
+
+
 async def query_content_ledger(
     *,
     entity_id: str,
@@ -399,13 +409,61 @@ async def query_recruiting_ledger(
     )
 
 
+def queryable_ledger_contract_id(value: object) -> str | None:
+    """Canonical id of a queryable contract named by id or alias, else ``None``."""
+
+    text = str(value or "").strip()
+    contract_id = _LEDGER_ALIASES.get(text.casefold(), text)
+    return contract_id if contract_id in QUERYABLE_LEDGER_CONTRACTS else None
+
+
+async def query_installed_workspace_ledger(
+    config: Mapping[str, Any],
+    *,
+    entity_id: str,
+    workspace_id: str,
+    filters: Mapping[str, Any] | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Query the current rows of one installed contract at its configured location.
+
+    ``config`` is an entry of ``workspace_queryable_ledger_configs``; callers
+    never choose the directory themselves.
+    """
+
+    contract_id = str(config.get("contract_id") or "")
+    common = {
+        "entity_id": entity_id,
+        "workspace_id": workspace_id,
+        "directory": str(config.get("directory") or _DEFAULT_DIRECTORIES.get(contract_id, "")),
+        "filters": filters,
+        "limit": limit,
+    }
+    if contract_id == CONTENT_LEDGER_CONTRACT_ID:
+        return await query_content_ledger(
+            **common,
+            legacy_directories=tuple(config.get("legacy_directories") or ()),
+            legacy_identity_fields=tuple(config.get("legacy_identity_fields") or ()),
+        )
+    if contract_id == FINANCE_LEDGER_CONTRACT_ID:
+        return await query_finance_ledger(**common)
+    if contract_id == RECRUITING_LEDGER_CONTRACT_ID:
+        return await query_recruiting_ledger(**common)
+    if contract_id == RELATIONSHIP_LEDGER_CONTRACT_ID:
+        return await query_relationship_ledger(**common)
+    raise LedgerQueryError("unsupported_contract", f"{contract_id or 'Ledger'} is not queryable")
+
+
 __all__ = [
     "LedgerQueryError",
     "QUERYABLE_LEDGER_CONTRACTS",
     "query_content_ledger",
     "query_finance_ledger",
+    "query_installed_workspace_ledger",
     "query_recruiting_ledger",
     "query_relationship_ledger",
+    "queryable_ledger_contract_id",
     "workspace_queryable_ledger_configs",
+    "workspace_ledger_read_tool",
     "workspace_ledger_runtime_tools",
 ]

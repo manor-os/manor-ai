@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import WorkspaceChat from "../../src/components/WorkspaceChat";
 import EmbeddedChat from "../../src/components/EmbeddedChat";
 import FloatingChat from "../../src/components/FloatingChat";
+import DetailDrawer from "../../src/components/ui/DetailDrawer";
 import { useAuthStore } from "../../src/stores/auth";
 import { useDisplayPreferences } from "../../src/stores/displayPreferences";
 import "../../src/index.css";
@@ -31,5 +32,6 @@ function Fixture() {
 createRoot(document.getElementById("root")!).render(
   <MemoryRouter><QueryClientProvider client={queries}>
     <Fixture />
+    <DetailDrawer />
   </QueryClientProvider></MemoryRouter>,
 );

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from dataclasses import replace
 from typing import Any, Iterable
 
@@ -17,12 +19,24 @@ def _tool_pool():
     return tool_pool
 
 
+_TOOL_REGISTRY_INIT_LOCK = threading.Lock()
+
+
 def runtime_ensure_tool_registry_initialized():
-    """Return the ToolPool after ensuring its registry is loaded."""
+    """Return the ToolPool after ensuring its registry is loaded.
+
+    Loading the registry imports tools that import ``runtime.human_input``. Two
+    workers that start tool calls together must not run that import chain
+    concurrently, or one sees the module half-initialised.
+    """
 
     pool = _tool_pool()
     if not pool.tool_count:
-        pool.initialize()
+        with _TOOL_REGISTRY_INIT_LOCK:
+            if not pool.tool_count:
+                from packages.core.ai.runtime import human_input  # noqa: F401
+
+                pool.initialize()
     return pool
 
 

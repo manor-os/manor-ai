@@ -65,8 +65,8 @@ class DevKeyProvider:
             logger.warning(
                 "DevKeyProvider: no DEV_CREDENTIAL_KEY set — generated an "
                 "ephemeral key. Existing ciphertexts will be unreadable "
-                "after process restart. Set DEV_CREDENTIAL_KEY=%s to persist.",
-                new_key.decode("ascii"),
+                "after process restart. Configure DEV_CREDENTIAL_KEY with "
+                "a securely generated key to persist credentials.",
             )
             self._fernet = Fernet(new_key)
             self._key_bytes = base64.urlsafe_b64decode(new_key)

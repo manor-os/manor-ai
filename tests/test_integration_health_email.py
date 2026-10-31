@@ -44,7 +44,7 @@ class _FakeIMAP:
 
     fail_login: Exception | None = None
 
-    def __init__(self, host, port, timeout=None):
+    def __init__(self, host, port, timeout=None, ssl_context=None):
         pass
 
     def login(self, username, password):
@@ -62,7 +62,7 @@ class _FakeSMTP:
     fail_login: Exception | None = None
     instances_cls: list[str] = []
 
-    def __init__(self, host, port, timeout=None):
+    def __init__(self, host, port, timeout=None, context=None):
         type(self).instances_cls.append(type(self).__name__)
         if type(self).fail_connect is not None:
             raise type(self).fail_connect
@@ -76,8 +76,9 @@ class _FakeSMTP:
     def ehlo(self):
         pass
 
-    def starttls(self):
-        pass
+    def starttls(self, *, context):
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
 
     def login(self, username, password):
         if type(self).fail_login is not None:
@@ -247,8 +248,9 @@ async def test_email_health_uses_shared_mail_transports(monkeypatch: pytest.Monk
         def ehlo(self):
             pass
 
-        def starttls(self):
-            pass
+        def starttls(self, *, context):
+            assert context.verify_mode == ssl.CERT_REQUIRED
+            assert context.check_hostname is True
 
         def login(self, username, password):
             events.append(("smtp-login", username, 0, False))

@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.chat_room import ChatRoom, ChatRoomInvite
@@ -12,19 +12,24 @@ from packages.core.models.user import Entity, User
 
 
 async def valid_chat_registration_invite(db: AsyncSession, token: str | None, email: str) -> bool:
-    """A pending exact-email chat invite can admit signup, never auto-join a room."""
+    """A live public link or exact-email invite admits signup, not membership."""
     if not token or len(token) > 256:
         return False
     normalized = email.strip().casefold()
     digest = hashlib.sha256(token.encode()).hexdigest()
+    email_invite = select(ChatRoomInvite.id).where(
+        ChatRoomInvite.room_id == ChatRoom.id,
+        ChatRoomInvite.token_hash == digest,
+        ChatRoomInvite.status == "pending",
+        ChatRoomInvite.expires_at > datetime.now(timezone.utc),
+        func.lower(ChatRoomInvite.email) == normalized,
+    ).exists()
     row = (await db.execute(
-        select(ChatRoom)
-        .join(ChatRoomInvite, ChatRoomInvite.room_id == ChatRoom.id)
-        .where(
-            ChatRoomInvite.token_hash == digest,
-            ChatRoomInvite.status == "pending",
-            ChatRoomInvite.expires_at > datetime.now(timezone.utc),
-            func.lower(ChatRoomInvite.email) == normalized,
+        select(ChatRoom).where(
+            or_(
+                (ChatRoom.kind == "group") & (ChatRoom.public_invite_token == token),
+                email_invite,
+            ),
             ChatRoom.status == "active",
         )
     )).scalar_one_or_none()

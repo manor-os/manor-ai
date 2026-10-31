@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from packages.core.ai.provider_retry import withhold_stream_events
 from packages.core.ai.runtime.output_policy import (
     PREVIOUS_TOOL_ACTIVITY_MARKER,
     _runtime_is_file_read_content_payload,
@@ -1227,6 +1228,9 @@ def runtime_skill_progress_callbacks(
         if on_tool_start is not None:
             on_tool_start(name, args)
 
+    # Text is held until the next tool is confirmed (text_reset clears it) and
+    # drafts are ignored, so a stream that drops mid-round showed no one.
+    withhold_stream_events(on_stream_event, {"text_delta", "tool_call_draft"})
     return start_tool, on_stream_event
 
 

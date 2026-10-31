@@ -30,14 +30,6 @@ def readonly_artifact_delivery(params: Any) -> bool:
     return contract.delivery is StepDelivery.ARTIFACT and contract.effects is StepEffects.READ_ONLY
 
 
-def artifact_result_schema(step: Any) -> dict[str, Any] | None:
-    """A schema describes final file slots only for an artifact-delivery Step."""
-    declaration = (getattr(step, "params", None) or {}).get(STEP_EXECUTION_CONTRACT_PARAM) or {}
-    if declaration.get("delivery") != StepDelivery.ARTIFACT.value:
-        return None
-    return getattr(step, "expected_output_schema", None)
-
-
 def artifact_submission_sha256(result: Any) -> str:
     return hashlib.sha256(json.dumps(
         result, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -88,18 +80,6 @@ def accepted_task_artifact_manifest(plan: Any, steps: list[Any]) -> dict[str, li
     return projected
 
 
-def task_artifact_refs_for_output(plan: Any, steps: list[Any]) -> dict[str, list[dict[str, Any]]] | None:
-    """V3 projections never fall back to unverified payload heuristics."""
-    from packages.core.plans.coordinator import TASK_COORDINATOR_PLAN_VERSION, TASK_COORDINATOR_PLAN_VERSION_KEY
-
-    manifest = accepted_task_artifact_manifest(plan, steps)
-    if manifest is not None:
-        return manifest
-    if (getattr(plan, "dispatcher_state", None) or {}).get(TASK_COORDINATOR_PLAN_VERSION_KEY) == TASK_COORDINATOR_PLAN_VERSION:
-        return {}
-    return None
-
-
 def reused_artifact_evidence(
     step: Any, result: Any, snapshots: list[dict[str, Any]], *,
     lease_id: str, completed_at: datetime,
@@ -123,34 +103,3 @@ def reused_artifact_evidence(
         },
     } for snapshot in snapshots]
 
-
-def reused_artifact_snapshots(step: Any) -> list[dict[str, Any]]:
-    """Only exact persisted Step/submission evidence can select the reuse path."""
-    if not readonly_artifact_delivery(getattr(step, "params", None)):
-        return []
-    finished_at = getattr(step, "finished_at", None)
-    if not isinstance(finished_at, datetime):
-        return []
-    digest = artifact_submission_sha256(getattr(step, "result", None))
-    snapshots: list[dict[str, Any]] = []
-    for ref in getattr(step, "evidence_refs", None) or []:
-        if not isinstance(ref, dict) or ref.get("source") != ARTIFACT_DELIVERY_SOURCE:
-            continue
-        fields = ref.get("fields") if isinstance(ref.get("fields"), dict) else {}
-        snapshot = fields.get("snapshot")
-        if (
-            ref.get("kind") == "artifact"
-            and fields.get("disposition") == "reused"
-            and fields.get("owner_plan_id") == str(step.plan_id)
-            and fields.get("owner_step_id") == str(step.id)
-            and fields.get("lease_id")
-            and fields.get("owner_attempt_count") == getattr(step, "attempt_count", None)
-            and fields.get("owner_finished_at") == finished_at.astimezone(timezone.utc).isoformat()
-            and fields.get("submission_sha256") == digest
-            and isinstance(snapshot, dict)
-            and snapshot.get("document_id") == ref.get("document_id")
-            and snapshot.get("fs_path") == ref.get("fs_path")
-            and snapshot.get("source_sha256")
-        ):
-            snapshots.append(deepcopy(snapshot))
-    return snapshots

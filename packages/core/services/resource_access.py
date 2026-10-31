@@ -42,6 +42,8 @@ from packages.core.models.permission import (
 from packages.core.models.staff import Staff
 from packages.core.permissions import resolve_effective_user_role_name
 from packages.core.models.workspace import WorkspaceStaff
+from packages.core.services.collaborator_scope import actor_workspace_scope, collaborator_live_workspaces
+from packages.core.services.external_collaboration_access import COLLABORATOR_MEMBERSHIP_ROLE
 from packages.core.services.workspace_access import (
     is_entity_admin_role,
     user_can_read_all_workspaces,
@@ -115,14 +117,32 @@ def _expires_after_now(expires_at: datetime | None) -> bool:
     return expires_at > now
 
 
+async def _collaborator_workspaces(
+    db: AsyncSession, *, user_id: str | None, entity_id: str, role: str | None,
+) -> frozenset[str] | None:
+    """A collaborator's live-granted Workspaces, else None, without a lookup for anyone else.
+
+    The resolved role names a collaborator (their membership role); otherwise
+    only the acting context (HTTP boundary, runtime gate) does.
+    """
+    if str(role or "") == COLLABORATOR_MEMBERSHIP_ROLE:
+        return await collaborator_live_workspaces(db, user_id=user_id, entity_id=entity_id)
+    return await actor_workspace_scope(db, user_id=user_id, entity_id=entity_id)
+
+
 async def resolve_user_role(
     db: AsyncSession,
     *,
     user_id: str | None,
     entity_id: str,
     role: str | None = None,
+    membership_role: dict | None = None,
 ) -> str | None:
-    """Resolve the caller's authoritative role in this entity."""
+    """Resolve the caller's authoritative role in this entity.
+
+    ``membership_role`` receives the raw UserMembership role from the same
+    queries (see ``resolve_effective_user_role_name``).
+    """
     if not user_id:
         return role
     resolved_role = await resolve_effective_user_role_name(
@@ -130,6 +150,7 @@ async def resolve_user_role(
         user_id=user_id,
         entity_id=entity_id,
         legacy_role=role,
+        membership_role=membership_role,
     )
     return resolved_role or None
 
@@ -339,7 +360,14 @@ async def _user_can_access_resource_with_resolved_role(
             if visibility == Visibility.PUBLIC:
                 return True
             if str(resolved_role or "") not in ENTITY_READ_ROLES:
-                return False
+                # An external collaborator (by membership, not a StaffRole name)
+                # reads company resources only through a live-granted Workspace
+                # the resource is scoped to.
+                scope = (
+                    await _collaborator_workspaces(db, user_id=user_id, entity_id=entity_id, role=resolved_role)
+                    if descriptor.workspace_id else None
+                )
+                return bool(scope and str(descriptor.workspace_id) in scope)
             if descriptor.workspace_id:
                 return await user_can_read_workspace_id(
                     db,
@@ -478,6 +506,11 @@ async def readable_resource_ids(
         workspace_ids=workspace_ids,
     ) if workspace_ids else set()
 
+    collaborator_workspaces = (
+        await _collaborator_workspaces(db, user_id=user_id, entity_id=entity_id, role=resolved_role)
+        if str(resolved_role or "") not in ENTITY_READ_ROLES
+        else None
+    )
     for descriptor in remaining:
         if (descriptor.resource_type, descriptor.resource_id) in granted_pairs:
             visible.add(descriptor.resource_id)
@@ -492,6 +525,10 @@ async def readable_resource_ids(
                 not descriptor.workspace_id
                 or str(descriptor.workspace_id) in readable_workspaces
             )
+        ) or (
+            visibility == Visibility.ENTITY
+            and collaborator_workspaces
+            and str(descriptor.workspace_id or "") in collaborator_workspaces
         ):
             visible.add(descriptor.resource_id)
         elif (

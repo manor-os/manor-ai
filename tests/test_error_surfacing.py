@@ -458,7 +458,7 @@ def test_transient_window_expires_even_when_the_count_has_not():
     都用不完 —— 那也不能让用户干等半小时以上还看不到卡片。"""
     from datetime import datetime, timedelta, timezone
 
-    from packages.core.services.retry_policy import (
+    from packages.core.dispatcher.retry_policy import (
         TRANSIENT_MAX_WINDOW_SECONDS,
         advance_transient_retry,
     )
@@ -482,7 +482,7 @@ def test_escalated_streak_starts_over():
     连续失败。每次重新开始都仍然要一次人工决定,不会变成静默死循环。"""
     from datetime import datetime, timezone
 
-    from packages.core.services.retry_policy import advance_transient_retry
+    from packages.core.dispatcher.retry_policy import advance_transient_retry
 
     now = datetime(2026, 8, 1, tzinfo=timezone.utc)
     spent = {"transient_retry": {

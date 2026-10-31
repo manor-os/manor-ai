@@ -462,7 +462,7 @@ async def resolve_simulation_action(
         message_id=message.id,
         user_id=user_id,
         resolution=resolution,
-        emit_followup=False,
+        publish_resolution=False,
     )
     if resolved is None:
         raise SimulationRuntimeError("simulation action message no longer exists")

@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes, useLocation } from "react-router-dom";
+import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
 import ChatMarkdown from "../../src/components/ChatMarkdown";
 import { ChatMessageReferenceStrip, chatMessageReferencesFromAttachments } from "../../src/components/ChatMessageDisplay";
 import FileViewer from "../../src/pages/FileViewer";
@@ -13,6 +13,7 @@ import "../../src/index.css";
 await setLocale("en");
 const name = "AI_SDE_20小时课程_Agenda与课程内容.md";
 const id = "01M1B8KT380NRNZ9DGX8ZVGF7A";
+const taskOutputDocx = "task-output-docx";
 const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
 function Completion() {
@@ -38,9 +39,37 @@ function Completion() {
   </main>;
 }
 
+function ViewerRoute() {
+  return <>
+    <nav aria-label="Viewer fixture controls">
+      <Link to="/viewer/doc-b">Switch fixture document</Link>
+    </nav>
+    <FileViewer />
+  </>;
+}
+
+function TaskOutputDocxLink() {
+  return (
+    <Link
+      to={`/viewer/${taskOutputDocx}`}
+      state={{
+        taskOutputPreview: {
+          name: "task-output.docx",
+          file_type: "docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          encoding: "base64",
+          content: "PHA+VGFzayBvdXRwdXQgV29yZDwvcD4=",
+        },
+      }}
+    >
+      Open task output DOCX
+    </Link>
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={client}><BrowserRouter><Routes>
-    <Route path="/viewer/:docId" element={<FileViewer />} />
-    <Route path="*" element={<Completion />} />
+    <Route path="/viewer/:docId" element={<ViewerRoute />} />
+    <Route path="*" element={<><TaskOutputDocxLink /><Completion /></>} />
   </Routes></BrowserRouter></QueryClientProvider>,
 );

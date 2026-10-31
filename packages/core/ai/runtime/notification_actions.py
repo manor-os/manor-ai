@@ -26,6 +26,8 @@ async def runtime_notify_user_action(
     params: dict[str, Any] | None = None,
     workspace_id: str | None = None,
     agent_id: str | None = None,
+    workflow_run_id: str | None = None,
+    actor_user_id: str | None = None,
 ) -> str:
     """Send a user notification through the Runtime action boundary."""
 
@@ -43,13 +45,37 @@ async def runtime_notify_user_action(
     if severity not in _RUNTIME_VALID_NOTIFICATION_SEVERITIES:
         severity = "info"
     kind = str(raw_params.get("kind") or "agent_message").strip() or "agent_message"
+    requested_key = str(raw_params.get("idempotency_key") or "").strip()
+    if len(requested_key) > 200:
+        return _runtime_notification_err("idempotency_key must be at most 200 characters")
+    from packages.core.models.base import generate_ulid
+
+    notification_key = f"agent:{workspace_id or 'entity'}:{requested_key or generate_ulid()}"
 
     from sqlalchemy import and_, or_, select
 
     from packages.core.database import async_session
     from packages.core.models.user import User, UserMembership
 
+    meta = {"sent_by_agent": agent_id} if agent_id else {}
     async with async_session() as db:
+        if workflow_run_id:
+            from packages.core.governance.service import workflow_run_is_executable
+
+            if not await workflow_run_is_executable(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                user_id=actor_user_id,
+                workflow_run_id=workflow_run_id,
+            ):
+                return _runtime_notification_err("workflow_notification_origin_unavailable")
+            # These values come from the Runtime envelope, never tool params.
+            # Keep them for delayed delivery after the Workflow has completed.
+            meta["workflow_origin"] = {
+                "run_id": workflow_run_id,
+                "actor_user_id": actor_user_id,
+            }
         row = (await db.execute(
             select(User).outerjoin(
                 UserMembership,
@@ -85,7 +111,8 @@ async def runtime_notify_user_action(
             link=link if isinstance(link, str) else None,
             severity=severity,
             workspace_id=workspace_id if isinstance(workspace_id, str) else None,
-            meta={"sent_by_agent": agent_id} if agent_id else None,
+            meta=meta or None,
+            idempotency_key=notification_key,
         )
     except Exception as exc:
         logger.exception(
@@ -95,11 +122,29 @@ async def runtime_notify_user_action(
         )
         return _runtime_notification_err(str(exc))
 
-    return _runtime_notification_ok({
-        "user_id": target_user_id,
-        "kind": kind,
-        "severity": severity,
-    })
+    from packages.core.models.notification import Notification, NotificationOutboxEvent
+
+    async with async_session() as db:
+        notification = await db.scalar(select(Notification).where(
+            Notification.entity_id == entity_id,
+            Notification.user_id == target_user_id,
+            Notification.workspace_id == workspace_id,
+            Notification.idempotency_key == notification_key,
+        ))
+        if notification is None:
+            return _runtime_notification_err("notification_not_created_or_recipient_unavailable")
+        outbox = await db.scalar(select(NotificationOutboxEvent).where(
+            NotificationOutboxEvent.notification_id == notification.id,
+        ))
+        return _runtime_notification_ok({
+            "user_id": target_user_id,
+            "kind": kind,
+            "severity": severity,
+            "notification_id": notification.id,
+            "dispatch_status": notification.dispatch_status,
+            "delivery_status": outbox.status if outbox else "unavailable",
+            "delivered_at": outbox.delivered_at if outbox else None,
+        })
 
 
 # The event ``type`` drives both the bell icon and notify()'s per-event

@@ -14,7 +14,6 @@ from auth_helpers import register_user_and_get_token
     [
         ("oss", "local", False),
         ("cloud", "local", False),
-        ("cloud", "local-k8s", False),
         ("cloud", "development", False),
         ("cloud", "staging", True),
         ("cloud", "production", True),
@@ -44,7 +43,7 @@ async def test_local_unlimited_workspace_budget_gate_still_enforces_operator_cap
     from packages.core.models.workspace import Workspace
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
 
     workspace = Workspace(
         id=generate_ulid(),
@@ -73,7 +72,7 @@ def test_worker_budget_gate_is_independent_of_tenant_credit_limits(
         auto_pause_on_budget=True,
     )
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
     allowed, reason = check_worker_budget(worker)
     assert allowed is False
     assert "worker over budget" in reason
@@ -85,7 +84,7 @@ def test_worker_budget_gate_is_independent_of_tenant_credit_limits(
 
 
 @pytest.mark.asyncio
-async def test_local_k8s_ai_credit_gate_is_unlimited(
+async def test_local_ai_credit_gate_is_unlimited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from packages.core.services.plan_gate import check
@@ -95,7 +94,7 @@ async def test_local_k8s_ai_credit_gate_is_unlimited(
             raise AssertionError("local AI credit bypass must not query billing data")
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
 
     result = await check(NoDatabaseAccess(), "entity-local", "ai_budget_usd")
 
@@ -104,7 +103,7 @@ async def test_local_k8s_ai_credit_gate_is_unlimited(
 
 
 @pytest.mark.asyncio
-async def test_local_k8s_usage_summary_tracks_usage_without_a_balance(
+async def test_local_usage_summary_tracks_usage_without_a_balance(
     monkeypatch: pytest.MonkeyPatch,
     db_session,
 ) -> None:
@@ -114,7 +113,7 @@ async def test_local_k8s_usage_summary_tracks_usage_without_a_balance(
     from packages.core.services.plan_enforcement import get_usage_summary
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
     entity = Entity(
         id=generate_ulid(),
         name="Local unlimited usage",
@@ -157,7 +156,7 @@ async def test_local_unlimited_workspace_usage_honors_custom_budget_alerts(
     from packages.core.models.workspace import Workspace
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=generate_ulid(),
@@ -409,7 +408,7 @@ async def test_action_step_attributes_total_to_plan_but_only_action_to_budget(
 
 
 @pytest.mark.asyncio
-async def test_local_k8s_legacy_cost_meter_never_applies_a_plan_budget(
+async def test_local_legacy_cost_meter_never_applies_a_plan_budget(
     monkeypatch: pytest.MonkeyPatch,
     db_session,
 ) -> None:
@@ -418,7 +417,7 @@ async def test_local_k8s_legacy_cost_meter_never_applies_a_plan_budget(
     from packages.core.services.plan_enforcement import record_ai_cost
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
     entity = Entity(
         id=generate_ulid(),
         name="Local unlimited metering",

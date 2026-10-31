@@ -160,7 +160,7 @@ _ENTRIES = (
     StatLibraryEntry(
         key="workspace.workflows.success_rate",
         name="Workflow success rate",
-        description="Completed workflow runs divided by terminal workflow runs.",
+        description="Completed workflow runs divided by completed and failed runs. Cancelled runs are not judged.",
         category="workflows",
         value_type="percent",
         unit="percent",
@@ -174,7 +174,7 @@ _ENTRIES = (
     StatLibraryEntry(
         key="workspace.agents.runs",
         name="Agent runs",
-        description="Agent executions started in the selected time window.",
+        description="Agent runs (delegated Task work) started in the selected time window.",
         category="agents",
         value_type="number",
         unit="runs",
@@ -188,7 +188,7 @@ _ENTRIES = (
     StatLibraryEntry(
         key="workspace.agents.success_rate",
         name="Agent success rate",
-        description="Completed agent executions divided by terminal executions.",
+        description="Agent runs that delivered divided by delivered and failed agent runs. Cancelled runs are not judged.",
         category="agents",
         value_type="percent",
         unit="percent",

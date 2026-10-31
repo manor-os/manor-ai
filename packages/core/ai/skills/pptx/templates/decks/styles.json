@@ -1,0 +1,5535 @@
+{
+  "version": 3,
+  "aliases": {
+    "minimal": "mono",
+    "business": "consulting",
+    "tech": "neon",
+    "academic": "editorial",
+    "vibrant": "pop",
+    "elegant": "starlit"
+  },
+  "styles": {
+    "cobalt": {
+      "name": "Cobalt System / 钴蓝几何",
+      "use_for": "Brand, identity, product strategy and polished corporate decks.",
+      "fonts": {
+        "display": "Arial Black",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.3,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "upper",
+      "colors": {
+        "background": "F7F3E8",
+        "surface": "EDE6D3",
+        "primary": "1F3FD6",
+        "accent": "F2D22E",
+        "text": "111111",
+        "muted": "4F4B42",
+        "line": "D9D0BA",
+        "on_primary": "F7F3E8",
+        "on_primary_muted": "C9D2F7",
+        "on_accent": "111111",
+        "dark": "111111",
+        "on_dark": "F7F3E8",
+        "on_dark_muted": "BDB7A8",
+        "accent_on_dark": "F2D22E",
+        "accent_on_light": "1F3FD6"
+      },
+      "chart": [
+        "1F3FD6",
+        "F2D22E",
+        "111111",
+        "7F93EA",
+        "C9B98F",
+        "4F4B42"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent"
+        }
+      },
+      "header": "bar",
+      "card": {
+        "radius": 18,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ],
+          [
+            "primary",
+            "on_primary",
+            "on_primary_muted"
+          ],
+          [
+            "accent",
+            "on_accent",
+            "on_accent"
+          ]
+        ],
+        "variants": [
+          "filled",
+          "numeral",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 22
+      },
+      "icons": "tabler-outline",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [
+          "diamonds",
+          "brackets"
+        ],
+        "section": [
+          "diamonds"
+        ],
+        "contrast": [
+          "diamonds"
+        ],
+        "closing": [
+          "brackets"
+        ],
+        "content": [
+          "corner_mark"
+        ]
+      },
+      "cover": "cutout",
+      "numerals": "circle",
+      "art_direction": "clean studio stationery and product photography, cobalt blue and lemon yellow props on ivory paper, crisp daylight, minimal geometric composition",
+      "cover_plain": "field",
+      "shadows": true,
+      "type": {
+        "cover": [
+          80,
+          48
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          40,
+          32
+        ],
+        "section": [
+          56,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.05
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "ghost",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": [
+          "steps",
+          "panels"
+        ],
+        "process": "growing",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "checklist",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "side",
+        "market": "bars",
+        "launches": "chips",
+        "case_study": "split",
+        "testimonials": "cards"
+      },
+      "decor": {
+        "block": "brush",
+        "block_color": "accent",
+        "underline": true
+      },
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "2A4FF0",
+            "1530B8"
+          ],
+          "angle": 120,
+          "grain": 0.09,
+          "vignette": 0.16
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.07,
+          "vignette": 0.06
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.09,
+          "vignette": 0.18
+        },
+        "section": {
+          "base": [
+            "2A4FF0",
+            "1530B8"
+          ],
+          "angle": 120,
+          "grain": 0.09,
+          "vignette": 0.16
+        },
+        "closing": {
+          "base": [
+            "2A4FF0",
+            "1530B8"
+          ],
+          "angle": 120,
+          "grain": 0.09,
+          "vignette": 0.16
+        }
+      }
+    },
+    "mono": {
+      "name": "Mono Acid / 黑白酸黄",
+      "use_for": "Premium proposals, strategy, product and executive decks; the default for most requests.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": false,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "F3F3F0",
+        "surface": "E3E3DF",
+        "primary": "111111",
+        "accent": "E3F55A",
+        "text": "111111",
+        "muted": "55554F",
+        "line": "CFCFC9",
+        "on_primary": "F3F3F0",
+        "on_primary_muted": "B4B4AD",
+        "on_accent": "111111",
+        "dark": "111111",
+        "on_dark": "F3F3F0",
+        "on_dark_muted": "A9A9A2",
+        "accent_on_dark": "E3F55A",
+        "accent_on_light": "111111"
+      },
+      "chart": [
+        "111111",
+        "B9CC2E",
+        "8C8C86",
+        "55554F",
+        "CFCFC9",
+        "3A3A36"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "tag",
+      "card": {
+        "radius": 22,
+        "cycle": [
+          [
+            "accent",
+            "on_accent",
+            "on_accent"
+          ],
+          [
+            "surface",
+            "text",
+            "muted"
+          ],
+          [
+            "primary",
+            "on_primary",
+            "on_primary_muted"
+          ]
+        ],
+        "variants": [
+          "numeral",
+          "filled",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 28
+      },
+      "icons": "tabler-outline",
+      "icon_container": "square",
+      "motifs": {
+        "cover": [
+          "asterisk",
+          "meta_rule"
+        ],
+        "section": [
+          "asterisk"
+        ],
+        "contrast": [
+          "asterisk"
+        ],
+        "closing": [
+          "asterisk",
+          "meta_rule"
+        ],
+        "content": [
+          "meta_rule"
+        ]
+      },
+      "cover": "typographic",
+      "numerals": "big",
+      "art_direction": "monochrome studio photography of obsidian and glass sculpture, soft grey backdrop, dramatic single light, black and white, premium and calm",
+      "cover_plain": "field",
+      "shadows": true,
+      "type": {
+        "cover": [
+          96,
+          56
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          48,
+          32
+        ],
+        "section": [
+          64,
+          40
+        ],
+        "statement": [
+          64,
+          40
+        ],
+        "leading": 1.05
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "highlight": "accent",
+        "font": "Georgia",
+        "italic": true
+      },
+      "variants": {
+        "agenda": "cards",
+        "statement": "ghost",
+        "numbered": "tall",
+        "icon_grid": "columns",
+        "stats": [
+          "rules",
+          "steps"
+        ],
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "chips",
+        "quote": "centered",
+        "bullets": "rows",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "stage",
+        "market": "circles",
+        "launches": "chips",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "frame": "centered",
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.06,
+          "vignette": 0.05
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.05,
+          "vignette": 0.04
+        },
+        "section": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.1,
+          "vignette": 0.2
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.1,
+          "vignette": 0.2
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.06,
+          "vignette": 0.05
+        }
+      }
+    },
+    "consulting": {
+      "name": "Consulting / 咨询叙事",
+      "use_for": "Business reviews, board and management reporting, consulting recommendations, finance.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.05,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "FFFFFF",
+        "surface": "F3F5F8",
+        "primary": "0E1B2C",
+        "accent": "C8102E",
+        "text": "0E1B2C",
+        "muted": "4A5568",
+        "line": "D5DAE1",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "B9C3D2",
+        "on_accent": "FFFFFF",
+        "dark": "0E1B2C",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "B9C3D2",
+        "accent_on_dark": "FF6B7F",
+        "accent_on_light": "C8102E"
+      },
+      "chart": [
+        "0E1B2C",
+        "C8102E",
+        "5A6B85",
+        "9AA7BA",
+        "D7A0A8",
+        "2F4A6D"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        }
+      },
+      "header": "rule",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "outline",
+          "numeral",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [
+          "accent_bar"
+        ],
+        "section": [
+          "accent_bar",
+          "big_numeral_field"
+        ],
+        "contrast": [],
+        "closing": [],
+        "content": [
+          "tracker"
+        ]
+      },
+      "cover": "split",
+      "numerals": "plain",
+      "art_direction": "corporate architecture photography, glass and steel facades, muted navy tones, overcast daylight, precise and calm",
+      "cover_plain": "field",
+      "shadows": false,
+      "type": {
+        "cover": [
+          60,
+          48
+        ],
+        "title": [
+          40,
+          32
+        ],
+        "section": [
+          52,
+          36
+        ],
+        "statement": [
+          52,
+          36
+        ],
+        "leading": 1.12
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "label",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "plain",
+        "numbered": "numeral",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "cards",
+        "quote": "bar",
+        "bullets": "rows",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "strip",
+        "metric": "side",
+        "logos": "grid",
+        "pricing": "columns",
+        "device": "side",
+        "market": "bars",
+        "launches": "list",
+        "case_study": "band",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": true
+      },
+      "frame": "band",
+      "backdrop": {
+        "cover": {
+          "base": [
+            "15283F",
+            "0A1420"
+          ],
+          "angle": 120,
+          "grid": {
+            "step": 64,
+            "alpha": 0.045
+          },
+          "grain": 0.05,
+          "vignette": 0.12
+        },
+        "content": {
+          "base": [
+            "background"
+          ]
+        },
+        "section": {
+          "base": [
+            "background"
+          ]
+        },
+        "contrast": {
+          "base": [
+            "15283F",
+            "0A1420"
+          ],
+          "angle": 120,
+          "grid": {
+            "step": 64,
+            "alpha": 0.045
+          },
+          "grain": 0.05,
+          "vignette": 0.12
+        },
+        "closing": {
+          "base": [
+            "15283F",
+            "0A1420"
+          ],
+          "angle": 120,
+          "grid": {
+            "step": 64,
+            "alpha": 0.045
+          },
+          "grain": 0.05,
+          "vignette": 0.12
+        }
+      }
+    },
+    "ink": {
+      "name": "Ink Landscape / 水墨东方",
+      "use_for": "Chinese culture, tea, heritage and lifestyle brands, cultural tourism, Eastern aesthetics.",
+      "fonts": {
+        "display": "Georgia",
+        "latin": "Georgia",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.1,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "F3EFE4",
+        "surface": "E7E0CF",
+        "primary": "1A1A1A",
+        "accent": "B8321F",
+        "text": "1A1A1A",
+        "muted": "5E584C",
+        "line": "CFC5AF",
+        "on_primary": "F3EFE4",
+        "on_primary_muted": "BDB5A3",
+        "on_accent": "F3EFE4",
+        "dark": "1A1A1A",
+        "on_dark": "F3EFE4",
+        "on_dark_muted": "BDB5A3",
+        "accent_on_dark": "E0664F",
+        "accent_on_light": "B8321F",
+        "ink": "8A8578"
+      },
+      "chart": [
+        "1A1A1A",
+        "B8321F",
+        "8A8578",
+        "5E584C",
+        "C9B89A",
+        "3A3A3A"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "side",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "variants": [
+          "filled",
+          "icon",
+          "numeral"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [
+          "ink_hills",
+          "seal"
+        ],
+        "section": [
+          "ink_hills",
+          "seal"
+        ],
+        "contrast": [
+          "ink_hills"
+        ],
+        "closing": [
+          "ink_hills",
+          "seal"
+        ],
+        "content": [
+          "paper_rule"
+        ]
+      },
+      "cover": "split",
+      "numerals": "plain",
+      "art_direction": "traditional Chinese ink wash landscape painting, misty layered mountains, rice paper texture, monochrome with a single touch of vermilion, generous empty space",
+      "cover_plain": "field",
+      "shadows": false,
+      "type": {
+        "cover": [
+          72,
+          48
+        ],
+        "cover_leading": 1.1,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.15
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "none",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "centered",
+        "numbered": "numeral",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "zigzag",
+        "timeline": "vertical",
+        "image_cards": "cards",
+        "quote": "centered",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "split",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "strip",
+        "metric": "side",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "side",
+        "market": "circles",
+        "launches": "list",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.1,
+              0.95,
+              0.6,
+              0.45,
+              "D8D2C2",
+              0.8
+            ],
+            [
+              0.9,
+              0.9,
+              0.5,
+              0.4,
+              "E3DDCE",
+              0.7
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.08
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.09,
+          "vignette": 0.06
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.12,
+          "vignette": 0.2
+        },
+        "section": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.1,
+              0.95,
+              0.6,
+              0.45,
+              "D8D2C2",
+              0.8
+            ],
+            [
+              0.9,
+              0.9,
+              0.5,
+              0.4,
+              "E3DDCE",
+              0.7
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.08
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.1,
+              0.95,
+              0.6,
+              0.45,
+              "D8D2C2",
+              0.8
+            ],
+            [
+              0.9,
+              0.9,
+              0.5,
+              0.4,
+              "E3DDCE",
+              0.7
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.08
+        }
+      }
+    },
+    "gradient": {
+      "name": "Soft Gradient / 柔光渐变",
+      "use_for": "Product launches, SaaS, AI and consumer tech, modern startup pitches.",
+      "fonts": {
+        "display": "Arial Black",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.3,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "F6F0FB",
+        "surface": "FFFFFF",
+        "primary": "5B3DF5",
+        "accent": "5B3DF5",
+        "text": "1B1530",
+        "muted": "4C4566",
+        "line": "E2D8F2",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "DCD5FF",
+        "on_accent": "FFFFFF",
+        "dark": "1B1530",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "C7C0DD",
+        "accent_on_dark": "B9A8FF",
+        "accent_on_light": "5B3DF5",
+        "grad_a": "FFD6E8",
+        "grad_b": "E6DBFF",
+        "grad_c": "FFE7CF"
+      },
+      "chart": [
+        "5B3DF5",
+        "FF6FA3",
+        "FFA94D",
+        "37B4E0",
+        "9B8CF2",
+        "1B1530"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 26,
+        "alpha": 72,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "variants": [
+          "icon",
+          "filled",
+          "numeral"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 30
+      },
+      "icons": "phosphor-duotone",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "glass",
+      "numerals": "circle",
+      "art_direction": "soft 3D abstract shapes, glossy glass spheres and ribbons, pastel pink lavender and peach gradient lighting, clean studio render",
+      "cover_plain": "field",
+      "shadows": true,
+      "type": {
+        "cover": [
+          80,
+          48
+        ],
+        "cover_leading": 1.02,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "body"
+      },
+      "emphasis": {
+        "font": "Georgia",
+        "italic": true,
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "cards",
+        "statement": "centered",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "rules",
+        "process": "circles",
+        "timeline": "glow",
+        "image_cards": "chips",
+        "quote": "centered",
+        "bullets": "checklist",
+        "closing": "centered",
+        "chart": "split",
+        "progress": "rings",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "chips",
+        "case_study": "band",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.8,
+              0.25,
+              0.7,
+              0.9,
+              "grad_a",
+              0.95
+            ],
+            [
+              0.25,
+              0.85,
+              0.8,
+              0.8,
+              "grad_b",
+              0.95
+            ],
+            [
+              0.6,
+              0.75,
+              0.5,
+              0.6,
+              "grad_c",
+              0.9
+            ]
+          ],
+          "grain": 0.04
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.95,
+              0.05,
+              0.5,
+              0.5,
+              "grad_a",
+              0.7
+            ],
+            [
+              0.0,
+              1.0,
+              0.5,
+              0.5,
+              "grad_b",
+              0.7
+            ]
+          ],
+          "grain": 0.035
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "blooms": [
+            [
+              0.8,
+              0.8,
+              0.7,
+              0.8,
+              "accent",
+              0.45
+            ],
+            [
+              0.15,
+              0.2,
+              0.5,
+              0.6,
+              "B03A9C",
+              0.35
+            ]
+          ],
+          "grain": 0.1
+        },
+        "section": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.8,
+              0.25,
+              0.7,
+              0.9,
+              "grad_a",
+              0.95
+            ],
+            [
+              0.25,
+              0.85,
+              0.8,
+              0.8,
+              "grad_b",
+              0.95
+            ],
+            [
+              0.6,
+              0.75,
+              0.5,
+              0.6,
+              "grad_c",
+              0.9
+            ]
+          ],
+          "grain": 0.04
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.8,
+              0.25,
+              0.7,
+              0.9,
+              "grad_a",
+              0.95
+            ],
+            [
+              0.25,
+              0.85,
+              0.8,
+              0.8,
+              "grad_b",
+              0.95
+            ],
+            [
+              0.6,
+              0.75,
+              0.5,
+              0.6,
+              "grad_c",
+              0.9
+            ]
+          ],
+          "grain": 0.04
+        }
+      }
+    },
+    "starlit": {
+      "name": "Starlit / 星夜金",
+      "use_for": "Launch events, premium brands, awards, keynotes and annual galas (dark navy with gold).",
+      "fonts": {
+        "display": "Georgia",
+        "latin": "Georgia",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.1,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "0B1026",
+        "surface": "161D3E",
+        "primary": "E3B861",
+        "accent": "E3B861",
+        "text": "F4EFE3",
+        "muted": "AEB4CC",
+        "line": "2B3460",
+        "on_primary": "0B1026",
+        "on_primary_muted": "3A3420",
+        "on_accent": "0B1026",
+        "dark": "060914",
+        "on_dark": "F4EFE3",
+        "on_dark_muted": "AEB4CC",
+        "accent_on_dark": "E3B861",
+        "accent_on_light": "E3B861",
+        "star": "F4EFE3"
+      },
+      "chart": [
+        "E3B861",
+        "8FA2E8",
+        "F4EFE3",
+        "C98B5E",
+        "5E6BA8",
+        "AEB4CC"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "bar",
+      "card": {
+        "radius": 16,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 18
+      },
+      "icons": "tabler-outline",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [
+          "moon"
+        ],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": [
+          "moon"
+        ]
+      },
+      "cover": "full",
+      "numerals": "circle",
+      "art_direction": "cinematic night sky over a quiet landscape, countless stars, warm golden light, deep navy blue, elegant and calm",
+      "cover_plain": "field",
+      "shadows": false,
+      "type": {
+        "cover": [
+          72,
+          48
+        ],
+        "cover_leading": 1.05,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.1
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "none",
+        "font": "body"
+      },
+      "emphasis": {
+        "italic": true,
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "centered",
+        "numbered": "numeral",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "zigzag",
+        "timeline": "glow",
+        "image_cards": "cards",
+        "quote": "centered",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "split",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "strip",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "icon",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.75,
+              0.3,
+              0.7,
+              0.6,
+              "2C3C9A",
+              0.6
+            ],
+            [
+              0.3,
+              0.7,
+              0.6,
+              0.5,
+              "5A2C7A",
+              0.35
+            ],
+            [
+              0.85,
+              0.25,
+              0.2,
+              0.25,
+              "accent",
+              0.25
+            ]
+          ],
+          "stars": {
+            "count": 260
+          },
+          "grain": 0.08
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.9,
+              0.1,
+              0.5,
+              0.5,
+              "2C3C9A",
+              0.35
+            ]
+          ],
+          "stars": {
+            "count": 70
+          },
+          "grain": 0.07
+        },
+        "section": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.75,
+              0.3,
+              0.7,
+              0.6,
+              "2C3C9A",
+              0.6
+            ],
+            [
+              0.3,
+              0.7,
+              0.6,
+              0.5,
+              "5A2C7A",
+              0.35
+            ],
+            [
+              0.85,
+              0.25,
+              0.2,
+              0.25,
+              "accent",
+              0.25
+            ]
+          ],
+          "stars": {
+            "count": 260
+          },
+          "grain": 0.08
+        },
+        "closing": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.75,
+              0.3,
+              0.7,
+              0.6,
+              "2C3C9A",
+              0.6
+            ],
+            [
+              0.3,
+              0.7,
+              0.6,
+              0.5,
+              "5A2C7A",
+              0.35
+            ],
+            [
+              0.85,
+              0.25,
+              0.2,
+              0.25,
+              "accent",
+              0.25
+            ]
+          ],
+          "stars": {
+            "count": 260
+          },
+          "grain": 0.08
+        },
+        "contrast": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.75,
+              0.3,
+              0.7,
+              0.6,
+              "2C3C9A",
+              0.6
+            ],
+            [
+              0.3,
+              0.7,
+              0.6,
+              0.5,
+              "5A2C7A",
+              0.35
+            ],
+            [
+              0.85,
+              0.25,
+              0.2,
+              0.25,
+              "accent",
+              0.25
+            ]
+          ],
+          "stars": {
+            "count": 260
+          },
+          "grain": 0.08
+        }
+      }
+    },
+    "pop": {
+      "name": "Pop Color / 活力色块",
+      "use_for": "Marketing campaigns, events, consumer brands, training and community decks.",
+      "fonts": {
+        "display": "Arial Black",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.3,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "FFFBF3",
+        "surface": "FFE07A",
+        "primary": "3A36D6",
+        "accent": "FF5A47",
+        "text": "151515",
+        "muted": "47433B",
+        "line": "F0E2C6",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "D8D7FF",
+        "on_accent": "151515",
+        "dark": "151515",
+        "on_dark": "FFFBF3",
+        "on_dark_muted": "C9C2B4",
+        "accent_on_dark": "FFE07A",
+        "accent_on_light": "D93A28",
+        "cyan": "39C2EE",
+        "pink": "FF9BCF",
+        "coral": "FF7A5C",
+        "yellow": "FFE07A"
+      },
+      "chart": [
+        "3A36D6",
+        "FF5A47",
+        "39C2EE",
+        "FFC21A",
+        "FF9BCF",
+        "151515"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "yellow"
+        },
+        "section": {
+          "bg": "coral",
+          "text": "text",
+          "muted": "dark",
+          "accent": "dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "yellow"
+        }
+      },
+      "header": "bar",
+      "card": {
+        "radius": 28,
+        "cycle": [
+          [
+            "yellow",
+            "text",
+            "muted"
+          ],
+          [
+            "cyan",
+            "text",
+            "text"
+          ],
+          [
+            "pink",
+            "text",
+            "text"
+          ],
+          [
+            "coral",
+            "text",
+            "text"
+          ]
+        ],
+        "variants": [
+          "filled",
+          "icon",
+          "numeral"
+        ]
+      },
+      "image": {
+        "geometry": "circle",
+        "radius": 0
+      },
+      "icons": "tabler-filled",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [
+          "confetti",
+          "circles"
+        ],
+        "section": [
+          "confetti"
+        ],
+        "content": [
+          "confetti_sparse"
+        ],
+        "contrast": [
+          "confetti"
+        ],
+        "closing": [
+          "confetti",
+          "circles"
+        ]
+      },
+      "cover": "cutout",
+      "numerals": "circle",
+      "art_direction": "saturated studio photography of cheerful people and props against bright solid color backdrops, playful, high energy, crisp light",
+      "cover_plain": "field",
+      "shadows": true,
+      "type": {
+        "cover": [
+          80,
+          48
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          64,
+          40
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.05
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "cards",
+        "statement": "boxed",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "steps",
+        "process": "growing",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "checklist",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "side",
+        "market": "bars",
+        "launches": "chips",
+        "case_study": "split",
+        "testimonials": "cards"
+      },
+      "decor": {
+        "block": "blob",
+        "block_color": "yellow"
+      },
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "primary"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.85,
+              0.5,
+              0.6,
+              "accent",
+              0.35
+            ],
+            [
+              0.1,
+              0.1,
+              0.4,
+              0.5,
+              "7A75FF",
+              0.4
+            ]
+          ],
+          "grain": 0.08
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.05,
+          "vignette": 0.0
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.08,
+          "vignette": 0.15
+        },
+        "section": {
+          "base": [
+            "FF7A5C"
+          ],
+          "blooms": [
+            [
+              0.9,
+              0.9,
+              0.5,
+              0.6,
+              "FFC14D",
+              0.35
+            ]
+          ],
+          "grain": 0.08
+        },
+        "closing": {
+          "base": [
+            "primary"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.85,
+              0.5,
+              0.6,
+              "accent",
+              0.35
+            ],
+            [
+              0.1,
+              0.1,
+              0.4,
+              0.5,
+              "7A75FF",
+              0.4
+            ]
+          ],
+          "grain": 0.08
+        }
+      }
+    },
+    "editorial": {
+      "name": "Editorial / 杂志编辑",
+      "use_for": "Research, academic talks, culture, publishing, reports that read like a magazine.",
+      "fonts": {
+        "display": "Georgia",
+        "latin": "Georgia",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.1,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "F5EDDF",
+        "surface": "EADCC2",
+        "primary": "1F1A15",
+        "accent": "C2412A",
+        "text": "1F1A15",
+        "muted": "5F5446",
+        "line": "D6C4A4",
+        "on_primary": "F5EDDF",
+        "on_primary_muted": "C8BBA6",
+        "on_accent": "FFF7EC",
+        "dark": "1F1A15",
+        "on_dark": "F5EDDF",
+        "on_dark_muted": "C8BBA6",
+        "accent_on_dark": "E7A23A",
+        "accent_on_light": "B23A25",
+        "mustard": "D9A23B"
+      },
+      "chart": [
+        "1F1A15",
+        "C2412A",
+        "D9A23B",
+        "7A6A55",
+        "B9A07A",
+        "4A4038"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "mustard",
+          "text": "text",
+          "muted": "dark",
+          "accent": "dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "rule",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "variants": [
+          "numeral",
+          "filled",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [
+          "rules",
+          "offset_block"
+        ],
+        "section": [
+          "rules"
+        ],
+        "content": [
+          "rules_top"
+        ],
+        "contrast": [
+          "rules"
+        ],
+        "closing": [
+          "rules"
+        ]
+      },
+      "cover": "cutout",
+      "numerals": "big",
+      "art_direction": "warm editorial portrait and still-life photography, film grain, mustard and vermilion tones, natural window light",
+      "cover_plain": "field",
+      "shadows": false,
+      "type": {
+        "cover": [
+          84,
+          48
+        ],
+        "cover_leading": 1.02,
+        "title": [
+          46,
+          32
+        ],
+        "section": [
+          64,
+          40
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "label",
+        "font": "body"
+      },
+      "emphasis": {
+        "italic": true,
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "ghost",
+        "numbered": "tall",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "cards",
+        "quote": "centered",
+        "bullets": "rows",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "metric": "side",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "side",
+        "market": "circles",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "columns"
+      },
+      "decor": {
+        "block": "brush",
+        "block_color": "mustard",
+        "underline": true
+      },
+      "chart_style": {
+        "grid": true
+      },
+      "frame": "column",
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.09,
+          "vignette": 0.1
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.07,
+          "vignette": 0.06
+        },
+        "section": {
+          "base": [
+            "D9A23B"
+          ],
+          "grain": 0.09,
+          "vignette": 0.14
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "grain": 0.12,
+          "vignette": 0.22
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.09,
+          "vignette": 0.1
+        }
+      }
+    },
+    "neon": {
+      "name": "Neon Grid / 霓虹科技",
+      "use_for": "Technology, AI, engineering, developer and data platform decks (dark).",
+      "fonts": {
+        "display": "Impact",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 0.95,
+        "display_bold": false,
+        "mono": "Courier New"
+      },
+      "title_case": "upper",
+      "colors": {
+        "background": "0A0B12",
+        "surface": "151826",
+        "primary": "C6FF3D",
+        "accent": "C6FF3D",
+        "text": "F2F4FA",
+        "muted": "A3A9BF",
+        "line": "262B40",
+        "on_primary": "0A0B12",
+        "on_primary_muted": "2B3A12",
+        "on_accent": "0A0B12",
+        "dark": "05060B",
+        "on_dark": "F2F4FA",
+        "on_dark_muted": "A3A9BF",
+        "accent_on_dark": "C6FF3D",
+        "accent_on_light": "C6FF3D",
+        "violet": "9B7BFF"
+      },
+      "chart": [
+        "C6FF3D",
+        "9B7BFF",
+        "3DD6FF",
+        "FF6FB1",
+        "F2F4FA",
+        "5C6380"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "violet"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary",
+          "accent": "on_primary"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "tag",
+      "card": {
+        "radius": 14,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 14
+      },
+      "icons": "tabler-outline",
+      "icon_container": "square",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "full",
+      "numerals": "big",
+      "art_direction": "futuristic data center and abstract circuitry, dark background with neon lime and violet light trails, cinematic, sharp",
+      "cover_plain": "field",
+      "shadows": false,
+      "type": {
+        "cover": [
+          88,
+          52
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          48,
+          32
+        ],
+        "section": [
+          72,
+          40
+        ],
+        "statement": [
+          64,
+          40
+        ],
+        "leading": 1.02
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "violet"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "boxed",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "steps",
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "icon",
+        "case_study": "band",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.15,
+              0.55,
+              0.7,
+              "accent",
+              0.28
+            ],
+            [
+              0.1,
+              0.95,
+              0.5,
+              0.5,
+              "1E4FFF",
+              0.18
+            ]
+          ],
+          "grid": {
+            "step": 96,
+            "alpha": 0.07,
+            "color": "FFFFFF",
+            "fade": "up"
+          },
+          "grain": 0.1,
+          "vignette": 0.25
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.95,
+              0.0,
+              0.45,
+              0.5,
+              "accent",
+              0.14
+            ]
+          ],
+          "grid": {
+            "step": 96,
+            "alpha": 0.045,
+            "color": "FFFFFF",
+            "fade": "up"
+          },
+          "grain": 0.09
+        },
+        "contrast": {
+          "base": [
+            "accent"
+          ],
+          "grain": 0.06,
+          "vignette": 0.12
+        },
+        "section": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.15,
+              0.55,
+              0.7,
+              "accent",
+              0.28
+            ],
+            [
+              0.1,
+              0.95,
+              0.5,
+              0.5,
+              "1E4FFF",
+              0.18
+            ]
+          ],
+          "grid": {
+            "step": 96,
+            "alpha": 0.07,
+            "color": "FFFFFF",
+            "fade": "up"
+          },
+          "grain": 0.1,
+          "vignette": 0.25
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.15,
+              0.55,
+              0.7,
+              "accent",
+              0.28
+            ],
+            [
+              0.1,
+              0.95,
+              0.5,
+              0.5,
+              "1E4FFF",
+              0.18
+            ]
+          ],
+          "grid": {
+            "step": 96,
+            "alpha": 0.07,
+            "color": "FFFFFF",
+            "fade": "up"
+          },
+          "grain": 0.1,
+          "vignette": 0.25
+        }
+      }
+    },
+    "aurora": {
+      "name": "Aurora Mesh / 极光网格",
+      "use_for": "AI-native startups, seed and Series A pitches, developer and AI products.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": false,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "140B2E",
+        "surface": "231848",
+        "primary": "F5B3FF",
+        "accent": "F5B3FF",
+        "text": "FFFFFF",
+        "muted": "D4CBEF",
+        "line": "3A2D66",
+        "on_primary": "140B2E",
+        "on_primary_muted": "4A3A70",
+        "on_accent": "140B2E",
+        "dark": "0B0619",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "D4CBEF",
+        "accent_on_dark": "F5B3FF",
+        "accent_on_light": "F5B3FF",
+        "grad_a": "2A1373",
+        "grad_b": "9B2FB8",
+        "grad_c": "D9468F"
+      },
+      "chart": [
+        "F5B3FF",
+        "9B7BFF",
+        "5CC8FF",
+        "FFFFFF",
+        "D9468F",
+        "6E5AB8"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "surface",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 20,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 20
+      },
+      "icons": "tabler-outline",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "centered",
+      "cover_plain": "centered",
+      "numerals": "big",
+      "art_direction": "luminous violet and magenta mesh-gradient light with soft abstract depth, minimal, calm, no objects",
+      "shadows": false,
+      "type": {
+        "cover": [
+          72,
+          48
+        ],
+        "cover_leading": 1.05,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "centered",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "rules",
+        "process": "circles",
+        "timeline": "glow",
+        "image_cards": "overlay",
+        "quote": "centered",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "icon",
+        "case_study": "band",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 100,
+          "blooms": [
+            [
+              0.78,
+              0.78,
+              0.9,
+              1.0,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.15,
+              0.25,
+              0.8,
+              0.9,
+              "grad_a",
+              0.9
+            ],
+            [
+              0.55,
+              0.45,
+              0.6,
+              0.6,
+              "grad_b",
+              0.6
+            ]
+          ],
+          "grain": 0.12
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.92,
+              0.95,
+              0.6,
+              0.6,
+              "grad_b",
+              0.35
+            ],
+            [
+              0.05,
+              0.05,
+              0.5,
+              0.5,
+              "grad_a",
+              0.5
+            ]
+          ],
+          "grain": 0.12
+        },
+        "contrast": {
+          "base": [
+            "surface",
+            "background"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.5,
+              1.0,
+              1.0,
+              0.7,
+              "grad_c",
+              0.5
+            ]
+          ],
+          "grain": 0.12
+        },
+        "section": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 100,
+          "blooms": [
+            [
+              0.78,
+              0.78,
+              0.9,
+              1.0,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.15,
+              0.25,
+              0.8,
+              0.9,
+              "grad_a",
+              0.9
+            ],
+            [
+              0.55,
+              0.45,
+              0.6,
+              0.6,
+              "grad_b",
+              0.6
+            ]
+          ],
+          "grain": 0.12
+        },
+        "closing": {
+          "base": [
+            "background",
+            "dark"
+          ],
+          "angle": 100,
+          "blooms": [
+            [
+              0.78,
+              0.78,
+              0.9,
+              1.0,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.15,
+              0.25,
+              0.8,
+              0.9,
+              "grad_a",
+              0.9
+            ],
+            [
+              0.55,
+              0.45,
+              0.6,
+              0.6,
+              "grad_b",
+              0.6
+            ]
+          ],
+          "grain": 0.12
+        }
+      }
+    },
+    "documentary": {
+      "name": "Documentary / 纪实大字",
+      "use_for": "Mission-driven startups, climate, health and marketplace pitches told through real people.",
+      "fonts": {
+        "display": "Impact",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 0.95,
+        "display_bold": false,
+        "mono": "Courier New"
+      },
+      "title_case": "upper",
+      "colors": {
+        "background": "F3F1EC",
+        "surface": "E6E2D9",
+        "primary": "111111",
+        "accent": "C23E14",
+        "text": "111111",
+        "muted": "4D4A44",
+        "line": "CFCAC0",
+        "on_primary": "F3F1EC",
+        "on_primary_muted": "B9B4AA",
+        "on_accent": "FFFFFF",
+        "dark": "111111",
+        "on_dark": "F3F1EC",
+        "on_dark_muted": "B9B4AA",
+        "accent_on_dark": "FF7A4D",
+        "accent_on_light": "C23E14"
+      },
+      "chart": [
+        "111111",
+        "C23E14",
+        "8A847A",
+        "CFCAC0",
+        "FF7A4D",
+        "4D4A44"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        }
+      },
+      "header": "rule",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "outline",
+          "numeral",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [
+          "paper_rule"
+        ],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "poster",
+      "cover_plain": "poster",
+      "numerals": "big",
+      "art_direction": "documentary reportage photography of real people at work, natural light, candid moment, slight film grain, muted colour",
+      "shadows": false,
+      "type": {
+        "cover": [
+          112,
+          64
+        ],
+        "cover_leading": 0.95,
+        "title": [
+          46,
+          32
+        ],
+        "section": [
+          72,
+          40
+        ],
+        "statement": [
+          64,
+          40
+        ],
+        "leading": 1.0
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "label",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "ghost",
+        "numbered": "numeral",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "zigzag",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "lines",
+        "closing": "plain",
+        "chart": "split",
+        "progress": "bars",
+        "team": "portraits",
+        "gallery": "strip",
+        "metric": "side",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "side",
+        "market": "circles",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": true
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "111111"
+          ],
+          "grain": 0.16,
+          "vignette": 0.3
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.08,
+          "vignette": 0.06
+        },
+        "section": {
+          "base": [
+            "111111"
+          ],
+          "grain": 0.16,
+          "vignette": 0.3
+        },
+        "closing": {
+          "base": [
+            "111111"
+          ],
+          "grain": 0.16,
+          "vignette": 0.3
+        },
+        "contrast": {
+          "base": [
+            "111111"
+          ],
+          "grain": 0.16,
+          "vignette": 0.3
+        }
+      }
+    },
+    "periwinkle": {
+      "name": "Periwinkle UI / 长春花",
+      "use_for": "Consumer apps, SaaS and fintech pitches where the product screen is the hero.",
+      "fonts": {
+        "display": "Arial Black",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.2,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "F1F2FF",
+        "surface": "FFFFFF",
+        "primary": "4B51D6",
+        "accent": "3A3FC4",
+        "text": "15173D",
+        "muted": "4A4E7A",
+        "line": "D8DAF5",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "DCDDFF",
+        "on_accent": "15173D",
+        "dark": "15173D",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "C9CBF2",
+        "accent_on_dark": "FFD166",
+        "accent_on_light": "3A3FC4",
+        "card": "FFFFFF",
+        "card_bar": "B9BCF7",
+        "device": "15173D"
+      },
+      "chart": [
+        "4B51D6",
+        "FFD166",
+        "8E93F0",
+        "15173D",
+        "B9BCF7",
+        "FF8FA3"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        },
+        "section": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary_muted",
+          "accent": "accent_on_dark"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 22,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "variants": [
+          "icon",
+          "filled",
+          "numeral"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 24
+      },
+      "icons": "phosphor-duotone",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [
+          "ui_cards"
+        ],
+        "section": [
+          "ui_cards"
+        ],
+        "content": [],
+        "contrast": [],
+        "closing": [
+          "ui_cards"
+        ]
+      },
+      "cover": "device",
+      "cover_plain": "device",
+      "numerals": "circle",
+      "art_direction": "a clean mobile app screen with simple cards, charts and buttons, flat UI in periwinkle and white, no readable text",
+      "shadows": true,
+      "type": {
+        "cover": [
+          80,
+          52
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.05
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "cards",
+        "statement": "centered",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "panels",
+        "process": "circles",
+        "timeline": "glow",
+        "image_cards": "chips",
+        "quote": "centered",
+        "bullets": "checklist",
+        "closing": "centered",
+        "chart": "split",
+        "progress": "rings",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "side",
+        "market": "bars",
+        "launches": "chips",
+        "case_study": "split",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background",
+            "4048C8"
+          ],
+          "angle": 120,
+          "blooms": [
+            [
+              0.8,
+              0.2,
+              0.6,
+              0.7,
+              "B9A6FF",
+              0.55
+            ],
+            [
+              0.2,
+              0.9,
+              0.6,
+              0.6,
+              "FF9FD0",
+              0.35
+            ]
+          ],
+          "grain": 0.06
+        },
+        "content": {
+          "base": [
+            "surface"
+          ],
+          "blooms": [
+            [
+              1.0,
+              0.0,
+              0.45,
+              0.5,
+              "C9C2FF",
+              0.5
+            ]
+          ],
+          "grain": 0.03
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "blooms": [
+            [
+              0.8,
+              0.8,
+              0.6,
+              0.7,
+              "4B51D6",
+              0.45
+            ]
+          ],
+          "grain": 0.08
+        },
+        "section": {
+          "base": [
+            "background",
+            "4048C8"
+          ],
+          "angle": 120,
+          "blooms": [
+            [
+              0.8,
+              0.2,
+              0.6,
+              0.7,
+              "B9A6FF",
+              0.55
+            ],
+            [
+              0.2,
+              0.9,
+              0.6,
+              0.6,
+              "FF9FD0",
+              0.35
+            ]
+          ],
+          "grain": 0.06
+        },
+        "closing": {
+          "base": [
+            "background",
+            "4048C8"
+          ],
+          "angle": 120,
+          "blooms": [
+            [
+              0.8,
+              0.2,
+              0.6,
+              0.7,
+              "B9A6FF",
+              0.55
+            ],
+            [
+              0.2,
+              0.9,
+              0.6,
+              0.6,
+              "FF9FD0",
+              0.35
+            ]
+          ],
+          "grain": 0.06
+        }
+      }
+    },
+    "signal": {
+      "name": "Signal Space / 信号黄",
+      "use_for": "Growth-stage and consumer pitches led by one bold metric; dark keynote rooms.",
+      "fonts": {
+        "display": "Arial Black",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.15,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "0A0A0F",
+        "surface": "17171F",
+        "primary": "FFD60A",
+        "accent": "FFD60A",
+        "text": "F5F5F0",
+        "muted": "A7A7B3",
+        "line": "2A2A35",
+        "on_primary": "0A0A0F",
+        "on_primary_muted": "3A3410",
+        "on_accent": "0A0A0F",
+        "dark": "050508",
+        "on_dark": "F5F5F0",
+        "on_dark_muted": "A7A7B3",
+        "accent_on_dark": "FFD60A",
+        "accent_on_light": "FFD60A",
+        "planet": "15151D",
+        "device": "24242E"
+      },
+      "chart": [
+        "FFD60A",
+        "F5F5F0",
+        "6C6C7A",
+        "FFE873",
+        "A7A7B3",
+        "3A3A48"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary",
+          "accent": "on_primary"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "bar",
+      "card": {
+        "radius": 18,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "numeral",
+          "icon",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 18
+      },
+      "icons": "tabler-outline",
+      "icon_container": "square",
+      "motifs": {
+        "cover": [
+          "horizon",
+          "kpi_ring"
+        ],
+        "section": [
+          "horizon"
+        ],
+        "content": [
+          "horizon_low"
+        ],
+        "contrast": [],
+        "closing": [
+          "horizon"
+        ]
+      },
+      "cover": "device",
+      "cover_plain": "field",
+      "numerals": "big",
+      "art_direction": "a sleek phone showing a dark app dashboard with one bright yellow chart, deep black space background, product photography",
+      "shadows": false,
+      "type": {
+        "cover": [
+          84,
+          52
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          64,
+          40
+        ],
+        "statement": [
+          60,
+          40
+        ],
+        "leading": 1.04
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "centered",
+        "numbered": "tall",
+        "icon_grid": "grid",
+        "stats": "steps",
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "stage",
+        "market": "bars",
+        "launches": "list",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.5,
+              1.0,
+              1.2,
+              0.5,
+              "accent",
+              0.3
+            ],
+            [
+              0.85,
+              0.2,
+              0.5,
+              0.5,
+              "2A2A40",
+              0.6
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.2
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.5,
+              1.1,
+              1.2,
+              0.35,
+              "accent",
+              0.12
+            ]
+          ],
+          "grain": 0.09
+        },
+        "contrast": {
+          "base": [
+            "accent"
+          ],
+          "grain": 0.06,
+          "vignette": 0.12
+        },
+        "section": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.5,
+              1.0,
+              1.2,
+              0.5,
+              "accent",
+              0.3
+            ],
+            [
+              0.85,
+              0.2,
+              0.5,
+              0.5,
+              "2A2A40",
+              0.6
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.2
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              0.5,
+              1.0,
+              1.2,
+              0.5,
+              "accent",
+              0.3
+            ],
+            [
+              0.85,
+              0.2,
+              0.5,
+              0.5,
+              "2A2A40",
+              0.6
+            ]
+          ],
+          "grain": 0.1,
+          "vignette": 0.2
+        }
+      }
+    },
+    "plain": {
+      "name": "Plain Text / 纯文字",
+      "use_for": "Seed pitches and demo days where the argument carries the deck: one claim per slide, nothing else.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "FFFFFF",
+        "surface": "F4F4F4",
+        "primary": "111111",
+        "accent": "C4501A",
+        "text": "111111",
+        "muted": "555555",
+        "line": "DDDDDD",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "BBBBBB",
+        "on_accent": "FFFFFF",
+        "dark": "111111",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "BBBBBB",
+        "accent_on_dark": "FF8A4C",
+        "accent_on_light": "C4501A"
+      },
+      "chart": [
+        "111111",
+        "C4501A",
+        "888888",
+        "BBBBBB",
+        "555555",
+        "E0A88A"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "background",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "outline",
+          "numeral"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "split",
+      "cover_plain": "field",
+      "numerals": "plain",
+      "art_direction": "simple honest product photography on a plain white background, natural light, no styling",
+      "shadows": false,
+      "type": {
+        "cover": [
+          64,
+          44
+        ],
+        "cover_leading": 1.05,
+        "title": [
+          40,
+          32
+        ],
+        "section": [
+          52,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.1
+      },
+      "chrome": {
+        "top": false,
+        "rule": false,
+        "bottom": "none",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "plain",
+        "numbered": "numeral",
+        "icon_grid": "grid",
+        "stats": "rules",
+        "process": "circles",
+        "timeline": "vertical",
+        "image_cards": "cards",
+        "quote": "bar",
+        "bullets": "rows",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "strip",
+        "metric": "side",
+        "logos": "grid",
+        "pricing": "columns",
+        "device": "side",
+        "market": "bars",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      }
+    },
+    "swiss": {
+      "name": "Swiss Grid / 瑞士网格",
+      "use_for": "Data-heavy investor updates, fintech and B2B decks with many numbers.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "1B1C20",
+        "surface": "2A2C32",
+        "primary": "FF4F1F",
+        "accent": "FF4F1F",
+        "text": "F2F2EE",
+        "muted": "A2A3A8",
+        "line": "34363C",
+        "on_primary": "1B1C20",
+        "on_primary_muted": "3A1408",
+        "on_accent": "1B1C20",
+        "dark": "111215",
+        "on_dark": "F2F2EE",
+        "on_dark_muted": "A2A3A8",
+        "accent_on_dark": "FF6B3D",
+        "accent_on_light": "D63A0C",
+        "card_text": "111215",
+        "card_muted": "5A5B60",
+        "card": "FFFFFF"
+      },
+      "chart": [
+        "FF4F1F",
+        "F2F2EE",
+        "6E7076",
+        "FF9A78",
+        "A2A3A8",
+        "3B3D44"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "primary",
+          "text": "on_primary",
+          "muted": "on_primary",
+          "accent": "on_primary"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "rule",
+      "card": {
+        "radius": 0,
+        "cycle": [
+          [
+            "card",
+            "card_text",
+            "card_muted"
+          ]
+        ],
+        "variants": [
+          "numeral",
+          "icon",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0
+      },
+      "icons": "tabler-outline",
+      "icon_container": "square",
+      "motifs": {
+        "cover": [
+          "swiss_grid"
+        ],
+        "section": [
+          "swiss_grid"
+        ],
+        "content": [
+          "swiss_grid"
+        ],
+        "contrast": [],
+        "closing": [
+          "swiss_grid"
+        ]
+      },
+      "cover": "split",
+      "cover_plain": "field",
+      "numerals": "big",
+      "art_direction": "precise architectural photography of modern concrete and glass, strong geometry, neutral grey with one orange accent",
+      "shadows": false,
+      "type": {
+        "cover": [
+          80,
+          52
+        ],
+        "cover_leading": 1.0,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          72,
+          40
+        ],
+        "statement": [
+          60,
+          40
+        ],
+        "leading": 1.04
+      },
+      "chrome": {
+        "top": true,
+        "rule": true,
+        "bottom": "label",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "ghost",
+        "numbered": "numeral",
+        "icon_grid": "grid",
+        "stats": "panels",
+        "process": "circles",
+        "timeline": "axis",
+        "image_cards": "cards",
+        "quote": "bar",
+        "bullets": "rows",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "mosaic",
+        "metric": "side",
+        "logos": "grid",
+        "pricing": "columns",
+        "device": "side",
+        "market": "bars",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": true
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.08,
+          "vignette": 0.12
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.07,
+          "vignette": 0.08
+        },
+        "contrast": {
+          "base": [
+            "accent"
+          ],
+          "grain": 0.07,
+          "vignette": 0.12
+        },
+        "section": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.08,
+          "vignette": 0.12
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "grain": 0.08,
+          "vignette": 0.12
+        }
+      }
+    },
+    "keynote": {
+      "name": "Keynote Stage / 发布会舞台",
+      "use_for": "Product launches, keynotes and big announcements: one idea, one number or one product per slide.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.05,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "000000",
+        "surface": "1C1C1E",
+        "primary": "F5F5F7",
+        "accent": "2997FF",
+        "text": "F5F5F7",
+        "muted": "98989D",
+        "line": "38383A",
+        "on_primary": "000000",
+        "on_primary_muted": "3A3A3C",
+        "on_accent": "FFFFFF",
+        "dark": "000000",
+        "on_dark": "F5F5F7",
+        "on_dark_muted": "98989D",
+        "accent_on_dark": "2997FF",
+        "accent_on_light": "0071E3"
+      },
+      "chart": [
+        "2997FF",
+        "F5F5F7",
+        "636366",
+        "BF5AF2",
+        "30D158",
+        "FF9F0A"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "none",
+      "frame": "centered",
+      "card": {
+        "radius": 28,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "variants": [
+          "filled",
+          "numeral",
+          "icon"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 28
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "stage",
+      "cover_plain": "stage",
+      "numerals": "big",
+      "art_direction": "studio product photography on pure black, dramatic rim light, the object floating alone, no props, no reflections",
+      "shadows": false,
+      "type": {
+        "cover": [
+          84,
+          52
+        ],
+        "cover_leading": 1.02,
+        "title": [
+          48,
+          32
+        ],
+        "section": [
+          72,
+          40
+        ],
+        "statement": [
+          72,
+          40
+        ],
+        "leading": 1.06
+      },
+      "chrome": {
+        "top": false,
+        "rule": false,
+        "bottom": "none",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "giant",
+        "numbered": "tall",
+        "icon_grid": "bento",
+        "stats": [
+          "hero",
+          "bento"
+        ],
+        "process": "numerals",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "centered",
+        "bullets": "keynote",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "comparison": "spec",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "stage",
+        "market": "circles",
+        "launches": "icon",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "000000"
+          ],
+          "blooms": [
+            [
+              0.5,
+              -0.1,
+              1.0,
+              0.8,
+              "2A2A30",
+              0.9
+            ],
+            [
+              0.5,
+              1.05,
+              0.9,
+              0.35,
+              "accent",
+              0.22
+            ]
+          ],
+          "grain": 0.06
+        },
+        "content": {
+          "base": [
+            "000000"
+          ],
+          "blooms": [
+            [
+              0.5,
+              -0.15,
+              1.1,
+              0.6,
+              "1C1C20",
+              0.8
+            ]
+          ],
+          "grain": 0.05
+        },
+        "section": {
+          "base": [
+            "000000"
+          ],
+          "blooms": [
+            [
+              0.5,
+              -0.1,
+              1.0,
+              0.8,
+              "2A2A30",
+              0.9
+            ],
+            [
+              0.5,
+              1.05,
+              0.9,
+              0.35,
+              "accent",
+              0.22
+            ]
+          ],
+          "grain": 0.06
+        },
+        "closing": {
+          "base": [
+            "000000"
+          ],
+          "blooms": [
+            [
+              0.5,
+              -0.1,
+              1.0,
+              0.8,
+              "2A2A30",
+              0.9
+            ],
+            [
+              0.5,
+              1.05,
+              0.9,
+              0.35,
+              "accent",
+              0.22
+            ]
+          ],
+          "grain": 0.06
+        },
+        "contrast": {
+          "base": [
+            "000000"
+          ],
+          "blooms": [
+            [
+              0.5,
+              -0.1,
+              1.0,
+              0.8,
+              "2A2A30",
+              0.9
+            ],
+            [
+              0.5,
+              1.05,
+              0.9,
+              0.35,
+              "accent",
+              0.22
+            ]
+          ],
+          "grain": 0.06
+        }
+      }
+    },
+    "stripe": {
+      "name": "Stripe Wave / 渐变波浪",
+      "use_for": "Platform and fintech launches, developer products, metrics-led product updates.",
+      "fonts": {
+        "display": "Arial",
+        "latin": "Arial",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": true,
+        "mono": "Courier New"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "FFFFFF",
+        "surface": "F6F9FC",
+        "primary": "0A2540",
+        "accent": "635BFF",
+        "text": "0A2540",
+        "muted": "425466",
+        "line": "E3E8EE",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "ADBDCC",
+        "on_accent": "FFFFFF",
+        "dark": "0A2540",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "ADBDCC",
+        "accent_on_dark": "80E9FF",
+        "accent_on_light": "635BFF",
+        "grad_a": "A960EE",
+        "grad_b": "FF6B6B",
+        "grad_c": "90E0FF",
+        "card": "FFFFFF"
+      },
+      "chart": [
+        "635BFF",
+        "0A2540",
+        "00D4FF",
+        "A960EE",
+        "FF6B6B",
+        "ADBDCC"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent_on_light"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 14,
+        "cycle": [
+          [
+            "card",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 14
+      },
+      "icons": "tabler-outline",
+      "icon_container": "square",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "split",
+      "cover_plain": "field",
+      "numerals": "big",
+      "art_direction": "a clean payments dashboard UI with charts and cards, soft shadows, white and blurple, cropped at the edge, no readable text",
+      "shadows": true,
+      "type": {
+        "cover": [
+          72,
+          48
+        ],
+        "cover_leading": 1.04,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "label",
+        "font": "body"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "cards",
+        "statement": "centered",
+        "numbered": "numeral",
+        "icon_grid": "cards",
+        "stats": "metrics",
+        "process": "pipeline",
+        "timeline": "axis",
+        "image_cards": "cards",
+        "quote": "bar",
+        "bullets": "checklist",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "circles",
+        "gallery": "mosaic",
+        "comparison": "columns",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "side",
+        "market": "bars",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "background"
+          ],
+          "panel": {
+            "points": [
+              [
+                0.66,
+                0.0
+              ],
+              [
+                1.0,
+                0.0
+              ],
+              [
+                1.0,
+                0.74
+              ],
+              [
+                0.66,
+                0.4
+              ]
+            ],
+            "base": [
+              "grad_a"
+            ],
+            "blooms": [
+              [
+                0.15,
+                0.1,
+                0.6,
+                0.9,
+                "80E9FF",
+                0.95
+              ],
+              [
+                0.5,
+                0.3,
+                0.6,
+                0.9,
+                "grad_a",
+                1.0
+              ],
+              [
+                0.8,
+                0.05,
+                0.5,
+                0.7,
+                "FFCB57",
+                0.9
+              ],
+              [
+                0.95,
+                0.35,
+                0.5,
+                0.7,
+                "grad_b",
+                1.0
+              ]
+            ]
+          },
+          "grain": 0.02
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "panel": {
+            "points": [
+              [
+                0.62,
+                0.0
+              ],
+              [
+                1.0,
+                0.0
+              ],
+              [
+                1.0,
+                0.02
+              ],
+              [
+                0.62,
+                0.05
+              ]
+            ],
+            "base": [
+              "grad_a"
+            ],
+            "blooms": [
+              [
+                0.7,
+                0.0,
+                0.3,
+                0.2,
+                "80E9FF",
+                0.9
+              ],
+              [
+                0.95,
+                0.0,
+                0.3,
+                0.2,
+                "grad_b",
+                0.9
+              ]
+            ]
+          },
+          "grain": 0.015
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.15,
+              0.6,
+              0.6,
+              "grad_a",
+              0.35
+            ],
+            [
+              0.95,
+              0.3,
+              0.4,
+              0.5,
+              "grad_b",
+              0.25
+            ]
+          ],
+          "grain": 0.08
+        },
+        "section": {
+          "base": [
+            "dark"
+          ],
+          "blooms": [
+            [
+              0.85,
+              0.15,
+              0.6,
+              0.6,
+              "grad_a",
+              0.35
+            ],
+            [
+              0.95,
+              0.3,
+              0.4,
+              0.5,
+              "grad_b",
+              0.25
+            ]
+          ],
+          "grain": 0.08
+        },
+        "closing": {
+          "base": [
+            "background"
+          ],
+          "panel": {
+            "points": [
+              [
+                0.66,
+                0.0
+              ],
+              [
+                1.0,
+                0.0
+              ],
+              [
+                1.0,
+                0.74
+              ],
+              [
+                0.66,
+                0.4
+              ]
+            ],
+            "base": [
+              "grad_a"
+            ],
+            "blooms": [
+              [
+                0.15,
+                0.1,
+                0.6,
+                0.9,
+                "80E9FF",
+                0.95
+              ],
+              [
+                0.5,
+                0.3,
+                0.6,
+                0.9,
+                "grad_a",
+                1.0
+              ],
+              [
+                0.8,
+                0.05,
+                0.5,
+                0.7,
+                "FFCB57",
+                0.9
+              ],
+              [
+                0.95,
+                0.35,
+                0.5,
+                0.7,
+                "grad_b",
+                1.0
+              ]
+            ]
+          },
+          "grain": 0.02
+        }
+      }
+    },
+    "bloom": {
+      "name": "Bloom / 花影",
+      "use_for": "Lifestyle, beauty, hospitality and consumer brands; brand stories, launches and proposals that should feel light and airy.",
+      "fonts": {
+        "display": "Segoe UI Light",
+        "latin": "Segoe UI",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": false,
+        "mono": "Consolas"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "FBF8F4",
+        "surface": "FFFFFF",
+        "card": "FFFFFF",
+        "primary": "24324F",
+        "accent": "D9482B",
+        "text": "1B1B1F",
+        "muted": "585B66",
+        "line": "E6E1DA",
+        "on_primary": "FFFFFF",
+        "on_primary_muted": "C9CFDD",
+        "on_accent": "FFFFFF",
+        "dark": "2E5C99",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "EAF0FA",
+        "accent_on_dark": "FFE1D6",
+        "accent_on_light": "D9482B",
+        "grad_a": "7DB4EC",
+        "grad_b": "F29BB2",
+        "grad_c": "FFC98F"
+      },
+      "chart": [
+        "D9482B",
+        "2E5C99",
+        "F29BB2",
+        "7DB4EC",
+        "FFC98F",
+        "585B66"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 18,
+        "cycle": [
+          [
+            "card",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "outline"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 18,
+        "treatment": "halftone",
+        "tint": "scrim"
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "centered",
+      "cover_plain": "centered",
+      "numerals": "big",
+      "art_direction": "soft-focus nature and lifestyle photography, shallow depth of field, airy pastel daylight, flowers, sky and petals, no text",
+      "shadows": true,
+      "type": {
+        "cover": [
+          76,
+          48
+        ],
+        "cover_leading": 1.05,
+        "title": [
+          42,
+          30
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "centered",
+        "numbered": "tall",
+        "icon_grid": "cards",
+        "stats": "hero",
+        "process": "numerals",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "centered",
+        "bullets": "keynote",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "comparison": "spec",
+        "metric": "centered",
+        "logos": "open",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "chips",
+        "case_study": "band",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "24508C",
+            "4A80C0"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.06,
+              0.18,
+              0.36,
+              0.55,
+              "grad_b",
+              0.75
+            ],
+            [
+              0.94,
+              0.86,
+              0.36,
+              0.5,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.62,
+              1.02,
+              0.34,
+              0.3,
+              "grad_b",
+              0.5
+            ],
+            [
+              0.96,
+              0.06,
+              0.22,
+              0.3,
+              "grad_c",
+              0.5
+            ]
+          ],
+          "dots": {
+            "x": 0.9,
+            "y": 0.13,
+            "r": 0.06,
+            "alpha": 0.7
+          },
+          "grain": 0.05
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "blooms": [
+            [
+              1.0,
+              1.0,
+              0.45,
+              0.5,
+              "grad_b",
+              0.35
+            ],
+            [
+              0.0,
+              0.0,
+              0.35,
+              0.4,
+              "grad_c",
+              0.3
+            ]
+          ],
+          "grain": 0.035
+        },
+        "section": {
+          "base": [
+            "24508C",
+            "4A80C0"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.06,
+              0.18,
+              0.36,
+              0.55,
+              "grad_b",
+              0.75
+            ],
+            [
+              0.94,
+              0.86,
+              0.36,
+              0.5,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.62,
+              1.02,
+              0.34,
+              0.3,
+              "grad_b",
+              0.5
+            ],
+            [
+              0.96,
+              0.06,
+              0.22,
+              0.3,
+              "grad_c",
+              0.5
+            ]
+          ],
+          "dots": {
+            "x": 0.9,
+            "y": 0.13,
+            "r": 0.06,
+            "alpha": 0.7
+          },
+          "grain": 0.05
+        },
+        "closing": {
+          "base": [
+            "24508C",
+            "4A80C0"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.06,
+              0.18,
+              0.36,
+              0.55,
+              "grad_b",
+              0.75
+            ],
+            [
+              0.94,
+              0.86,
+              0.36,
+              0.5,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.62,
+              1.02,
+              0.34,
+              0.3,
+              "grad_b",
+              0.5
+            ],
+            [
+              0.96,
+              0.06,
+              0.22,
+              0.3,
+              "grad_c",
+              0.5
+            ]
+          ],
+          "dots": {
+            "x": 0.9,
+            "y": 0.13,
+            "r": 0.06,
+            "alpha": 0.7
+          },
+          "grain": 0.05
+        },
+        "contrast": {
+          "base": [
+            "24508C",
+            "4A80C0"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.06,
+              0.18,
+              0.36,
+              0.55,
+              "grad_b",
+              0.75
+            ],
+            [
+              0.94,
+              0.86,
+              0.36,
+              0.5,
+              "grad_c",
+              0.75
+            ],
+            [
+              0.62,
+              1.02,
+              0.34,
+              0.3,
+              "grad_b",
+              0.5
+            ],
+            [
+              0.96,
+              0.06,
+              0.22,
+              0.3,
+              "grad_c",
+              0.5
+            ]
+          ],
+          "dots": {
+            "x": 0.9,
+            "y": 0.13,
+            "r": 0.06,
+            "alpha": 0.7
+          },
+          "grain": 0.05
+        }
+      }
+    },
+    "velvet": {
+      "name": "Velvet Glow / 丝绒光",
+      "use_for": "AI products, creative tech and launch events; pitches and keynotes that should feel cinematic and new.",
+      "fonts": {
+        "display": "Segoe UI Light",
+        "latin": "Segoe UI",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.0,
+        "display_bold": false,
+        "mono": "Consolas"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "22094D",
+        "surface": "301468",
+        "card": "301468",
+        "primary": "F3B6FF",
+        "accent": "F3B6FF",
+        "text": "FFFFFF",
+        "muted": "DCCDF6",
+        "line": "4D2C8A",
+        "on_primary": "22094D",
+        "on_primary_muted": "5B3C94",
+        "on_accent": "22094D",
+        "dark": "12042B",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "DCCDF6",
+        "accent_on_dark": "F3B6FF",
+        "accent_on_light": "F3B6FF",
+        "grad_a": "3D10A8",
+        "grad_b": "B845D6",
+        "grad_c": "FF8BCB",
+        "glow": "C9A7FF"
+      },
+      "chart": [
+        "F3B6FF",
+        "C9A7FF",
+        "FF8BCB",
+        "FFFFFF",
+        "8F6BFF",
+        "6E4FB8"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "section": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "closing": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "surface",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 20,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "icon",
+          "numeral",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "round",
+        "radius": 20
+      },
+      "icons": "tabler-outline",
+      "icon_container": "circle",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "centered",
+      "cover_plain": "centered",
+      "numerals": "big",
+      "art_direction": "cinematic violet and magenta light, silky gradients, soft glow, abstract depth, no objects, no text",
+      "shadows": false,
+      "type": {
+        "cover": [
+          72,
+          48
+        ],
+        "cover_leading": 1.05,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          60,
+          36
+        ],
+        "statement": [
+          56,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent"
+      },
+      "variants": {
+        "agenda": "list",
+        "statement": "giant",
+        "numbered": "tall",
+        "icon_grid": "bento",
+        "stats": "hero",
+        "process": "pipeline",
+        "timeline": "glow",
+        "image_cards": "overlay",
+        "quote": "centered",
+        "bullets": "lines",
+        "closing": "centered",
+        "chart": "panel",
+        "progress": "rings",
+        "team": "circles",
+        "gallery": "mosaic",
+        "comparison": "spec",
+        "metric": "centered",
+        "logos": "grid",
+        "pricing": "cards",
+        "device": "stage",
+        "market": "circles",
+        "launches": "icon",
+        "case_study": "band",
+        "testimonials": "cards"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "240A58",
+            "0E0426"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.67,
+              0.65,
+              0.48,
+              0.58,
+              "FF6ED2",
+              1.0
+            ],
+            [
+              0.19,
+              0.22,
+              0.41,
+              0.53,
+              "6446FF",
+              0.85
+            ],
+            [
+              0.81,
+              0.21,
+              0.23,
+              0.31,
+              "FFBEEB",
+              0.6
+            ],
+            [
+              0.43,
+              0.9,
+              0.35,
+              0.28,
+              "9628DC",
+              0.7
+            ]
+          ],
+          "bands": [
+            {
+              "y": 0.8,
+              "amp": 0.17,
+              "alpha": 0.55,
+              "width": 22,
+              "blur": 18,
+              "color": "FFEAF8"
+            }
+          ],
+          "grain": 0.14
+        },
+        "content": {
+          "base": [
+            "240A58",
+            "0E0426"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.67,
+              0.65,
+              0.48,
+              0.58,
+              "FF6ED2",
+              0.55
+            ],
+            [
+              0.19,
+              0.22,
+              0.41,
+              0.53,
+              "6446FF",
+              0.5
+            ],
+            [
+              0.43,
+              0.9,
+              0.35,
+              0.28,
+              "9628DC",
+              0.45
+            ]
+          ],
+          "grain": 0.12
+        },
+        "section": {
+          "base": [
+            "240A58",
+            "0E0426"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.67,
+              0.65,
+              0.48,
+              0.58,
+              "FF6ED2",
+              1.0
+            ],
+            [
+              0.19,
+              0.22,
+              0.41,
+              0.53,
+              "6446FF",
+              0.85
+            ],
+            [
+              0.81,
+              0.21,
+              0.23,
+              0.31,
+              "FFBEEB",
+              0.6
+            ],
+            [
+              0.43,
+              0.9,
+              0.35,
+              0.28,
+              "9628DC",
+              0.7
+            ]
+          ],
+          "bands": [
+            {
+              "y": 0.8,
+              "amp": 0.17,
+              "alpha": 0.55,
+              "width": 22,
+              "blur": 18,
+              "color": "FFEAF8"
+            }
+          ],
+          "grain": 0.14
+        },
+        "closing": {
+          "base": [
+            "240A58",
+            "0E0426"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.67,
+              0.65,
+              0.48,
+              0.58,
+              "FF6ED2",
+              1.0
+            ],
+            [
+              0.19,
+              0.22,
+              0.41,
+              0.53,
+              "6446FF",
+              0.85
+            ],
+            [
+              0.81,
+              0.21,
+              0.23,
+              0.31,
+              "FFBEEB",
+              0.6
+            ],
+            [
+              0.43,
+              0.9,
+              0.35,
+              0.28,
+              "9628DC",
+              0.7
+            ]
+          ],
+          "bands": [
+            {
+              "y": 0.8,
+              "amp": 0.17,
+              "alpha": 0.55,
+              "width": 22,
+              "blur": 18,
+              "color": "FFEAF8"
+            }
+          ],
+          "grain": 0.14
+        },
+        "contrast": {
+          "base": [
+            "240A58",
+            "0E0426"
+          ],
+          "angle": 90,
+          "blooms": [
+            [
+              0.67,
+              0.65,
+              0.48,
+              0.58,
+              "FF6ED2",
+              1.0
+            ],
+            [
+              0.19,
+              0.22,
+              0.41,
+              0.53,
+              "6446FF",
+              0.85
+            ],
+            [
+              0.81,
+              0.21,
+              0.23,
+              0.31,
+              "FFBEEB",
+              0.6
+            ],
+            [
+              0.43,
+              0.9,
+              0.35,
+              0.28,
+              "9628DC",
+              0.7
+            ]
+          ],
+          "bands": [
+            {
+              "y": 0.8,
+              "amp": 0.17,
+              "alpha": 0.55,
+              "width": 22,
+              "blur": 18,
+              "color": "FFEAF8"
+            }
+          ],
+          "grain": 0.14
+        }
+      }
+    },
+    "photo": {
+      "name": "Photo Essay / 影像",
+      "use_for": "Brand stories, travel, hospitality, real estate, culture and any deck carried by its photographs.",
+      "fonts": {
+        "display": "Georgia",
+        "latin": "Segoe UI",
+        "ea": "Microsoft YaHei",
+        "display_scale": 1.1,
+        "display_bold": false,
+        "mono": "Consolas"
+      },
+      "title_case": "none",
+      "colors": {
+        "background": "111113",
+        "surface": "1D1D21",
+        "card": "1D1D21",
+        "primary": "F2C14E",
+        "accent": "F2C14E",
+        "text": "FFFFFF",
+        "muted": "D2D2D6",
+        "line": "38383E",
+        "on_primary": "111113",
+        "on_primary_muted": "4A4A50",
+        "on_accent": "111113",
+        "dark": "000000",
+        "on_dark": "FFFFFF",
+        "on_dark_muted": "DADADE",
+        "accent_on_dark": "F2C14E",
+        "accent_on_light": "8A6410",
+        "scrim": "000000"
+      },
+      "chart": [
+        "F2C14E",
+        "FFFFFF",
+        "9BA3AF",
+        "E8875B",
+        "6FA3C8",
+        "5E5E66"
+      ],
+      "roles": {
+        "cover": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "section": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "content": {
+          "bg": "background",
+          "text": "text",
+          "muted": "muted",
+          "accent": "accent"
+        },
+        "contrast": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        },
+        "closing": {
+          "bg": "dark",
+          "text": "on_dark",
+          "muted": "on_dark_muted",
+          "accent": "accent_on_dark"
+        }
+      },
+      "header": "none",
+      "card": {
+        "radius": 4,
+        "cycle": [
+          [
+            "surface",
+            "text",
+            "muted"
+          ]
+        ],
+        "outline": "line",
+        "variants": [
+          "numeral",
+          "outline",
+          "filled"
+        ]
+      },
+      "image": {
+        "geometry": "rect",
+        "radius": 0,
+        "bleed": true
+      },
+      "icons": "tabler-outline",
+      "icon_container": "none",
+      "motifs": {
+        "cover": [],
+        "section": [],
+        "content": [],
+        "contrast": [],
+        "closing": []
+      },
+      "cover": "bleed",
+      "cover_plain": "centered",
+      "numerals": "big",
+      "art_direction": "cinematic editorial photography, natural light, shallow depth of field, calm colour grade, quiet negative space on one side for text",
+      "shadows": false,
+      "type": {
+        "cover": [
+          72,
+          46
+        ],
+        "cover_leading": 1.04,
+        "title": [
+          44,
+          32
+        ],
+        "section": [
+          64,
+          40
+        ],
+        "statement": [
+          60,
+          36
+        ],
+        "leading": 1.08
+      },
+      "chrome": {
+        "top": true,
+        "rule": false,
+        "bottom": "dots",
+        "font": "mono"
+      },
+      "emphasis": {
+        "color": "accent",
+        "italic": true
+      },
+      "variants": {
+        "agenda": "typographic",
+        "statement": "plain",
+        "numbered": "tall",
+        "icon_grid": "columns",
+        "stats": "rules",
+        "process": "numerals",
+        "timeline": "axis",
+        "image_cards": "overlay",
+        "quote": "bar",
+        "bullets": "lines",
+        "closing": "plain",
+        "chart": "panel",
+        "progress": "bars",
+        "team": "portraits",
+        "gallery": "mosaic",
+        "comparison": "columns",
+        "metric": "side",
+        "logos": "open",
+        "pricing": "columns",
+        "device": "side",
+        "market": "circles",
+        "launches": "list",
+        "case_study": "split",
+        "testimonials": "columns"
+      },
+      "decor": {},
+      "chart_style": {
+        "grid": false
+      },
+      "backdrop": {
+        "cover": {
+          "base": [
+            "dark"
+          ],
+          "photo": {
+            "blur": 8,
+            "dim": 0.55,
+            "tint": "000000"
+          },
+          "grain": 0.06
+        },
+        "section": {
+          "base": [
+            "dark"
+          ],
+          "photo": {
+            "blur": 8,
+            "dim": 0.55,
+            "tint": "000000"
+          },
+          "grain": 0.06
+        },
+        "closing": {
+          "base": [
+            "dark"
+          ],
+          "photo": {
+            "blur": 8,
+            "dim": 0.55,
+            "tint": "000000"
+          },
+          "grain": 0.06
+        },
+        "content": {
+          "base": [
+            "background"
+          ],
+          "photo": {
+            "blur": 14,
+            "dim": 0.82,
+            "tint": "background"
+          },
+          "grain": 0.06
+        },
+        "contrast": {
+          "base": [
+            "dark"
+          ],
+          "photo": {
+            "blur": 6,
+            "dim": 0.62,
+            "tint": "000000"
+          },
+          "grain": 0.06
+        }
+      }
+    }
+  }
+}

@@ -90,6 +90,15 @@ def _stream_response(native: bool, with_tools: bool, *, broken: bool = False) ->
 
 @pytest_asyncio.fixture
 async def transport(monkeypatch):
+    # These tests are about format/compatibility retries, not the model
+    # catalog: no synced reasoning efforts, so no reasoning_effort is added.
+    from packages.core.services import model_pricing
+
+    monkeypatch.setattr(model_pricing, "cached_reasoning_efforts", lambda _model: None)
+    monkeypatch.setattr(
+        model_pricing, "cached_reasoning_controls",
+        lambda _model: {"efforts": None, "toggle": False, "budget": None},
+    )
     state = SimpleNamespace(provider="vercel", source="official", requests=[], records=[], events=[])
     clients = []
     routes = {
@@ -490,8 +499,15 @@ async def test_schema_downgrade_stays_monotonic_through_compatibility_retry(
     assert calls == ([_CALL] if with_tools else None)
     assert usage["total"] == 15
     assert usage["response_format_fallback"] == {"type": "json_schema", "reason": "unsupported_format"}
-    assert ["response_format" in request["payload"] for request in transport.requests] == [True, False, False]
-    assert [rejected in request["payload"] for request in transport.requests] == [True, True, False]
+    # A tool call whose reasoning is refused retries at reasoning none (routes
+    # that only refuse reasoning with tools), then without the parameter.
+    downgrade = rejected == "reasoning_effort" and with_tools
+    assert ["response_format" in request["payload"] for request in transport.requests] == (
+        [True, False, False, False] if downgrade else [True, False, False]
+    )
+    assert [rejected in request["payload"] for request in transport.requests] == (
+        [True, True, True, False] if downgrade else [True, True, False]
+    )
     assert transport.preflight.await_count == 1
     assert len(transport.records) == 1
     assert transport.records[0]["usage"]["response_format_fallback"] == usage["response_format_fallback"]

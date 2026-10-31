@@ -37,15 +37,24 @@ def _selectors(value):
 
 
 @pytest.mark.parametrize('raw', [
-    None,
     {'hitl_required_capabilities': ['external.email']},
     {'never_allow_actions': ['billing.*']},
-    {'automated_runs_always_allow': True},
 ])
 def test_blueprint_safe_import_review_never_covers_reads(raw):
     rules = normalize_legacy_workspace_policy(raw, safe_import=True)['approval']['rules']
     assert rules, 'the import still asks for review'
     assert READ not in list(_selectors(rules))
+
+
+@pytest.mark.parametrize('raw', [
+    None,
+    {'auto_approve_capabilities': ['file.write', 'manor.composite'], 'auto_approve_actions': ['workspace.file.create']},
+    {'automated_runs_always_allow': True},
+])
+def test_blueprint_safe_import_drops_template_grants_without_review_gates(raw):
+    # A template cannot confer consent, and its grants must not turn into
+    # review gates that outrank the installer's chosen mode.
+    assert normalize_legacy_workspace_policy(raw, safe_import=True)['approval']['rules'] == []
 
 
 def test_template_risk_review_never_covers_reads():
@@ -54,9 +63,27 @@ def test_template_risk_review_never_covers_reads():
     assert selectors and READ not in selectors
 
 
+# Modules that read the category list only to validate one declared category;
+# they emit no rules, which the behaviour test below pins.
+CATEGORY_VALIDATORS = {
+    'packages/core/governance/action_effects.py',
+}
+
+
+def test_effect_declarations_validate_categories_and_emit_no_rules():
+    from packages.core.governance import action_effects
+
+    tables = [action_effects.ACTION_CATALOG, dict(action_effects.ACTION_EFFECTS),
+              dict(action_effects.MCP_SERVER_CATEGORIES), dict(action_effects.PROVIDER_CATEGORY_EFFECTS)]
+    assert not list(_selectors(tables)), 'effect declarations are facts, never rules'
+    with pytest.raises(ValueError):
+        action_effects.ActionEffect('reversible', 'not-a-category')
+
+
 def test_every_category_wide_generator_is_covered():
     found = {str(path.relative_to(ROOT)) for path in (ROOT / 'packages').rglob('*.py')
              if 'get_args(ApprovalCategory)' in path.read_text(encoding='utf-8')}
+    found -= CATEGORY_VALIDATORS
     assert found == {path for path in CATEGORY_WIDE_GENERATORS if (ROOT / path).exists()}, (
         'A module now expands rules over every approval category; exclude read '
         'and add it to the behaviour tests above.')

@@ -1,6 +1,6 @@
 """Unified LLM execution context builder.
 
-Used by: Chat Service, TaskRunner, InternalWorker, Planner.
+Used by: Chat Service, the Task agent loop, InternalWorker, Planner.
 Resolves model, system prompt, tools, and history in one call.
 
 Usage:
@@ -84,6 +84,7 @@ async def build_agent_context(
     runtime_metadata: Optional[dict] = None,
     skill_refs: Iterable[dict] | None = None,
     load_history: bool = True,
+    blocked_tool_names: Iterable[str] | None = None,
 ) -> AgentExecutionContext:
     """Build a complete execution context for any LLM call.
 
@@ -103,6 +104,8 @@ async def build_agent_context(
         extra_system_prompt: Appended to the resolved system prompt.
         runtime_metadata: Task-owned metadata that nested tool calls must
             inherit through the RuntimeEnvelope.
+        blocked_tool_names: Tools this run must never offer or call (the
+            RuntimeEnvelope carries them to every gate).
     """
     from packages.core.constants.agents import is_master_agent, MANOR_AGENT_ID
 
@@ -123,13 +126,14 @@ async def build_agent_context(
             resolve_model_for_user,
         )
         ctx.model = await resolve_model_for_user(
-            model_role, user_id=user_id, entity_id=entity_id, db=db,
+            model_role, user_id=user_id, entity_id=entity_id, db=db, workspace_id=workspace_id,
         )
         ctx.llm_metadata = await resolve_llm_metadata_for_user(
             model_role,
             user_id=user_id,
             entity_id=entity_id,
             db=db,
+            workspace_id=workspace_id,
         )
         ctx.byok = bool(ctx.llm_metadata)
     except Exception:
@@ -200,6 +204,7 @@ async def build_agent_context(
             active_user_message=active_user_message,
             manual_skill_selected=bool(skill_refs),
             skill_refs=skill_refs,
+            blocked_tool_names=blocked_tool_names,
             legacy_extra_context=runtime.extra_context,
             initial_extra_context=runtime.extra_context,
         )

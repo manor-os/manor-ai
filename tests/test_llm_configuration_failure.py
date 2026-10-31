@@ -61,6 +61,16 @@ async def test_optional_classifier_does_not_parse_failed_completion(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_missing_configuration_stops_first_round_and_survives_history_projection(monkeypatch):
+    from packages.core.services.usage_service import build_durable_llm_billing_callbacks
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    reserve, _ = build_durable_llm_billing_callbacks(
+        source_prefix="oss-missing-configuration", entity_id="oss-entity",
+        user_id=None, agent_id=None, workspace_id=None, conversation_id=None,
+        fallback_model="openai/test-model",
+    )
+    database = Mock(side_effect=AssertionError("OSS must not reserve Cloud credits"))
+    monkeypatch.setattr("packages.core.database.async_session", database)
     completion = AsyncMock(return_value=("", {"error": "Missing configuration", "error_code": CODE}))
     execute = AsyncMock(side_effect=AssertionError("No tool execution without a model response"))
     monkeypatch.setattr(
@@ -68,6 +78,7 @@ async def test_missing_configuration_stops_first_round_and_survives_history_proj
     )
     result = await agentic_loop(
         system_prompt="system", user_message="List my properties", tools=[], tool_executor=execute,
+        on_llm_call_before=reserve,
     )
     assert result.stop_reason == "error"
     assert result.error == CODE
@@ -75,6 +86,7 @@ async def test_missing_configuration_stops_first_round_and_survives_history_proj
     assert result.rounds == 1
     completion.assert_awaited_once()
     execute.assert_not_awaited()
+    database.assert_not_called()
     meta = runtime_assistant_result_meta(result)
     assert meta["stream_status"] == "error"
     public = runtime_public_assistant_message_content(result.content, meta)

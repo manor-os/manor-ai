@@ -42,6 +42,11 @@ an agent, but it cannot replace a missing runtime edge or persistence contract.
 
 ## Boundary rules
 
+- Business scenarios belong in Blueprint, Workflow, and Skill configuration.
+  Reuse public Workspace capabilities first. A runtime extension requires an
+  identified shared contract gap and evidence that an unrelated scenario can
+  use the same capability. Do not introduce scenario-specific tables, routes,
+  tools, UI tabs, or policy bypasses; renaming them is not generalization.
 - Proposal generates context-dependent Task instances. Blueprint never exports
   those Task rows, their Plans, Steps, Leases, runs, or artifacts.
 - A Task Plan step and a Workflow step are different execution models. Do not

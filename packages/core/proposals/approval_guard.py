@@ -67,7 +67,7 @@ async def require_current_proposal_policy(db, *, record, items, actor_id, actor_
             resource_kind="proposal" if is_task else "proposal_item",
             resource_id=record.id if is_task else item.id,
             task_id=(item.payload or {}).get("task_id") if is_task else None,
-            category="automation", impact="external", spent_credits_per_kind=spent)
+            spent_credits_per_kind=spent)
         if not decision.allowed and not decision.pause_for_hitl:
             raise ProposalApprovalBlocked(decision.reason or "Proposal is blocked by current policy")
         if decision.pause_for_hitl and actor_kind != "user":

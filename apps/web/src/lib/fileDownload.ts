@@ -29,9 +29,14 @@ export async function saveFileResponse(
   name: string,
   loadResponse: () => Promise<Response>,
   signal?: AbortSignal,
+  requestNativeDownload?: () => Promise<void>,
 ): Promise<FileDownloadResult> {
   const picker = (window as SaveFileWindow).showSaveFilePicker;
   if (!picker) {
+    if (requestNativeDownload) {
+      await requestNativeDownload();
+      return "requested";
+    }
     const response = await loadResponse();
     const blob = await response.blob();
     signal?.throwIfAborted();

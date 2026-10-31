@@ -24,12 +24,13 @@ def test_every_short_interval_entry_expires_by_its_next_tick():
     }
     from packages.core.queues import TASK_QUEUES, UNDECLARED_TASK_QUEUE, CeleryQueue
 
+    expiring_queues = {CeleryQueue.CONTROL}
     assert "runtime-sandbox-scheduler" in short
     assert "runtime-outbox-dispatch" in short
     for name, entry in short.items():
         expires = (entry.get("options") or {}).get("expires")
         queue = TASK_QUEUES.get(entry["task"], UNDECLARED_TASK_QUEUE)
-        if queue in (CeleryQueue.CONTROL, CeleryQueue.OPS):
+        if queue in expiring_queues:
             # Control-plane and monitoring ticks are superseded by their successor.
             assert expires is not None and 0 < expires <= entry["schedule"], f"{name}: {expires}"
         else:
@@ -61,13 +62,11 @@ def test_timedelta_intervals_are_treated_like_numbers():
 def test_only_control_and_ops_queue_tasks_get_an_automatic_expiry():
     schedule = {
         "control": {"task": "runtime.sandbox_scheduler", "schedule": 2.0},
-        "ops": {"task": "ops.collect_snapshot", "schedule": 30.0},
         "heavy": {"task": "media.recover_stale_jobs", "schedule": 60.0},
         "unknown": {"task": "not.registered", "schedule": 5.0},
     }
     _apply_beat_expiry(schedule)
     assert schedule["control"]["options"]["expires"] == 2.0
-    assert schedule["ops"]["options"]["expires"] == 30.0
     assert "options" not in schedule["heavy"]
     assert "options" not in schedule["unknown"], "undeclared tasks route to heavy and must not expire"
 
@@ -86,9 +85,3 @@ def test_no_real_entry_hides_behind_a_timedelta_schedule():
             assert expires is None or expires > 0
 
 
-def test_ops_entries_expire_like_any_control_tick():
-    """The ops queue keeps up (bounded walks, single-flight snapshot), so a
-    stale monitoring tick is simply superseded by its successor."""
-    schedule = celery_app.conf.beat_schedule
-    for name in ("ops-collect-snapshot", "ops-log-scan"):
-        assert schedule[name]["options"]["expires"] <= schedule[name]["schedule"]

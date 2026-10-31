@@ -46,6 +46,7 @@ _WORKSPACE_ACTION_DESCRIPTIONS = {
     "update_goal_value": "Record a verified current value for one Workspace goal.",
     "get_stat_status": "Read the Workspace's tracked stats and their latest assessments.",
     "record_stat_assessment": "Record an assessment for one Workspace stat.",
+    "add_assessed_metrics": "Track video views, comments, likes, followers or active users, assessed by an agent on a schedule.",
     "visualize_ledgers": "Chart this Workspace's ledgers (finance, content, recruiting, relationships).",
 }
 
@@ -67,6 +68,8 @@ def _workspace_action_schemas() -> dict[str, dict]:
     return {
         "create_task": tools.WORKSPACE_CREATE_TASK_SCHEMA,
         "update_task_runtime": tools.WORKSPACE_UPDATE_TASK_RUNTIME_SCHEMA,
+        "start_task": tools.WORKSPACE_START_TASK_SCHEMA,
+        "hold_for_approval": tools.WORKSPACE_HOLD_FOR_APPROVAL_SCHEMA,
         "list_knowledge": tools.WORKSPACE_LIST_KNOWLEDGE_SCHEMA,
         "create_knowledge_folder": tools.WORKSPACE_CREATE_KNOWLEDGE_FOLDER_SCHEMA,
         "add_knowledge_documents": tools.WORKSPACE_ADD_KNOWLEDGE_DOCUMENTS_SCHEMA,

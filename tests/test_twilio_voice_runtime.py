@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig, TwilioVoiceCallSession
@@ -259,6 +259,9 @@ async def test_twilio_call_binding_scope_accepts_virtual_master_without_agent_ro
     from packages.core.constants.agents import MANOR_AGENT_ID
     from packages.core.services.voice.binding import resolve_twilio_call_binding_scope
 
+    # Other tests in the same database commit a Manor AI Agent row; this case
+    # is about the virtual master without one. The fixture rolls this back.
+    await db_session.execute(delete(Agent).where(Agent.id == MANOR_AGENT_ID))
     call_session, _raw_token, _binding, subscription = await _create_bound_voice_call(
         db_session,
         suffix="master-agent",

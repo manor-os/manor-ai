@@ -133,6 +133,13 @@ def scheduled_job_next_run_at(
     # only an explicit false value disables the clock.
     if getattr(job, "enabled", True) is False:
         return None
+    stop_after = getattr(job, "stop_after", None)
+    if stop_after is not None:
+        if stop_after.tzinfo is None:
+            stop_after = stop_after.replace(tzinfo=timezone.utc)
+        if now_utc >= stop_after.astimezone(timezone.utc):
+            job.enabled = False
+            return None
     if bool(getattr(job, "delete_after_run", False)) and getattr(
         job,
         "last_run_at",
@@ -214,4 +221,19 @@ def refresh_scheduled_job_next_run_at(
         inclusive=inclusive,
     )
     job.next_run_at = next_run_at
+    if next_run_at is None:
+        return None
+    stop_after = getattr(job, "stop_after", None)
+    if stop_after is not None:
+        if stop_after.tzinfo is None:
+            stop_after = stop_after.replace(tzinfo=timezone.utc)
+        else:
+            stop_after = stop_after.astimezone(timezone.utc)
+    if stop_after is not None and next_run_at >= stop_after:
+        # A bounded schedule can be exhausted while its final legal
+        # occurrence is already committed to the worker queue. Keep the Job
+        # enabled until the existing stop-after guard consumes this terminal
+        # clock point, so that worker can finish while future work cannot run.
+        job.next_run_at = stop_after
+        return stop_after
     return next_run_at

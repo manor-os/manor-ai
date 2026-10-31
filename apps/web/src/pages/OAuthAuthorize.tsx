@@ -2,11 +2,10 @@
  * OAuth 2.0 Authorize consent page (Manor as IdP).
  *
  * Visually modelled on Google's OAuth consent screen:
- *   - Clean white card on a soft background
- *   - Manor logomark + app name as the title
- *   - "Continuing as {user}" chip
- *   - Bulleted permission list with monochrome icons
- *   - Cancel / Continue at the bottom
+ *   - Borderless white card on a soft background
+ *   - Official Manor mark + the app's official mark, app name as the title
+ *   - Signed-in account row
+ *   - Short permission list, then Cancel / Continue
  *
  * Flow:
  *   1. Client app (e.g. PMS) redirects user here with client_id+redirect_uri+state.
@@ -19,7 +18,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 import { IconManorLogo } from "../components/icons";
+import IntegrationLogo from "../components/IntegrationLogo";
+import { resolveIntegrationBrand } from "../lib/brands/catalog";
 import CurrentEmailVerification from "../components/auth/CurrentEmailVerification";
+import Button from "../components/ui/Button";
+import { isSameAuthIdentity } from "../lib/authToken";
 
 interface ClientInfo {
   client_id: string;
@@ -29,6 +32,10 @@ interface ClientInfo {
   allowed_scopes: string[];
   require_pkce?: boolean;
   require_verified_email?: boolean;
+  /** False for apps that registered themselves (e.g. a local MCP client). */
+  verified?: boolean;
+  /** Server-side match of the requested redirect URI (loopback ports vary). */
+  redirect_uri_allowed?: boolean | null;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "";
@@ -66,37 +73,43 @@ function CheckIcon() {
   );
 }
 
-function ShieldIcon() {
-  return (
-    <svg className="w-5 h-5 text-stone-500 shrink-0" viewBox="0 0 20 20" fill="currentColor" aria-hidden>
-      <path fillRule="evenodd" d="M10 1.5l7 3v5c0 4.2-2.93 7.83-7 9-4.07-1.17-7-4.8-7-9v-5l7-3z" clipRule="evenodd" />
-    </svg>
-  );
+/** "Claude Code (manor-staging)" → title "Claude Code", qualifier "manor-staging". */
+function splitClientName(name: string): { title: string; qualifier: string } {
+  const match = name.match(/^(.+?)\s*\(([^()]+)\)\s*$/);
+  return match ? { title: match[1], qualifier: match[2] } : { title: name, qualifier: "" };
 }
 
-function ArrowSwap() {
-  return (
-    <svg className="w-6 h-6 text-stone-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden>
-      <path d="M7 7h10M7 7l3-3M7 7l3 3M17 17H7M17 17l-3-3M17 17l-3 3" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
+// A self-registered app chooses its own name, so it only gets the official
+// mark of the coding agents that register this way, never any catalog brand.
+const UNVERIFIED_APP_BRANDS = new Set(["claude", "openai", "cursor", "googlegemini", "continue"]);
+
+function appBrandKey(title: string, verified: boolean): string | null {
+  const brand = resolveIntegrationBrand(title);
+  if (!brand?.icon) return null;
+  return verified || UNVERIFIED_APP_BRANDS.has(brand.key) ? brand.key : null;
 }
 
-function ManorMark() {
+function LogoTile({ children, dark = false }: { children: React.ReactNode; dark?: boolean }) {
   return (
-    <div className="w-10 h-10 rounded-lg bg-black text-white flex items-center justify-center select-none shrink-0" aria-hidden="true">
-      <IconManorLogo size={30} />
+    <div
+      className={`w-12 h-12 rounded-[14px] flex items-center justify-center select-none shrink-0 ${
+        dark ? "bg-black text-white" : "bg-white text-stone-700 font-semibold text-sm"
+      }`}
+      style={{ boxShadow: "var(--shadow-md)" }}
+      aria-hidden="true"
+    >
+      {children}
     </div>
   );
 }
 
 const Frame = ({ children }: { children: React.ReactNode }) => (
   <div className="min-h-screen flex items-center justify-center bg-stone-50 p-4 sm:p-6">
-    <div className="w-full max-w-md">
-      <div className="text-center mb-6 text-xs text-stone-400 select-none">
-        MANOR · IDENTITY
-      </div>
-      <div className="bg-white rounded-2xl shadow-[0_2px_24px_-8px_rgba(28,25,23,0.12)] ring-1 ring-stone-200 p-7 sm:p-9 text-stone-900">
+    <div className="w-full max-w-sm">
+      <div
+        className="bg-white rounded-[22px] p-7 sm:p-8 text-stone-900"
+        style={{ boxShadow: "var(--shadow-lg)" }}
+      >
         {children}
       </div>
     </div>
@@ -113,7 +126,8 @@ export default function OAuthAuthorize() {
   // Capture the consent route for this render. Reading window.location inside
   // a replayed effect can wrap the login URL into its own `next` parameter.
   const backUrl = location.pathname + location.search;
-  const { user } = useAuthStore();
+  const { user, token: accountToken, checkAuth } = useAuthStore();
+  const accountIdentity = user ? JSON.stringify([user.id, user.entity_id, user.email]) : "";
 
   const clientId = searchParams.get("client_id") || "";
   const redirectUri = searchParams.get("redirect_uri") || "";
@@ -129,6 +143,8 @@ export default function OAuthAuthorize() {
   const [submitting, setSubmitting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [emailVerified, setEmailVerified] = useState(false);
+  const [accountReady, setAccountReady] = useState(false);
+  const [accountAttempt, setAccountAttempt] = useState(0);
 
   // Validate required params up front
   const paramsError = useMemo(() => {
@@ -146,15 +162,27 @@ export default function OAuthAuthorize() {
     return "";
   }, [clientId, redirectUri, responseType, codeChallenge, codeChallengeMethod, searchParams]);
 
-  // If unauthenticated, bounce to login and come back
+  // A cold consent-page load has a token but no hydrated user. Confirm the
+  // account before showing consent, including remembered-session restoration.
   useEffect(() => {
     if (paramsError) return;
-    const token = localStorage.getItem("manor_token");
-    if (!token) {
-      const next = encodeURIComponent(backUrl);
-      navigate(`/login?next=${next}`, { replace: true });
-    }
-  }, [paramsError, navigate, backUrl]);
+    let cancelled = false;
+    setAccountReady(false);
+    void checkAuth().then(() => {
+      if (cancelled) return;
+      const session = useAuthStore.getState();
+      if (!session.user) {
+        if (!session.token) {
+          navigate(`/login?next=${encodeURIComponent(backUrl)}`, { replace: true });
+          return;
+        }
+        setError("Could not confirm your Manor account. Try again before authorizing this app.");
+        setLoading(false);
+      }
+      setAccountReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [paramsError, navigate, backUrl, checkAuth, accountAttempt]);
 
   // Load client info (with auto-retry on transient 502s during deploy)
   useEffect(() => {
@@ -163,6 +191,7 @@ export default function OAuthAuthorize() {
       setError(paramsError);
       return;
     }
+    if (!accountReady || !accountIdentity) return;
     const token = localStorage.getItem("manor_token");
     if (!token) return; // wait for redirect
     let cancelled = false;
@@ -173,7 +202,7 @@ export default function OAuthAuthorize() {
       setError("");
       try {
         const r = await fetch(
-          `${API_BASE}/api/v1/oauth/clients/${encodeURIComponent(clientId)}`,
+          `${API_BASE}/api/v1/oauth/clients/${encodeURIComponent(clientId)}?redirect_uri=${encodeURIComponent(redirectUri)}`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
         if (cancelled) return;
@@ -201,7 +230,7 @@ export default function OAuthAuthorize() {
           return;
         }
         const data = (await r.json()) as ClientInfo;
-        if (!data.redirect_uris.includes(redirectUri)) {
+        if (!(data.redirect_uri_allowed ?? data.redirect_uris.includes(redirectUri))) {
           setError(
             `The redirect URL "${safeDomain(redirectUri)}" is not registered for this app.`
           );
@@ -229,10 +258,10 @@ export default function OAuthAuthorize() {
     return () => {
       cancelled = true;
     };
-  }, [clientId, redirectUri, paramsError, retryCount, codeChallenge]);
+  }, [clientId, redirectUri, paramsError, retryCount, codeChallenge, accountReady, accountIdentity]);
 
   async function handleApprove() {
-    if (paramsError || !info || (info.require_pkce && !codeChallenge)
+    if (paramsError || !accountReady || !user || !info || (info.require_pkce && !codeChallenge)
       || (info.require_verified_email && !emailVerified)) return;
     setSubmitting(true);
     setError("");
@@ -240,6 +269,14 @@ export default function OAuthAuthorize() {
     if (!token) {
       const next = encodeURIComponent(backUrl);
       navigate(`/login?next=${next}`, { replace: true });
+      return;
+    }
+    if (!isSameAuthIdentity(accountToken, token)) {
+      // Another tab changed accounts: show that account for a fresh review,
+      // never authorize it under the identity previously shown on this page.
+      setSubmitting(false);
+      setLoading(true);
+      setAccountAttempt((attempt) => attempt + 1);
       return;
     }
     try {
@@ -288,11 +325,11 @@ export default function OAuthAuthorize() {
   }
 
   // — Loading + auto-retry
-  if (loading) {
+  if (loading || (!paramsError && !accountReady)) {
     return (
       <Frame>
         <div className="flex flex-col items-center py-6">
-          <div className="w-10 h-10 rounded-full border-2 border-stone-200 border-t-teal-600 animate-spin mb-4" />
+          <div className="w-10 h-10 rounded-full border-2 border-stone-200 border-t-manor-600 animate-spin mb-4" />
           <p className="text-sm text-stone-600">
             {retryCount > 0 ? `Connecting to Manor… (retry ${retryCount}/3)` : "Loading…"}
           </p>
@@ -313,6 +350,7 @@ export default function OAuthAuthorize() {
             className="flex-1 px-4 py-2.5 rounded-lg border border-stone-300 hover:bg-stone-50 text-sm font-medium text-stone-700"
             onClick={() => {
               setRetryCount(0);
+              setAccountAttempt((attempt) => attempt + 1);
               setError("");
               setLoading(true);
             }}
@@ -335,29 +373,37 @@ export default function OAuthAuthorize() {
   const userName = user?.display_name || user?.first_name || user?.email || "your account";
   const userEmail = user?.email || "";
   const appHost = safeDomain(redirectUri);
+  const { title: appTitle, qualifier: appQualifier } = splitClientName(info?.name || "");
+  const appBrand = appBrandKey(appTitle, info?.verified !== false);
 
   return (
     <Frame>
-      {/* Header: Manor mark + app icon side-by-side */}
-      <div className="flex items-center justify-center gap-4 mb-6">
-        <ManorMark />
-        <ArrowSwap />
-        <div className="w-10 h-10 rounded-lg bg-stone-100 text-stone-700 flex items-center justify-center font-semibold text-sm select-none shrink-0 ring-1 ring-stone-200">
-          {initialsOf(info?.name)}
+      {/* Header: official Manor mark + the app's official mark */}
+      <div className="flex items-center justify-center gap-3 mb-6">
+        <LogoTile dark>
+          <IconManorLogo size={26} />
+        </LogoTile>
+        <div className="flex gap-1" aria-hidden="true">
+          <span className="w-1 h-1 rounded-full bg-stone-300" />
+          <span className="w-1 h-1 rounded-full bg-stone-300" />
+          <span className="w-1 h-1 rounded-full bg-stone-300" />
         </div>
+        <LogoTile>
+          {appBrand ? <IntegrationLogo provider={appBrand} size={26} /> : initialsOf(appTitle)}
+        </LogoTile>
       </div>
 
-      <h1 className="text-2xl font-semibold text-center mb-1 leading-tight">
-        Sign in to {info?.name}
+      <h1 className="text-xl font-semibold text-center leading-tight">
+        Sign in to {appTitle}
       </h1>
-      <p className="text-sm text-stone-500 text-center mb-6">
-        with your Manor account
+      <p className="text-sm text-stone-500 text-center mt-1 mb-6">
+        {appQualifier ? <>{appQualifier} · </> : null}with your Manor account
       </p>
 
-      {/* User account chip */}
+      {/* Signed-in account */}
       {user && (
-        <div className="flex items-center gap-3 p-3 mb-5 rounded-xl bg-stone-50 ring-1 ring-stone-200">
-          <div className="w-9 h-9 rounded-full bg-manor-600 text-white flex items-center justify-center font-medium text-xs select-none shrink-0">
+        <div className="flex items-center gap-3 px-3 py-2.5 mb-5 rounded-xl bg-stone-50">
+          <div className="w-8 h-8 rounded-full bg-manor-600 text-white flex items-center justify-center font-medium text-xs select-none shrink-0">
             {initialsOf(userName, userEmail)}
           </div>
           <div className="min-w-0 flex-1">
@@ -369,61 +415,58 @@ export default function OAuthAuthorize() {
         </div>
       )}
 
-      {/* Description */}
       {info?.description && (
         <p className="text-sm text-stone-600 mb-4">{info.description}</p>
       )}
 
-      {/* Permissions list */}
       {info?.require_verified_email && (
         <CurrentEmailVerification key={`${clientId}:${user?.id}:${user?.email}`} onVerified={setEmailVerified} />
       )}
 
-      <p className="text-xs font-medium uppercase tracking-wide text-stone-500 mb-2">
-        This will allow {info?.name} to
-      </p>
+      {/* Permissions */}
       <ul className="space-y-2 mb-5">
         <li className="flex items-start gap-2.5">
           <CheckIcon />
-          <span className="text-sm text-stone-700">
-            See your name and email address
-          </span>
+          <span className="text-sm text-stone-700">See your name and email address</span>
         </li>
         <li className="flex items-start gap-2.5">
           <CheckIcon />
           <span className="text-sm text-stone-700">
-            Act on your behalf within {info?.name}
+            {info?.verified === false
+              ? "Build and change Workspaces as you"
+              : `Act on your behalf within ${appTitle}`}
           </span>
         </li>
       </ul>
 
-      {/* Security note */}
-      <div className="flex items-start gap-2 p-3 mb-6 rounded-lg bg-stone-50 text-xs text-stone-600">
-        <ShieldIcon />
-        <span>
-          You'll return to <span className="font-medium text-stone-900">{appHost}</span> after signing in. Manor never shares your password.
-        </span>
-      </div>
+      {info?.verified === false && (
+        <p className="flex items-start gap-2 mb-5 text-xs leading-relaxed text-stone-500">
+          <span aria-hidden className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0" style={{ background: "#b27c34" }} />
+          <span>
+            <span className="font-medium text-stone-700">Unverified app.</span> Manor can't confirm
+            “{info.name}”. Continue only if you just started this sign-in from a tool you trust on
+            this computer.
+          </span>
+        </p>
+      )}
 
-      {/* Action buttons */}
       <div className="flex gap-3">
-        <button
-          type="button"
-          disabled={submitting}
-          className="flex-1 px-4 py-2.5 rounded-lg border border-stone-300 hover:bg-stone-50 text-sm font-medium text-stone-700 disabled:opacity-50 transition"
-          onClick={handleDeny}
-        >
+        <Button variant="outline" className="flex-1" disabled={submitting} onClick={handleDeny}>
           Cancel
-        </button>
-        <button
-          type="button"
-          disabled={submitting || !!(info?.require_verified_email && !emailVerified)}
-          className="flex-1 px-4 py-2.5 rounded-lg bg-manor-600 text-white hover:bg-manor-500 text-sm font-semibold disabled:opacity-50 transition"
+        </Button>
+        <Button
+          className="flex-1"
+          loading={submitting}
+          disabled={!!(info?.require_verified_email && !emailVerified)}
           onClick={handleApprove}
         >
           {submitting ? "Signing in…" : "Continue"}
-        </button>
+        </Button>
       </div>
+
+      <p className="mt-4 text-center text-xs text-stone-400">
+        You'll return to <span className="text-stone-500">{appHost}</span> after signing in.
+      </p>
     </Frame>
   );
 }

@@ -22,6 +22,7 @@ from packages.core.models.people import Client
 from packages.core.models.staff import Staff, STAFF_KIND_EMPLOYEE
 from packages.core.models.user import User, UserMembership
 from packages.core.services.tool_cache_version import bump_tool_cache_version
+from packages.core.services.workspace_access import set_link_columns
 
 
 # ── Clients ────────────────────────────────────────────────────────────────
@@ -196,6 +197,120 @@ async def _sync_linked_staff_access(db: AsyncSession, member: Staff) -> None:
         ).scalars()
     )
     access_enabled = len(active_staff_ids) == 1
+    await _apply_entity_access(
+        db,
+        user_id=member.user_id,
+        entity_id=member.entity_id,
+        enabled=access_enabled,
+        staff_id=active_staff_ids[0] if access_enabled else None,
+    )
+
+
+async def _apply_entity_access(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    entity_id: str,
+    enabled: bool,
+    staff_id: str | None = None,
+) -> None:
+    """Set one Entity's membership on or off and keep the login consistent.
+
+    Turning access off revokes every token, and if this was the user's primary
+    Entity moves them to their next active one (or marks them inactive).
+    """
+    access_enabled = enabled
+    membership = (
+        await db.execute(
+            select(UserMembership).where(
+                UserMembership.user_id == user_id,
+                UserMembership.entity_id == entity_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if membership is not None:
+        membership.status = "active" if access_enabled else "inactive"
+        if access_enabled and staff_id:
+            # The Staff link alone is not an authority change (see set_link_columns).
+            await set_link_columns(db, membership, staff_id=staff_id)
+
+    user = await db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        return
+    if access_enabled:
+        if user.entity_id == entity_id:
+            user.status = "active"
+        return
+
+    # Tokens are versioned globally, so this immediately revokes every token
+    # that could still carry the removed entity scope.
+    user.token_version = int(user.token_version or 0) + 1
+    if user.entity_id != entity_id:
+        return
+
+    # The person's own next company, never a collaborator membership: that
+    # is access to one customer Workspace, not a company to work in.
+    from packages.core.services.auth_service import normalize_membership_role
+    from packages.core.services.external_collaboration_access import home_membership
+
+    next_membership = await home_membership(db, user.id, entity_id)
+    if next_membership is None:
+        user.status = "inactive"
+        return
+
+    user.entity_id = next_membership.entity_id
+    user.role = normalize_membership_role(next_membership.role)
+    user.status = "active"
+
+
+async def assign_staff_role(
+    db: AsyncSession,
+    member: Staff,
+    *,
+    role_id: str | None = None,
+    role_name: str | None = None,
+) -> None:
+    """Point a Staff row at one role and carry it to the linked login.
+
+    The StaffRole is the authority, so a role given by name (the Team page and
+    the Users page both send names) resolves to the Entity's role of that name.
+    A name that is neither a system role nor an existing StaffRole is only a
+    descriptive label and leaves the assigned role alone.
+    """
+    from packages.core.models.staff import StaffRole
+    from packages.core.permissions import _ROLE_HIERARCHY
+    from packages.core.services.auth_service import _role_for_staff_membership
+
+    normalized = (role_name or "").strip().lower()
+    query = select(StaffRole).where(
+        StaffRole.entity_id == member.entity_id,
+        StaffRole.status == "active",
+    )
+    if role_id:
+        query = query.where(StaffRole.id == role_id)
+    elif normalized:
+        query = query.where(func.lower(StaffRole.name) == normalized)
+    else:
+        return
+    role = (
+        await db.execute(query.order_by(StaffRole.created_at.asc()).limit(1))
+    ).scalar_one_or_none()
+
+    meta = dict(member.meta or {})
+    if role is not None:
+        member.role_id = role.id
+        meta["role"] = role.name
+    elif not role_id and normalized in _ROLE_HIERARCHY:
+        # No seeded StaffRole yet: the system role name itself is the authority.
+        member.role_id = None
+        meta["role"] = normalized
+    else:
+        return
+    member.meta = meta
+    await db.flush()
+
+    if not member.user_id:
+        return
     membership = (
         await db.execute(
             select(UserMembership).where(
@@ -204,48 +319,51 @@ async def _sync_linked_staff_access(db: AsyncSession, member: Staff) -> None:
             )
         )
     ).scalar_one_or_none()
-    if membership is not None:
-        membership.status = "active" if access_enabled else "inactive"
-        if access_enabled:
-            membership.staff_id = active_staff_ids[0]
-
+    if membership is None:
+        return
+    membership.role = await _role_for_staff_membership(db, member)
     user = await db.get(User, member.user_id)
-    if user is None or user.deleted_at is not None:
-        return
-    if access_enabled:
-        if user.entity_id == member.entity_id:
-            user.status = "active"
-        return
+    if user is not None and user.entity_id == member.entity_id:
+        user.role = membership.role
+    await db.flush()
 
-    # Tokens are versioned globally, so this immediately revokes every token
-    # that could still carry the removed entity scope.
-    user.token_version = int(user.token_version or 0) + 1
-    if user.entity_id != member.entity_id:
-        return
 
-    next_membership = (
+async def deactivate_entity_member(
+    db: AsyncSession, *, user_id: str, entity_id: str
+) -> bool:
+    """Remove one person's access to this Entity only, like deactivating them.
+
+    Their live Staff rows become inactive (so the Team page agrees) and the
+    membership is turned off; their other companies are untouched.
+    """
+    membership_id = (
         await db.execute(
-            select(UserMembership)
-            .where(
-                UserMembership.user_id == user.id,
-                UserMembership.entity_id != member.entity_id,
-                UserMembership.status == "active",
-                UserMembership.deleted_at.is_(None),
+            select(UserMembership.id).where(
+                UserMembership.user_id == user_id,
+                UserMembership.entity_id == entity_id,
             )
-            .order_by(
-                UserMembership.is_primary.desc(),
-                UserMembership.created_at.asc(),
-            )
-            .limit(1)
         )
     ).scalar_one_or_none()
-    if next_membership is None:
-        user.status = "inactive"
-        return
-
-    user.entity_id = next_membership.entity_id
-    user.role = next_membership.role
-    user.status = "active"
+    staff_rows = list(
+        (
+            await db.execute(
+                select(Staff).where(
+                    Staff.user_id == user_id,
+                    Staff.entity_id == entity_id,
+                    Staff.deleted_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    if membership_id is None and not staff_rows:
+        return False
+    for row in staff_rows:
+        row.status = "inactive"
+    await db.flush()
+    await _apply_entity_access(db, user_id=user_id, entity_id=entity_id, enabled=False)
+    await db.flush()
+    await bump_tool_cache_version(entity_id, "staff")
+    return True
 
 
 async def update_staff_member(
@@ -255,6 +373,7 @@ async def update_staff_member(
     if not member:
         return None
     status_was_provided = "status" in fields
+    role_id = fields.pop("role_id", None)
 
     meta_updates = _pop_meta_labels(fields)
     if meta_updates:
@@ -266,6 +385,10 @@ async def update_staff_member(
         if hasattr(member, k) and v is not None:
             setattr(member, k, v)
 
+    if role_id or meta_updates.get("role"):
+        await assign_staff_role(
+            db, member, role_id=role_id, role_name=meta_updates.get("role"),
+        )
     await db.flush()
     if status_was_provided:
         await _sync_linked_staff_access(db, member)

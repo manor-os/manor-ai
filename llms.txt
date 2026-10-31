@@ -27,7 +27,7 @@ The canonical public product name is Manor AI. Older launch material may use “
 - Deployment: Docker Compose for the full self-hosted stack; Python 3.11+, Node.js 20+, PostgreSQL 16 with pgvector, and Redis 7 for development.
 - Model access: bring your own provider keys; OpenAI-compatible model routing is supported.
 - Data: the self-hosted operator controls the application database, cache, object storage, and files.
-- License: fair-code/source-available under the Sustainable Use License 1.0; resale, white-labeling, and competing hosted services are restricted.
+- License: fair-code/source-available under the Sustainable Use License 1.0; internal business, personal and non-commercial use are permitted. Distribution or provision to others must be free of charge for non-commercial purposes; commercial hosted access requires a separate agreement. Preserve required notices and identify modifications; trademarks are governed separately.
 
 ## Canonical answers
 

@@ -36,6 +36,19 @@ from packages.core.services.actor_authorization import (
     AuthenticatedUserCredential,
     resolve_current_user_actor,
 )
+from packages.core.services.collaborator_steering import collaborator_request_acting
+from packages.core.services.external_collaboration_access import (
+    COLLABORATOR_MEMBERSHIP_ROLE,
+    collaboration_ended,
+    live_collaborator_grants,
+)
+from packages.core.services.collaborator_session import (
+    COLLABORATION_ENDED,
+    pin_session,
+    session_scope,
+    require_collaborator_session,
+)
+from apps.api.collaborator_boundary import enforce_collaborator_route
 from packages.core.workers.protocol import (
     WORKER_PROTOCOL_HEADER,
     require_current_worker_protocol,
@@ -90,6 +103,17 @@ def authenticated_user_credential_from_claims(
 
 
 
+async def _collaborator_live_grants(request: Request, db: AsyncSession, actor) -> list:
+    """Live access grants of this actor, read once per request."""
+    key = (actor.user_id, actor.entity_id)
+    cache = getattr(request.state, "collaborator_live_grants", None)
+    if cache is None:
+        cache = request.state.collaborator_live_grants = {}
+    if key not in cache:
+        cache[key] = await live_collaborator_grants(db, user_id=actor.user_id, entity_id=actor.entity_id)
+    return cache[key]
+
+
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -102,6 +126,15 @@ async def get_current_user(
     claims = decode_token(credentials.credentials)
     if not claims:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+    return await authenticate_token_claims(request, claims, db)
+
+
+async def authenticate_token_claims(request: Request, claims: dict, db: AsyncSession) -> User:
+    """Admit decoded access-token claims: revocation, account, membership, suspension.
+
+    Shared by the REST bearer dependency and resource endpoints (e.g. ``/mcp``)
+    that decode their own audience-bound token first.
+    """
     request.state.auth_claims = claims
     from packages.core.services.auth_context import set_current_mfa_verified
     set_current_mfa_verified("mfa" in {
@@ -136,6 +169,8 @@ async def get_current_user(
         enforce_entity_suspension=False,
     )
     if actor is None:
+        if await collaboration_ended(db, user_id=str(user.id), entity_id=str(token_entity_id)):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, COLLABORATION_ENDED)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Team membership is inactive or unavailable")
     # Present the selected entity as a request-local ORM view without making
     # an auth read persist User.entity_id/User.role.  Security decisions re-read
@@ -143,6 +178,26 @@ async def get_current_user(
     user._authenticated_user_credential = credential
     set_committed_value(user, "entity_id", actor.entity_id)
     set_committed_value(user, "role", actor.display_role)
+    # None for every actor except an external collaborator, whose live grants
+    # are the only Workspaces any route may reach (apps/api/collaborator_boundary).
+    user._collaborator_workspace_ids = None
+    collaborator = actor.display_role == COLLABORATOR_MEMBERSHIP_ROLE
+    # A collaborator authenticates only with a scoped session, and a scoped
+    # session only ever resolves to a collaborator (packages/core/services/collaborator_session).
+    require_collaborator_session(claims, collaborator=collaborator)
+    pin_session(None, None, ())
+    if collaborator:
+        # The token reaches only the Workspace it pins, while the grant it names is live there.
+        allowed = session_scope(claims, await _collaborator_live_grants(request, db, actor))
+        if not allowed:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, COLLABORATION_ENDED)
+        user._collaborator_workspace_ids = allowed
+        # Knowledge, resource and runtime decisions in this request read the same scope.
+        pin_session(actor.entity_id, actor.user_id, allowed)
+        await enforce_collaborator_route(request, allowed, db, actor.entity_id, actor.user_id)
+        # Tasks this request writes are steered by the collaborator, and the
+        # integrations it binds carry the collaborator's provenance.
+        collaborator_request_acting(db, actor.entity_id, actor.user_id)
 
     # Check entity-level suspension (set by platform admin)
     from packages.core.constants.plans import is_cloud
@@ -181,8 +236,16 @@ def require_role(*roles: str):
 async def _primary_llm_byok_configured_for_user(
     db: AsyncSession,
     user: User,
+    *,
+    payer_entity_id: str | None = None,
 ) -> bool:
-    """Return whether primary chat LLM calls should bypass platform AI credits."""
+    """Return whether primary chat LLM calls should bypass platform AI credits.
+
+    Only the payer's keys count: when another company pays (a client delivery
+    trial), the user's own keys do not exempt the run from its gate.
+    """
+    entity_id = payer_entity_id or user.entity_id
+    user_id = user.id if entity_id == user.entity_id else None
 
     try:
         from packages.core.ai.llm_client import metadata_has_native_byok
@@ -193,15 +256,15 @@ async def _primary_llm_byok_configured_for_user(
 
         metadata = await resolve_llm_metadata_for_user(
             "primary",
-            user_id=user.id,
-            entity_id=user.entity_id,
+            user_id=user_id,
+            entity_id=entity_id,
         )
         if not metadata:
             return False
         model = await resolve_model_for_user(
             "primary",
-            user_id=user.id,
-            entity_id=user.entity_id,
+            user_id=user_id,
+            entity_id=entity_id,
         )
         routed_metadata = {**metadata, "_resolved_model": model}
         return metadata_has_native_byok(routed_metadata)
@@ -224,18 +287,38 @@ async def enforce_plan_resource(
     *,
     user: User,
     db: AsyncSession,
+    workspace_id: str | None = None,
 ):
-    """Apply the standard plan gate from a conditional request branch."""
+    """Apply the standard plan gate from a conditional request branch.
+
+    ``workspace_id`` is the Workspace the AI work runs in, as already
+    resolved and authorized by the caller; its payer is gated (the provider
+    during a client delivery trial).
+    """
     if resource == "ai_budget_usd":
         # Model resolution uses its own short-lived session. Release the auth
         # transaction first so concurrent streams do not each hold one
         # PgBouncer backend while waiting for another.
         await _commit_open_dependency_transaction(db)
-        if await _primary_llm_byok_configured_for_user(db, user):
+        payer_entity_id = user.entity_id
+        if workspace_id:
+            from packages.core.services.billing_payer import TrialSponsorUnavailable, payer_entity_id as resolve_payer
+
+            try:
+                payer_entity_id = await resolve_payer(db, user.entity_id, workspace_id)
+            except TrialSponsorUnavailable:
+                payer_entity_id = None  # the gate below refuses it as a trial
+            await _commit_open_dependency_transaction(db)
+        if payer_entity_id and await _primary_llm_byok_configured_for_user(
+            db, user, payer_entity_id=payer_entity_id,
+        ):
             return None
 
     from packages.core.services.plan_gate import check
-    result = await check(db, user.entity_id, resource)
+    if resource == "ai_budget_usd" and workspace_id:
+        result = await check(db, user.entity_id, resource, workspace_id=workspace_id)
+    else:
+        result = await check(db, user.entity_id, resource)
     if not result.allowed:
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
@@ -246,7 +329,7 @@ async def enforce_plan_resource(
                 "plan": result.plan,
                 "resets_at": result.resets_at,
                 # Drives which unified limit reminder the UI shows.
-                "kind": _PLAN_LIMIT_KIND.get(resource, "generic"),
+                "kind": result.kind or _PLAN_LIMIT_KIND.get(resource, "generic"),
             },
         )
     await _commit_open_dependency_transaction(db)
@@ -269,6 +352,21 @@ def require_plan(resource: str):
         db: AsyncSession = Depends(get_db),
     ):
         return await enforce_plan_resource(resource, user=user, db=db)
+    return _dep
+
+
+def require_workspace_ai_plan():
+    """Dependency: the AI-credit gate for a route's ``workspace_id`` path parameter.
+
+    The payer lookup only matches deliveries targeting the caller's own
+    company, so an unverified id cannot borrow another company's sponsor.
+    """
+    async def _dep(
+        workspace_id: str,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ):
+        return await enforce_plan_resource("ai_budget_usd", user=user, db=db, workspace_id=workspace_id)
     return _dep
 
 
@@ -391,15 +489,19 @@ async def require_workspace_readable(
 ) -> None:
     """404 unless ``user`` may read ``workspace_id`` (when one is supplied).
 
-    Workspace-scoped list endpoints on standalone routers (tasks, goals, plans,
+    Workspace-scoped list endpoints on standalone routers (tasks, goals,
     dashboard) filter only by ``entity_id`` + an attacker-supplied
     ``workspace_id``. Without this gate, an entity member who is not part of a
-    ``members_only`` workspace could read its tasks/goals/plans/activity by
+    ``members_only`` workspace could read its tasks/goals/activity by
     passing its id — bypassing the ``_require_workspace_read`` checks on
     ``/workspaces/{id}/*``. A falsy ``workspace_id`` (entity-wide query) is a
-    no-op here.
+    no-op here, except for an external collaborator: entity-level rows and
+    Workspaces outside their live grants are never theirs to read.
     """
     workspace_id = (workspace_id or "").strip()
+    collaborator_scope = getattr(user, "_collaborator_workspace_ids", None)
+    if collaborator_scope is not None and workspace_id not in collaborator_scope:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
     if not workspace_id:
         return
     from packages.core.services.permission_gate import ResourcePermissionGate
@@ -422,9 +524,16 @@ async def require_workspace_writable(
     Writing is stricter than reading: an ``entity_visible`` workspace is
     readable org-wide but only members may write to it, and ``viewer`` members
     are read-only. Entity owner/admin keep the firm-wide override. A falsy
-    ``workspace_id`` (entity-level row with no workspace) is a no-op.
+    ``workspace_id`` (entity-level row with no workspace) is a no-op, except
+    for an external collaborator, who may write only inside live grants.
     """
     workspace_id = (workspace_id or "").strip()
+    collaborator_scope = getattr(user, "_collaborator_workspace_ids", None)
+    if collaborator_scope is not None and workspace_id not in collaborator_scope:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You do not have write access to this workspace",
+        )
     if not workspace_id:
         return
     from packages.core.services.workspace_access import user_can_write_workspace_id

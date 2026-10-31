@@ -67,7 +67,8 @@ async def test_transactional_hook_order_and_failures(failure, monkeypatch):
             raise RuntimeError("checkpoint store down")
 
     bridge = SimpleNamespace(prepare=prepare, refresh=refresh, accept=lambda: events.append("accept"))
-    expected = {"archive": RuntimeError, "publish": RuntimeError, "budget": ContextBudgetExceeded,
+    # Archive and checkpoint storage failures degrade instead of failing the turn.
+    expected = {"budget": ContextBudgetExceeded,
                 "cancel": asyncio.CancelledError, "revoke": compaction.MemoryScopeDenied}
     kwargs = dict(on_context_compacted=archive, on_context_checkpoint=publish, context_memory=bridge)
     if failure in expected:
@@ -81,7 +82,14 @@ async def test_transactional_hook_order_and_failures(failure, monkeypatch):
     else:
         result = await _compact_messages(original, None, 0, **kwargs)
         assert result[0]["content"] == ("Rules" if failure == "reload" else "Fresh memory ")
-        assert events == ["archive", "extract", "reload", "publish"] + ([] if failure == "reload" else ["accept"])
+        expected_events = {
+            # No archive id to extract against; the lossless checkpoint carries the records.
+            "archive": ["archive", "reload", "publish", "accept"],
+            # No durable checkpoint, so the memory manifest must not advance.
+            "publish": ["archive", "extract", "reload", "publish"],
+            "reload": ["archive", "extract", "reload", "publish"],
+        }.get(failure, ["archive", "extract", "reload", "publish", "accept"])
+        assert events == expected_events
         events.clear()
         await _compact_messages(result, None, 0, **kwargs)
         assert events == []  # no need to compact => no Memory calls

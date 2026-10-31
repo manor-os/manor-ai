@@ -15,11 +15,16 @@ import packages.core.ai.agentic_loop as loop
 import packages.core.ai.runtime.tool_guidance as guidance
 from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
 from packages.core.ai.runtime.tool_effect_intents import RuntimeToolEffectPersistenceError
-from packages.core.workers.submit_result import SUBMIT_RESULT_TERMINAL_POLICY
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 RETIRED_FLAG = "MANOR_AGENT_TOOL_ERROR_SELF_REPAIR"
+# A caller-armed terminal tool: any submit_result call ends the loop.
+SUBMIT_RESULT_TERMINAL_POLICY = {
+    "terminal_tool_results": [
+        {"tool_names": ["submit_result"], "stop_reason": "submit_result", "notice": "Result submitted."},
+    ],
+}
 
 
 def _tool(name):

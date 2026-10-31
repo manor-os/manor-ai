@@ -149,13 +149,3 @@ def test_completion_attachment_never_promotes_a_filename_to_document_id():
     assert "document_id" not in attachments[0]
     assert attachments[0]["previewUrl"].startswith("/api/v1/fs/ent_1/Workspaces/Demo/")
 
-
-def test_existing_task_with_filename_id_still_requires_artifact_projection():
-    from packages.core.services.task_execution_reconcile import _has_unprojected_local_artifacts
-
-    assert _has_unprojected_local_artifacts({
-        "files": [{"document_id": quote(NAME), "fs_path": f"Workspaces/Demo/{NAME}"}],
-    })
-    assert not _has_unprojected_local_artifacts({
-        "files": [{"document_id": "doc_real", "fs_path": f"Workspaces/Demo/{NAME}"}],
-    })

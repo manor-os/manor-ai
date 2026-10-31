@@ -329,7 +329,7 @@ def test_capability_blocker_is_server_owned_runtime_detail():
 
 @pytest.mark.asyncio
 async def test_list_board_and_detail_share_legacy_projection(monkeypatch):
-    from packages.core.services import task_execution_reconcile, workspace_access
+    from packages.core.services import workspace_access
 
     task = task_row(owner_subscription_id="sub-a", owner_service_key="researcher")
     user = SimpleNamespace(id="user-a", entity_id="entity-a", role="member")
@@ -345,7 +345,6 @@ async def test_list_board_and_detail_share_legacy_projection(monkeypatch):
         "blocked": [task], "_counts": {"blocked": 1},
     }))
     monkeypatch.setattr(routes, "get_task", AsyncMock(return_value=task))
-    monkeypatch.setattr(task_execution_reconcile, "reconcile_task_from_latest_completed_plan", AsyncMock())
 
     listing = await routes.list_my_tasks(
         status=None, workspace_id="workspace-a", workspace_id_alias=None,

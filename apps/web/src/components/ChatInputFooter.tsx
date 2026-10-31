@@ -1,3 +1,4 @@
+import { ROOM_FILE_MAX_BYTES } from "../lib/roomFileLimits";
 /**
  * ChatInputFooter — shared chat composer footer.
  *
@@ -15,6 +16,8 @@ import {
   useCallback,
   useMemo,
   useLayoutEffect,
+  lazy,
+  Suspense,
   type CSSProperties,
 } from "react";
 import { createPortal } from "react-dom";
@@ -48,13 +51,17 @@ import {
   IconFlow,
   IconPlus,
   IconSkill,
+  IconSmile,
   IconUpload,
 } from "./icons";
+import AnchoredPopover from "./ui/AnchoredPopover";
 import Select from "./ui/Select";
 import { t } from "../lib/i18n";
 import { prepareChatUploadFile } from "../lib/browserImage";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { connectorAccessState, integrationSetupState } from "../lib/integration-usability.mjs";
+
+const RoomEmojiPicker = lazy(() => import("./chat/RoomEmojiPicker"));
 
 
 export interface AttachedItem {
@@ -86,7 +93,7 @@ type ComposerDocumentOption = {
   current_user_capabilities?: string[];
 };
 
-const ROOM_FILE_MAX_BYTES = 100 * 1024 * 1024;
+
 
 function roomKnowledgeBlockReason(doc: ComposerDocumentOption): string | null {
   if (doc.classification === "confidential" || doc.classification === "restricted" ||
@@ -1667,6 +1674,24 @@ export default function ChatInputFooter({
     [updateAutocompleteState, value],
   );
 
+  // The picker takes focus, so the caret is read when the button is pressed.
+  const emojiCursorRef = useRef<number | null>(null);
+  const insertEmoji = useCallback(
+    (emoji: string) => {
+      const cursorPos = Math.min(emojiCursorRef.current ?? value.length, value.length);
+      const next = `${value.slice(0, cursorPos)}${emoji}${value.slice(cursorPos)}`;
+      const nextCursor = cursorPos + emoji.length;
+      emojiCursorRef.current = nextCursor;
+      pendingCursorRef.current = nextCursor;
+      onChange(next);
+      setTimeout(() => {
+        editorRef.current?.focus();
+        setPlainOffset(editorRef.current, nextCursor);
+      }, 0);
+    },
+    [onChange, value],
+  );
+
   const selectMention = useCallback(
     (mention: MentionOption) => {
       const editorValue = getEditorText(editorRef.current) || value;
@@ -2961,7 +2986,7 @@ export default function ChatInputFooter({
                             size={28}
                           />
                         ) : mention.avatarUrl ? (
-                          <img src={mention.avatarUrl} alt="" />
+                          <UserAvatar name={mention.name} avatarUrl={mention.avatarUrl} size={28} />
                         ) : (
                           mention.name.charAt(0).toUpperCase()
                         )}
@@ -3250,6 +3275,43 @@ export default function ChatInputFooter({
                 )}
               </button>
             </div>
+
+            {humanChat && (
+              <AnchoredPopover
+                ariaLabel={t("component.chat_input_footer.emoji")}
+                width={320}
+                align="left"
+                panelClassName="room-emoji-popover"
+                trigger={
+                  <button
+                    onPointerDown={() => {
+                      emojiCursorRef.current = document.activeElement === editorRef.current
+                        ? getPlainOffset(editorRef.current)
+                        : null;
+                    }}
+                    disabled={streaming || disabled}
+                    title={t("component.chat_input_footer.emoji")}
+                    aria-label={t("component.chat_input_footer.emoji")}
+                    className="chat-composer-icon-btn"
+                    type="button"
+                  >
+                    <IconSmile size={18} />
+                  </button>
+                }
+              >
+                {({ close }) => (
+                  <Suspense fallback={<div className="p-4"><InlineRowsSkeleton rows={4} dense /></div>}>
+                    <RoomEmojiPicker
+                      reactions={false}
+                      onSelect={(emoji) => {
+                        close();
+                        insertEmoji(emoji);
+                      }}
+                    />
+                  </Suspense>
+                )}
+              </AnchoredPopover>
+            )}
 
             {/* Integrations */}
             {!humanChat && !isSimple && <>

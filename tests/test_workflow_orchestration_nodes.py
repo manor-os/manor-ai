@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -419,10 +420,61 @@ async def test_workflow_project_node_creates_patches_and_reads_validated_state(d
         db_session,
     )
     assert loaded["output"] == patched["output"]
+    # The empty grant has no validated publication declaration to preserve.
     assert run.trigger_data["_workflow_runtime_context"] == {
         "workflow_project_id": patched["output"]["project_id"],
-        "workflow_action_grant_id": publication_grant.id,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_project_made_again_is_made_in_a_take_of_its_own(db_session):
+    runner = WorkflowRunner()
+    first = _run()
+    made = await runner._execute_workflow_project_step(
+        {"id": "create", "config": {"operation": "create", "project_type": "episode", "state": {},
+                                    "folder": {"name": "E01 Pilot"}, "output_var": "episode"}},
+        {}, first, db_session,
+    )
+    root = made["output"]["state"]["project_root"]
+    assert made["output"]["production_root"] == root
+
+    remake = _run()
+    remake.id = remake.lineage_root_run_id = "remake-run"
+    step = {"id": "open", "config": {"operation": "get", "project_id": made["output"]["project_id"],
+                                     "production": "take", "output_var": "episode"}}
+    opened = await runner._execute_workflow_project_step(step, {}, remake, db_session)
+    take = f"{root}/takes/remake-run"
+    assert opened["output"]["production_root"] == take
+    assert remake.trigger_data["_workflow_runtime_context"]["workflow_project_root"] == take
+
+    other = await runner._execute_workflow_project_step(
+        {"id": "series", "config": {"operation": "create", "project_type": "series", "state": {},
+                                    "folder": {"name": "Pilot series"}}},
+        {}, remake, db_session,
+    )
+    assert other["output"]["production_root"] == other["output"]["state"]["project_root"]
+    # Coming back to the episode later in the run keeps its take.
+    reopened = await runner._execute_workflow_project_step(
+        {"id": "reopen", "config": {"operation": "get", "project_id": made["output"]["project_id"]}},
+        {}, remake, db_session,
+    )
+    assert reopened["output"]["production_root"] == take
+
+    retry = _run()
+    retry.id, retry.lineage_root_run_id = "retry-run", "remake-run"
+    retry.trigger_data = deepcopy(remake.trigger_data)
+    assert (await runner._execute_workflow_project_step(step, {}, retry, db_session))["output"][
+        "production_root"] == take
+
+    # A revision of that take keeps its lineage but makes a take of its own.
+    revision = _run()
+    revision.id, revision.lineage_root_run_id = "revise-run", "remake-run"
+    revision.trigger_data = {**deepcopy(remake.trigger_data), "_workflow_revision": {"of_run_id": "remake-run"}}
+    assert (await runner._execute_workflow_project_step(step, {}, revision, db_session))["output"][
+        "production_root"] == f"{root}/takes/revise-run"
+    assert (await runner._execute_workflow_project_step(
+        {"id": "reopen", "config": {"operation": "get", "project_id": made["output"]["project_id"]}},
+        {}, revision, db_session))["output"]["production_root"] == f"{root}/takes/revise-run"
 
 
 @pytest.mark.asyncio
@@ -1429,6 +1481,11 @@ async def test_agent_step_includes_declared_output_schema_in_model_prompt(monkey
     assert "Output contract:" in captured["user_message"]
     assert '"start_url"' in captured["user_message"]
     assert "Return ONLY a value that conforms to this JSON Schema" in captured["user_message"]
+    # A step that acts repairs what it can before it reports a blocker, and
+    # never fails a result that is on target within rounding.
+    assert "Finish the work before you report it" in captured["user_message"]
+    assert "within one frame or 0.05 seconds" in captured["user_message"]
+    assert captured["user_message"].index("Finish the work") < captured["user_message"].index("Output contract:")
 
 
 @pytest.mark.asyncio
@@ -1878,6 +1935,7 @@ async def test_stickman_step_retries_after_an_exhausted_in_loop_budget(monkeypat
         "blocked_capability": "video",
         "retry_budget_exhausted": True,
         "retryable": False,
+        "effect_state": "none",
     })
 
     assert calls == 2

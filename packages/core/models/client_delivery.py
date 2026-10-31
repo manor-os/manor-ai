@@ -9,6 +9,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base, TimestampMixin, generate_ulid
 
 
+#: A delivered Workspace's ``_blueprint.blueprint_id`` is this prefix plus the
+#: delivery id: its update source is the delivery row, not a Marketplace row.
+DELIVERY_BLUEPRINT_ID_PREFIX = "client-delivery:"
+
+
 class ClientContact(Base, TimestampMixin):
     __tablename__ = "client_contacts"
     __table_args__ = (UniqueConstraint("entity_id", "client_id", "email", name="uq_client_contact_email"),)
@@ -29,7 +34,11 @@ class ClientContact(Base, TimestampMixin):
 
 class ClientWorkspaceDelivery(Base, TimestampMixin):
     __tablename__ = "client_workspace_deliveries"
-    __table_args__ = (Index("ix_client_delivery_client", "entity_id", "client_id"),)
+    __table_args__ = (
+        Index("ix_client_delivery_client", "entity_id", "client_id"),
+        # The billing payer lookup reads a Workspace's delivery on every charge.
+        Index("ix_client_delivery_target_workspace", "target_workspace_id"),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26))
     client_id: Mapped[str] = mapped_column(String(26))
@@ -50,3 +59,7 @@ class ClientWorkspaceDelivery(Base, TimestampMixin):
     phase: Mapped[str] = mapped_column(String(32), default="delivered", server_default="delivered")
     acceptance: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     email_delivery: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    # The release ``payload`` holds: its content version and the Knowledge
+    # documents the provider selected, so a published update re-exports the same
+    # selection. Empty on rows from before updates: version 1.0.0, no documents.
+    content_release: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")

@@ -867,6 +867,11 @@ async def test_workspace_draft_creation_modes_are_independent(
             "goals": goals,
             "channel_config": {},
             **({"heartbeat_enabled": heartbeat_enabled} if heartbeat_enabled is not None else {}),
+            **(
+                {"_draft_schema_version": CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION}
+                if heartbeat_enabled is False and not with_goal
+                else {}
+            ),
             "heartbeat_cadence": "daily",
             "_creation_preferences": {
                 "goal_confirmed": True,
@@ -882,8 +887,9 @@ async def test_workspace_draft_creation_modes_are_independent(
     await db_session.commit()
     workspace = await db_session.get(Workspace, workspace_id)
     assert workspace is not None
-    assert workspace.status == "active"
     expected_autonomy = heartbeat_enabled is not False
+    explicit_workflow_mode = heartbeat_enabled is False and not with_goal
+    assert workspace.status == ("paused" if explicit_workflow_mode else "active")
     assert workspace.heartbeat_enabled is expected_autonomy
     strategist_settings = ((workspace.settings or {}).get("strategist") or {})
     assert "auto_approve_proposals" not in strategist_settings
@@ -924,6 +930,16 @@ async def test_workspace_draft_creation_modes_are_independent(
         "send_agent_greetings",
         SimpleNamespace(delay=lambda *args, **kwargs: None),
     )
+    # Active Workspaces now stage the first Strategist assessment through the
+    # durable scheduler occurrence. Keep that handoff in-process for this
+    # creation-mode test instead of requiring a broker.
+    from packages.core import database
+    from packages.core.tasks import scheduler_tasks
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(database, "create_worker_session", lambda: factory)
+    monkeypatch.setattr(scheduler_tasks, "_publish_scheduled_dispatch", lambda _dispatch: None)
     dispatch = await dispatch_workspace_post_commit(
         db_session,
         workspace_id=workspace_id,
@@ -932,8 +948,9 @@ async def test_workspace_draft_creation_modes_are_independent(
     )
     await db_session.commit()
 
-    assert dispatch["strategist_dispatched"] is expected_autonomy
-    assert bool(strategist_calls) is expected_autonomy
+    assert dispatch.get("strategist_dispatched", False) is expected_autonomy
+    # The durable occurrence replaces the legacy direct task publish above.
+    assert strategist_calls == []
 
 
 @pytest.mark.asyncio

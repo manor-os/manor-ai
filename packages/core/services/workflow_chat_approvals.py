@@ -89,6 +89,11 @@ def _review_variable(config: dict[str, Any]) -> str | None:
     return match.group(1) if match else None
 
 
+def workflow_review_is_editable(config: dict[str, Any]) -> bool:
+    """Edits apply only to a review that is exactly one Workflow variable."""
+    return _review_variable(config) is not None
+
+
 def _review_matches_original(original: Any, submitted: Any) -> bool:
     if original is None:
         return isinstance(submitted, (dict, list, str))
@@ -237,6 +242,12 @@ async def resolve_chat_workflow_wait(
     if not authority.allowed:
         return authority.reason or "You do not have permission to resolve this Workflow approval."
 
+    from packages.core.services.workflow_message_actions import split_revision_feedback
+
+    submitted_review, note = split_revision_feedback(submitted_review, None)
+    if submitted_review is not None and submitted_review == pending.get("review"):
+        # Sending back the review as shown is not an edit.
+        submitted_review = None
     review_edited = False
     review_variable = _review_variable(config)
     if submitted_review is not None and normalized_choice not in cancel_choices:
@@ -283,7 +294,7 @@ async def resolve_chat_workflow_wait(
                 else {}
             ),
         },
-        emit_followup=False,
+        publish_resolution=False,
     )
     from packages.core.services.hitl_requests import mark_hitl_request_resolved
 
@@ -295,14 +306,17 @@ async def resolve_chat_workflow_wait(
     )
 
     if normalized_choice in cancel_choices:
+        from packages.core.constants.task import CancelSource
+        from packages.core.services.workflow_run_control import cancel_run
+
         nested = context.get("nested") is True
+        # The run is paused at this wait (checked above), so it is cancellable.
+        cancel_run(run, actor_id=user_id, source=CancelSource.USER)
         if nested:
             from packages.core.ai.workflow_runner import (
                 mark_workflow_terminal_effects_pending,
             )
-            from packages.core.services.workflow_run_control import cancel_run
 
-            cancel_run(run, actor_id=user_id)
             trigger_data = dict(run.trigger_data or {})
             trigger_data["_workflow_chat_cancel_ancestors"] = {
                 "host_run_id": str(context.get("host_run_id") or ""),
@@ -310,9 +324,6 @@ async def resolve_chat_workflow_wait(
             }
             run.trigger_data = trigger_data
             mark_workflow_terminal_effects_pending(run)
-        else:
-            run.status = "cancelled"
-            run.completed_at = datetime.now(timezone.utc)
         from packages.core.services.workflow_chat_projection import project_workflow_run_status
 
         await project_workflow_run_status(db, run=run)
@@ -332,6 +343,7 @@ async def resolve_chat_workflow_wait(
     response_variable = str(pending.get("response_variable") or f"{step_id}_response")
     response_value = {
         "choice": normalized_choice,
+        **({"note": note} if note else {}),
         **({"review_edited": True} if review_edited else {}),
         **({"standing": True} if normalized_choice == "always_approve" else {}),
     }

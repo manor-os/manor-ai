@@ -447,7 +447,7 @@ def _stub_active_ws_identity(monkeypatch) -> None:
             return False
 
     async def resolve(payload: dict, _user_id: str):
-        return str(payload["entity_id"]), int(payload.get("token_version", 0))
+        return str(payload["entity_id"]), int(payload.get("token_version", 0)), False
 
     async def recipients(*, entity_id: str, candidate_user_ids: set[str]):
         del entity_id
@@ -479,6 +479,41 @@ def test_ws_reject_invalid_token():
     with closing(_make_app_and_client()) as client:
         with pytest.raises(WebSocketDisconnect) as exc_info:
             with client.websocket_connect("/ws?token=bad.token.here") as ws:
+                ws.receive_json()
+
+    assert exc_info.value.code == 4001
+
+
+def test_ws_accepts_bearer_handshake_header_without_query_token(monkeypatch):
+    """Native clients authenticate with the Authorization header and no ?token= query."""
+    _stub_active_ws_identity(monkeypatch)
+    token = create_access_token(user_id="user-header", entity_id="ent-1", role="owner")
+    with closing(_make_app_and_client()) as client:
+        with client.websocket_connect("/ws", headers={"Authorization": f"Bearer {token}"}) as ws:
+            data = ws.receive_json()
+            assert data["event"] == "connected"
+            assert data["data"]["user_id"] == "user-header"
+
+
+@pytest.mark.parametrize("authorization", ["Bearer bad.token.here", "Basic dXNlcjpwYXNz"])
+def test_ws_rejects_bad_or_non_bearer_handshake_credentials(authorization):
+    with closing(_make_app_and_client()) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws", headers={"Authorization": authorization}) as ws:
+                ws.receive_json()
+
+    assert exc_info.value.code == 4001
+
+
+def test_ws_query_token_takes_precedence_over_handshake_header(monkeypatch):
+    """A bad query token is not rescued by a valid header on the same handshake."""
+    _stub_active_ws_identity(monkeypatch)
+    token = create_access_token(user_id="user-header", entity_id="ent-1", role="owner")
+    with closing(_make_app_and_client()) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                "/ws?token=bad.token.here", headers={"Authorization": f"Bearer {token}"},
+            ) as ws:
                 ws.receive_json()
 
     assert exc_info.value.code == 4001
@@ -1140,12 +1175,31 @@ async def test_connection_manager_keeps_one_lock_for_queued_reconnect_waiters():
 
 @pytest.mark.asyncio
 async def test_redis_relay_reconnects_after_pubsub_stream_ends(monkeypatch):
-    """A transient Redis disconnect must recreate the subscription task."""
+    """A transient Redis disconnect must recreate the subscription task.
+
+    Pub/sub has no replay, so sockets that stayed connected through the outage
+    are told to resync once the relay is subscribed again.
+    """
     import redis.asyncio as aioredis
 
     second_connected = asyncio.Event()
     release_second = asyncio.Event()
     clients: list[object] = []
+
+    class RecordingWebSocket:
+        def __init__(self):
+            self.frames: list[dict] = []
+
+        async def accept(self):
+            return None
+
+        async def send_text(self, message: str):
+            self.frames.append(json.loads(message))
+
+    relay_manager = ConnectionManager()
+    monkeypatch.setattr(ws_router, "manager", relay_manager)
+    socket = RecordingWebSocket()
+    await relay_manager.connect("user-1", "entity-1", 0, socket)
 
     class FakePubSub:
         def __init__(self, *, blocks: bool):
@@ -1190,6 +1244,11 @@ async def test_redis_relay_reconnects_after_pubsub_stream_ends(monkeypatch):
         await asyncio.wait_for(second_connected.wait(), timeout=3)
         assert len(clients) == 2
         assert not relay.done()
+        for _ in range(100):
+            if socket.frames:
+                break
+            await asyncio.sleep(0)
+        assert socket.frames == [{"event": "resync", "data": {}}]
     finally:
         release_second.set()
         relay.cancel()
@@ -1377,7 +1436,7 @@ async def test_websocket_identity_resolution_rejects_logged_out_token(client):
     assert await _resolve_active_websocket_identity(
         payload,
         registration["user_id"],
-    ) == (registration["entity_id"], 0)
+    ) == (registration["entity_id"], 0, False)
 
     logout = await client.post(
         "/api/v1/auth/logout",

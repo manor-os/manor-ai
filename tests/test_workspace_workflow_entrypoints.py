@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -75,6 +75,51 @@ def _entrypoint(binding_id: str, *, threshold: float = 0.85):
         }],
     )
     return normalize_chat_entrypoint(binding, workflow)
+
+
+def test_run_inputs_carry_the_input_schema_constraints_the_run_is_validated_against() -> None:
+    """A brief the run's input_schema refused was accepted by the form, so the run failed at step one."""
+    from packages.core.services.workspace_workflow_router import workflow_run_inputs
+
+    workflow = SimpleNamespace(variables={}, steps=[{"id": "start", "type": "trigger", "config": {
+        "run_inputs": [{"key": "brief", "type": "string", "schema": {"type": "string", "x-ui": {"control": "textarea"}}},
+                       {"key": "notes", "type": "string"}],
+        "input_schema": {"type": "object", "properties": {"brief": {"type": "string", "minLength": 2, "pattern": "\\S"}}},
+    }}])
+    brief, notes = workflow_run_inputs(workflow)
+    assert brief["schema"] == {"type": "string", "x-ui": {"control": "textarea"}, "minLength": 2, "pattern": "\\S"}
+    assert "schema" not in notes
+
+
+def test_entry_point_reads_in_the_viewers_language_while_routing_reads_what_was_authored() -> None:
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    workflow = SimpleNamespace(id="flow", name="Flow", description="", variables={}, steps=[{
+        "id": "start", "type": "trigger", "config": {"run_inputs": [{
+            "key": "language", "type": "string", "label": "Language", "default": "English",
+            "schema": {"type": "string", "enum": ["English", "Chinese"], "x-enum-labels": ["English", "Chinese"]},
+            "i18n": {"zh": {"label": "语言", "default": "Chinese", "key": "lang",
+                            "schema": {"enum": ["x", "y"], "x-enum-labels": ["英语", "中文"]}}},
+        }]},
+    }])
+    binding = SimpleNamespace(id="binding", workspace_id="workspace", name="Make", config={"chat_entrypoint": {
+        "enabled": True, "title": "Make a video", "intent": {"enabled": True, "description": "Video requests"},
+        "i18n": {"zh": {"title": "做视频"}},
+    }})
+
+    shown = normalize_chat_entrypoint(binding, workflow, locale="zh-CN")
+    assert shown.title == "做视频"
+    assert shown.run_inputs[0]["label"] == "语言"
+    assert shown.run_inputs[0]["default"] == "Chinese"
+    # What a run accepts is never translated: the key and the allowed values stay.
+    assert shown.run_inputs[0]["key"] == "language"
+    assert shown.run_inputs[0]["schema"]["enum"] == ["English", "Chinese"]
+    assert shown.run_inputs[0]["schema"]["x-enum-labels"] == ["英语", "中文"]
+
+    routed = normalize_chat_entrypoint(binding, workflow)
+    assert routed.title == "Make a video"
+    assert routed.run_inputs[0]["label"] == "Language"
+    assert "i18n" not in routed.run_inputs[0]["schema"]
 
 
 def test_normalize_chat_entrypoint_exposes_only_safe_config() -> None:
@@ -706,10 +751,12 @@ async def test_workspace_flow_launcher_reuses_origin_and_maps_entrypoint_inputs(
     )
     add_message = AsyncMock(side_effect=[SimpleNamespace(id="activity-a"), SimpleNamespace(id="starter-a")])
     start_run = AsyncMock(return_value=run)
-    prepare_inputs = AsyncMock(return_value={
-        "request": "Create a Manor product video.",
-        "attachments": [],
-    })
+    async def prepared(*_args, unmatched=None, **_kwargs):
+        # A choice named in Chat that the input does not offer is asked about.
+        unmatched["request"] = ["Unknown Co"]
+        return {"request": "Create a Manor product video.", "attachments": []}
+
+    prepare_inputs = AsyncMock(side_effect=prepared)
     monkeypatch.setattr(
         "packages.core.services.conversation_messages.add_message",
         add_message,
@@ -766,6 +813,9 @@ async def test_workspace_flow_launcher_reuses_origin_and_maps_entrypoint_inputs(
         "message-user-a"
     )
     assert add_message.await_count == 2
+    starter = add_message.await_args_list[1].kwargs["pending_action"]
+    assert starter["workflow_id"] == run.workflow_id
+    assert starter["input_notes"] == {"request": "Not found among the available choices: Unknown Co"}
     prepare_inputs.assert_awaited_once()
     db.commit.assert_awaited_once()
     assert db.execute.await_args_list[0].args[0]._for_update_arg is not None
@@ -1279,6 +1329,91 @@ async def test_structured_workflow_input_prefill_extracts_an_editable_chat_draft
         captured["messages"],
         ensure_ascii=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_prefill_maps_named_records_to_their_ledger_keys(monkeypatch) -> None:
+    from packages.core.ai.runtime.completions import RuntimeTextCompletionResult
+    from packages.core.services import workflow_record_source
+    from packages.core.services.workflow_record_source import resolve_record_select_inputs
+    from packages.core.services.workspace_workflow_router import (
+        normalize_chat_entrypoint,
+        prepare_workspace_workflow_inputs,
+    )
+
+    binding = _Binding(
+        id="binding-record-select",
+        workflow_id="workflow-record-select",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": True}},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Find trending posts",
+        steps=[{
+            "id": "start",
+            "type": "trigger",
+            "config": {"run_inputs": [{
+                "key": "creators",
+                "type": "json",
+                "required": False,
+                "default": [],
+                "prefill": {"source": "chat_message", "mode": "structured"},
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "x-ui": {"control": "record_select", "record_source": {"ledger": "relationship_ledger"}},
+                },
+            }]},
+        }],
+    )
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+    assert entrypoint is not None
+
+    async def options(db, source, **kwargs):
+        assert source.contract_id == "manor.relationship_ledger/v1"
+        # Most recently updated first; Chat sees only the first 200.
+        return [
+            {"value": "creator:nasa", "label": "NASA"},
+            {"value": "creator:natgeo", "label": "Nat Geo"},
+            *({"value": f"creator:old{index}", "label": f"Old {index}"} for index in range(250)),
+        ]
+
+    captured = {}
+
+    async def completion(messages, **kwargs):
+        captured["request"] = json.loads(messages[1]["content"])
+        return RuntimeTextCompletionResult(
+            content=json.dumps({"inputs": {"creators": ["creator:nasa", "creator:untracked"]}}),
+            usage={},
+        )
+
+    monkeypatch.setattr(workflow_record_source, "load_record_choices", options)
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.completions.runtime_execute_text_completion",
+        completion,
+    )
+    pinned = await resolve_record_select_inputs(
+        None, entrypoint.run_inputs, entity_id="entity-a", workspace_id="workspace-a",
+    )
+    unmatched: dict = {}
+    values = await prepare_workspace_workflow_inputs(
+        replace(entrypoint, run_inputs=pinned),
+        message="Find today's top posts from NASA and Untracked",
+        attachment_refs=[],
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        unmatched=unmatched,
+    )
+
+    items = captured["request"]["input_schemas"]["creators"]["items"]
+    assert len(items["enum"]) == 200
+    assert items["enum"][:2] == ["creator:nasa", "creator:natgeo"]
+    assert items["x-enum-labels"][:2] == ["NASA", "Nat Geo"]
+    assert values["creators"] == ["creator:nasa"], "only keys the source offers, never labels"
+    assert unmatched == {"creators": ["creator:untracked"]}, "an unknown name is reported, not guessed"
+    assert "enum" not in entrypoint.run_inputs[0]["schema"]["items"], "the stored control stays live"
 
 
 def test_prefilled_uri_cleanup_preserves_valid_url_encoding() -> None:
@@ -2040,6 +2175,67 @@ async def test_failed_retry_attempt_projects_its_current_failure_as_next_retry(
     assert activity.meta["workflow_retry_from_step_id"] == "claim_video_project"
     assert activity.pending_action["step_id"] == "claim_video_project"
     assert activity.pending_action["retry_from_step_id"] == "claim_video_project"
+    assert activity.pending_action["retry_from_step_name"] == "Claim project"
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_effect_projects_reconciliation_without_retry_action(
+    monkeypatch,
+) -> None:
+    from packages.core.services import workflow_chat_projection as projection
+
+    activity = SimpleNamespace(
+        meta={
+            "workflow_title": "Publish campaign video",
+            "workflow_retry_from_step_id": "upload",
+        },
+        content="",
+        pending_action={"kind": "workflow_retry"},
+    )
+    run = SimpleNamespace(
+        id="failed-upload",
+        binding_id="binding-1",
+        trigger_source="workspace_chat",
+        trigger_data={
+            "_workspace_chat_entrypoint": {
+                "enabled": True,
+                "conversation_id": "conversation-1",
+                "activity_message_id": "activity-1",
+            },
+        },
+        definition_snapshot={
+            "steps": [{"id": "upload", "type": "agent", "config": {}}],
+        },
+        step_results={
+            "upload": {
+                "status": "failed",
+                "effect_state": "unconfirmed",
+                "do_not_replay": True,
+            },
+        },
+        variables={},
+        status="failed",
+        current_step_id="upload",
+        effective_attempt_number=1,
+        effective_retry_of_run_id=None,
+        effective_retry_from_step_id=None,
+        error="upload outcome unknown",
+    )
+
+    async def activity_message(*_args, **_kwargs):
+        return activity
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(projection, "_activity_message", activity_message)
+    monkeypatch.setattr(projection, "_notify_update", noop)
+
+    await projection._project_workflow_run_status_chat(object(), run=run)
+
+    assert activity.content == "Publish campaign video requires reconciliation before it can be retried."
+    assert "workflow_retry_from_step_id" not in activity.meta
+    assert activity.pending_action is None
 
 
 @pytest.mark.asyncio
@@ -2428,7 +2624,8 @@ async def test_cancelled_workflow_input_does_not_block_new_intent(
         ({"manual_skill_ids": "skill-1"}, False),
         ({"manual_skill_refs": '[{"kind":"id","value":"skill-1"}]'}, False),
         ({"chat_mode": "video"}, False),
-        ({"message": "@Demo Producer create this video."}, False),
+        # Handles in the text are content; a picked mention arrives as agent_id.
+        ({"message": "Add @nasa and @spacex to the creator watchlist."}, True),
         ({"ephemeral": True}, False),
         ({"editor_context": "{}"}, False),
         ({"thread_ref_kind": "task", "thread_ref_id": "task-1"}, False),
@@ -2962,7 +3159,7 @@ async def test_workspace_retry_preflights_snapshot_services_before_creating_run(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workspace_manual", [False, True])
-async def test_paused_automation_binding_allows_explicit_run_without_reenabling(
+async def test_paused_workspace_keeps_configured_binding_active_during_manual_run(
     client: AsyncClient, db_session, workspace_manual: bool,
 ) -> None:
     from packages.core.models.workflow import WorkflowBinding
@@ -2984,12 +3181,12 @@ async def test_paused_automation_binding_allows_explicit_run_without_reenabling(
     )
     assert pause.status_code == 200, pause.text
     await db_session.refresh(stored_binding)
-    assert stored_binding.enabled is False
-    assert stored_binding.status == "paused"
-    with pytest.raises(ValueError, match="binding is inactive"):
-        await start_workflow_from_binding(
-            db_session, stored_binding, started_by=registration["user_id"],
-        )
+    assert stored_binding.enabled is True
+    assert stored_binding.status == "active"
+    configured_run = await start_workflow_from_binding(
+        db_session, stored_binding, started_by=registration["user_id"],
+    )
+    assert configured_run.trigger_source == "event"
     await db_session.rollback()
 
     response = await client.post(
@@ -3002,8 +3199,8 @@ async def test_paused_automation_binding_allows_explicit_run_without_reenabling(
         "user_id": registration["user_id"],
     }
     await db_session.refresh(stored_binding)
-    assert stored_binding.enabled is False
-    assert stored_binding.status == "paused"
+    assert stored_binding.enabled is True
+    assert stored_binding.status == "active"
 
 
 @pytest.mark.asyncio
@@ -3055,7 +3252,7 @@ async def test_paused_workspace_proposal_flow_requires_explicit_user_dispatch(
             "user_id": registration["user_id"],
         }
     else:
-        with pytest.raises(ValueError, match="active Workspace"):
+        with pytest.raises(ValueError, match="enabled configured Workflow"):
             await start_workflow_from_binding(
                 db_session, stored_binding,
                 started_by=registration["user_id"], trigger_source=trigger_source,
@@ -3066,6 +3263,63 @@ async def test_paused_workspace_proposal_flow_requires_explicit_user_dispatch(
                 WorkflowRun.workspace_id == workspace["id"],
             )
         ) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_by_another_person_continues_as_the_run_starter(
+    client: AsyncClient, db_session,
+) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.services.workflow_run_trace import workflow_definition_fingerprint
+    from packages.core.services.workflow_service import (
+        RETRY_REQUESTED_BY_KEY,
+        retry_workflow_run,
+        start_workflow_from_binding,
+    )
+
+    registration, _headers, _workspace, binding = await _seed_workspace_entrypoint(
+        client, "retry_for_starter",
+    )
+    starter = registration["user_id"]
+    stored_binding = await db_session.get(WorkflowBinding, binding["id"])
+    run = await start_workflow_from_binding(
+        db_session, stored_binding, started_by=starter, trigger_source="manual", user_requested=True,
+    )
+    run.status = "failed"
+    original_fingerprint = run.definition_snapshot["fingerprint"]
+    # The Workflow is edited after the failure.
+    workflow = await db_session.get(WorkflowDefinition, run.workflow_id)
+    workflow.steps = [
+        {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["end"]},
+        {"id": "end", "type": "end", "name": "Edited", "config": {}, "next": []},
+    ]
+    workflow.version = int(workflow.version or 1) + 1
+    await db_session.flush()
+    assert workflow_definition_fingerprint(workflow) != original_fingerprint
+
+    # A manager or provider taking over retries it: it stays the starter's run.
+    operator = generate_ulid()
+    retry = await retry_workflow_run(
+        db_session, run_id=run.id, entity_id=run.entity_id, started_by=operator, definition="current",
+    )
+    assert retry.started_by == starter
+    assert retry.trigger_data["_workspace_user_request"] == {"user_id": starter}
+    assert retry.trigger_data[RETRY_REQUESTED_BY_KEY] == {"user_id": operator}
+    # It runs what the starter started, never the edited definition.
+    assert retry.definition_snapshot["fingerprint"] == original_fingerprint
+
+    # A starter who can no longer reach the Workspace is not impersonated.
+    orphan = await start_workflow_from_binding(
+        db_session, stored_binding, started_by=starter, trigger_source="manual", user_requested=True,
+    )
+    orphan.status = "failed"
+    orphan.started_by = generate_ulid()
+    await db_session.flush()
+    with pytest.raises(ValueError, match="can no longer access its Workspace"):
+        await retry_workflow_run(
+            db_session, run_id=orphan.id, entity_id=orphan.entity_id, started_by=starter,
+        )
 
 
 @pytest.mark.asyncio
@@ -3814,10 +4068,11 @@ async def test_explicit_workspace_entrypoint_stream_starts_projected_run(
         f"/api/v1/workspaces/{workspace['id']}/chat/messages",
         headers=headers,
     )).json()
-    assert any(
-        message.get("body") == "✓ Workflow started"
+    # The starter card records the choice itself; no receipt is posted.
+    assert not any(
+        message["message_kind"] == "system"
+        and any(ref.get("type") == "message" for ref in message.get("refs") or [])
         for message in resolved_messages
-        if message["message_kind"] == "system"
     )
     assert queued == [runs[0]["id"]]
 
@@ -4252,7 +4507,6 @@ async def test_starter_card_allows_independent_new_chat_intent_run(
 @pytest.mark.parametrize(
     ("suffix", "message", "controls"),
     [
-        ("mention", "@Demo Producer create this video.", {}),
         ("disabled", "Create the full deliverable now.", {"disable_tools": "true"}),
         ("blocked", "Create the full deliverable now.", {"blocked_tools": "browser"}),
     ],
@@ -5214,6 +5468,9 @@ async def test_workflow_activity_redacts_and_bounds_structured_step_error(
     assert b"scenes[2].receipt" in encoded
     assert b"opaque-finding" in encoded
     assert activity["pending_action"]["observed_problem"] == workflow_error
+    # Open-decision lists show the title, never the raw tool error.
+    assert activity["pending_action"]["title"].startswith(f"{activity['meta']['workflow_title']} stopped")
+    assert "secret" not in activity["pending_action"]["title"]
 
 
 @pytest.mark.asyncio
@@ -5511,6 +5768,79 @@ async def test_workflow_final_output_projection_is_idempotent_by_run(
     }
 
 
+def test_completed_message_carries_the_whole_result_and_the_card_a_short_one():
+    run = SimpleNamespace(id="run-long-1", workflow_id="workflow-long-1", status="completed",
+                          definition_snapshot={"name": "Video Studio"})
+    summary = "Video Edit could not start because the sandbox service was unavailable. " * 8
+    content, reference = workflow_result_chat_projection(run, {"status": "blocked", "summary": summary})
+
+    # Nobody has to open the run to read what happened.
+    assert content == "Video Studio completed.\n\n" + summary.strip()
+    assert len(reference["summary"]) == 280 and reference["summary"].endswith("…")
+
+
+def test_a_finished_run_is_announced_under_the_flow_name_it_was_started_as():
+    run = SimpleNamespace(id="run-named-1", workflow_id="workflow-named-1", status="completed",
+                          definition_snapshot={"name": "opc create social from brief v1"},
+                          trigger_data={"_workflow_name": "Create Social Posts from Brief"})
+    content, reference = workflow_result_chat_projection(run, {"status": "completed"})
+
+    assert content.startswith("Create Social Posts from Brief completed")
+    assert reference["workflow_name"] == "Create Social Posts from Brief"
+
+
+def test_completed_message_speaks_the_results_language_and_attaches_linked_files():
+    from packages.core.services.workflow_chat_projection import _workflow_final_output_attachments
+
+    run = SimpleNamespace(id="run-zh-1", workflow_id="workflow-zh-1", status="completed",
+                          definition_snapshot={"name": "单集生成"})
+    result = {
+        "status": "delivered",
+        "summary": "第四集已经做好，全长约 111 秒，可以直接打开观看。",
+        "mp4_link": "[EP.04.mp4](/viewer/01M5R4RNCAW2MEACMBNBE35EYZ)",
+        # An echoed input path is not a link and is not a deliverable.
+        "scripts_path": "Workspaces/_by_id/ws/EP.04-script-v3.md",
+    }
+    content, _reference = workflow_result_chat_projection(run, result)
+    assert content.startswith("「单集生成」已完成\n\n第四集已经做好")
+
+    attachments = _workflow_final_output_attachments(result, entity_id="entity-1")
+    assert [(item["name"], item["document_id"], item["fileType"]) for item in attachments] == [
+        ("EP.04.mp4", "01M5R4RNCAW2MEACMBNBE35EYZ", "mp4"),
+    ]
+
+
+def test_retry_card_default_change_does_not_blame_the_person_and_speaks_their_language():
+    from packages.core.services.workflow_chat_projection import default_retry_change
+
+    zh = default_retry_change("EP.04 这次没做完（导出视频时出了问题）：画面检查暂时没读到，系统环境的问题。")
+    assert zh.startswith("直接点「重试」") and "先改好再重试" in zh
+    en = default_retry_change("Render failed: the review machine was busy.")
+    assert en.startswith("Retry this step.") and "Correct the failed input" not in en
+
+
+def test_failure_line_keeps_the_readable_error_and_drops_raw_payloads():
+    from packages.core.services.workflow_chat_projection import user_facing_error_text
+
+    raw = (
+        'EP.05 制作失败：保存字幕文件时出错，没有导出成片。Full blocking error: '
+        '{"contract":"tool_error","status":"error","details":{"mode":"authorization_receipt_mismatch",'
+        '"operation":{"paths":["Workspaces/_by_id/ws/workflow/run/artifacts/EP.05-n1-cues.json"]}}}.'
+    )
+    text, shortened = user_facing_error_text(raw)
+    assert text == "EP.05 制作失败：保存字幕文件时出错，没有导出成片。" and shortened
+    # Readable errors pass through untouched; an error that is only a payload keeps what failed.
+    assert user_facing_error_text("剪辑机器暂时没空位，等几分钟再试即可。") == ("剪辑机器暂时没空位，等几分钟再试即可。", False)
+    # A bulleted list from a stop step reads as one line: sentences in a row, fragments with "; ".
+    assert user_facing_error_text("Fix these:\n- Connect Instagram.\n- Confirm the recipient.") == (
+        "Fix these: Connect Instagram. Confirm the recipient.", False,
+    )
+    assert user_facing_error_text("Missing:\n- title\n- recipient")[0] == "Missing: title; recipient"
+    assert user_facing_error_text('Retry failed: [{"error": "quota_exceeded", "message": "Daily quota"}]')[0] == "Retry failed"
+    long_text, long_shortened = user_facing_error_text("步骤失败。" * 200)
+    assert len(long_text) <= 361 and long_text.endswith("…") and long_shortened
+
+
 def test_topic_brief_final_output_becomes_chat_friendly_summary_and_reference():
     run = SimpleNamespace(
         id="run-topic-1",
@@ -5578,6 +5908,40 @@ def test_retry_projection_wraps_legacy_request_schema_for_existing_runs():
     assert "revision_notes" in normalized["properties"]
 
 
+def test_failed_input_retry_projects_only_declared_direct_bindings():
+    from copy import deepcopy
+
+    field = {"type": "string", "title": "Report title", "minLength": 1}
+    run = SimpleNamespace(
+        status="failed", current_step_id="validate_report", variables={"report_title": ""},
+        step_results={"validate_report": {"status": "failed", "code": "input_schema_validation_failed"}},
+        execution_snapshot={"variables": {"report_title": "", "secret": "private"}, "steps": [{
+            "id": "validate_report", "type": "transform", "config": {
+                "inputs": [
+                    {"key": "title", "value": "{{report_title}}"},
+                    {"key": "generated", "value": "{{prior.output}}"},
+                    {"key": "undeclared", "value": "{{unexpected}}"},
+                    {"key": "secret", "value": "{{secret}}"},
+                ],
+                "input_schema": {"type": "object", "properties": {
+                    "title": field, "generated": {"type": "string"}, "undeclared": {"type": "string"},
+                    "secret": {"type": "string", "writeOnly": True},
+                }, "required": ["title", "generated", "undeclared", "secret"]},
+            },
+        }]},
+    )
+    before = deepcopy(run.execution_snapshot)
+    assert _workflow_retry_input_schema(run, {}) == {
+        "type": "object", "properties": {"report_title": field},
+        "required": ["report_title"], "additionalProperties": False,
+    }
+    assert run.execution_snapshot == before
+    explicit = {"type": "object", "properties": {}}
+    assert _workflow_retry_input_schema(run, {"editable_input_schema": explicit}) == explicit
+    run.step_results["validate_report"]["code"] = "provider_unavailable"
+    assert _workflow_retry_input_schema(run, {}) == explicit
+
+
 def test_retry_projection_does_not_wrap_an_unrelated_request_schema():
     schema = {
         "type": "object",
@@ -5623,6 +5987,7 @@ async def test_retryable_business_outcome_projects_editable_retry_attempt(
         {
             "id": "handoff",
             "type": "transform",
+            "name": "Hand off to editor",
             "config": {
                 "set": {
                     "project": {
@@ -5688,6 +6053,8 @@ async def test_retryable_business_outcome_projects_editable_retry_attempt(
     retry_action = activity["pending_action"]
     assert retry_action["kind"] == "workflow_retry"
     assert retry_action["retry_from_step_id"] == "handoff"
+    # Retry controls show the step people named, not its id.
+    assert retry_action["retry_from_step_name"] == "Hand off to editor"
     assert retry_action["retry_segment_ids"] == ["SEG-002"]
     assert retry_action["editable_input_schema"]["properties"]["corrected_input"]
     assert retry_action["values"]["corrected_input"] == "current value"
@@ -5702,6 +6069,7 @@ async def test_retryable_business_outcome_projects_editable_retry_attempt(
     assert compact["intervention"]["message_id"] == activity["id"]
     assert compact["intervention"]["step_id"] == "handoff"
     assert compact["intervention"]["retry_from_step_id"] == "handoff"
+    assert compact["intervention"]["retry_from_step_name"] == "Hand off to editor"
     assert compact["intervention"]["editable_input_schema"] == retry_action[
         "editable_input_schema"
     ]
@@ -6505,8 +6873,19 @@ async def test_workflow_input_card_resumes_same_run_with_response(
                 "options": ["respond", "cancel"],
                 "response_variable": "missing_context",
                 "input_schema": {
-                    "type": "object", "properties": {"choice": {"type": "string"}},
-                    "required": ["choice"],
+                    "type": "object",
+                    "properties": {
+                        "primary_audio": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["document_id"],
+                                "properties": {"document_id": {"type": "string", "minLength": 1}},
+                            },
+                            "minItems": 1,
+                        },
+                    },
+                    "required": ["primary_audio"],
                 },
             },
             "next": ["end"],
@@ -6540,20 +6919,35 @@ async def test_workflow_input_card_resumes_same_run_with_response(
     )).json()
     input_request = next(message for message in messages if message["pending_action"])
     assert input_request["pending_action"]["kind"] == "workflow_input"
+    assert input_request["pending_action"]["input_schema"]["required"] == ["primary_audio"]
+
+    invalid = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages/{input_request['id']}/resolve",
+        headers=headers,
+        json={"choice": "respond", "payload": {"missing_context": {"primary_audio": [{}]}}},
+    )
+    assert invalid.status_code == 422
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=headers,
+    )).json()
+    assert next(message for message in messages if message["id"] == input_request["id"])["resolved_at"] is None
 
     queued.clear()
     resolved = await client.post(
         f"/api/v1/workspaces/{workspace['id']}/chat/messages/{input_request['id']}/resolve",
         headers=headers,
-        json={"choice": "respond", "note": "https://example.test/onboarding"},
+        json={
+            "choice": "respond",
+            "payload": {"missing_context": {"primary_audio": [{"document_id": "doc-audio"}]}},
+        },
     )
 
     assert resolved.status_code == 200
     resumed = (await client.get(f"/api/v1/workflows/runs/{run['id']}", headers=headers)).json()
     assert resumed["status"] == "running"
     assert resumed["variables"]["missing_context"] == {
-        "choice": "respond",
-        "note": "https://example.test/onboarding",
+        "primary_audio": [{"document_id": "doc-audio"}],
     }
     assert queued == [run["id"]]
 
@@ -6635,3 +7029,103 @@ async def test_workflow_input_cancel_is_terminal_and_duplicate_is_idempotent(
     assert cancelled_run["status"] == "cancelled"
     assert duplicate.status_code == 200
     assert queued == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["run_page", "chat_card"])
+async def test_retry_of_a_run_its_flow_could_not_advance_starts_over_on_the_current_flow(
+    client: AsyncClient, db_session, surface: str,
+) -> None:
+    """Retrying the frozen Flow would stop at the same step; once the Flow changed, Retry starts over."""
+    from packages.core.models.task import Message
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_chat_projection import project_workflow_run_status
+    from packages.core.services.workflow_run_trace import (
+        STALLED_PROBLEM, STALLED_RESTART_CHANGE, STALLED_RETRY_ERROR,
+    )
+
+    request_input = {"key": "request", "label": "Request", "type": "string", "required": True}
+    steps = [
+        {"id": "trigger", "type": "trigger", "config": {"run_inputs": [request_input]}, "next": ["end"]},
+        {"id": "end", "type": "end", "config": {}, "next": []},
+    ]
+    _, headers, workspace, binding = await _seed_workspace_entrypoint(client, f"stalled_{surface}", steps=steps)
+    started = await client.post(f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers, json={
+        "variables": {"request": "Three tips"},
+        "trigger_data": {"workspace_manual": True, "_workspace_app_action": "action:tips"},
+    })
+    assert started.status_code == 201, started.text
+    run_id = started.json()["id"]
+    stalled = await db_session.get(WorkflowRun, run_id)
+    stalled.status = "failed"
+    stalled.current_step_id = "end"
+    stalled.error = "No runnable steps and workflow not complete (current step: end). Steps: end [end]: not run"
+    await db_session.commit()
+
+    summary_url = f"/api/v1/workflows/runs/{run_id}?detail=false"
+    # Unchanged Flow: a retry would stall again, so none is offered or accepted.
+    assert (await client.get(summary_url, headers=headers)).json()["intervention"] is None
+    refused = await client.post(f"/api/v1/workflows/runs/{run_id}/retry", headers=headers, json={})
+    assert refused.status_code == 409 and STALLED_RETRY_ERROR in refused.text, refused.text
+
+    changed = await client.put(f"/api/v1/workflows/{binding['workflow_id']}", headers=headers, json={"steps": [
+        {**steps[0], "next": ["finish"]},
+        {"id": "finish", "type": "end", "config": {}, "next": []},
+    ]})
+    assert changed.status_code == 200, changed.text
+    offer = (await client.get(summary_url, headers=headers)).json()["intervention"]
+    assert offer["kind"] == "workflow_retry" and offer["retry_from_step_id"] == "trigger"
+    assert offer["required_change"] == STALLED_RESTART_CHANGE and offer["observed_problem"] == STALLED_PROBLEM
+
+    if surface == "run_page":
+        restarted = await client.post(f"/api/v1/workflows/runs/{run_id}/retry", headers=headers, json={})
+        assert restarted.status_code == 201, restarted.text
+        fresh_id = restarted.json()["id"]
+    else:
+        await db_session.refresh(stalled)
+        await project_workflow_run_status(db_session, run=stalled)
+        await db_session.commit()
+        card = await db_session.scalar(select(Message).where(
+            Message.meta["workflow_run_id"].astext == run_id, Message.pending_action.is_not(None),
+        ))
+        assert card.pending_action["kind"] == "workflow_retry"
+        assert card.pending_action["observed_problem"] == STALLED_PROBLEM
+        resolved = await client.post(
+            f"/api/v1/workspaces/{workspace['id']}/chat/messages/{card.id}/resolve",
+            headers=headers, json={"choice": "retry"},
+        )
+        assert resolved.status_code == 200, resolved.text
+        db_session.expire_all()
+        fresh_id = (await db_session.get(WorkflowRun, run_id)).trigger_data["_restarted_as_run_id"]
+    db_session.expire_all()
+    fresh = await db_session.get(WorkflowRun, fresh_id)
+    stalled = await db_session.get(WorkflowRun, run_id)
+    assert fresh.id != run_id and fresh.binding_id == binding["id"]
+    assert fresh.trigger_data["request"] == "Three tips"
+    assert fresh.trigger_data["_workspace_app_action"] == "action:tips"
+    assert [node["id"] for node in fresh.definition_snapshot["nodes"]] == ["trigger", "finish"]
+    assert stalled.trigger_data["_restarted_as_run_id"] == fresh.id
+    # Once started again, the stalled run offers nothing more and a second Retry starts nothing.
+    assert (await client.get(summary_url, headers=headers)).json()["intervention"] is None
+    again = await client.post(f"/api/v1/workflows/runs/{run_id}/retry", headers=headers, json={})
+    assert again.status_code == 409, again.text
+
+
+@pytest.mark.asyncio
+async def test_a_run_started_from_a_workspace_flow_is_named_after_that_flow(client: AsyncClient) -> None:
+    """Built-in definitions keep slug names; people see the Flow's own name."""
+    _, headers, workspace, binding = await _seed_workspace_entrypoint(client, "flow-name")
+    import packages.core.database as db_module
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+
+    async with db_module.async_session() as db:
+        stored = await db.get(WorkflowBinding, binding["id"])
+        stored.name = "Make an image"
+        (await db.get(WorkflowDefinition, stored.workflow_id)).name = "opc-create-image-from-topic-v1"
+        await db.commit()
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers,
+        json={"execute": False, "trigger_data": {"workspace_manual": True}},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["workflow_name"] == "Make an image"

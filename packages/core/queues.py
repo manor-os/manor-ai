@@ -2,22 +2,22 @@
 
 Manor runs four different kinds of Celery task in one broker:
 
-* the **control plane** — ``internal_worker_tick`` (5s), ``cleanup_expired_leases``
-  (30s), ``scheduler.tick`` (60s), the ops/monitor beats. Every one of them is
+* the **control plane** — ``cleanup_expired_leases`` (30s), ``scheduler.tick``
+  (60s), the outbox publisher, the ops/monitor beats. Every one of them is
   short, bounded and DB-shaped, and every one of them must run *on time*: they
   are the loop that dispatches new leases and reclaims dead ones.
 * **interactive** — durable Chat execution and exact checkpoint resume. These
   tasks are user-facing and may stay active across agent/tool boundaries, so
   cloud deployments isolate them from the control-plane concurrency pool.
-* **heavy** — ``execute_lease`` and friends. A single step may legitimately run
-  for hours (``packages/core/services/step_deadline.py`` allows up to 6h).
+* **heavy** — Task agent loops and other long work. A single task may
+  legitimately run for an hour or more.
 * **versioned recovery** — short settlement-only deliveries whose wire and
   fencing contract must never be consumed by a pre-upgrade worker.
 
 With one queue and one worker they share the same concurrency slots, so four
-concurrent long steps stop the control plane dead: no new leases are
+concurrent long tasks stop the control plane dead: no new leases are
 dispatched, no expired leases reclaimed, no scheduled job fires. Splitting them
-by queue is what makes a long step a *local* cost instead of a global stall.
+by queue is what makes a long task a *local* cost instead of a global stall.
 
 The split is an explicit, exhaustive registry keyed by the task's dotted name —
 never a prefix/glob match over names. ``tests/test_orchestration_hardening.py``
@@ -45,11 +45,6 @@ class CeleryQueue(str, Enum):
     INTERACTIVE = "interactive"
     ROOM_AGENTS = "room-agents"
     HEAVY = "heavy"
-    # Host/container monitoring. Its walks call Docker once per running
-    # container, so a 30 s tick takes seconds on a busy host; on the control
-    # pool that held a slot the millisecond ticks needed, on the heavy pool it
-    # sat behind minute-long agent work. Its own queue keeps it off both.
-    OPS = "ops"
     # Settlement payloads are a versioned wire contract. Keeping them on a
     # queue introduced with their consumer prevents an old rolling-deploy
     # worker from accepting a message whose fencing semantics it does not know.
@@ -93,14 +88,17 @@ CELERY_BUILTIN_TASK_QUEUES: dict[str, CeleryQueue] = {
 
 TASK_QUEUES: dict[str, CeleryQueue] = {
     # ── control plane: short, bounded, must run on schedule ──────────
-    "packages.core.tasks.ai_tasks.internal_worker_tick": CeleryQueue.CONTROL,
     "packages.core.tasks.ai_tasks.cleanup_expired_leases": CeleryQueue.CONTROL,
     "packages.core.tasks.ai_tasks.budget_monthly_reset": CeleryQueue.CONTROL,
     "scheduler.tick": CeleryQueue.CONTROL,
+    # Dispatch only records the occurrence and publishes the job's own task,
+    # so a due schedule never waits behind long heavy work to start.
+    "scheduler.dispatch_job": CeleryQueue.CONTROL,
     "scheduler.skill_generation_sweep": CeleryQueue.CONTROL,
     "workflow.resume_sweep": CeleryQueue.CONTROL,
     "workflow.terminal_effect_sweep": CeleryQueue.CONTROL,
     "workflow.recover_expired_claims": CeleryQueue.CONTROL,
+    "workflow.redispatch_unclaimed_runs": CeleryQueue.CONTROL,
     "scheduler.project_scheduled_agent_result": CeleryQueue.CONTROL,
     "scheduler.recover_prepared_dispatch": CeleryQueue.CONTROL,
     "scheduler.settle_scheduled_agent_run": CeleryQueue.RECOVERY_V2,
@@ -116,24 +114,15 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "monitor.sla_breach_check": CeleryQueue.CONTROL,
     "monitor.workspace_readiness_check": CeleryQueue.CONTROL,
     "experiments.guardrail_tick": CeleryQueue.CONTROL,
-    # Monitoring lives on its own queue (see ``CeleryQueue.OPS``): the
-    # snapshot and log scan walk Docker once per running container, which is
-    # bounded (OPS_SNAPSHOT_BUDGET_SECONDS, single-flight) but still seconds
-    # per tick — long enough to starve the 1-2 s control ticks sharing a
-    # two-slot pool, and too frequent to sit behind heavy agent work.
-    "ops.collect_snapshot": CeleryQueue.OPS,
-    "ops.alert_tick": CeleryQueue.OPS,
-    "ops.log_scan": CeleryQueue.OPS,
-    "ops.send_digest": CeleryQueue.OPS,
     "runtime.sandbox_scheduler": CeleryQueue.CONTROL,
     "runtime.outbox_dispatch": CeleryQueue.CONTROL,
-    "runtime.plan_cycle_recovery": CeleryQueue.CONTROL,
+    "approval.reevaluate_pending": CeleryQueue.CONTROL,
     "runtime.task_coordinator_recovery": CeleryQueue.CONTROL,
     "runtime.dispatch_task_execution": CeleryQueue.CONTROL,
     "runtime.dispatch_task_coordinator": CeleryQueue.CONTROL,
-    "runtime.run_task_coordinator": CeleryQueue.HEAVY,
     "runtime.run_task_agent_loop": CeleryQueue.HEAVY,
-    "runtime.dispatch_plan_cycle": CeleryQueue.CONTROL,
+    "runtime.dispatch_task_agent_child": CeleryQueue.CONTROL,
+    "runtime.run_task_agent_child": CeleryQueue.HEAVY,
     "runtime.allocate_sandbox": CeleryQueue.INTERACTIVE,
     "runtime.execute_run": CeleryQueue.INTERACTIVE,
     "runtime.resume_run": CeleryQueue.INTERACTIVE,
@@ -141,9 +130,6 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "room_agent.recover_pending": CeleryQueue.CONTROL,
 
     # ── heavy: unbounded duration, user-visible execution ────────────
-    "packages.core.tasks.ai_tasks.execute_lease": CeleryQueue.HEAVY,
-    "packages.core.tasks.ai_tasks.plan_and_run_task": CeleryQueue.HEAVY,
-    "packages.core.tasks.ai_tasks.run_plan": CeleryQueue.HEAVY,
     "packages.core.tasks.ai_tasks.run_agent_task": CeleryQueue.HEAVY,
     "packages.core.tasks.ai_tasks.run_morning_briefing": CeleryQueue.HEAVY,
     "packages.core.tasks.ai_tasks.run_strategist_review": CeleryQueue.HEAVY,
@@ -159,10 +145,14 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "memory.entity_chat_extraction_sweep": CeleryQueue.HEAVY,
     "learning.apply_candidate": CeleryQueue.HEAVY,
     "embeddings.batch_index": CeleryQueue.HEAVY,
+    # One model call (+ ffmpeg for video/audio) per uploaded media file.
+    "knowledge.analyze_media": CeleryQueue.HEAVY,
+    "knowledge.sweep_media_analysis": CeleryQueue.HEAVY,
+    # A few model calls translating a Workspace's labels after an edit.
+    "workspace.translate_text": CeleryQueue.HEAVY,
     "embeddings.sweep_pending": CeleryQueue.HEAVY,
     "media.cleanup_media_references": CeleryQueue.HEAVY,
     "media.process_video_job": CeleryQueue.HEAVY,
-    "media.process_suno_audio_job": CeleryQueue.HEAVY,
     "media.recover_stale_jobs": CeleryQueue.HEAVY,
     "apify.reconcile_collections": CeleryQueue.HEAVY,
     # Channel replies are user-facing and must remain available while a
@@ -178,12 +168,14 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "events.dispatch_external_due": CeleryQueue.HEAVY,
     "integrations.health_check": CeleryQueue.HEAVY,
     "integrations.health_tick": CeleryQueue.HEAVY,
-    "scheduler.dispatch_job": CeleryQueue.HEAVY,
+    "integrations.deliver_incident_notices": CeleryQueue.HEAVY,
+    "workspace.digest_sweep": CeleryQueue.HEAVY,
     "monitor.daily_health_briefing": CeleryQueue.HEAVY,
     "calendar.reconcile_booking_metadata": CeleryQueue.HEAVY,
     "maintenance.cleanup_ai_edit_sessions": CeleryQueue.HEAVY,
     "maintenance.cleanup_chat_uploads": CeleryQueue.HEAVY,
     "maintenance.cleanup_document_upload_recovery": CeleryQueue.HEAVY,
+    "maintenance.cleanup_oauth_dynamic_clients": CeleryQueue.HEAVY,
     "maintenance.recover_runtime_file_commits": CeleryQueue.HEAVY,
     "maintenance.repair_missing_document_files": CeleryQueue.HEAVY,
     "maintenance.sync_openrouter_pricing": CeleryQueue.HEAVY,
@@ -191,6 +183,7 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "ops.purge_soft_deleted_workspaces": CeleryQueue.HEAVY,
     "metrics.daily_rollup": CeleryQueue.HEAVY,
     "metrics.http_flush": CeleryQueue.HEAVY,
+    "metrics.workspace_health_refresh": CeleryQueue.HEAVY,
     "run_workflow": CeleryQueue.HEAVY,
     "resume_workflow": CeleryQueue.HEAVY,
 }

@@ -17,8 +17,9 @@ import WorkingHoursEditor, { WORKING_HOURS_TIME_OPTIONS } from "../components/ui
 import { IconBuilding, IconCalendar, IconCopy, IconEdit, IconExternalLink, IconLink, IconPalette, IconPlus, IconTrash } from "../components/icons";
 import NangoConnectButton from "../components/integrations/NangoConnectButton";
 import { clearAuthBrowserState } from "../lib/authToken";
-import { setPreferredTimeZone } from "../lib/format";
+import { deviceTimeZone, getPreferredTimeZone, setPreferredTimeZoneForUser } from "../lib/format";
 import { useAuthStore } from "../stores/auth";
+import { COLLABORATOR_ROLE } from "../lib/collaboratorSession";
 import {
   THEME_STORAGE_KEY,
   applyThemePreference,
@@ -33,6 +34,7 @@ import {
 } from "../lib/aiEditPreferences";
 
 import { t } from "../lib/i18n";
+import { userAvatarImage } from "../lib/userAvatar";
 
 async function leaveSessionOrLogout() {
   await useAuthStore.getState().logout();
@@ -73,7 +75,7 @@ async function applyPeopleContextResult(
   queryClient.setQueryData(["people-me"], result.context);
   const nextUser = await api.auth.me();
   localStorage.setItem("manor_user", JSON.stringify(nextUser));
-  setPreferredTimeZone(nextUser.timezone);
+  setPreferredTimeZoneForUser(nextUser);
   useAuthStore.setState({ user: nextUser });
   queryClient.setQueryData(["auth-me"], nextUser);
   invalidateEntityScopedQueries(queryClient);
@@ -406,6 +408,7 @@ function IDCard({ user }: { user: any }) {
         year: "numeric",
         month: "long",
         day: "numeric",
+        timeZone: getPreferredTimeZone(),
       })
     : "Recently";
 
@@ -452,9 +455,9 @@ function IDCard({ user }: { user: any }) {
           e.currentTarget.style.boxShadow = "0 6px 20px rgba(67,107,101,0.2)";
         }}
       >
-        {user.avatar_url ? (
+        {userAvatarImage(user.avatar_url) ? (
           <img
-            src={user.avatar_url}
+            src={userAvatarImage(user.avatar_url)}
             alt=""
             style={{ width: 96, height: 96, objectFit: "cover" }}
           />
@@ -885,8 +888,11 @@ function CompanyCard({
                   <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#292524" }}>
                     {membership.entity_name || membership.entity_id}
                   </p>
-                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#a8a29e", textTransform: "capitalize" }}>
-                    {membership.staff_role_name || membership.role || "member"}
+                  {/* Raw role names are capitalized; the translated label keeps its own casing. */}
+                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#a8a29e", textTransform: membership.role === COLLABORATOR_ROLE ? undefined : "capitalize" }}>
+                    {membership.role === COLLABORATOR_ROLE
+                      ? t("collaboration.external_membership")
+                      : membership.staff_role_name || membership.role || "member"}
                   </p>
                 </div>
                 <button
@@ -1080,6 +1086,14 @@ type CustomModelDraft = {
   apiKey: string;
   baseUrl: string;
   useSavedApiKey: boolean;
+  // Declared limits of a custom chat model; blank keeps the defaults.
+  contextWindowTokens?: string;
+  maxOutputTokens?: string;
+};
+
+const parseTokenLimit = (value?: string): number | undefined => {
+  const digits = (value || "").replace(/[,_\s]/g, "");
+  return digits ? Number(digits) : undefined;
 };
 
 type CustomModelTestState = {
@@ -1252,17 +1266,21 @@ export function AIModelSection({
     setSavingCustomRole(role);
     setApiKeyErrors((prev) => ({ ...prev, [role]: "" }));
     try {
-      await api.auth.saveCustomModel({
+      const saved = await api.auth.saveCustomModel({
         role,
         model: draft.model.trim(),
         api_key: draft.apiKey.trim() || undefined,
         use_saved_api_key: draft.useSavedApiKey && !draft.apiKey.trim(),
         base_url: draft.baseUrl.trim() || undefined,
         test_token: testState.testToken,
+        context_window_tokens: parseTokenLimit(draft.contextWindowTokens),
+        max_output_tokens: parseTokenLimit(draft.maxOutputTokens),
       });
+      // The server may add the provider prefix a bare media model ID routes by.
+      const savedModel = saved.models?.[role] || draft.model.trim();
       setDrafts((prev) => ({
         ...prev,
-        [role]: { ...draft, apiKey: "", useSavedApiKey: true },
+        [role]: { ...draft, model: savedModel, apiKey: "", useSavedApiKey: true },
       }));
       setExpandedOwnRole(null);
       queryClient.invalidateQueries({ queryKey: ["llm-config"] });
@@ -1448,12 +1466,18 @@ export function AIModelSection({
     "zyphra/zonos-v0.1-hybrid": { in: 7.0, out: 0, unit: "token" },
     "zyphra/zonos-v0.1-transformer": { in: 7.0, out: 0, unit: "token" },
     "sesame/csm-1b": { in: 7.0, out: 0, unit: "token" },
+    // ElevenLabs bills per input character: USD per 1M characters.
+    "elevenlabs/eleven-v4": { in: 80.0, out: 0, unit: "token" },
+    "elevenlabs/eleven-v4-turbo": { in: 40.0, out: 0, unit: "token" },
+    "elevenlabs/eleven-v3": { in: 80.0, out: 0, unit: "token" },
+    "elevenlabs/eleven-multilingual-v2": { in: 80.0, out: 0, unit: "token" },
+    "elevenlabs/eleven-flash-v2.5": { in: 40.0, out: 0, unit: "token" },
     "google/lyria-3-clip-preview": { in: 0.04, unit: "second" },
     "google/lyria-3-pro-preview": { in: 0.08, unit: "second" },
+    "elevenlabs/music-v2.5": { in: 0.00125, unit: "second" },
     "openai/gpt-4o-audio-preview": { in: 2.5, out: 10.0, unit: "token" },
     "openai/gpt-audio-mini": { in: 0.6, out: 2.4, unit: "token" },
     "openai/gpt-audio": { in: 2.5, out: 10.0, unit: "token" },
-    "suno/music": { in: 0.10, unit: "asset" },
     "bytedance/seedance-2.5": { in: 0.231, unit: "second" },
     "bytedance/seedance-2.0": { in: 0.134, unit: "second" },
     "bytedance/seedance-2.0-fast": { in: 0.107, unit: "second" },
@@ -1492,7 +1516,7 @@ export function AIModelSection({
         return "Self-hosted speech-to-text needs a matching OpenAI or Groq speech API key from your provider account.";
       }
       if (roleKey === "audio") {
-        return "Self-hosted audio generation needs the matching Google, OpenAI, or Suno API key from your provider account.";
+        return "Self-hosted audio generation needs the matching Google or OpenAI API key from your provider account.";
       }
       if (roleKey === "sfx") {
         return "Self-hosted sound-effects generation needs the matching OpenAI API key from your provider account.";
@@ -1519,7 +1543,7 @@ export function AIModelSection({
     qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     zyphra: "https://api.zyphracloud.com/api/v1",
     sesame: "https://openrouter.ai/api/v1",
-    suno: "https://api.suno.com/v0",
+    elevenlabs: "https://openrouter.ai/api/v1",
   };
 
   const inferBaseUrl = (modelId: string, roleKey = ""): string => {
@@ -1585,6 +1609,10 @@ export function AIModelSection({
           const roleApiKeys = (llmConfig as any)?.role_api_keys || {};
           const roleApiKeyModels =
             (llmConfig as any)?.role_api_key_models || {};
+          const roleModelLimits: Record<
+            string,
+            { context_window_tokens?: number; max_output_tokens?: number }
+          > = (llmConfig as any)?.role_model_limits || {};
           const savedApiKey =
             roleApiKeys[role.key] ||
             (role.key === "primary" ? (llmConfig as any)?.llm_api_key : "");
@@ -1601,9 +1629,9 @@ export function AIModelSection({
           };
           const testState = testStates[role.key] || { status: "idle" as const };
           const currentSignature = draftSignature(role.key, draft);
-          const canUseCustomModel = ["primary", "worker", "embedding"].includes(
-            role.key,
-          );
+          // Any role takes a custom model ID; it saves only after a live test passes.
+          const canUseCustomModel = !role.locked;
+          const isMediaRole = !["primary", "worker", "embedding"].includes(role.key);
           const isDraftCatalogModel = options.some(
             (option: any) => option.id === draft.model.trim(),
           );
@@ -1829,6 +1857,10 @@ export function AIModelSection({
                             ...prev,
                             [role.key]: defaultPanelTab,
                           }));
+                          const savedLimits =
+                            savedApiKeyModel === currentModel
+                              ? roleModelLimits[role.key] || {}
+                              : {};
                           setDrafts((prev) => ({
                             ...prev,
                             [role.key]: {
@@ -1836,6 +1868,12 @@ export function AIModelSection({
                               apiKey: "",
                               baseUrl: baseUrlInputs[role.key] || "",
                               useSavedApiKey: hasRoleApiKey,
+                              contextWindowTokens: savedLimits.context_window_tokens
+                                ? String(savedLimits.context_window_tokens)
+                                : "",
+                              maxOutputTokens: savedLimits.max_output_tokens
+                                ? String(savedLimits.max_output_tokens)
+                                : "",
                             },
                           }));
                           setTestStates((prev) => ({
@@ -2181,18 +2219,18 @@ export function AIModelSection({
                           >
                             {t("page.account.catalog_byok_requires_live_test")}
                           </p>
-                        ) : !canUseCustomModel && (
+                        ) : isMediaRole && (
                           <p
                             style={{
                               fontSize: 11,
-                              color: "#936027",
+                              color: "#78716c",
                               margin: 0,
                               padding: 10,
                               borderRadius: 8,
-                              background: "#f3ecd6",
+                              background: "rgba(28,25,23,0.04)",
                             }}
                           >
-                            {t("page.account.custom_model_test_catalog_only")}
+                            {t("page.account.custom_media_model_hint")}
                           </p>
                         )}
                         {role.key === "embedding" && (
@@ -2449,6 +2487,53 @@ export function AIModelSection({
                               )}
                             </div>
                           </div>
+                          {["primary", "worker"].includes(role.key) &&
+                            !isDraftCatalogModel && (
+                              <div style={{ marginTop: 8 }}>
+                                <div
+                                  className="account-ai-key-grid"
+                                  style={{
+                                    display: "grid",
+                                    gridTemplateColumns:
+                                      "repeat(auto-fit, minmax(min(100%, 240px), 1fr))",
+                                    gap: 10,
+                                  }}
+                                >
+                                  {(
+                                    [
+                                      ["contextWindowTokens", "page.account.model_context_window_tokens", "128000"],
+                                      ["maxOutputTokens", "page.account.model_max_output_tokens", "16384"],
+                                    ] as const
+                                  ).map(([field, label, placeholder]) => (
+                                    <label key={field} style={{ fontSize: 10, color: "#78716c" }}>
+                                      {t(label)}
+                                      <input
+                                        className="manor-input"
+                                        inputMode="numeric"
+                                        value={draft[field] || ""}
+                                        onChange={(e) =>
+                                          updateDraft(role.key, {
+                                            [field]: e.target.value,
+                                          })
+                                        }
+                                        placeholder={placeholder}
+                                        disabled={!canEditProviderSettings}
+                                        style={{
+                                          width: "100%",
+                                          fontSize: 12,
+                                          padding: "7px 10px",
+                                          marginTop: 2,
+                                          opacity: canEditProviderSettings ? 1 : 0.55,
+                                        }}
+                                      />
+                                    </label>
+                                  ))}
+                                </div>
+                                <span style={{ fontSize: 9, color: "#78716c", marginTop: 2, display: "block" }}>
+                                  {t("page.account.model_limits_hint")}
+                                </span>
+                              </div>
+                            )}
                           <p
                             style={{
                               fontSize: 10,
@@ -3814,6 +3899,7 @@ export default function Account() {
   const [lastName, setLastName] = useState("");
   const [phone, setPhone] = useState("");
   const [timezone, setTimezone] = useState("UTC");
+  const [timezoneChosen, setTimezoneChosen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState("");
   const [formError, setFormError] = useState("");
@@ -3838,7 +3924,7 @@ export default function Account() {
     setFirstName(user.first_name || "");
     setLastName(user.last_name || "");
     setPhone(user.phone || "");
-    setTimezone(user.timezone || "UTC");
+    setTimezone((user.timezone_user_set ? user.timezone : deviceTimeZone() || user.timezone) || "UTC");
     setInited(true);
   }
 
@@ -3854,10 +3940,18 @@ export default function Account() {
         last_name: lastName || undefined,
         phone: phone || undefined,
         display_name: displayName,
-        timezone,
+        // Only a pick fixes the zone; otherwise it keeps following the device.
+        timezone: timezoneChosen ? timezone : undefined,
       });
-      setPreferredTimeZone(updatedUser.timezone);
+      setPreferredTimeZoneForUser(updatedUser);
       localStorage.setItem("manor_user", JSON.stringify(updatedUser));
+      const current = useAuthStore.getState().user;
+      if (current?.id === updatedUser.id) {
+        useAuthStore.setState({
+          user: { ...current, timezone: updatedUser.timezone, timezone_user_set: updatedUser.timezone_user_set },
+        });
+      }
+      setTimezoneChosen(false);
       queryClient.invalidateQueries({ queryKey: ["auth-me"] });
       setSuccess("Profile saved");
       setTimeout(() => setSuccess(""), 3000);
@@ -4069,9 +4163,13 @@ export default function Account() {
                 </label>
                 <Select
                   value={timezone}
-                  onChange={setTimezone}
+                  onChange={(value) => {
+                    setTimezone(value);
+                    setTimezoneChosen(true);
+                  }}
                   filterable
-                  options={[
+                  options={Array.from(new Set([
+                    timezone,
                     "UTC",
                     "America/New_York",
                     "America/Chicago",
@@ -4086,9 +4184,12 @@ export default function Account() {
                     "Asia/Dubai",
                     "Asia/Riyadh",
                     "Australia/Sydney",
-                  ]}
+                  ]))}
                   placeholder={t("page.account.select_timezone")}
                 />
+                {!user.timezone_user_set && !timezoneChosen && (
+                  <p className="mt-1 text-xs text-stone-500">{t("page.account.timezone_follows_device")}</p>
+                )}
               </div>
             </div>
 

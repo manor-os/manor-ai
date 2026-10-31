@@ -5,7 +5,7 @@ from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
@@ -323,18 +323,52 @@ async def usage_by_source(
     # source == business_type) — TokenUsageLog.cost_usd is an estimated
     # provider cost in USD, which is neither credits nor always present.
     credit_filters = _usage_scope_filters(CreditUsageLog, user, scope)
+    credit_filters.append(CreditUsageLog.created_at >= start)
+    # A client delivery trial this company paid for is charged here but ran
+    # in the customer's Workspace: its token log is the customer's, so it is
+    # reported as one row per trial instead of folding into our own sources.
+    from packages.core.services.billing_payer import (
+        TRIAL_USAGE_SOURCE,
+        sponsored_trial_workspaces,
+        trial_usage_label,
+    )
+
+    trials = await sponsored_trial_workspaces(db, user.entity_id, include_ended=True)
+    own_credit_filters = list(credit_filters)
+    if trials:
+        own_credit_filters.append(or_(
+            CreditUsageLog.workspace_id.is_(None),
+            CreditUsageLog.workspace_id.not_in(list(trials)),
+        ))
     credit_rows = (await db.execute(
         select(
             CreditUsageLog.business_type,
             func.sum(CreditUsageLog.total_credit).label("credit_used"),
         )
-        .where(*credit_filters, CreditUsageLog.created_at >= start)
+        .where(*own_credit_filters)
         .group_by(CreditUsageLog.business_type)
     )).all()
     credits_by_source = {
         (r.business_type or "Unknown"): int(r.credit_used or 0)
         for r in credit_rows
     }
+
+    trial_rows = []
+    if trials:
+        trial_rows = (await db.execute(
+            select(
+                CreditUsageLog.workspace_id,
+                func.count().label("request_count"),
+                func.sum(CreditUsageLog.input_tokens).label("input_tokens"),
+                func.sum(CreditUsageLog.output_tokens).label("output_tokens"),
+                func.sum(CreditUsageLog.total_tokens).label("total_tokens"),
+                func.sum(CreditUsageLog.total_credit).label("credit_used"),
+                func.max(CreditUsageLog.created_at).label("last_used"),
+            )
+            .where(*credit_filters, CreditUsageLog.workspace_id.in_(list(trials)))
+            .group_by(CreditUsageLog.workspace_id)
+            .order_by(func.sum(CreditUsageLog.total_credit).desc())
+        )).all()
 
     return [
         {
@@ -347,6 +381,20 @@ async def usage_by_source(
             "last_used": r.last_used.isoformat() if r.last_used else None,
         }
         for r in rows
+    ] + [
+        {
+            "source": TRIAL_USAGE_SOURCE,
+            "label": trial_usage_label(trials[r.workspace_id]),
+            "trial_name": trials[r.workspace_id],
+            "workspace_id": r.workspace_id,
+            "request_count": r.request_count or 0,
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "credit_used": int(r.credit_used or 0),
+            "last_used": r.last_used.isoformat() if r.last_used else None,
+        }
+        for r in trial_rows
     ]
 
 

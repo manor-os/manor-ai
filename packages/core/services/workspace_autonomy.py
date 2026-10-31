@@ -21,13 +21,31 @@ class WorkspaceAutonomyFields(Protocol):
     deleted_at: datetime | None
 
 
-def workspace_allows_manual_work(workspace: WorkspaceAutonomyFields | None) -> bool:
-    """Pausing autonomy does not disable user-directed Workspace work."""
+def workspace_allows_configured_work(workspace: WorkspaceAutonomyFields | None) -> bool:
+    """An available Workspace can run deployed work with its own lifecycle.
+
+    This is only a lifecycle check; callers still enforce actor, deployment,
+    run-origin, readiness, approval and credit boundaries.
+    """
     return bool(
         workspace is not None
         and workspace.deleted_at is None
         and workspace.status in {"active", "paused"}
     )
+
+
+def workspace_allows_manual_work(workspace: WorkspaceAutonomyFields | None) -> bool:
+    """Pausing autonomy does not disable user-directed Workspace work."""
+    return workspace_allows_configured_work(workspace)
+
+
+def scheduled_job_is_independent(execution_type: str | None) -> bool:
+    """Deployed Workflows and collectors own their enabled state.
+
+    Goal-linked collector schedules are additionally reconciled by the Goal
+    runtime; Strategist, Goal and initiative drivers remain autonomy-owned.
+    """
+    return execution_type in {"workflow", "workspace_stat_collection"}
 
 
 def resolve_workspace_autonomy_state(

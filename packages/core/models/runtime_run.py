@@ -44,6 +44,12 @@ class SandboxReservationStatus(str, Enum):
     CANCELLED = "cancelled"
     EXPIRED = "expired"
     FAILED = "failed"
+    # A run parked on a command waiting for one of its sandbox's execution
+    # slots (not a container allocation: no scheduler sweep ever claims it).
+    EXEC_WAITING = "exec_waiting"
+    # The command left the slot queue (started, finished, or can no longer
+    # start): the run may resume and collect it.
+    EXEC_READY = "exec_ready"
 
     @classmethod
     def terminal(cls) -> frozenset[str]:

@@ -273,6 +273,7 @@ class ResourcePermissionGate:
             folder_ids={str(folder.id) for folder in entity_folders},
             _actor=actor,
         )
+        await access_context.preload_folder_workspace_access(db)
         readable_folders: list[DocumentFolder] = []
         for folder in entity_folders:
             workspace_ids = access_context.folder_workspace_ids(folder.id)

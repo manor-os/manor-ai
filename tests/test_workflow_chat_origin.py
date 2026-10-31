@@ -129,10 +129,20 @@ async def test_personal_workflow_update_notification_carries_entity_scope(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize(
+    ("read_only", "review", "projected_read_only"),
+    [
+        (False, "{{topic_brief}}", False),
+        (True, "{{topic_brief}}", True),
+        # A review assembled from several variables cannot be written back.
+        (False, {"brief": "{{topic_brief}}"}, True),
+    ],
+)
 async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
     db_session,
     read_only,
+    review,
+    projected_read_only,
 ) -> None:
     entity_id = generate_ulid()
     user_id = generate_ulid()
@@ -163,7 +173,7 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
                     "options": ["approve", "cancel"],
                     "response_variable": "topic_decision",
                     "review_title": "Review Topic Brief",
-                    "review": "{{topic_brief}}",
+                    "review": review,
                     "review_read_only": read_only,
                 },
                 "next": [],
@@ -229,9 +239,12 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
     assert approval.message_kind == "hitl_request"
     assert approval.pending_action["workflow_run_id"] == run.id
     assert approval.pending_action["step_id"] == "approve_topic"
-    assert approval.pending_action["review"] == {"title": "A grounded topic"}
-    assert approval.pending_action.get("review_read_only", False) is read_only
-    assert approval.meta["hitl_requests"][0]["review_read_only"] is read_only
+    assert approval.pending_action["review"] == (
+        {"title": "A grounded topic"} if isinstance(review, str)
+        else {"brief": {"title": "A grounded topic"}}
+    )
+    assert approval.pending_action.get("review_read_only", False) is projected_read_only
+    assert approval.meta["hitl_requests"][0]["review_read_only"] is projected_read_only
     assert approval.meta["hitl_requests"][0]["workflow"]["id"] == workflow.id
 
 
@@ -239,12 +252,15 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
     ("choice", "approved"),
     [("approve", True), ("leave_unpublished", False)],
 )
+# A review assembled from several variables is read-only; returning it as shown still decides.
+@pytest.mark.parametrize("review", ["{{publication_review}}", {"video": "{{publication_review}}"}])
 @pytest.mark.asyncio
 async def test_variable_backed_video_review_resumes_non_cancel_decisions(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
     choice: str,
     approved: bool,
+    review,
 ) -> None:
     entity_id = generate_ulid()
     user_id = generate_ulid()
@@ -304,7 +320,7 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
                     ],
                     "approval_values": ["approve"],
                     "response_variable": "video_decision",
-                    "review": "{{publication_review}}",
+                    "review": review,
                 },
                 "next": ["done"],
             },
@@ -375,7 +391,7 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
     action_message = json.dumps({
         "hitl_id": approval.id,
         "action": choice,
-        "payload": {"review": publication_review},
+        "payload": {"review": approval.pending_action["review"]},
     })
     assert await chat_hitl_action_is_pending(
         db_session,

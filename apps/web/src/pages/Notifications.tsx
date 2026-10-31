@@ -39,6 +39,7 @@ import {
   IconReport,
   IconSend,
   IconServer,
+  IconShare,
   IconSettings,
   IconSparkles,
   IconTimeline,
@@ -83,10 +84,13 @@ const TYPE_ICONS: Record<string, ComponentType<IconProps>> = {
   workspace_setup_required: IconConnection,
   system_health: IconServer,
   daily_briefing: IconReport,
+  workspace_digest: IconReport,
+  integration_account_issue: IconWarning,
   system: IconSettings,
   warning: IconWarning,
   team_invite_received: IconUsers,
   team_invite_sent: IconSend,
+  integration_shared: IconShare,
   error: IconError,
 };
 
@@ -118,10 +122,13 @@ const TYPE_LABELS: Record<string, string> = {
   workspace_setup_required: "Workspace setup",
   system_health: "System health",
   daily_briefing: "Daily briefing",
+  workspace_digest: "Daily digest",
+  integration_account_issue: "Account needs attention",
   system: "System",
   warning: "Warning",
   team_invite_received: "Team invitation",
   team_invite_sent: "Invitation sent",
+  integration_shared: "Account shared",
   error: "Error",
 };
 

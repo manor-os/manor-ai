@@ -9,7 +9,7 @@
  *
  * Used by: EmbeddedChat, FloatingChat, WorkspaceChat
  */
-import { useEffect, useState, useRef, useId } from "react";
+import { useCallback, useEffect, useState, useRef, useId } from "react";
 import {
   friendlyApprovalActionLabel,
   friendlyApprovalDescription,
@@ -18,9 +18,12 @@ import {
   structuredApprovalCopy,
 } from "../../lib/approvalCopy";
 import { t } from "../../lib/i18n";
+import { appPath } from "../../embed/embedContext";
+import ChatMarkdown from "../ChatMarkdown";
 import Chip from "./Chip";
 import AnchoredPopover from "./AnchoredPopover";
 import HitlKnowledgePicker from "./HitlKnowledgePicker";
+import InAppActionLink from "./InAppActionLink";
 import Input from "./Input";
 import Modal from "./Modal";
 import Select from "./Select";
@@ -46,7 +49,10 @@ import {
   workflowSchemaType,
   type WorkflowInputSchema,
 } from "../workflows/WorkflowSchemaFields";
-import WorkflowApprovalReview from "../workflows/WorkflowApprovalReview";
+import WorkflowApprovalReview, { ApprovalChangePreview } from "../workflows/WorkflowApprovalReview";
+import WorkflowInputSuggestions from "../workflows/WorkflowInputSuggestions";
+import InlineFileReferenceCard from "../InlineFileReferenceCard";
+import { entityStoragePath } from "../../lib/fileReferences";
 import ApprovalSaveRuleAction from "../approvals/ApprovalSaveRuleAction";
 import {
   proposalApprovedRowIds,
@@ -86,6 +92,8 @@ export interface Resolution {
   choice: string;
   note?: string;
   payload?: Record<string, any>;
+  /** Set by approvals whose effect is a delivery (external replies). */
+  delivery_outcome?: "sent" | "unknown" | "not_sent" | string;
 }
 
 type ApprovalTone = "approve" | "always" | "reject" | "secondary";
@@ -207,31 +215,46 @@ export function CardOriginLink({ taskId }: { taskId?: string | null }) {
   const id = String(taskId || "").trim();
   if (!id) return null;
   return (
-    <a className="chat-hitl-origin-link" href={`/tasks/${id}`}>
+    <a className="chat-hitl-origin-link" href={appPath(`/tasks/${id}`)}>
       {t("component.chat_action_card.view_task")}
     </a>
   );
 }
 
+/** The task id of a "/tasks/<id>" route; "" for any other link. */
+function taskIdFromRoute(link: string | null | undefined): string {
+  const match = String(link || "").split(/[?#]/)[0].match(/^\/?tasks\/([^/]+)\/?$/);
+  return match ? match[1] : "";
+}
+
+/** A record id (ULID / UUID) names nothing a person can read. */
+const RECORD_ID_SEGMENT = /^(?:[0-9a-z]{26}|[0-9a-f]{8}-[0-9a-f-]{27})$/i;
+
 /** Human label for an in-app route: "/integrations" → "Open integrations". */
-function routeLinkLabel(link: string): string {
-  const segment = String(link || "")
+export function routeLinkLabel(link: string): string {
+  if (taskIdFromRoute(link)) return t("component.chat_action_card.view_task");
+  const segments = String(link || "")
     .split(/[?#]/)[0]
     .split("/")
-    .filter(Boolean)
-    .pop();
+    .filter(Boolean);
+  const last = segments.pop();
+  // "/things/<id>" opens one thing: label it by its collection, not its id.
+  const segment = last && RECORD_ID_SEGMENT.test(last) ? segments.pop() : last;
   const name = segment ? humanizeKey(segment).toLowerCase() : "";
   return name
     ? t("component.chat_action_card.open_route").replace("{name}", name)
     : t("component.chat_action_card.open_link");
 }
 
-export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, content, argsPreview, operation, hitlType, payload, taskId }: {
+export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, pathsFromText = false, content, argsPreview, operation, hitlType, payload, taskId }: {
   prompt?: string;
   action?: string;
   tool?: string;
   hasWorkspace?: boolean;
+  /** The request's own `paths`: entity storage paths, opened as such. */
   paths?: string[];
+  /** `paths` were scraped from message text, so are never trusted. */
+  pathsFromText?: boolean;
   content?: unknown;
   argsPreview?: unknown;
   operation?: unknown;
@@ -260,6 +283,11 @@ export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, con
   if (structured) {
     // Typed card: say what this is, why, and what to do — in the request's
     // own words, with shared display formatting applied to internal labels.
+    // An action link to this card's own task already is its origin link.
+    const linkedTaskId = taskIdFromRoute(structured.actionLink).toLowerCase();
+    const originTaskId = linkedTaskId && linkedTaskId === String(taskId || "").trim().toLowerCase()
+      ? null
+      : taskId;
     return (
       <div className="chat-hitl-summary">
         <div className="chat-hitl-title">{structured.headline}</div>
@@ -273,12 +301,8 @@ export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, con
           </div>
         )}
         <div className="chat-hitl-links">
-          {structured.actionLink && (
-            <a className="chat-hitl-action-link" href={structured.actionLink}>
-              {routeLinkLabel(structured.actionLink)}
-            </a>
-          )}
-          <CardOriginLink taskId={taskId} />
+          {structured.actionLink && <InAppActionLink link={structured.actionLink} />}
+          <CardOriginLink taskId={originTaskId} />
         </div>
       </div>
     );
@@ -299,7 +323,10 @@ export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, con
   // Only ever surface genuine human-readable text. Never dump the raw action
   // payload (tool keys, internal operation objects) into the chat.
   const rawContent = content ?? argsPreview ?? operation;
-  const contentText = typeof rawContent === "string" ? previewText(rawContent) : null;
+  // Some requests repeat the target path as their content; that is not content.
+  const contentText = typeof rawContent === "string" && !shownPaths.includes(rawContent.trim())
+    ? previewText(rawContent)
+    : null;
   return (
     <div className="chat-hitl-summary">
       <div className="chat-hitl-title">
@@ -313,12 +340,25 @@ export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, con
       )}
       {previewPaths.length > 0 && (
         <div className="chat-hitl-paths" aria-label={t("component.chat_action_card.files_requiring_approval")}>
-          {previewPaths.map((path) => (
-            <code key={path}>{pathLabel(path)}</code>
-          ))}
+          {previewPaths.map((path) => {
+            if ([".", "./", "/"].includes(path)) return <code key={path}>{pathLabel(path)}</code>;
+            // Approval paths are storage paths, which free-text file detection
+            // refuses; without trust the chip did nothing when clicked.
+            const storagePath = pathsFromText ? "" : entityStoragePath(path);
+            return (
+              <InlineFileReferenceCard
+                key={path}
+                reference={storagePath || path}
+                label={path.split("/").pop() || path}
+                trustedReference={Boolean(storagePath)}
+                compact
+              />
+            );
+          })}
           {remainingPathCount > 0 && <span>{t("component.chat_action_card.more_count").replace("{count}", String(remainingPathCount))}</span>}
         </div>
       )}
+      {!contentText && argsPreview != null && <ApprovalChangePreview argsPreview={argsPreview} />}
       {taskId && (
         <div className="chat-hitl-links">
           <CardOriginLink taskId={taskId} />
@@ -476,7 +516,7 @@ export function WorkspaceOperationReviewCard({ action, onResolve, disabled }: {
             names: disconnectedIntegrations.map(humanizeKey).join(", "),
           })}</strong>
           <div>{t("component.chat_action_card.integration_connect_hint")}</div>
-          <a href="/integrations">{t("component.chat_action_card.open_integrations")}</a>
+          <a href={appPath("/integrations")}>{t("component.chat_action_card.open_integrations")}</a>
         </div>
       )}
       {otherErrors.length > 0 && (
@@ -1276,11 +1316,7 @@ export function HitlErrorCard({ action, onResolve, disabled, hasTaskReference }:
             disabled={disabled}
           />
         )}
-        {hasSeparateActionLink && (
-          <a className="chat-hitl-action-link" href={actionLink}>
-            {routeLinkLabel(actionLink)}
-          </a>
-        )}
+        {hasSeparateActionLink && <InAppActionLink link={actionLink} />}
         {!hasTaskReference && <CardOriginLink taskId={action.task_id} />}
       </div>
     </div>
@@ -1387,6 +1423,7 @@ type WorkflowStarterInput = {
   default?: unknown;
   description?: string;
   schema?: WorkflowInputSchema;
+  suggestions?: string[];
 };
 
 function formatWorkflowInputValue(value: unknown, type: string): string {
@@ -1409,6 +1446,7 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
       item && typeof item === "object" && String((item as WorkflowStarterInput).key || "").trim(),
     ));
   const visibleInputs = inputs.filter((input) => !input.hidden);
+  const starterWorkflowId = typeof action.workflow_id === "string" ? action.workflow_id : undefined;
   const structuredInputs = visibleInputs.filter((input) => Boolean(input.schema));
   const useUnifiedSchemaGrid = structuredInputs.length > 0
     && structuredInputs.length === visibleInputs.length;
@@ -1420,6 +1458,9 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
         ...(input.schema || {}),
         title: input.label || input.schema?.title || humanizeKey(input.key),
         description: input.description || input.schema?.description,
+        ...(input.suggestions?.length
+          ? { "x-ui": { ...(input.schema?.["x-ui"] || {}), suggestions: input.suggestions } }
+          : {}),
       },
     ])),
     required: structuredInputs.filter((input) => input.required).map((input) => input.key),
@@ -1435,8 +1476,23 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
         : formatWorkflowInputValue(initialValues[input.key] ?? input.default, input.type || "string"),
     ]),
   ));
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [fileBusy, setFileBusy] = useState(false);
+  // Choices named in Chat that the input does not offer, shown where the person picks.
+  const [errors, setErrors] = useState<Record<string, string>>(() => Object.fromEntries(
+    Object.entries(asRecord(action.input_notes) || {})
+      .filter(([, note]) => typeof note === "string")
+      .map(([key, note]) => [key, String(note)]),
+  ));
+  const [busyFieldKeys, setBusyFieldKeys] = useState<Set<string>>(() => new Set());
+  const setFileBusy = useCallback((rootKey: string, busy: boolean) => {
+    setBusyFieldKeys((current) => {
+      if (current.has(rootKey) === busy) return current;
+      const next = new Set(current);
+      if (busy) next.add(rootKey);
+      else next.delete(rootKey);
+      return next;
+    });
+  }, []);
+  const fileBusy = busyFieldKeys.size > 0;
 
   const submit = () => {
     if (fileBusy) return;
@@ -1510,7 +1566,8 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
               errors={errors}
               disabled={disabled}
               workspaceId={workspaceId}
-              onFileBusyChange={setFileBusy}
+              workflowId={starterWorkflowId}
+              onFileBusyChange={(busy) => setFileBusy("unified", busy)}
               onChange={(path, nextValue) => {
                 setValues((current) => (
                   setWorkflowValueAtPath(current, path, nextValue) as Record<string, unknown>
@@ -1525,7 +1582,10 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
           {!useUnifiedSchemaGrid && visibleInputs.map((input) => {
             const type = input.type || "string";
             const id = `workflow-starter-input-${input.key}`;
-            if (input.schema?.["x-ui"]?.control === "knowledge_file") {
+            const ownControl = input.schema?.["x-ui"]?.control;
+            // Controls with their own picker (files, records, time zones, dates) render through the shared schema field.
+            if (input.schema && (ownControl === "knowledge_file" || ownControl === "record_select" || ownControl === "timezone"
+              || input.schema.format === "date" || input.schema.format === "date-time")) {
               return <WorkflowSchemaFields
                 key={input.key}
                 rootKey=""
@@ -1542,7 +1602,8 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
                 errors={errors}
                 disabled={disabled}
                 workspaceId={workspaceId}
-                onFileBusyChange={setFileBusy}
+                workflowId={starterWorkflowId}
+                onFileBusyChange={(busy) => setFileBusy(`input:${input.key}`, busy)}
                 onChange={(path, nextValue) => {
                   setValues((current) => setWorkflowValueAtPath(current, path, nextValue) as Record<string, unknown>);
                   setErrors((current) => ({ ...current, [workflowInputErrorPath("", path)]: "" }));
@@ -1563,6 +1624,7 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
                     errors={errors}
                     disabled={disabled}
                     workspaceId={workspaceId}
+                    onFileBusyChange={(busy) => setFileBusy(`input:${input.key}`, busy)}
                     onChange={(path, nextValue) => {
                       setValues((current) => ({
                         ...current,
@@ -1577,12 +1639,13 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
                 </div>
               );
             }
-            return (
+            const field = (
               <label key={input.key} className="workflow-starter-input-field" htmlFor={id}>
                 <span>
                   {input.label || humanizeKey(input.key)}
                   {input.required ? " *" : ""}
                 </span>
+                {input.description && <small className="workflow-starter-input-help">{input.description}</small>}
                 {type === "boolean" ? (
                   <input
                     type="checkbox"
@@ -1612,6 +1675,20 @@ function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, su
                 {errors[input.key] && <small>{errors[input.key]}</small>}
               </label>
             );
+            if (disabled || type !== "string" || !input.suggestions?.length) return field;
+            return (
+              <div key={input.key} className="workflow-starter-input-field-group">
+                {field}
+                <WorkflowInputSuggestions
+                  suggestions={input.suggestions}
+                  value={values[input.key]}
+                  onPick={(suggestion) => {
+                    setValues((current) => ({ ...current, [input.key]: suggestion }));
+                    setErrors((current) => ({ ...current, [input.key]: "" }));
+                  }}
+                />
+              </div>
+            );
           })}
           <div className="workflow-starter-input-actions">
             <button type="button" className="chat-hitl-btn-secondary" onClick={() => onResolve("cancel")} disabled={disabled}>
@@ -1634,15 +1711,19 @@ function WorkflowRetryCard({ action, onResolve, disabled, workspaceId }: {
   workspaceId?: string;
 }) {
   const schema = asRecord(action.editable_input_schema) as WorkflowInputSchema | null;
+  // Segments to redo go back only to a Flow whose retry form asks for them; any other
+  // Flow rejects variables it does not declare.
   const suppliedValues = {
     ...(asRecord(action.values) || {}),
-    retry_segment_ids: action.retry_segment_ids || (asRecord(action.values) || {}).retry_segment_ids,
+    ...(schema?.properties?.retry_segment_ids
+      ? { retry_segment_ids: action.retry_segment_ids || (asRecord(action.values) || {}).retry_segment_ids }
+      : {}),
   };
   const [values, setValues] = useState<unknown>(() => (
     schema ? workflowSchemaDraft(schema, suppliedValues) : {}
   ));
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const retryFrom = String(action.retry_from_step_id || action.step_id || "").trim();
+  const retryFrom = String(action.retry_from_step_name || action.retry_from_step_id || action.step_id || "").trim();
   const observedProblems = Array.isArray(action.observed_problem)
     ? stringList(action.observed_problem)
     : [];
@@ -1712,8 +1793,44 @@ function WorkflowRetryCard({ action, onResolve, disabled, workspaceId }: {
   );
 }
 
-export function HitlInputCard({ action, onResolve, placeholder, disabled, resetToken, showSkip = true }: {
+/** What an input card asks, in the asker's own words.
+ *
+ *  `payload.why` is not shown: the record layer requires one, so producers
+ *  fill it from the asker's context or justification and otherwise with a
+ *  stock line ("The agent needs this to finish the task.") that tells the
+ *  person nothing the card does not already say. */
+function inputCardCopy(action?: PendingAction): { question: string; context: string } {
+  const payload = asRecord(action?.payload);
+  const question = typeof payload?.question === "string"
+    ? payload.question.trim()
+    : typeof action?.prompt === "string" ? action.prompt.trim() : "";
+  const justification = asRecord(payload?.justification);
+  const context = [payload?.context, justification?.why_human_required]
+    .find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+  return { question, context: context ? context.trim() : "" };
+}
+
+/** Past this a question is a paragraph: it reads at body weight, not bold. */
+const LONG_QUESTION_CHARS = 140;
+
+function InputQuestionSummary({ question, context }: { question: string; context: string }) {
+  if (!question && !context) return null;
+  const long = question.length > LONG_QUESTION_CHARS || question.includes("\n");
+  return (
+    <div className="chat-hitl-summary">
+      {question && (
+        <div className={`chat-hitl-title${long ? " chat-hitl-title--long" : ""}`}>
+          <ChatMarkdown content={question} />
+        </div>
+      )}
+      {context && <div className="chat-hitl-description">{context}</div>}
+    </div>
+  );
+}
+
+export function HitlInputCard({ action, onResolve, placeholder, disabled, resetToken, showSkip = true, workspaceId }: {
   action?: PendingAction;
+  workspaceId?: string;
   onResolve: (
     choice: string,
     note?: string,
@@ -1734,12 +1851,7 @@ export function HitlInputCard({ action, onResolve, placeholder, disabled, resetT
   // Keep the note and File objects while a failed upload/resolve becomes retryable.
   useEffect(() => { setSubmitting(false); }, [resetToken]);
   const inputPayload = asRecord(action?.payload);
-  const question = typeof inputPayload?.question === "string"
-    ? inputPayload.question.trim()
-    : typeof action?.prompt === "string" ? action.prompt.trim() : "";
-  const context = typeof inputPayload?.context === "string"
-    ? inputPayload.context.trim()
-    : typeof inputPayload?.why === "string" ? inputPayload.why.trim() : "";
+  const { question, context } = inputCardCopy(action);
   // Inline metadata HITL synthesizes approval options without a Task/Step
   // origin. Only persisted input cards may use their top-level options.
   const rawOptions = inputPayload?.options
@@ -1781,12 +1893,7 @@ export function HitlInputCard({ action, onResolve, placeholder, disabled, resetT
 
   return (
     <div className="chat-hitl-input-card">
-      {(question || context) && (
-        <div className="chat-hitl-summary">
-          {question && <div className="chat-hitl-title">{question}</div>}
-          {context && <div className="chat-hitl-description">{context}</div>}
-        </div>
-      )}
+      <InputQuestionSummary question={question} context={context} />
       {options.length > 0 && (
         <div className="chat-hitl-input-options" role="group" aria-label={question || t("component.chat_action_card.type_your_response")}>
           {options.map((option) => (
@@ -1900,6 +2007,7 @@ export function HitlInputCard({ action, onResolve, placeholder, disabled, resetT
             : [...current, { id: document.id, name: document.name, type: "knowledge" }])}
           onClose={() => setKnowledgeOpen(false)}
           restoreFocus={() => attachButtonRef.current?.focus()}
+          workspaceId={workspaceId}
         />
       )}
     </div>
@@ -2149,6 +2257,12 @@ function ResolvedActionSummary({ action, hasTaskReference }: { action: PendingAc
     );
   }
 
+  if (action.kind === PendingActionKind.HUMAN_INPUT) {
+    // Answered: what was asked, not the call to answer it.
+    const { question, context } = inputCardCopy(action);
+    if (question || context) return <InputQuestionSummary question={question} context={context} />;
+  }
+
   if (
     action.prompt ||
     action.action ||
@@ -2179,48 +2293,65 @@ function ResolvedActionSummary({ action, hasTaskReference }: { action: PendingAc
   return null;
 }
 
+function deliveryOutcomeLabel(resolution: Resolution): string {
+  const outcome = String(resolution.delivery_outcome || "");
+  if (outcome === "sent") return t("component.chat_action_card.delivery_sent");
+  if (outcome === "unknown") return t("component.chat_action_card.delivery_unknown");
+  if (outcome === "not_sent") return t("component.chat_action_card.delivery_not_sent");
+  return "";
+}
+
+function ResolvedCheckIcon() {
+  return (
+    <svg className="chat-hitl-resolved-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M5 12.5l4.5 4.5L19 7.5" />
+    </svg>
+  );
+}
+
+/** An answered card's options collapse into this one line inside the same
+ * bubble: "You chose “Approve” · Sent". No separate receipt is posted. */
 export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?: string }) {
   const choice = resolution.choice || "";
   const tone = approvalTone(choice);
   const normalized = normalizeChoice(choice);
-  const isRetry = normalized === "retry" || normalized === "retry_now";
-  const isSkipped = normalized === "skip";
-  const isCancelled = normalized === "cancel" || normalized === "stopped";
   const isApprove = tone === "approve" || tone === "always";
-  const isFeedback = normalized === "feedback";
-  const isRespond = ["respond", "provide_answers", "submit"].includes(normalized);
-  const isReject = tone === "reject";
-  const isRevise = normalized === "revise" || normalized === "request_changes";
-  const isNeutral = !isApprove && !isReject && !isFeedback && !isRespond && !isCancelled;
-
-  const label = normalized === "superseded" ? t("component.chat_action_card.superseded")
+  const isReply = ["respond", "provide_answers", "submit", "feedback"].includes(normalized);
+  const isReject = tone === "reject" && normalized !== "stopped";
+  const isPersonChoice = isApprove || isReject || [
+    "retry", "retry_now", "cancel", "revise", "request_changes",
+  ].includes(normalized);
+  // Closed by the system, or a choice this card does not know: never claim
+  // that someone approved it.
+  const systemStatus = normalized === "superseded" ? t("component.chat_action_card.superseded")
     : normalized === "expired" ? t("component.chat_action_card.expired")
-    : isRetry ? t("component.chat_action_card.retry_requested")
-    : isCancelled ? t("component.status.cancelled")
-    : isSkipped ? t("component.chat_action_card.skipped")
-    : isRevise ? t("component.chat_action_card.revision_requested")
-    : isFeedback ? t("component.chat_action_card.feedback_sent")
-    : isRespond ? t("component.chat_action_card.responded")
-    : tone === "always" ? t("component.chat_action_card.always_approved")
-    : isApprove ? (normalized === "approve_selected" ? t("component.chat_action_card.partially_approved") : t("component.chat_action_card.approved"))
-    : isReject ? t("component.chat_action_card.rejected")
-    : t("component.chat_action_card.status_unknown");
-  const variant = isNeutral
+    : normalized === "stopped" ? t("component.status.cancelled")
+    : !isReply && !isPersonChoice ? t("component.chat_action_card.status_unknown")
+    : "";
+
+  const label = systemStatus
+    || (isReply
+      ? by
+        ? t("component.chat_action_card.someone_replied", { name: by })
+        : t("component.chat_action_card.you_replied")
+      : by
+        ? t("component.chat_action_card.someone_chose", { name: by, choice: approvalLabel(choice) })
+        : t("component.chat_action_card.you_chose", { choice: approvalLabel(choice) }));
+  const variant = systemStatus
     ? "chat-hitl-resolved--revised"
-    : (isApprove || isFeedback || isRespond)
+    : (isApprove || isReply)
       ? "chat-hitl-resolved--approved"
-      : "chat-hitl-resolved--rejected";
-  const icon = isRevise ? "↻ " : isNeutral ? "— " : (isApprove || isFeedback || isRespond) ? "✓ " : "✗ ";
+      : isReject
+        ? "chat-hitl-resolved--rejected"
+        : "chat-hitl-resolved--revised";
+  const outcome = deliveryOutcomeLabel(resolution);
 
   return (
     <div className={`chat-hitl-resolved ${variant}`}>
-      {icon}{label}
-      {by && (
-        <span className="chat-hitl-resolved-by">
-          {" "}{t("component.chat_action_card.resolved_by").replace("{name}", by)}
-        </span>
-      )}
-      {resolution.note && <span className="chat-hitl-resolved-note"> — {resolution.note}</span>}
+      {systemStatus ? <span className="chat-hitl-resolved-icon" aria-hidden="true">—</span> : <ResolvedCheckIcon />}
+      <span className="chat-hitl-resolved-label">{label}</span>
+      {outcome && <span className="chat-hitl-resolved-outcome"> · {outcome}</span>}
+      {resolution.note && <span className="chat-hitl-resolved-note"> · {resolution.note}</span>}
     </div>
   );
 }
@@ -2248,19 +2379,10 @@ export function ProposalResolution({ action, resolution, by }: {
     resolution,
     rows.map((row) => row.id),
   ) || new Set<string>();
-  const isApproval = normalized.includes("approve");
 
   return (
     <div className="chat-proposal-resolution">
-      <div className={`chat-hitl-resolved ${isApproval ? "chat-hitl-resolved--approved" : "chat-hitl-resolved--rejected"}`}>
-        {isApproval ? "✓ " : "✗ "}
-        {t("component.chat_action_card.proposal_decision")}
-        {by && (
-          <span className="chat-hitl-resolved-by">
-            {" "}{t("component.chat_action_card.resolved_by").replace("{name}", by)}
-          </span>
-        )}
-      </div>
+      <ResolvedBadge resolution={{ ...resolution, note: undefined }} by={by} />
       <ul className="chat-proposal-resolution-details">
         {rows.map((row) => {
           const approved = approvedIds.has(row.id);
@@ -2292,14 +2414,14 @@ export function ProposalResolution({ action, resolution, by }: {
 
 /* ── Composite: renders the right card based on pending_action ── */
 
-export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, currentUserName, resetToken, proposalSelectedRowIds, onProposalSelectedRowIdsChange, proposalRowsRenderedElsewhere, workspaceId, hasTaskReference }: {
+export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, resetToken, proposalSelectedRowIds, onProposalSelectedRowIdsChange, proposalRowsRenderedElsewhere, workspaceId, hasTaskReference }: {
   action: PendingAction;
   resolved?: boolean;
   resolution?: Resolution | null;
   disabled?: boolean;
   /** Display name of whoever resolved this action (from the server). */
   resolvedByName?: string;
-  /** Fallback name shown for an optimistic local resolution (the viewer). */
+  /** Kept for callers; the viewer's own choice always reads "You chose". */
   currentUserName?: string;
   /** Increment after a failed request so an optimistic action becomes interactive again. */
   resetToken?: number;
@@ -2346,9 +2468,8 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   };
 
   if (effectiveResolution) {
-    // Server-provided resolver wins; an optimistic local resolution is always
-    // the current viewer.
-    const by = resolvedByName || (localResolution ? currentUserName : undefined);
+    // Another person's choice names them; the viewer's own reads "You chose".
+    const by = resolvedByName;
     if (action.kind === PendingActionKind.APPROVE_PROPOSALS) {
       return <ProposalResolution action={action} resolution={effectiveResolution} by={by} />;
     }
@@ -2378,7 +2499,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   }
 
   if (action.kind === PendingActionKind.HUMAN_INPUT) {
-    return <HitlInputCard action={action} onResolve={resolveOnce} disabled={locked} resetToken={resetToken} showSkip={false} />;
+    return <HitlInputCard action={action} onResolve={resolveOnce} disabled={locked} resetToken={resetToken} showSkip={false} workspaceId={workspaceId} />;
   }
 
   if (action.kind === PendingActionKind.WORKFLOW_STARTER_INPUT) {
@@ -2399,6 +2520,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
         placeholder={typeof action.prompt === "string" ? action.prompt : undefined}
         disabled={locked}
         resetToken={resetToken}
+        workspaceId={workspaceId}
       />
     );
   }

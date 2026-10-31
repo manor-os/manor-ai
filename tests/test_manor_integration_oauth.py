@@ -207,6 +207,7 @@ def _provider_transport(monkeypatch, provider, prefix, owner_id, entity_id):
             return httpx.Response(200, json={
                 "sub": f"{provider}:remote-org:remote-user", "email": "owner@test.com", "name": "Owner",
                 "manor_user_id": owner_id, "manor_entity_id": state["identity_entity"],
+                "grant_status": state.get("grant_status"),
             })
         if request.url.path == "/api/oauth/revoke":
             return httpx.Response(state["revoke_status"], json={"ok": state["revoke_status"] == 200})
@@ -425,6 +426,96 @@ async def test_reconnect_and_duplicate_add_retire_previous_grants(client, monkey
             tokens = lease_oauth_account_tokens(row, requester_id="test", reason="test")
             assert tokens == {"access_token": f"opaque-access-{sequence}", "refresh_token": f"opaque-refresh-{sequence}"}
             assert "pending_revocations" not in json.dumps(row.profile)
+
+
+@pytest.mark.parametrize("provider,prefix", [("manor_pms", "PMS"), ("manor_mcp_minutes", "MINUTES")])
+async def test_unreadable_reconnect_requires_live_provider_retirement_proof(client, monkeypatch, oauth_vault, provider, prefix):
+    import packages.core.database as db_module
+    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+
+    headers, user_id, entity_id = await _owner(client, prefix.lower())
+    seen, remote = _provider_transport(monkeypatch, provider, prefix, user_id, entity_id)
+    callback = f"/api/v1/integrations/oauth/{provider}/callback"
+    state = await _start(client, provider, headers)
+    assert (await client.get(callback, params={"code": "first", "state": state})).status_code == 302
+    async with db_module.async_session() as db:
+        row = (await db.execute(select(OAuthAccount).where(OAuthAccount.user_id == user_id))).scalar_one()
+        row_id = row.id
+        row.credential_ref = "unreadable-original-envelope"
+        row.profile = {**row.profile, "oauth_refresh": {"reauth_required": True, "error": "credential_decrypt_failed"}}
+        await db.commit()
+    # Existing providers without the contract remain disabled; the newly
+    # exchanged grant is retired instead of silently orphaned.
+    state = await _start(client, provider, headers, row_id)
+    failed = await client.get(callback, params={"code": "second", "state": state})
+    assert failed.status_code == 502
+    assert parse_qs(seen[-1].content.decode())["token"] == ["opaque-refresh-2"]
+    async with db_module.async_session() as db:
+        row = await db.get(OAuthAccount, row_id)
+        assert row.credential_ref == "unreadable-original-envelope"
+        assert not manor_oauth.manor_oauth_account_matches(row)
+    remote["grant_status"] = {"version": 1, "grant_id": "fresh-grant", "sole_active_grant": True}
+    state = await _start(client, provider, headers, row_id)
+    connected = await client.get(callback, params={"code": "third", "state": state})
+    assert connected.status_code == 302
+    async with db_module.async_session() as db:
+        row = await db.get(OAuthAccount, row_id)
+        assert manor_oauth.manor_oauth_account_matches(row, entity_id=entity_id)
+        assert lease_oauth_account_tokens(row, requester_id="test", reason="test") == {
+            "access_token": "opaque-access-3", "refresh_token": "opaque-refresh-3",
+        }
+        assert "grant_status" not in row.profile
+
+
+async def test_unreadable_reconnect_retains_both_grants_when_cleanup_is_unavailable(client, monkeypatch, oauth_vault):
+    import packages.core.database as db_module
+    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+
+    provider = "manor_mcp_minutes"
+    headers, user_id, _ = await _owner(client, "unreadable_cleanup")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    _, remote = _provider_transport(monkeypatch, provider, "MINUTES", user_id, me.json()["entity_id"])
+    callback = f"/api/v1/integrations/oauth/{provider}/callback"
+    state = await _start(client, provider, headers)
+    assert (await client.get(callback, params={"code": "first", "state": state})).status_code == 302
+    async with db_module.async_session() as db:
+        row = (await db.execute(select(OAuthAccount).where(OAuthAccount.user_id == user_id))).scalar_one()
+        row_id = row.id
+        row.credential_ref = "unreadable-original-envelope"
+        await db.commit()
+    remote["revoke_status"] = 503
+    state = await _start(client, provider, headers, row_id)
+    assert (await client.get(callback, params={"code": "second", "state": state})).status_code == 502
+    async with db_module.async_session() as db:
+        row = await db.get(OAuthAccount, row_id)
+        assert not manor_oauth.manor_oauth_account_matches(row)
+        tokens = lease_oauth_account_tokens(row, requester_id="test", reason="test")
+        assert tokens["unreadable_credential"]["ref"] == "unreadable-original-envelope"
+        assert tokens["pending_revocations"][0]["refresh_token"] == "opaque-refresh-2"
+        assert "opaque-" not in json.dumps(row.profile)
+    remote["revoke_status"] = 200
+    # Cleaning the readable new grant must not delete the unreadable old one.
+    assert (await client.delete(f"/api/v1/integrations/mcp-servers/{provider}/connections/{row_id}", headers=headers)).status_code == 502
+
+
+async def test_grant_retirement_receipt_rejects_other_identity_and_stale_metadata(monkeypatch):
+    row = SimpleNamespace(provider="manor_mcp_minutes", user_id="owner", provider_user_id="subject", profile={
+        "manor_oauth": {"version": 1, "issuer": "https://application.example", "subject": "subject", "user_id": "owner", "entity_id": "entity"},
+    })
+    _, remote = _provider_transport(monkeypatch, row.provider, "MINUTES", row.user_id, "entity")
+    row.provider_user_id = row.profile["manor_oauth"]["subject"] = f"{row.provider}:remote-org:remote-user"
+    for receipt in (None, {"version": 1, "grant_id": "new", "sole_active_grant": False}, {"version": True, "grant_id": "new", "sole_active_grant": True}):
+        remote["grant_status"] = receipt
+        assert not await manor_oauth._provider_confirms_previous_grants_retired(row, "fresh-access")
+    remote["grant_status"] = {"version": 1, "grant_id": "new", "sole_active_grant": True}
+    remote["identity_entity"] = "another-entity"
+    assert not await manor_oauth._provider_confirms_previous_grants_retired(row, "fresh-access")
+    remote["identity_entity"] = "entity"
+    row.profile["manor_oauth"]["issuer"] = "https://old.example"
+    assert not await manor_oauth._provider_confirms_previous_grants_retired(row, "fresh-access")
+    row.profile["manor_oauth"]["issuer"] = "https://application.example"
+    row.profile["oauth_disconnect"] = {"status": "pending"}
+    assert not await manor_oauth._provider_confirms_previous_grants_retired(row, "fresh-access")
 
 
 @pytest.mark.parametrize("provider,prefix", [("manor_pms", "PMS"), ("manor_mcp_minutes", "MINUTES")])

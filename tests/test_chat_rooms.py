@@ -21,6 +21,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document
 from packages.core.models.notification import Notification
 from packages.core.models.permission import Capability, GrantStatus, ResourceGrant, ResourceType, SubjectType
+from packages.core.models.staff import Staff
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.user_session import UserSessionLease, UserSessionLog
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
@@ -128,11 +129,18 @@ async def test_group_reply_and_other_sender_reactions_are_scoped(client: AsyncCl
     guest_headers, guest = await _register(client, "reply_reaction_guest")
     outsider_headers, _ = await _register(client, "reply_reaction_outsider")
     owner_avatar = f"/api/v1/fs/{owner['entity_id']}/avatars/owner.png"
-    guest_avatar = f"/api/v1/fs/{guest['entity_id']}/avatars/guest.png"
+    guest_avatar = f"/api/v1/fs/{guest['entity_id']}/avatars/guest-team-photo.png"
     owner_user = (await db_session.execute(select(User).where(User.id == owner["id"]))).scalar_one()
     guest_user = (await db_session.execute(select(User).where(User.id == guest["id"]))).scalar_one()
     owner_user.avatar_url = owner_avatar
-    guest_user.avatar_url = guest_avatar
+    # The guest's only photo is on their team page; the old generated placeholder never wins.
+    guest_user.avatar_url = (
+        "https://api.dicebear.com/9.x/initials/svg?seed=0a1b2c3d"
+        "&backgroundColor=0f766e,14b8a6,0d9488,0ea5e9,6366f1,8b5cf6"
+    )
+    db_session.add(Staff(
+        entity_id=guest["entity_id"], user_id=guest["id"], name="Guest", avatar_url=guest_avatar,
+    ))
     await db_session.commit()
     created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
         "kind": "group", "title": "Replies", "owner_scope": "personal",
@@ -644,7 +652,9 @@ async def test_personal_group_ai_execution_audit_is_not_assigned_to_company(clie
 
 
 @pytest.mark.asyncio
-async def test_group_can_copy_own_knowledge_as_room_only_file(client: AsyncClient, db_session, tmp_path, monkeypatch):
+@pytest.mark.parametrize("inline_limit", [100 * 1024 * 1024, 4])
+async def test_group_can_copy_own_knowledge_as_room_only_file(client: AsyncClient, db_session, tmp_path, monkeypatch, inline_limit):
+    monkeypatch.setattr("apps.api.routers.chat_rooms.ROOM_FILE_INLINE_MAX_BYTES", inline_limit)
     owner_headers, owner = await _register(client, "knowledge_room_owner")
     guest_headers, guest = await _register(client, "knowledge_room_guest")
     guest_avatar = f"/api/v1/fs/{guest['entity_id']}/avatars/guest.png"
@@ -1031,7 +1041,8 @@ async def test_group_file_removal_respects_sender_and_manager_roles(client: Asyn
 async def test_group_file_validation_and_scan_failure_create_no_message(client: AsyncClient, db_session, monkeypatch):
     from apps.api.routers import chat_rooms
 
-    assert chat_rooms._ROOM_FILE_MAX_BYTES == 100 * 1024 * 1024
+    assert chat_rooms._ROOM_FILE_MAX_BYTES == 1024 * 1024 * 1024
+    assert chat_rooms._ROOM_FILES_TOTAL_MAX_BYTES == 10 * 1024 * 1024 * 1024
     owner_headers, owner = await _register(client, "file_validation_owner")
     created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
         "kind": "group", "title": "Validation", "owner_scope": "personal",
@@ -1091,11 +1102,60 @@ async def test_group_file_larger_than_old_limit_is_accepted(client: AsyncClient,
 
 
 @pytest.mark.asyncio
+async def test_group_chunk_file_upload_download_and_scan_failure(client: AsyncClient, db_session, monkeypatch):
+    from apps.api.routers import chat_rooms
+
+    monkeypatch.setattr(chat_rooms, "ROOM_FILE_INLINE_MAX_BYTES", 4)
+    monkeypatch.setattr(chat_rooms, "_ROOM_FILE_MAX_BYTES", 11)
+    owner_headers, _ = await _register(client, "file_chunk_owner")
+    outsider_headers, _ = await _register(client, "file_chunk_outsider")
+    created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
+        "kind": "group", "title": "Chunk file", "owner_scope": "personal",
+        "recipient_email": "chunk-guest@example.com",
+    })
+    assert created.status_code == 201, created.text
+    endpoint = f"/api/v1/chat/rooms/{created.json()['id']}/files"
+    scanned = []
+
+    async def scan(source, **kwargs):
+        scanned.append(source.read(11))
+        source.seek(0)
+        return "text/plain"
+
+    monkeypatch.setattr(chat_rooms, "inspect_upload_stream", scan)
+    uploaded = await client.post(endpoint, headers=owner_headers,
+                                 files={"file": ("chunked.txt", b"hello world", "text/plain")})
+    assert uploaded.status_code == 201, uploaded.text
+    assert scanned == [b"hello world"]
+    attachment = uploaded.json()["attachments"][0]
+    stored = await db_session.get(ChatRoomFile, attachment["id"])
+    assert stored.content is None and stored.chunk_count == 1 and stored.content_sha256
+    downloaded = await client.get(attachment["download_url"], headers=owner_headers)
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == b"hello world"
+    assert downloaded.headers["content-length"] == "11"
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert (await client.get(attachment["download_url"], headers=outsider_headers)).status_code == 404
+    assert (await client.post(endpoint, headers=owner_headers,
+                              files={"file": ("oversize.txt", b"hello world!", "text/plain")})).status_code == 413
+
+    async def reject(*args, **kwargs):
+        raise UploadSecurityError("Malware scanner is unavailable", status_code=503)
+
+    monkeypatch.setattr(chat_rooms, "inspect_upload_stream", reject)
+    assert (await client.post(endpoint, headers=owner_headers,
+                              files={"file": ("rejected.txt", b"not clean", "text/plain")})).status_code == 503
+    assert [item["id"] for item in (await client.get(endpoint, headers=owner_headers)).json()] == [attachment["id"]]
+    assert (await client.delete(attachment["download_url"], headers=owner_headers)).status_code == 204
+    assert (await client.get(attachment["download_url"], headers=owner_headers)).status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_group_file_ingress_is_bounded_before_multipart_parse(client: AsyncClient, db_session, monkeypatch):
     from apps.api.middleware.room_file_ingress import ROOM_FILE_BODY_MAX_BYTES
     from apps.api.routers import chat_rooms
 
-    assert ROOM_FILE_BODY_MAX_BYTES == 100 * 1024 * 1024 + 128 * 1024
+    assert ROOM_FILE_BODY_MAX_BYTES == 1024 * 1024 * 1024 + 128 * 1024
 
     owner_headers, _ = await _register(client, "file_ingress_owner")
     created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
@@ -1115,10 +1175,13 @@ async def test_group_file_ingress_is_bounded_before_multipart_parse(client: Asyn
         "Content-Type": "multipart/form-data; boundary=declared",
     }, content=b"x")
     assert declared.status_code == 413, declared.text
+    # Exercise the same receive-side boundary without allocating a GiB fixture.
+    test_body_limit = 4096
+    monkeypatch.setattr("apps.api.middleware.room_file_ingress.ROOM_FILE_BODY_MAX_BYTES", test_body_limit)
 
     async def oversized_chunks():
         yield b"--stream\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\n\r\n"
-        yield b"x" * ROOM_FILE_BODY_MAX_BYTES
+        yield b"x" * test_body_limit
 
     # Streaming content has no Content-Length, so the receive-side count must
     # reject it before Starlette parses/spools the multipart file.
@@ -1142,7 +1205,9 @@ async def test_group_file_ingress_is_bounded_before_multipart_parse(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_group_file_quota_serializes_concurrent_uploads(client: AsyncClient, db_session):
+async def test_group_file_quota_serializes_concurrent_uploads(client: AsyncClient, db_session, monkeypatch):
+    # Scale the ceiling so legacy-sized fixture rows can exercise the race.
+    monkeypatch.setattr("apps.api.routers.chat_rooms._ROOM_FILES_TOTAL_MAX_BYTES", 500 * 1024 * 1024)
     owner_headers, owner = await _register(client, "file_quota_owner")
     created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
         "kind": "group", "title": "Quota", "owner_scope": "personal",

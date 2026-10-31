@@ -767,6 +767,135 @@ async def test_v11_export_selects_exact_safe_knowledge_starter_files(
     assert "unavailable or ineligible" in rejected_response.text
 
 
+async def test_v11_initial_template_authoring_preserves_working_file_and_access(
+    client: AsyncClient, db_session: AsyncSession, tmp_path,
+):
+    headers, _ = await _register(client, "initialtemplate")
+    ws = await _create_workspace(client, headers, "Support queue")
+    workspace = await db_session.get(Workspace, ws["id"])
+    owner = await db_session.scalar(select(User).where(User.entity_id == workspace.entity_id))
+    group = DocumentGroup(
+        id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+        name="Support files", settings={},
+    )
+    working = "ticket_id,status\ncustomer-ticket-123,open\n"
+    file = tmp_path / "queue.csv"
+    file.write_text(working)
+    original_metadata = {"content_text": working, "artifact": {"storage_scope": "artifact"}}
+    document = Document(
+        id=generate_ulid(), entity_id=workspace.entity_id, name="queue.csv",
+        fs_path=str(file), file_size=len(working.encode()), mime_type="text/csv",
+        metadata_=deepcopy(original_metadata), owner_id=owner.id, created_by=owner.id,
+        # A Workspace folder floors its files at internal; the declared
+        # template, not the working file, is what leaves the Workspace.
+        visibility="workspace", classification="internal", pii_detected=False,
+        quarantine_status="clean", is_trashed=False,
+    )
+    db_session.add_all([group, document])
+    await db_session.flush()
+    db_session.add(DocumentGroupMember(document_id=document.id, group_id=group.id))
+    await db_session.commit()
+    url = f"/api/v1/workspaces/{workspace.id}/blueprint-export/knowledge-documents/{document.id}/initial-template"
+    candidates_url = f"/api/v1/workspaces/{workspace.id}/blueprint-export/knowledge-documents"
+    export_url = f"/api/v1/workspaces/{workspace.id}/export-blueprint-payload"
+    export_body = {"knowledge_pack_mode": "inline_text", "knowledge_document_ids": [document.id]}
+    assert (await client.get(candidates_url, headers=headers)).json() == []
+    ineligible = await client.post(export_url, headers=headers, json=export_body)
+    assert ineligible.status_code == 400 and "ineligible" in ineligible.text
+    document.classification = "confidential"
+    await db_session.commit()
+    denied = await client.put(url, headers=headers, json={"body_md": "ticket_id,status\n"})
+    assert denied.status_code == 422
+    document.classification = "internal"
+    await db_session.commit()
+    template_body = "ticket_id,status\n"
+    configured = await client.put(url, headers=headers, json={"body_md": template_body})
+    assert configured.status_code == 200, configured.text
+    assert configured.json()["template"]["mode"] == "initial_file"
+    same = await client.put(url, headers=headers, json={"body_md": template_body})
+    assert same.status_code == 200 and same.json() == configured.json()
+    await db_session.refresh(document)
+    assert document.metadata_["content_text"] == working
+    assert document.metadata_["artifact"] == original_metadata["artifact"]
+    assert document.metadata_["blueprint_initial_body_md"] == template_body
+    assert document.file_size == len(working.encode()) and file.read_text() == working
+    [candidate] = (await client.get(candidates_url, headers=headers)).json()
+    assert candidate["id"] == document.id and candidate["content_source"] == "initial_template"
+    assert candidate["file_size"] == len(template_body.encode())
+    assert "body_md" not in candidate
+    exported = await client.post(export_url, headers=headers, json=export_body)
+    assert exported.status_code == 200, exported.text
+    [pack] = exported.json()["embedded"]["knowledge_packs"]
+    [starter] = pack["starter_documents"]
+    assert starter["body_md"] == template_body and "customer-ticket-123" not in exported.text
+
+    # An installed template's identity can differ from its document key.
+    document.metadata_ = {
+        **document.metadata_,
+        "blueprint_template": {"id": "support-queue", "mode": "initial_file", "version": 4},
+    }
+    await db_session.commit()
+    updated_body = "ticket_id,status,owner\n"
+    updated = await client.put(url, headers=headers, json={"body_md": updated_body})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["template"] == {"id": "support-queue", "mode": "initial_file", "version": 5}
+    await db_session.refresh(document)
+    assert document.metadata_["blueprint_initial_body_md"] == updated_body
+    assert document.metadata_["content_text"] == working and file.read_text() == working
+
+    foreign_headers, _ = await _register(client, "initialtemplateforeign")
+    denied = await client.put(url, headers=foreign_headers, json={"body_md": "stolen\n"})
+    assert denied.status_code == 404
+
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import user_has_document_capability
+
+    editor = await _create_entity_user(
+        workspace.entity_id, "initialtemplateeditor", role="member",
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace.id, user_id=editor["id"], role="editor", status="active",
+    ))
+    await db_session.commit()
+    assert await user_has_document_capability(
+        db_session, document=document, user_id=editor["id"], capabilities={Capability.EDIT},
+    )
+    before_editor = deepcopy(document.metadata_)
+    for unauthorized_body in ("ticket_id,edited_by_member\n", None):
+        denied = await client.put(url, headers=editor["headers"], json={"body_md": unauthorized_body})
+        assert denied.status_code == 403, denied.text
+        await db_session.refresh(document)
+        assert document.metadata_ == before_editor and file.read_text() == working
+
+    for body in (" ", "é" * (1024 * 512 + 1)):
+        rejected = await client.put(url, headers=headers, json={"body_md": body})
+        assert rejected.status_code == 422
+    document.visibility = "private"
+    await db_session.commit()
+    denied = await client.put(url, headers=headers, json={"body_md": "private copy\n"})
+    assert denied.status_code == 422
+    document.visibility = "workspace"
+    await db_session.commit()
+
+    another_ws = await _create_workspace(client, headers, "Other support queue")
+    shared = DocumentGroup(id=generate_ulid(), entity_id=workspace.entity_id,
+                           workspace_id=another_ws["id"], name="Shared", settings={})
+    db_session.add(shared)
+    await db_session.flush()
+    member = DocumentGroupMember(document_id=document.id, group_id=shared.id)
+    db_session.add(member)
+    await db_session.commit()
+    denied = await client.put(url, headers=headers, json={"body_md": "replacement\n"})
+    assert denied.status_code == 409
+    await db_session.delete(member)
+    await db_session.commit()
+    removed = await client.put(url, headers=headers, json={"body_md": None})
+    assert removed.status_code == 200 and removed.json()["template"] is None
+    await db_session.refresh(document)
+    assert document.metadata_ == original_metadata and file.read_text() == working
+    assert (await client.get(candidates_url, headers=headers)).json() == []
+
+
 async def test_v11_refreeze_replaces_only_same_workspace_editable_draft(
     client: AsyncClient,
     db_session: AsyncSession,

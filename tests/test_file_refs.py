@@ -10,6 +10,7 @@ from packages.core.services.file_refs import (
     is_internal_file_target,
     parse_file_reference,
     rewrite_reply_file_links,
+    signed_file_url_capability,
 )
 
 
@@ -73,6 +74,21 @@ def test_internal_targets_and_upload_paths():
     assert is_chat_upload_storage_path("uploads/chat/0123456789abcdef.png")
     assert is_chat_upload_storage_path("uploads/chat/0123456789abcdef/fedcba9876543210.pdf")
     assert not is_chat_upload_storage_path("uploads/other/0123456789abcdef.png")
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("https://app.example/api/v1/fs/public/claims.signature/poster.jpg", "claims.signature"),
+    ("/api/v1/fs/public/opaque-token?download=1#preview", "opaque-token"),
+    ("/api/v1/fs/public/", None),
+    ("/api/v1/fs/public//poster.jpg", None),
+    ("https://example.com/?next=/api/v1/fs/public/token", None),
+    ("https://[invalid/api/v1/fs/public/token", None),
+    (None, None),
+])
+def test_signed_file_capability_extraction_is_only_for_redaction(value, expected):
+    assert signed_file_url_capability(value) == expected
+    if expected:
+        assert parse_file_reference(value) is None
 
 
 def _resolver(known: dict[ParsedFileRef, dict]):

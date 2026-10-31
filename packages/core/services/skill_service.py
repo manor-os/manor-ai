@@ -22,6 +22,7 @@ from packages.core.ai.runtime import (
     runtime_public_failure_payload,
     runtime_skill_binding_ref,
 )
+from packages.core.ai.runtime.sandbox_toolset import sandbox_toolset_summary
 from packages.core.database_runtime import release_read_transaction
 from packages.core.models.base import generate_ulid
 from packages.core.models.permission import Visibility
@@ -193,7 +194,9 @@ def _sandbox_skill_runtime_contract(
     ]
     lines.extend([
         "## Sandbox Environment",
-        "- All skill files are mounted at `/skill/` (working directory).",
+        "- All skill files are mounted at `/skill/` (working directory). `/skill` is this Skill's own "
+        "directory in the user's shared sandbox: other Skills and other conversations of the user may "
+        "run beside it, but only your commands see this Skill and its credentials.",
         (
             "- The entity filesystem is mounted read-only at `/workspace/`. "
             "Uploaded chat files are available under `/workspace/uploads/chat/...`."
@@ -210,7 +213,9 @@ def _sandbox_skill_runtime_contract(
         "- Read skill files with `sandbox(action='read_file', params={'sandbox_id': ..., 'path':'/skill/SKILL.md'})` or targeted `exec` commands.",
         "- Write new files with `sandbox` action `write_file`; do not use `cat >`, `echo >`, `printf >`, `tee >`, or heredoc writes.",
         "- Do not use host shell/file tools such as `bash`, `read_file`, or root filesystem searches to inspect sandbox or workspace files.",
-        "- `/tmp/` is writable for temporary files and npm cache.",
+        "- `/tmp/` is writable for temporary files.",
+        # Generated from the image's toolset manifest, which the release verifies.
+        sandbox_toolset_summary(),
         "",
         "## Response Language",
         "- Match the user's original language for all user-visible narration, status updates, and the final answer.",
@@ -381,28 +386,58 @@ def _skill_bundle_claims_path(extra_files: dict[str, str], rel_path: str | None)
     return any(path == top or path.startswith(f"{top}/") for path in extra_files)
 
 
-def _skill_bundle_file_json(path: str, content: str) -> str:
+def _skill_bundle_file_json(path: str, content: str, args: dict) -> str:
     source_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    expected_sha = str(args.get("expected_sha256") or "").strip()
+    if expected_sha and expected_sha != source_sha:
+        return json.dumps({
+            "error": "source_changed", "path": path,
+            "expected_sha256": expected_sha, "source_sha256": source_sha,
+        })
     lines = content.splitlines(keepends=True)
+    try:
+        offset = min(len(lines), max(0, int(args.get("offset") or 0)))
+        limit = max(1, int(args["limit"])) if args.get("limit") is not None else len(lines)
+        max_chars = (
+            min(200_000, max(1, int(args["max_chars"])))
+            if args.get("max_chars") is not None else len(content)
+        )
+        if args.get("char_offset") is not None:
+            mode = "char"
+            start = min(len(content), max(0, int(args["char_offset"])))
+            scope_end = len(content)
+        else:
+            mode = "line"
+            start = sum(len(line) for line in lines[:offset])
+            scope_end = start + sum(len(line) for line in lines[offset:offset + limit])
+    except (TypeError, ValueError, OverflowError):
+        return json.dumps({"error": "File slice offsets and limits must be integers", "path": path})
+    end = min(scope_end, start + max_chars)
+    selected = content[start:end]
+    partial_line = bool(selected) and end < len(content) and not selected.endswith("\n")
+    next_offset = (
+        offset + len(selected.splitlines())
+        if mode == "line" and not partial_line and end < len(content) else None
+    )
     return json.dumps({
         "path": path,
         "source": "skill_bundle",
         "size": len(content.encode("utf-8")),
         "source_sha256": source_sha,
-        "slice_sha256": source_sha,
+        "slice_sha256": hashlib.sha256(selected.encode("utf-8")).hexdigest(),
         "total_lines": len(lines),
         "total_chars": len(content),
-        "mode": "line",
-        "offset": 0,
-        "char_offset": 0,
-        "lines_returned": len(lines),
-        "next_offset": None,
-        "next_char_offset": None,
-        "partial_line": False,
-        "truncated": False,
-        "char_truncated": False,
-        "line_truncated": False,
-        "content": content,
+        "mode": mode,
+        "offset": offset,
+        "char_offset": start,
+        "lines_returned": len(selected.splitlines()),
+        "next_offset": next_offset,
+        "next_char_offset": end if end < len(content) else None,
+        "partial_line": partial_line,
+        "truncated": end < len(content),
+        "char_truncated": end < scope_end,
+        "line_truncated": scope_end < len(content),
+        "content": selected,
     }, ensure_ascii=False)
 
 
@@ -460,7 +495,7 @@ def _try_read_skill_bundle_file(extra_files: dict[str, str], args: dict) -> str 
     if not rel_path:
         return None
     if rel_path in extra_files:
-        return _skill_bundle_file_json(rel_path, extra_files[rel_path])
+        return _skill_bundle_file_json(rel_path, extra_files[rel_path], args)
     if _skill_bundle_claims_path(extra_files, rel_path):
         return json.dumps({"error": f"File not found in skill bundle: {args.get('path', '')}"})
     return None
@@ -712,7 +747,7 @@ def builtin_skill_copy_sources(skills: list[Skill]) -> dict[str, str]:
 
 
 # Built-in Skills ship inside the image; the post-deploy publish job (or API
-# startup outside K8s) writes them. Listing Skills runs on every chat turn, and
+# startup on single-owner deployments) writes them. Listing Skills runs on every chat turn, and
 # a full seed walks ~13k bundle files and issues one query per built-in (~100
 # round trips). The packaged files cannot change during a process, so verify
 # once per process and database, then never again.
@@ -1338,6 +1373,26 @@ def _determine_skill_type(skill: Skill) -> str:
     return "prompt"
 
 
+async def skill_credentials_withheld(skill: Skill, *, entity_id: str, user_id: Optional[str]) -> bool:
+    """Whether a sandbox skill runs without its stored credentials.
+
+    The run drives the sandbox itself (exec, file reads), so whatever the
+    sandbox env holds is readable by whoever steers the run. When an external
+    collaborator acts -- their own run, or a run of a Task they steered --
+    the customer's skill credentials stay out of the sandbox; only a skill
+    every acting collaborator owns (they uploaded its credentials) gets its
+    env. Any other skill then runs without credentials and may fail; that is
+    intended.
+    """
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+    from packages.core.services.runtime_authorization.collaborator import is_runtime_collaborator
+
+    acting = set(collaborators_acting_now(entity_id))
+    if user_id and await is_runtime_collaborator(str(user_id), entity_id):
+        acting.add(str(user_id))
+    return bool(acting - {str(getattr(skill, "owner_user_id", None) or "")})
+
+
 async def _invoke_sandbox_skill(
     skill: Skill,
     entity_id: str,
@@ -1377,6 +1432,18 @@ async def _invoke_sandbox_skill(
             f"Sandbox service not configured (SANDBOX_SERVICE_URL unset). "
             f"Cannot run sandbox skill '{skill.name}'.",
         )
+    if not str(sandbox_binding_key or conversation_id or "").strip():
+        # Every sandbox operation is checked against the caller's binding
+        # slot, and a run with neither a conversation nor a task has none: a
+        # container admitted here could never be operated. Refuse before
+        # allocating one.
+        return _sandbox_skill_error_response(
+            skill,
+            f"Cannot open a sandbox for skill '{skill.name}': this run has no sandbox "
+            "binding scope (neither a conversation nor a task). Sandbox skills can only "
+            "run from a conversation or task run.",
+            code="not_configured",
+        )
 
     cfg = skill.config or {}
 
@@ -1400,6 +1467,9 @@ async def _invoke_sandbox_skill(
 
     # ── 2. Collect skill files ──────────────────────────────────────
     files: dict[str, str] = {}
+    # Set for a packaged built-in Skill (see sandbox_baked_skills).
+    baked_skill = None
+    bundle_paths: list[str] = []
 
     if skill.entity_id:
         # Entity-owned skill: load everything from MinIO
@@ -1431,27 +1501,40 @@ async def _invoke_sandbox_skill(
             if "SKILL.md" not in files:
                 files["SKILL.md"] = instructions
     else:
-        # Platform built-in skill: read from on-disk skill_dir
+        # Platform built-in skill: read from on-disk skill_dir. A packaged
+        # built-in ships in the sandbox image too: its files are read only if
+        # the runner turns out not to hold this exact version.
         skill_dir_str = cfg.get("skill_dir")
         if skill_dir_str:
             from packages.core.services.builtin_skill_loader import resolve_builtin_skill_dir
+            from packages.core.services.sandbox_baked_skills import (
+                baked_skill_ref,
+                packaged_skill_file_paths,
+                read_skill_upload_files,
+            )
 
             skill_dir_path = resolve_builtin_skill_dir(skill_dir_str)
             if skill_dir_path is not None and skill_dir_path.is_dir():
-                for p in skill_dir_path.rglob("*"):
-                    if p.is_file():
-                        rel = str(p.relative_to(skill_dir_path))
-                        try:
-                            files[rel] = p.read_text(encoding="utf-8")
-                        except Exception:
-                            pass
-        if not files:
-            files["SKILL.md"] = instructions
-        elif files.get("SKILL.md"):
-            instructions = files["SKILL.md"]
+                baked_skill = baked_skill_ref(skill_dir_path)
+                if baked_skill is not None:
+                    bundle_paths = packaged_skill_file_paths(baked_skill.name)
+                    try:
+                        instructions = (skill_dir_path / "SKILL.md").read_text(encoding="utf-8") or instructions
+                    except OSError:
+                        pass
+                else:
+                    files = read_skill_upload_files(skill_dir_path)
+        if baked_skill is None:
+            if not files:
+                files["SKILL.md"] = instructions
+            elif files.get("SKILL.md"):
+                instructions = files["SKILL.md"]
 
     # Require at least one executable script for sandbox execution
-    script_keys = [k for k in files if k not in ("SKILL.md", "requirements.txt", "credentials.json")]
+    script_keys = [
+        k for k in (bundle_paths if baked_skill is not None else files)
+        if k not in ("SKILL.md", "requirements.txt", "credentials.json")
+    ]
     if not script_keys:
         logger.warning(
             "[skill_service] sandbox skill has no scripts skill=%s entity=%s minio_dir=%s files=%s",
@@ -1472,6 +1555,12 @@ async def _invoke_sandbox_skill(
             env = _load_creds(skill.entity_id, skill.id, skill_dir=_mdir, config=cfg) or {}
         except Exception:
             pass
+    if env and await skill_credentials_withheld(skill, entity_id=entity_id, user_id=user_id):
+        logger.info(
+            "[skill_service] credentials withheld from a collaborator run skill=%s entity=%s",
+            skill.id, entity_id,
+        )
+        env = {}
     allowed_keys = list(env.keys())
 
     config_overrides = None
@@ -1519,6 +1608,8 @@ async def _invoke_sandbox_skill(
         source="workspace" if skill.entity_id else "builtin",
         config=config_overrides,
         auto_install=True,
+        baked_skill=baked_skill,
+        baked_file_paths=tuple(bundle_paths),
     )
     binding = SandboxBinding(
         conversation_id=binding_conversation or None,
@@ -1529,9 +1620,11 @@ async def _invoke_sandbox_skill(
         # A task worker has no durable run: admission reserves against the
         # task instead and waits for the allocation itself.
         task_id=task_id or None,
+        workflow_run_id=str(context.get("_workflow_run_id_from_context") or "") or None,
         # A prompt skill's nested loop shares the run's identity but cannot
         # be parked on a reservation; admission must not queue one for it.
         parent_skill=str(context.get("_runtime_parent_skill_from_context") or "") or None,
+        credentials_owner_user_id=(str(getattr(skill, "owner_user_id", None) or "") or None) if env else None,
     )
     if durable_external and runtime_run_id and runtime_tool_call_id:
         if db is None:
@@ -1555,7 +1648,7 @@ async def _invoke_sandbox_skill(
                 skill_info_parts.append(
                     f"scripts ({len(script_keys)}): {_compact_skill_items(script_keys)}"
                 )
-            if files.get("requirements.txt"):
+            if files.get("requirements.txt") or "requirements.txt" in bundle_paths:
                 skill_info_parts.append("dependencies: installed from requirements.txt")
             if env:
                 skill_info_parts.append(
@@ -1576,6 +1669,9 @@ async def _invoke_sandbox_skill(
                 "rounds": 0,
                 "stop_reason": "sandbox_ready",
                 "sandbox_id": result_sandbox_id,
+                # The runner's name for this Skill: its /skill view in the
+                # user's shared sandbox (staging writes through it).
+                "sandbox_skill": bundle.skill_name,
             }
         if attached is not None:
             # RuntimeToolSuspension: the ticket is still waiting for a runner.
@@ -1644,6 +1740,7 @@ async def _invoke_sandbox_skill(
         "rounds": 0,
         "stop_reason": "sandbox_ready",
         "sandbox_id": result_sandbox_id,
+        "sandbox_skill": bundle.skill_name,
     }
 
 
@@ -1996,6 +2093,24 @@ async def invoke_skill(
                     "missing_tools": sorted(missing_tools),
                 }
 
+        if (
+            is_external_surface
+            and not room_builtin_file_skill
+            and _determine_skill_type(skill) == "sandbox"
+        ):
+            # External principals never use the Sandbox (product decision
+            # 2026-10-06): their tool policy and authorization refuse every
+            # sandbox action. Refuse before admission instead of allocating a
+            # container they could never drive; the room file-skill receipt
+            # above is the only external Sandbox Skill path.
+            return {
+                "error": (
+                    f"Skill '{skill.slug or skill.name}' runs in the Sandbox, which "
+                    "is not available on this runtime surface."
+                ),
+                "code": "skill_surface_not_allowed",
+            }
+
     if enforce_bound_agent_access:
         available = (
             available_agent_skills
@@ -2051,16 +2166,6 @@ async def invoke_skill(
     )
 
     if skill_type == "sandbox":
-        from packages.core.contracts.step_execution import StepEffects, current_step_effects
-
-        if current_step_effects() in {StepEffects.READ_ONLY, StepEffects.ARTIFACT_WRITE}:
-            return {
-                "error": (
-                    "This Step execution contract does not permit sandbox Skill setup "
-                    "or unclassified code. Use a prompt/instructions Skill with individually gated tools."
-                ),
-                "code": "step_execution_contract",
-            }
         await release_read_transaction(db)
         return await _invoke_sandbox_skill(
             skill, entity_id, user_id, input_text,
@@ -2074,23 +2179,44 @@ async def invoke_skill(
             db=db,
         )
 
+    from packages.core.ai.runtime.skill_routing import is_chrome_skill
+    from packages.core.ai.runtime.nested_agent import runtime_nested_skill_resume_active
+
+    fresh_chrome_task = (
+        is_chrome_skill(skill.slug, skill.name)
+        and runtime_checkpoint is None
+        and not runtime_nested_skill_resume_active()
+    )
+
     # The tool surface needs only the Skill row and the caller scope: refuse an
     # unrunnable Skill before any prompt or bundle storage I/O. Instructions-only
     # guides return their text without a child loop and are never gated.
     tool_surface = None
+    withheld_tools: tuple[str, ...] = ()
     if (skill.config or {}).get("execution_mode") != INSTRUCTIONS_ONLY_SKILL_EXECUTION_MODE:
         from packages.core.ai.runtime import runtime_prepare_prompt_skill_tool_surface
+        from packages.core.ai.runtime.skills import runtime_skill_tools_withheld_from_surface
 
         tool_surface = runtime_prepare_prompt_skill_tool_surface(
             skill,
             allowed_tool_names=allowed_tool_names,
             runtime_envelope=runtime_envelope,
+            fresh_chrome_task=fresh_chrome_task,
         )
         dependency_refusal = _skill_dependency_refusal(
             skill, tool_surface, runtime_envelope=runtime_envelope,
         )
         if dependency_refusal is not None:
             return dependency_refusal
+        # A partly withheld Skill still runs, but the gap must be visible: the
+        # child is told which declared tools this scope keeps from it, and the
+        # caller's result names them, instead of a vague "tools unavailable".
+        withheld_tools = runtime_skill_tools_withheld_from_surface(skill, tool_surface)
+        if withheld_tools:
+            logger.info(
+                "skill.declared_tools_withheld %s",
+                {"skill": skill.slug or skill.name, "withheld_tools": list(withheld_tools)},
+            )
 
     # Bundle loading performs blocking storage I/O before the Agent loop.
     await release_read_transaction(db)
@@ -2163,6 +2289,12 @@ async def invoke_skill(
     )
     if execution_guidance:
         effective_prompt = f"{effective_prompt}\n\n{execution_guidance}"
+    if withheld_tools:
+        effective_prompt = (
+            f"{effective_prompt}\n\nThis caller's tool scope does not grant these tools this Skill declares: "
+            f"{', '.join(withheld_tools)}. Do not plan steps that need them. If the work requires one, "
+            "stop and report it by name as the blocker."
+        )
     # A staged Skill (one that stops at a declared stage for its caller to
     # invoke it again) reports its stage as validated JSON, so the caller's
     # runtime, not prose, decides whether the turn may end. A caller-supplied
@@ -2179,6 +2311,7 @@ async def invoke_skill(
             skill,
             allowed_tool_names=allowed_tool_names,
             runtime_envelope=runtime_envelope,
+            fresh_chrome_task=fresh_chrome_task,
         )
     skill_tools = tool_surface.tools
     skill_allowed_tool_names = (
@@ -2331,14 +2464,14 @@ async def invoke_skill(
             getattr(result, "error_detail", None)
         ),
     }
+    if withheld_tools:
+        response["withheld_tools"] = list(withheld_tools)
     continuation = (
         runtime_skill_continuation_from_content(continuation_stages, result.content)
         if result.stop_reason == "completed" else None
     )
     if continuation is not None:
         response["continuation"] = continuation
-    from packages.core.ai.runtime.skill_routing import is_chrome_skill
-
     if is_chrome_skill(skill.slug, skill.name):
         from packages.core.ai.runtime.chrome_run import (
             chrome_outcome_for_result,

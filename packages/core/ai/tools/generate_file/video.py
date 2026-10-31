@@ -57,4 +57,5 @@ async def handle_video(
         active_user_message=runtime_context.active_user_message,
         runtime_artifact_urls=runtime_context.runtime_artifact_urls,
         dependency_artifact_urls=runtime_context.dependency_artifact_urls,
+        workflow_context=kwargs,
     )

@@ -357,6 +357,11 @@ async def test_cancel_leaves_a_warm_registered_sandbox_in_place(
     monkeypatch.setattr("packages.core.services.sandbox_queue_service.release_sandbox_instance", release_local_lease)
     monkeypatch.setattr("packages.core.services.sandbox_session_service.is_sandbox_kept_warm", kept_warm)
 
+    async def runner_url(sandbox_id: str) -> str:
+        return "http://runner.internal:8000"
+
+    monkeypatch.setattr("packages.core.services.sandbox_session_service.sandbox_runner_base_url", runner_url)
+
     await cancel_runtime_run_resources(run)
 
     assert calls == ["cancel:sandbox_warm:exec_1"], "the running execution is cancelled, the container is not destroyed"

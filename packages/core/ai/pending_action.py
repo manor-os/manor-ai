@@ -28,21 +28,9 @@ The underscore prefix marks this as Manor-internal — the MCP spec
 ignores it, the LLM (which only reads ``content``) ignores it,
 existing tools that don't set it just don't.
 
-**Consumers** are the two places that dispatch MCP tools:
-
-  1. ``packages.core.ai.tools.mcp_builtin._build_handler`` (regular
-     chat — LLM tool calls). Sees ``_pending_action`` → posts a chat
-     message with that payload + tells the LLM the user is being
-     asked.
-
-  2. ``packages.core.plans.executor`` (Plan DAG steps). Sees
-     ``_pending_action`` → marks step ``waiting_human`` + posts a
-     chat message with the payload. Plan resumes when the user
-     resolves it via the resolve endpoint.
-
-Both consumers are unchanged today (Phase 3a = producer side only).
-The contract is documented here so they can be wired in a separate
-PR without retro-fitting all the producers.
+**Consumer**: ``packages.core.ai.tools.mcp_builtin._build_handler``
+(LLM tool calls). Sees ``_pending_action`` → posts a chat message with
+that payload + tells the LLM the user is being asked.
 
 Resolution
 ──────────

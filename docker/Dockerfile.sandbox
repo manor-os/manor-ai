@@ -3,7 +3,8 @@
 # This is the image that runs INSIDE each sandboxed Docker container
 # created by the sandbox-service. It is NOT the service itself.
 # Skill scripts are injected into a running container of this image
-# and executed in isolation.
+# and executed in isolation; built-in Skills ship in the image itself
+# (/opt/manor/skills, see the baked-skills stage).
 #
 # Build (once, before starting the stack):
 #   docker build -t sandbox-skill:latest -f docker/Dockerfile.sandbox .
@@ -36,40 +37,54 @@ RUN set -eu; \
     done; \
     ls -R /out
 
+# ── Sandbox toolset lists ───────────────────────────────────────────────
+# packages/core/ai/runtime/sandbox_toolset.toml is the single source of truth
+# for the tools this image ships (and for what the Agent is told it ships).
+# This stage turns it into one list per installer; each list reaches the
+# final stage on its own, so the layer installing it is cached on that
+# list's bytes only (a pip-only manifest edit never reruns apt, and editing
+# a probe or label reruns nothing heavy).
+FROM python:3.12-slim-bookworm AS toolset-lists
+COPY packages/core/ai/runtime/sandbox_toolset.toml packages/core/ai/runtime/sandbox_toolset.py /src/
+RUN python3 /src/sandbox_toolset.py --manifest /src/sandbox_toolset.toml export --out /out \
+    && cat /out/apt.txt /out/requirements.txt /out/npm.txt
+
+# ── Built-in Skills, baked ─────────────────────────────────────────────
+# packages/core/ai/runtime/builtin_skill_bundle.py selects the built-in Skill
+# directories exactly as the control plane's loader does, copies each one's
+# files, and records the same content digest the control plane computes. A
+# sandbox for a built-in Skill then gets the image's copy (the runner
+# materializes it into the workdir) instead of the files over HTTP, but only
+# while both digests are equal. Only /out reaches the final stage, in a late
+# layer: editing a Skill rebuilds that layer alone.
+FROM python:3.12-slim-bookworm AS baked-skills
+COPY packages/core/ai/skills/ /src/packages/core/ai/skills/
+COPY .agents/skills/ /src/.agents/skills/
+COPY packages/core/ai/runtime/builtin_skill_bundle.py /src/builtin_skill_bundle.py
+RUN python3 /src/builtin_skill_bundle.py bake --repo-root /src --out /out \
+    && python3 /src/builtin_skill_bundle.py verify --root /out
+
 FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    # npm cache and global prefix point to writable tmpfs locations.
-    # /home/sandbox is mounted as tmpfs at runtime (read-only root fs).
+    # Build-time npm cache and global prefix (hyperframes' own npm calls
+    # rely on a prefix separate from /usr/local). The runtime values are set
+    # at the end of this file (disk-backed install dir).
     NPM_CONFIG_CACHE=/home/sandbox/.npm \
     NPM_CONFIG_PREFIX=/home/sandbox/.npm-global \
     NODE_PATH=/home/sandbox/.npm-global/lib/node_modules:/usr/local/lib/node_modules \
     PATH="/home/sandbox/.npm-global/bin:${PATH}"
 
-# Install base tools and the system Chromium used by isolated video
-# review/render jobs. Node comes from the pinned Node 22 build stage below.
+# ── Sandbox toolset: system packages (from the manifest's apt list) ─────
+# Includes the system Chromium used by isolated video review/render jobs and
+# the Office/CJK fonts. Node comes from the pinned Node 22 build stage below.
+COPY --from=toolset-lists /out/apt.txt /opt/manor/toolset/apt.txt
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    chromium \
-    curl \
-    ffmpeg \
-    gcc \
-    git \
-    jq \
-    libreoffice-calc \
-    libreoffice-impress \
-    libreoffice-writer \
-    librsvg2-bin \
-    pandoc \
-    poppler-utils \
-    qpdf \
-    ripgrep \
-    tesseract-ocr \
+    && xargs -a /opt/manor/toolset/apt.txt \
+       apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && chromium --version
 
@@ -92,30 +107,44 @@ RUN npm install --global --prefix /usr/local \
     && hyperframes browser ensure \
     && hyperframes --version
 
+# ── Sandbox toolset: global npm packages (from the manifest) ────────────
+COPY --from=toolset-lists /out/npm.txt /opt/manor/toolset/npm.txt
+RUN set -eu; \
+    if [ -s /opt/manor/toolset/npm.txt ]; then \
+      xargs -a /opt/manor/toolset/npm.txt \
+        npm install --global --prefix /usr/local --no-fund --no-audit; \
+    fi; \
+    npm cache clean --force; \
+    rm -rf /root/.npm
+
 RUN useradd --create-home --shell /bin/bash sandbox
 
-# Office-compatible fonts keep generated and rendered presentations metrically
-# close to PowerPoint across Latin and CJK content.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-    fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
-    fonts-liberation fonts-noto-core fonts-noto-cjk fonts-roboto \
-    && rm -rf /var/lib/apt/lists/*
-
+# Office-compatible fonts (installed from the toolset's apt list above) keep
+# generated and rendered presentations metrically close to PowerPoint across
+# Latin and CJK content.
 COPY docker/fontconfig/70-manor-office-fonts.conf /etc/fonts/conf.d/70-manor-office-fonts.conf
 RUN fc-cache -f
 
+# ── Sandbox toolset: Python packages (from the manifest) ────────────────
+# Installed before the Skill manifests so a routine Skill edit reuses this
+# layer; the Skill layer below resolves both sets together.
+COPY --from=toolset-lists /out/requirements.txt /opt/manor/toolset/requirements.txt
+RUN pip install --no-cache-dir -r /opt/manor/toolset/requirements.txt \
+    && pip check
+
 # Shipped Skills' dependencies, installed once into the image (see the
 # skill-manifests stage). Python packages share the system site-packages and
-# must resolve together; each distinct package.json gets its own read-only
-# node_modules that the sandbox service links into the Skill workdir.
+# must resolve together, with the toolset's requirements in the same pip run
+# so a Skill can never move a toolset package outside its manifest bounds;
+# each distinct package.json gets its own read-only node_modules that the
+# sandbox service links into the Skill workdir.
 COPY --from=skill-manifests /out /opt/manor/skill-deps
 RUN set -eu; \
     requirements=""; \
     for manifest in /opt/manor/skill-deps/python/*.txt; do \
       [ -f "$manifest" ] && requirements="$requirements -r $manifest"; \
     done; \
-    if [ -n "$requirements" ]; then pip install --no-cache-dir $requirements; fi; \
+    if [ -n "$requirements" ]; then pip install --no-cache-dir -r /opt/manor/toolset/requirements.txt $requirements; fi; \
     pip check
 RUN set -eu; \
     for project in /opt/manor/skill-deps/node/*/; do \
@@ -124,6 +153,45 @@ RUN set -eu; \
     done; \
     npm cache clean --force; \
     rm -rf /root/.npm
+
+# ── manor CLI ───────────────────────────────────────────────────────────
+# In-sandbox client of the Manor API (/api/v1/sandbox-cli). Stdlib only; a
+# bash tool command hands it MANOR_API_URL and a short-lived MANOR_CLI_TOKEN
+# through per-exec env, never through the image or a file. The bash tool's
+# working copy of the entity files lives in the acting agent's own directory
+# of its work area on the runner's shared /workspace tmpfs
+# (/workspace/c/<area>/agents/<agent>/workspace, handed over as
+# MANOR_WORKSPACE); the image must not claim /workspace itself.
+COPY packages/core/services/sandbox_cli/manor_cli.py /usr/local/lib/manor/manor_cli.py
+RUN chmod 0644 /usr/local/lib/manor/manor_cli.py \
+    && printf '#!/bin/sh\nexec python3 /usr/local/lib/manor/manor_cli.py "$@"\n' > /usr/local/bin/manor \
+    && chmod 0755 /usr/local/bin/manor \
+    && python3 /usr/local/lib/manor/manor_cli.py --help >/dev/null
+# ── end manor CLI ───────────────────────────────────────────────────────
+
+# ── Sandbox toolset: runtime installs + verification ────────────────────
+# The sandbox runner mounts a per-container, disk-backed volume at
+# /opt/sandbox-local (removed with the container; see docker_backend.py
+# SANDBOX_LOCAL_DIR). Runtime `pip install` (a user install, since the system
+# site-packages is read-only) and `npm install -g` land there instead of the
+# memory-backed tmpfs counted against the container's memory limit. Docker
+# copies this directory into each new volume, so it must belong to the
+# sandbox user.
+RUN install -d -o sandbox -g sandbox -m 0755 /opt/sandbox-local
+ENV SANDBOX_LOCAL_DIR=/opt/sandbox-local \
+    PYTHONUSERBASE=/opt/sandbox-local/python \
+    NPM_CONFIG_PREFIX=/opt/sandbox-local/npm-global \
+    NPM_CONFIG_CACHE=/opt/sandbox-local/cache/npm \
+    NODE_PATH=/opt/sandbox-local/npm-global/lib/node_modules:/usr/local/lib/node_modules \
+    PATH="/opt/sandbox-local/python/bin:/opt/sandbox-local/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# The manifest and its verifier ship in the image: the release runs
+# `python3 /opt/manor/toolset/sandbox_toolset.py verify` against it, which
+# also checks the baked Skills below with builtin_skill_bundle.py.
+COPY packages/core/ai/runtime/sandbox_toolset.toml packages/core/ai/runtime/sandbox_toolset.py packages/core/ai/runtime/builtin_skill_bundle.py /opt/manor/toolset/
+
+# Built-in Skills (see the baked-skills stage), root-owned and read-only for
+# the sandbox user. Last, so a Skill edit rebuilds only this layer.
+COPY --from=baked-skills /out /opt/manor/skills
 
 USER sandbox
 WORKDIR /skill

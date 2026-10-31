@@ -49,6 +49,7 @@ from typing import Awaitable, Callable, Sequence
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.notification_types import (
+    EVENTS_BY_KIND,
     NotificationChannel,
     NotificationDeliveryStatus,
     NotificationDispatchStatus,
@@ -300,9 +301,115 @@ async def _persist_routed_notification(
     idempotency_key: str | None,
 ) -> None:
     """Persist the in-app fact and external fan-out intent atomically."""
+    from packages.core.database import async_session
+
+    scheduled = deliver_at is not None and deliver_at > datetime.now(timezone.utc)
+    async with async_session() as db:
+        notification, _created = await _stage(
+            db, entity_id=entity_id, user_id=user_id, type=type, title=title, body=body, link=link,
+            meta=meta, severity=severity, workspace_id=workspace_id, actions=actions,
+            callback_kind=callback_kind, callback_payload=callback_payload,
+            expires_in_seconds=expires_in_seconds, deliver_at=deliver_at, channels=channels,
+            idempotency_key=idempotency_key,
+        )
+        await db.commit()
+
+    if not scheduled:
+        from packages.core.services.notification_scheduler import (
+            dispatch_notification_outbox,
+        )
+
+        async with async_session() as db:
+            await dispatch_notification_outbox(
+                db,
+                notification_id=notification.id,
+            )
+
+
+async def stage_routed_notification(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user_id: str,
+    type: str,
+    title: str,
+    body: str | None = None,
+    link: str | None = None,
+    meta: dict | None = None,
+    idempotency_key: str | None = None,
+):
+    """Write a notification inside the caller's transaction, routed like ``notify``.
+
+    The in-app row lands with the caller's commit, together with its fan-out
+    intent: after the commit it goes to the channels the user chose for this
+    kind (email, Telegram, ...), straight away, or by the per-minute outbox
+    sweep if that first attempt cannot run.
+    """
+    meta = _compose_meta(meta, severity=None, workspace_id=None, actions=None, callback_kind=None)
+    notification, created = await _stage(
+        db, entity_id=entity_id, user_id=user_id, type=type, title=title, body=body, link=link,
+        meta=meta, severity=None, workspace_id=None, actions=None, callback_kind=None,
+        callback_payload=None, expires_in_seconds=None, deliver_at=None, channels=None,
+        idempotency_key=idempotency_key,
+    )
+    if created:
+        _deliver_after_commit(db, notification.id)
+    return notification
+
+
+_AFTER_COMMIT_DELIVERIES: set = set()
+
+
+def _deliver_after_commit(db: AsyncSession, notification_id: str) -> None:
+    import asyncio
+
+    from sqlalchemy import event as sa_event
+
+    loop = asyncio.get_running_loop()
+
+    async def deliver() -> None:
+        from packages.core.database import async_session
+        from packages.core.services.notification_scheduler import dispatch_notification_outbox
+
+        try:
+            async with async_session() as session:
+                await dispatch_notification_outbox(session, notification_id=notification_id)
+        except Exception:
+            logger.warning("notify: delivery after commit failed for %s; the outbox sweep retries", notification_id,
+                           exc_info=True)
+
+    def after_commit(sync_session) -> None:
+        if sync_session.in_nested_transaction() or loop.is_closed():
+            return
+        task = loop.create_task(deliver())
+        _AFTER_COMMIT_DELIVERIES.add(task)
+        task.add_done_callback(_AFTER_COMMIT_DELIVERIES.discard)
+
+    sa_event.listen(db.sync_session, "after_commit", after_commit, once=True)
+
+
+async def _stage(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user_id: str,
+    type: str,
+    title: str,
+    body: str | None,
+    link: str | None,
+    meta: dict | None,
+    severity: str | None,
+    workspace_id: str | None,
+    actions: list[dict] | None,
+    callback_kind: str | None,
+    callback_payload: dict | None,
+    expires_in_seconds: int | None,
+    deliver_at: datetime | None,
+    channels: list[str] | None,
+    idempotency_key: str | None,
+):
     from sqlalchemy import select
 
-    from packages.core.database import async_session
     from packages.core.models.notification import NotificationOutboxEvent
     from packages.core.services.notification_service import create_notification_once
 
@@ -320,60 +427,49 @@ async def _persist_routed_notification(
         "deliver_at": deliver_at.isoformat() if deliver_at is not None else None,
     }
 
-    async with async_session() as db:
-        notification, created = await create_notification_once(
-            db,
-            entity_id,
-            user_id,
-            type,
-            title,
-            body=body,
-            link=link,
-            meta=meta,
-            workspace_id=workspace_id,
-            idempotency_key=idempotency_key,
-            deliver_at=deliver_at,
-            dispatch_status=(
-                NotificationDispatchStatus.PENDING.value
-                if scheduled
-                else NotificationDispatchStatus.DISPATCHED.value
-            ),
-            push_realtime=not scheduled,
-        )
-        if created:
-            db.add(NotificationOutboxEvent(
-                notification_id=notification.id,
-                payload=payload,
-                status=NotificationOutboxStatus.PENDING.value,
-                available_at=available_at,
-            ))
-        else:
-            existing_outbox = (
-                await db.execute(
-                    select(NotificationOutboxEvent).where(
-                        NotificationOutboxEvent.notification_id == notification.id,
-                    )
+    notification, created = await create_notification_once(
+        db,
+        entity_id,
+        user_id,
+        type,
+        title,
+        body=body,
+        link=link,
+        meta=meta,
+        workspace_id=workspace_id,
+        idempotency_key=idempotency_key,
+        deliver_at=deliver_at,
+        dispatch_status=(
+            NotificationDispatchStatus.PENDING.value
+            if scheduled
+            else NotificationDispatchStatus.DISPATCHED.value
+        ),
+        push_realtime=not scheduled,
+    )
+    if created:
+        db.add(NotificationOutboxEvent(
+            notification_id=notification.id,
+            payload=payload,
+            status=NotificationOutboxStatus.PENDING.value,
+            available_at=available_at,
+        ))
+        await db.flush()
+    else:
+        existing_outbox = (
+            await db.execute(
+                select(NotificationOutboxEvent).where(
+                    NotificationOutboxEvent.notification_id == notification.id,
                 )
-            ).scalar_one_or_none()
-            if (
-                existing_outbox is None
-                or _delivery_intent_payload(dict(existing_outbox.payload or {})) != payload
-            ):
-                raise ValueError(
-                    "notification idempotency_key already exists with different delivery intent"
-                )
-        await db.commit()
-
-    if not scheduled:
-        from packages.core.services.notification_scheduler import (
-            dispatch_notification_outbox,
-        )
-
-        async with async_session() as db:
-            await dispatch_notification_outbox(
-                db,
-                notification_id=notification.id,
             )
+        ).scalar_one_or_none()
+        if (
+            existing_outbox is None
+            or _delivery_intent_payload(dict(existing_outbox.payload or {})) != payload
+        ):
+            raise ValueError(
+                "notification idempotency_key already exists with different delivery intent"
+            )
+    return notification, created
 
 
 async def dispatch_persisted_notification(
@@ -536,6 +632,7 @@ async def dispatch_persisted_notification(
                     entity_id=entity_id,
                     user_id=user_id,
                     **({"db": db} if db is not None else {}),
+                    **_unsubscribe_email_options(meta, kind=type, body=body, link=link),
                 )
                 if not delivered:
                     delivery_errors.append(
@@ -570,6 +667,46 @@ async def dispatch_persisted_notification(
         raise RuntimeError("; ".join(delivery_errors))
 
 
+def _unsubscribe_email_options(
+    meta: dict | None, *, kind: str, body: str | None, link: str | None,
+) -> dict:
+    """Opt-in: a notification whose meta sets ``email_unsubscribe_kind`` gets an unsubscribe link.
+
+    Honoured only when it names the notification's own kind and that kind
+    is in the catalog, so the link always turns off exactly what was sent.
+    """
+    if (meta or {}).get("email_unsubscribe_kind") != kind or kind not in EVENTS_BY_KIND:
+        return {}
+    return {"unsubscribe_kind": kind, "body": body, "link": link}
+
+
+def _email_text(value: str, *, quote: bool = False) -> str:
+    """Escape for HTML, and break ``{{ name }}`` so the email frame cannot substitute it."""
+    from html import escape
+
+    return escape(value, quote=quote).replace("{", "&#123;").replace("}", "&#125;")
+
+
+def _registered_email_with_unsubscribe(
+    *, title: str, body: str | None, link: str | None, unsubscribe: str,
+) -> str:
+    """Escaped title, body and absolute link, then an unsubscribe footer."""
+    from packages.core.services.signed_email_links import app_link
+
+    parts = [_email_text(part.strip()) for part in (title, body or "") if part and part.strip()]
+    url = (link or "").strip()
+    if url.startswith("/") and not url.startswith("//"):
+        url = app_link(url)
+    if url.startswith(("https://", "http://")):
+        parts.append(f'<a href="{_email_text(url, quote=True)}">{_email_text(url)}</a>')
+    parts.append(
+        '<span style="font-size:12px;color:#94a3b8">Don\'t want these emails? '
+        f'<a href="{_email_text(unsubscribe, quote=True)}" style="color:#64748b">Unsubscribe</a>. '
+        "In-app notifications continue.</span>"
+    )
+    return "\n\n".join(parts)
+
+
 async def _deliver_via_registered_email(
     *,
     to_address: str,
@@ -578,6 +715,9 @@ async def _deliver_via_registered_email(
     entity_id: str,
     user_id: str,
     db: AsyncSession | None = None,
+    unsubscribe_kind: str | None = None,
+    body: str | None = None,
+    link: str | None = None,
 ) -> bool:
     """Send an email notification to the user's registered email address.
 
@@ -585,13 +725,48 @@ async def _deliver_via_registered_email(
     inside Manor: ``User.email``. Users can still link extra email contacts,
     but the registered address should work without a manual channel-claim
     flow.
+
+    With ``unsubscribe_kind`` the email is built from ``title``, ``body`` and
+    ``link`` (made absolute) and carries a one-click unsubscribe link for that
+    kind, in the footer and in ``List-Unsubscribe`` headers. Without it the
+    email is ``text`` as before.
     """
     try:
         from packages.core.database import async_session
         from packages.core.models.channel import MessageLog
-        from packages.core.services.email_service import send_notification_email
+        from packages.core.services.email_service import send_common_email, send_notification_email
 
-        sent = await send_notification_email(to_address, title, text)
+        content, headers = text, None
+        if unsubscribe_kind:
+            from packages.core.models.user import User
+            from packages.core.services.notification_unsubscribe import unsubscribe_url
+
+            from sqlalchemy import select
+
+            async with (nullcontext(db) if db is not None else async_session()) as session:
+                user = await session.scalar(
+                    select(User).where(User.id == user_id, User.deleted_at.is_(None))
+                )
+            if user is None or not user.email:
+                logger.warning("notify: no registered user for unsubscribe link user=%s", user_id)
+                return False
+            unsubscribe = unsubscribe_url(user, unsubscribe_kind)
+            content = _registered_email_with_unsubscribe(
+                title=title, body=body, link=link, unsubscribe=unsubscribe,
+            )
+            headers = {
+                "List-Unsubscribe": f"<{unsubscribe}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
+
+        if headers:
+            # ``content`` is already escaped HTML with links; the plain-text
+            # notification helper would escape it a second time.
+            sent = await send_common_email(
+                to_address, f"Manor AI: {title}", content, headers=headers,
+            )
+        else:
+            sent = await send_notification_email(to_address, title, content)
         async with (nullcontext(db) if db is not None else async_session()) as db:
             db.add(MessageLog(
                 entity_id=entity_id,

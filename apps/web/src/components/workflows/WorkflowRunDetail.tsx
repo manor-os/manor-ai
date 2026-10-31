@@ -25,6 +25,7 @@ import MediaPreview from "./MediaPreview";
 import PublicationReceiptCards from "./PublicationReceiptCards";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
 import WorkflowRunResumeControl from "./WorkflowRunResumeControl";
+import WorkflowRunRetryControl from "./WorkflowRunRetryControl";
 import {
   buildWorkflowSnapshotNodes,
   buildWorkflowRunTimeline,
@@ -40,7 +41,9 @@ import {
   workflowArtifactLabel,
   workflowRunDurationMs,
   workflowRunIsLegacy,
+  workflowRunProgressPercent,
   workflowRunStatusPresentation,
+  workflowRunStateKey,
   type WorkflowArtifactRef,
   type WorkflowHistoryNode,
   type WorkflowHistoryRun,
@@ -49,6 +52,7 @@ import {
   type WorkflowSnapshotNode,
   type WorkflowRunTimelineEntry,
   type WorkflowRunView,
+  workflowRunTechnicalDetails,
 } from "./workflowRunDisplay";
 import type { MediaRef, MediaType } from "../../lib/workflowMedia";
 
@@ -330,7 +334,7 @@ function WorkflowChildRunDetail({ childRunId }: { childRunId: string }) {
         </div>
         <span className="workflow-run-history-status" data-status={runStatus(childRun.status)}>
           <span aria-hidden="true" />
-          {statusLabel(childRun.status)}
+          {t(workflowRunStateKey(childRun.status))}
         </span>
       </header>
       <WorkflowTimeline
@@ -490,17 +494,21 @@ export default function WorkflowRunDetail({
     : undefined;
   const controlRun = latestDetailedRun || family?.latestRun;
   const canControl = controlRun?.capabilities?.can_control === true;
-  const canHaveRetry = controlRun?.status === "failed" || controlRun?.status === "completed";
   const controlQuery = useQuery({
     queryKey: ["workflow-run-history-control", controlRunId],
     queryFn: () => api.workflows.getRun(controlRunId, false),
-    enabled: Boolean(familyQuery.isSuccess && controlRunId && canControl && canHaveRetry),
+    // The history family can retain a stale running projection after the
+    // runner has cancelled an uncertain external effect. Fetch the compact
+    // authoritative state before deciding whether a recovery control exists.
+    enabled: Boolean(familyQuery.isSuccess && controlRunId && canControl),
     refetchInterval: (query) => (
       runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false
     ),
     refetchIntervalInBackground: true,
   });
   const compactRun = controlQuery.data as WorkflowHistoryRun | undefined;
+  const controlStatus = compactRun?.status || controlRun?.status || "";
+  const canHaveRetry = ["failed", "cancelled", "completed"].includes(controlStatus);
   const canCancel = Boolean(controlRun && canCancelWorkflowRun({
     ...controlRun,
     status: compactRun?.status || controlRun.status,
@@ -545,8 +553,7 @@ export default function WorkflowRunDetail({
       sourceRun.id,
       {
         from_step_id: action?.retry_from_step_id
-          || sourceRun.retry_from_step_id
-          || sourceRun.current_step_id,
+          || sourceRun.retry_from_step_id,
         variables,
         execute: true,
       },
@@ -602,6 +609,7 @@ export default function WorkflowRunDetail({
     ? [...timeline].reverse().find((entry) => entry.nodeId === run.current_step_id)
     : undefined;
   const contextEntry = failedEntry || currentEntry;
+  const technicalDetails = workflowRunTechnicalDetails(run, t("component.workflow_run.error_truncated"));
   const controlTimeline = controlRun.id === run.id
     ? timeline
     : buildWorkflowRunTimeline(controlRun, currentDefinitionNodes);
@@ -614,6 +622,7 @@ export default function WorkflowRunDetail({
     status: runStatus(compactRun?.status || family.status),
     businessOutcome: compactRun?.business_outcome || family.businessOutcome,
   });
+  const familyProgress = workflowRunProgressPercent(family.processedCount, family.totalCount, family.status);
   const interventionSchemaCompatible = Boolean(
     intervention
     && workflowRetrySchemaIsCompatible(intervention.editable_input_schema),
@@ -626,15 +635,26 @@ export default function WorkflowRunDetail({
     && canShowDirectWorkflowRetry({
       ...controlRun,
       status: compactRun?.status || controlRun.status,
-      business_outcome: compactRun?.business_outcome ?? controlRun.business_outcome,
+      retry_from_step_id: compactRun?.retry_from_step_id,
       capabilities: compactRun?.capabilities || controlRun.capabilities,
-    }, Boolean(visibleIntervention)),
+      superseded: compactRun?.superseded || controlRun.superseded,
+    }, Boolean(intervention)),
+  );
+  const effectReviewRequired = compactRun?.intervention?.kind === "workflow_effect_review"
+    && compactRun.intervention.options?.some((option) => option === "review" || option === "review_applied");
+  const retryReviewRequired = Boolean(
+    controlQuery.isSuccess
+    && !visibleIntervention
+    && !directRetryAllowed
+    && !(compactRun?.superseded || controlRun.superseded)
+    && (controlStatus === "failed" || (controlStatus === "cancelled" && effectReviewRequired)),
   );
   const showControlSurface = canControl && canHaveRetry && (
     controlQuery.isLoading
     || controlQuery.isError
     || Boolean(visibleIntervention)
     || directRetryAllowed
+    || retryReviewRequired
   );
 
   return (
@@ -653,7 +673,7 @@ export default function WorkflowRunDetail({
         <div className="workflow-run-history-detail-actions">
           <span className="workflow-run-history-status" data-status={familyStatusPresentation.iconStatus}>
             <span aria-hidden="true" />
-            {t(`component.workflow_run.status.${familyStatusPresentation.labelKey}`)}
+            {t(familyStatusPresentation.stateKey)}
           </span>
           {canCancel && (
             <button
@@ -711,10 +731,7 @@ export default function WorkflowRunDetail({
           </div>
           <div>
             <dt>{t("component.workflow_run_history.progress")}</dt>
-            <dd>{t("component.workflow_run_history.steps_progress", {
-              count: family.processedCount,
-              total: family.totalCount,
-            })}</dd>
+            <dd className="mono">{familyProgress === null ? "—" : `${Math.floor(familyProgress)}%`}</dd>
           </div>
           <div>
             <dt>{t("component.workflow_run_history.artifacts")}</dt>
@@ -738,10 +755,16 @@ export default function WorkflowRunDetail({
             <IconClock size={16} />
             <div>
               <span>{failedEntry ? t("component.workflow_run_history.failure_context") : t("component.workflow_run_history.current_context")}</span>
-              <strong>{formatUserFacingText(contextEntry?.nodeName || run.current_step_id || statusLabel(run.status))}</strong>
+              <strong>{formatUserFacingText(contextEntry?.nodeName || run.current_step_id || t(workflowRunStateKey(run.status)))}</strong>
             </div>
           </div>
           <ValueBlock label={t("component.workflow_run_history.error")} value={contextEntry?.error ?? run.error} error />
+          {technicalDetails && (
+            <details className="workflow-run-history-value-block">
+              <summary>{t("component.workflow_run.technical_details")}</summary>
+              <pre className="workflow-run-history-value">{technicalDetails}</pre>
+            </details>
+          )}
         </section>
       )}
 
@@ -785,12 +808,23 @@ export default function WorkflowRunDetail({
               <Button
                 size="sm"
                 loading={retryMutation.isPending}
-                onClick={() => retryMutation.mutate({ sourceRun: controlRun })}
+                onClick={() => retryMutation.mutate({
+                  sourceRun: { ...controlRun, retry_from_step_id: compactRun?.retry_from_step_id },
+                })}
               >
                 <IconRefresh size={14} />
                 {t("component.workflow_run_history.retry")}
               </Button>
             </div>
+          ) : retryReviewRequired ? (
+            <WorkflowRunRetryControl
+              runId={controlRun.id}
+              workspaceId={controlRun.workspace_id || ""}
+              bindingId={controlRun.binding_id}
+              workflowId={controlRun.workflow_id}
+              reviewRequired={compactRun?.intervention?.kind === "workflow_effect_review" && compactRun.intervention.options?.includes("review")}
+              onRetried={(retried) => onSelectRun(retried.id)}
+            />
           ) : null}
         </section>
       )}

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, Iterable
@@ -43,8 +44,24 @@ SCHEDULED_JOB_SKILL_GENERATION_LEASE_TTL_SECONDS = (
 _WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS = 30
 _WORKFLOW_RUN_EXECUTION_RENEWAL_RETRY_SECONDS = 2
 _WORKFLOW_RUN_EXECUTION_RENEWAL_TIMEOUT_SECONDS = 10
-_WORKFLOW_RUN_EXECUTION_TRANSIENT_FAILURE_LIMIT = 3
+# A renewal that cannot reach PostgreSQL is not a lost lease: the durable row
+# keeps fencing every other owner until its own expiry. The owner keeps
+# retrying until its last *confirmed* expiry minus this margin, which absorbs
+# clock skew and the in-flight fenced commit. Counting failed attempts instead
+# turned a five-second database blip into a lost 25-minute workflow step.
+_EXECUTION_LEASE_SAFETY_MARGIN_SECONDS = 60
+# Session marker: lease statements bypass the business admission gate.
+DATABASE_LEASE_CONTROL_INFO_KEY = "database_lease_control"
 logger = logging.getLogger(__name__)
+
+
+def execution_lease_safety_margin(lease_ttl_seconds: float) -> float:
+    """Seconds before a confirmed expiry at which an owner stops trusting it."""
+
+    return min(
+        float(_EXECUTION_LEASE_SAFETY_MARGIN_SECONDS),
+        max(0.0, float(lease_ttl_seconds) / 4),
+    )
 
 CLAIM_GRANTED = "granted"
 CLAIM_HELD = "claim_held_by_live_execution"
@@ -130,9 +147,24 @@ class WorkflowRunExecutionClaim:
     lost_error_type: type[RuntimeError] = WorkflowRunExecutionClaimLost
     resource_label: str = "Execution"
     claim_key: str = ""
+    handoff: asyncio.Event | None = None
 
     def __bool__(self) -> bool:
         return self.granted
+
+    def retain_for_handoff(self) -> str:
+        """Keep this lease row on exit so exactly one successor can adopt it.
+
+        The row keeps fencing other owners until it expires. A successor that
+        presents this token swaps it atomically for its own; if none arrives
+        (for example the broker dropped the delivery), the expired row is what
+        the recovery sweep finds again.
+        """
+
+        if self.handoff is None or not self.claim_key:
+            raise RuntimeError("This execution claim cannot be handed off")
+        self.handoff.set()
+        return self.token
 
     def raise_if_lost(self) -> None:
         """Fence a durable commit or external-effect boundary."""
@@ -217,6 +249,7 @@ def _claim(
     lost_error_type: type[RuntimeError] = WorkflowRunExecutionClaimLost,
     resource_label: str = "Execution",
     claim_key: str = "",
+    handoff: asyncio.Event | None = None,
 ) -> WorkflowRunExecutionClaim:
     return WorkflowRunExecutionClaim(
         run_id=run_id,
@@ -228,6 +261,7 @@ def _claim(
         lost_error_type=lost_error_type,
         resource_label=resource_label,
         claim_key=claim_key,
+        handoff=handoff,
     )
 
 
@@ -281,6 +315,17 @@ _TAKE_OVER_EXPIRED_POSTGRES_CLAIM = text("""
     RETURNING claim_token
 """)
 
+_ADOPT_POSTGRES_CLAIM = text("""
+    UPDATE runtime_execution_claims
+    SET claim_token = :claim_token,
+        expires_at = CURRENT_TIMESTAMP
+            + CAST(:ttl_seconds AS DOUBLE PRECISION) * INTERVAL '1 second',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE claim_key = :claim_key
+      AND claim_token = :handoff_claim_token
+    RETURNING claim_token
+""")
+
 _RELEASE_POSTGRES_CLAIM = text("""
     DELETE FROM runtime_execution_claims
     WHERE claim_key = :claim_key
@@ -304,6 +349,34 @@ _LIVE_POSTGRES_CLAIM = text("""
       AND expires_at > CURRENT_TIMESTAMP
     FOR UPDATE
 """)
+
+
+_EXPIRED_POSTGRES_CLAIM = text("""
+    SELECT claim_token
+    FROM runtime_execution_claims
+    WHERE claim_key = :claim_key
+      AND expires_at <= CURRENT_TIMESTAMP
+""")
+
+
+async def expired_workflow_run_claim_token(run_id: str) -> str | None:
+    """Token of a Workflow Run lease whose owner stopped renewing it, if any.
+
+    A delivery that would take such a lease over is the successor of a lost
+    owner and must go through claim-loss recovery instead of executing.
+    """
+    from packages.core.database import create_worker_session
+
+    async with create_worker_session()() as db:
+        info = getattr(db, "info", None)
+        if isinstance(info, dict):
+            info[DATABASE_LEASE_CONTROL_INFO_KEY] = True
+        token = (await db.execute(
+            _EXPIRED_POSTGRES_CLAIM,
+            {"claim_key": f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{run_id}"},
+        )).scalar_one_or_none()
+        await db.commit()
+        return str(token) if token else None
 
 
 async def scheduled_run_has_live_execution_claim(db, run_id: str) -> bool:
@@ -343,6 +416,12 @@ async def _run_claim_statement(statement, parameters: dict) -> bool:
     from packages.core.database import create_worker_session
 
     async with create_worker_session()() as db:
+        info = getattr(db, "info", None)
+        if isinstance(info, dict):
+            # The lease fences the very business work that holds this loop's
+            # admission permits. Queueing its renewal behind that work turns
+            # load into self-inflicted claim loss.
+            info[DATABASE_LEASE_CONTROL_INFO_KEY] = True
         result = (await db.execute(statement, parameters)).scalar_one_or_none()
         await db.commit()
         return result is not None
@@ -354,7 +433,22 @@ async def _acquire_postgres_execution_claim(
     *,
     lease_ttl_seconds: int,
     expired_claim_token: str | None = None,
+    handoff_claim_token: str | None = None,
 ) -> bool:
+    if handoff_claim_token is not None:
+        # One-shot adoption: the token swap succeeds for exactly one
+        # successor, so duplicate deliveries of one handoff cannot both run.
+        adopted = await _run_claim_statement(
+            _ADOPT_POSTGRES_CLAIM,
+            {
+                "claim_key": claim_key,
+                "claim_token": token,
+                "ttl_seconds": lease_ttl_seconds,
+                "handoff_claim_token": handoff_claim_token,
+            },
+        )
+        if adopted:
+            return True
     if expired_claim_token is not None:
         return await _run_claim_statement(
             _TAKE_OVER_EXPIRED_POSTGRES_CLAIM,
@@ -409,6 +503,8 @@ async def _postgres_execution_claim(
     claim_key: str,
     lease_ttl_seconds: int,
     expired_claim_token: str | None = None,
+    handoff_claim_token: str | None = None,
+    handoff: asyncio.Event | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
     """Own one durable PostgreSQL lease without holding its DB connection."""
     granted = await _acquire_postgres_execution_claim(
@@ -416,6 +512,7 @@ async def _postgres_execution_claim(
         token,
         lease_ttl_seconds=lease_ttl_seconds,
         **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
+        **({"handoff_claim_token": handoff_claim_token} if handoff_claim_token is not None else {}),
     )
     try:
         yield _claim(
@@ -424,9 +521,12 @@ async def _postgres_execution_claim(
             granted=granted,
             reason=CLAIM_GRANTED if granted else CLAIM_HELD,
             claim_key=claim_key,
+            handoff=handoff,
         )
     finally:
-        if granted:
+        if granted and handoff is not None and handoff.is_set():
+            logger.info("Execution claim %s retained for handoff", claim_key)
+        elif granted:
             try:
                 await _release_postgres_execution_claim(claim_key, token)
             except Exception:
@@ -445,16 +545,23 @@ async def _renewable_execution_claim(
     *,
     kind: ExecutionClaimKind,
     expired_claim_token: str | None = None,
+    handoff_claim_token: str | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
     policy = ExecutionClaimPolicyFactory.create(kind)
     token = generate_ulid()
     claim_key = f"{policy.kind.value}:{resource_id}"
+    handoff = asyncio.Event()
+    # Measured before the statement is sent, so the local deadline can only
+    # be earlier than the expiry PostgreSQL actually wrote.
+    acquire_started = time.monotonic()
     async with _postgres_execution_claim(
         resource_id,
         token,
         claim_key=claim_key,
         lease_ttl_seconds=policy.lease_ttl_seconds,
+        handoff=handoff,
         **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
+        **({"handoff_claim_token": handoff_claim_token} if handoff_claim_token is not None else {}),
     ) as postgres_claim:
         if not postgres_claim:
             yield postgres_claim
@@ -463,14 +570,20 @@ async def _renewable_execution_claim(
         lost = asyncio.Event()
         terminal_committed = asyncio.Event()
         owner_task = asyncio.current_task()
+        trust_window = (
+            policy.lease_ttl_seconds
+            - execution_lease_safety_margin(policy.lease_ttl_seconds)
+        )
 
         async def _heartbeat() -> None:
             delay_seconds = _WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS
+            trusted_until = acquire_started + trust_window
             transient_failures = 0
             while True:
                 await asyncio.sleep(delay_seconds)
                 if terminal_committed.is_set():
                     return
+                renewal_started = time.monotonic()
                 try:
                     extended = await asyncio.wait_for(
                         _extend_postgres_execution_claim(
@@ -493,29 +606,51 @@ async def _renewable_execution_claim(
                 if terminal_committed.is_set():
                     return
                 if extended is True:
-                    transient_failures = 0
-                    delay_seconds = _WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS
-                    continue
-                if extended is None:
-                    transient_failures += 1
-                    if (
-                        transient_failures
-                        < _WORKFLOW_RUN_EXECUTION_TRANSIENT_FAILURE_LIMIT
-                    ):
-                        logger.warning(
-                            "%s %s lease renewal unavailable; retrying "
-                            "within the current fencing TTL (%d/%d)",
+                    if transient_failures:
+                        logger.info(
+                            "%s %s lease renewal recovered after %d failed "
+                            "attempt(s)",
                             policy.resource_label,
                             resource_id,
                             transient_failures,
-                            _WORKFLOW_RUN_EXECUTION_TRANSIENT_FAILURE_LIMIT,
                         )
-                        delay_seconds = (
-                            _WORKFLOW_RUN_EXECUTION_RENEWAL_RETRY_SECONDS
-                        )
-                        continue
+                    transient_failures = 0
+                    trusted_until = renewal_started + trust_window
+                    delay_seconds = _WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS
+                    continue
+                remaining = trusted_until - time.monotonic()
+                if extended is None and remaining > 0:
+                    # Unreachable is not lost. Nobody else can take an
+                    # unexpired row, so keep working and keep retrying with
+                    # backoff until the last confirmed expiry is near.
+                    transient_failures += 1
+                    delay_seconds = min(
+                        _WORKFLOW_RUN_EXECUTION_RENEWAL_RETRY_SECONDS
+                        * (2 ** min(transient_failures - 1, 8)),
+                        _WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS,
+                        remaining,
+                    )
+                    logger.warning(
+                        "%s %s lease renewal unavailable (attempt %d); "
+                        "the lease stays valid for %.0fs more, retrying in "
+                        "%.1fs",
+                        policy.resource_label,
+                        resource_id,
+                        transient_failures,
+                        remaining,
+                        delay_seconds,
+                    )
+                    continue
                 if terminal_committed.is_set():
                     return
+                logger.error(
+                    "%s %s lost its execution claim (%s)",
+                    policy.resource_label,
+                    resource_id,
+                    "lease token no longer held"
+                    if extended is False
+                    else f"no renewal confirmed for {trust_window:.0f}s",
+                )
                 lost.set()
                 # Cancellation is cooperative and provider wrappers sometimes
                 # suppress one CancelledError. Keep the owner poisoned until
@@ -549,6 +684,7 @@ async def _renewable_execution_claim(
                     lost_error_type=policy.lost_error_type,
                     resource_label=policy.resource_label,
                     claim_key=claim_key,
+                    handoff=handoff,
                 )
                 yield claim
             except asyncio.CancelledError as exc:
@@ -569,13 +705,19 @@ async def workflow_run_execution_claim(
     run_id: str,
     *,
     expired_claim_token: str | None = None,
+    handoff_claim_token: str | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
-    """Yield one renewable, exclusive execution claim for ``run_id``."""
+    """Yield one renewable, exclusive execution claim for ``run_id``.
+
+    ``handoff_claim_token`` adopts a lease a recovery owner retained for this
+    delivery; when that lease is gone the normal acquisition rules apply.
+    """
 
     async with _renewable_execution_claim(
         run_id,
         kind=ExecutionClaimKind.WORKFLOW_RUN,
         **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
+        **({"handoff_claim_token": handoff_claim_token} if handoff_claim_token is not None else {}),
     ) as claim:
         yield claim
 
@@ -640,6 +782,7 @@ __all__ = [
     "AgentTaskExecutionClaimLost",
     "CLAIM_GRANTED",
     "CLAIM_HELD",
+    "DATABASE_LEASE_CONTROL_INFO_KEY",
     "ExecutionClaimPolicy",
     "ExecutionClaimPolicyFactory",
     "WORKFLOW_RUN_EXECUTION_LEASE_TTL_SECONDS",
@@ -655,6 +798,8 @@ __all__ = [
     "WorkflowRunExecutionClaimLost",
     "agent_task_execution_claim",
     "commit_fenced_execution_boundary",
+    "execution_lease_safety_margin",
+    "expired_workflow_run_claim_token",
     "scheduled_run_execution_claim",
     "scheduled_run_has_live_execution_claim",
     "scheduled_job_skill_generation_claim",

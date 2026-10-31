@@ -121,7 +121,18 @@ def _validate_node_execution(
 
 
 def _runtime_identity(environment: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in environment.items() if key not in {"ci", "deployment_mode"}}
+    # Shards of one run may land on runners with different kernel patch
+    # releases; Python, lock, packages and OS/libc must still match.
+    return {
+        key: value
+        for key, value in environment.items()
+        if key not in {"ci", "deployment_mode", "kernel"}
+    }
+
+
+def _lane_identity(environment: dict[str, Any]) -> dict[str, Any]:
+    # Within a lane the deployment mode must match as well.
+    return {key: value for key, value in environment.items() if key != "kernel"}
 
 
 def _ci_identity(environment: dict[str, Any], directory: Path) -> tuple[str | None, str | None, str | None]:
@@ -215,8 +226,8 @@ def validate_reports(report_dirs: list[Path]) -> list[Report]:
         seen_nodeids.update(report.durations)
         lanes.setdefault(report.lane, []).append(report)
     for lane, lane_reports in lanes.items():
-        environment = lane_reports[0].environment
-        if any(report.environment != environment for report in lane_reports[1:]):
+        environment = _lane_identity(lane_reports[0].environment)
+        if any(_lane_identity(report.environment) != environment for report in lane_reports[1:]):
             raise ValueError(f"{lane}: reports must use the same environment identity")
         sharded = [report for report in lane_reports if report.group is not None]
         if sharded and len(sharded) != len(lane_reports):

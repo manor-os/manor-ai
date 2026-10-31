@@ -238,7 +238,9 @@ async def test_coordinator_requires_current_admitted_claim_not_phase_or_old_gene
     assert (await read(seeded))[0]["state"] == "planning"
     run.wake_generation = generate_ulid()
     await db_session.commit()
-    assert (await read(seeded))[0]["state"] == "awaiting_coordinator"
+    # Every run is an agent loop: without a live claim, one parked on its
+    # delegated agents is waiting on them.
+    assert (await read(seeded))[0]["state"] == ("waiting" if phase == "waiting_child" else "awaiting_coordinator")
     run.wake_generation = run.claim_generation
     run.lifecycle_generation = "obsolete-lifecycle"
     await db_session.commit()
@@ -288,7 +290,6 @@ async def test_parked_agent_loop_is_waiting_not_unstarted(db_session, phase, wai
 async def test_waiting_state_has_user_facing_labels():
     from packages.core.ai.runtime.workspace_response import _LABELS
     from packages.core.services.workspace_execution_evidence import ExecutionObservationState
-    from packages.core.strategist.execution_presentation import _STATE_LABELS
 
     for state in ExecutionObservationState:
-        assert state.value in _LABELS and state.value in _STATE_LABELS
+        assert state.value in _LABELS

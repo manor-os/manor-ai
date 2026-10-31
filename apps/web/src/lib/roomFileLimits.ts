@@ -1,0 +1,3 @@
+export const ROOM_FILE_MAX_BYTES = 1024 * 1024 * 1024;
+export const ROOM_FILE_BATCH_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+export const ROOM_FILE_PREVIEW_MAX_BYTES = 100 * 1024 * 1024;

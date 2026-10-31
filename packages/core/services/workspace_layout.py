@@ -6,6 +6,11 @@
         <existing ledger name>/               shared Workspace state
         workflow/<lineage root run id>/       real Workflow execution outputs
         tasks/<task id>/<type>/                Task execution outputs
+        projects/<project>/<child project>/    a WorkflowProject's own files
+
+A WorkflowProject that names a folder (``state.project_root``) keeps what it
+makes there, at the Workspace home whichever run or Task makes it, so a series
+and its episodes read as one tree: ``projects/<series>/<episode>/``.
 
 DocumentFolder projects physical Workspace files into Workspaces/<name>.
 Ordinary files have no automatic type directory outside an execution archive.
@@ -24,13 +29,27 @@ from enum import Enum
 
 WORKFLOW_ARTIFACT_SEGMENT = "workflow"
 TASK_ARTIFACT_SEGMENT = "tasks"
+PROJECT_ARTIFACT_SEGMENT = "projects"
+# A project made again keeps each version in a take folder of its own.
+PROJECT_TAKES_SEGMENT = "takes"
 WORKSPACE_LEDGER_DIRECTORIES = frozenset({
     "topic-ledger", "content-ledger", "finance-ledger",
     "recruiting-ledger", "relationship-ledger",
 })
 WORKSPACE_RESERVED_DIRECTORIES = WORKSPACE_LEDGER_DIRECTORIES | {
-    WORKFLOW_ARTIFACT_SEGMENT, TASK_ARTIFACT_SEGMENT,
+    WORKFLOW_ARTIFACT_SEGMENT, TASK_ARTIFACT_SEGMENT, PROJECT_ARTIFACT_SEGMENT,
 }
+
+
+def project_production_root(project_root: object) -> str | None:
+    """The run's project folder when the runtime assigned it (``projects/...``).
+
+    A production made inside such a project keeps its files there, on every
+    retry. A root a Blueprint writes itself is not one, so its run keeps the
+    run folder.
+    """
+    root = str(project_root or "").strip().strip("/")
+    return root if root.startswith(f"{PROJECT_ARTIFACT_SEGMENT}/") else None
 
 
 class WorkspaceArtifactDir(str, Enum):

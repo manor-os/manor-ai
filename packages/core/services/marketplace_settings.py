@@ -1,8 +1,13 @@
 """Marketplace platform settings — admin-managed knobs in PlatformSetting.
 
-Single KV document under key ``marketplace``. First (and v1-only) knob is
-``platform_fee_percent`` — the cut taken on paid blueprint sales via
-Stripe ``application_fee_amount``. Default 0: no fee.
+Single KV document under key ``marketplace``:
+
+``platform_fee_percent`` — the platform's cut of a paid blueprint sale
+(default 0: no fee). The seller is paid the rest.
+
+``seller_payout_hold_days`` — how long a creator sale's proceeds are held
+before the seller transfer is released (default 30), so refunds and
+disputes in that window come out of money the platform still holds.
 """
 from __future__ import annotations
 
@@ -12,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.platform_setting import PlatformSetting
 
 MARKETPLACE_SETTINGS_KEY = "marketplace"
+DEFAULT_SELLER_PAYOUT_HOLD_DAYS = 30
+MAX_SELLER_PAYOUT_HOLD_DAYS = 90
 
 
 async def _get_row(db: AsyncSession) -> PlatformSetting | None:
@@ -50,6 +57,42 @@ async def set_marketplace_fee_percent(
     row.updated_by = updated_by
     await db.flush()
     return percent
+
+
+async def get_seller_payout_hold_days(db: AsyncSession) -> int:
+    """Return the seller payout hold in days (default 30, clamped 0-90)."""
+    row = await _get_row(db)
+    if row is None:
+        return DEFAULT_SELLER_PAYOUT_HOLD_DAYS
+    value = (row.value or {}).get(
+        "seller_payout_hold_days", DEFAULT_SELLER_PAYOUT_HOLD_DAYS,
+    )
+    try:
+        return max(0, min(MAX_SELLER_PAYOUT_HOLD_DAYS, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_SELLER_PAYOUT_HOLD_DAYS
+
+
+async def set_seller_payout_hold_days(
+    db: AsyncSession, days: int, *, updated_by: str,
+) -> int:
+    if (
+        not isinstance(days, int)
+        or isinstance(days, bool)
+        or days < 0
+        or days > MAX_SELLER_PAYOUT_HOLD_DAYS
+    ):
+        raise ValueError(
+            f"seller_payout_hold_days must be an integer 0-{MAX_SELLER_PAYOUT_HOLD_DAYS}"
+        )
+    row = await _get_row(db)
+    if row is None:
+        row = PlatformSetting(key=MARKETPLACE_SETTINGS_KEY, value={})
+        db.add(row)
+    row.value = {**(row.value or {}), "seller_payout_hold_days": days}
+    row.updated_by = updated_by
+    await db.flush()
+    return days
 
 
 def platform_fee_cents(amount_cents: int, fee_percent: int) -> int:

@@ -398,8 +398,7 @@ portal, with the callback URL set to
 | `TWILIO_ALLOW_UNSIGNED_LOCAL` | Local-only Twilio webhook override; keep `false` in staging/production. Twilio Account SID, Auth Token, and phone number are supplied per Integration. |
 | `OPENAI_REALTIME_MODEL` | Native OpenAI Realtime model shared by Browser and Twilio Voice. Defaults to `gpt-realtime`. |
 
-Configure speech synthesis credentials for **Text-to-Speech** in Account → Models.
-For the `suno/music` model, configure a native Suno BYOK key for **Music & Score**.
+Configure speech synthesis BYOK credentials for **Text-to-Speech** in Account → Models.
 These role-specific credentials follow the Entity's model configuration. A
 missing or incompatible key blocks generation before any provider request;
 self-hosted audio never falls back to a deployment's managed credentials.
@@ -479,7 +478,7 @@ Secret Key into `NANGO_SECRET_KEY`.
 | `NANGO_PUBLIC_URL` | unset | Public hostname for OAuth callbacks and SaaS webhooks. Local dev can leave it empty; production should use `https://nango.<your-domain>` behind your reverse proxy. |
 | `NANGO_SECRET_KEY` | unset | From the Nango admin UI. Leave empty to disable Nango entirely. |
 | `NANGO_PUBLIC_KEY` | unset | Public key from the Nango admin UI. |
-| `NANGO_CONNECT_HMAC_KEY` | unset | A distinct 64-character lowercase-hex key for Nango Connect HMAC and the derived webhook URL credential. Required by the DOKS Nango bundle and browser OAuth; only the webhook receiver falls back to `NANGO_SECRET_KEY` for untouched local Compose. |
+| `NANGO_CONNECT_HMAC_KEY` | unset | A distinct 64-character lowercase-hex key for Nango Connect HMAC and the derived webhook URL credential. Required by browser OAuth; only the webhook receiver falls back to `NANGO_SECRET_KEY` for untouched local Compose. |
 | `NANGO_WEBHOOK_SECRET` | unset | Legacy Compose compatibility variable. Nango 0.36 does not sign outbound webhook requests with this value; do not rely on it for webhook authentication. |
 | `NANGO_WEBHOOK_URL` | unset | URL Nango POSTs webhooks to. Manor appends a derived `nango_webhook_token` query parameter because Nango 0.36 sends no signature header. Defaults to the Compose-internal `http://manor-api:8000/api/v1/nango/webhook`; override for production. |
 

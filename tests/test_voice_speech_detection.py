@@ -12,7 +12,7 @@ import pytest
 
 from packages.core.services.voice.gateway_call import SpeechDetector
 from packages.core.services.voice.realtime import VoiceAgentOutcome
-from tests.test_browser_voice import eventually
+from tests.test_browser_voice import HANG_GUARD_SECONDS, eventually
 from tests.test_gateway_voice import gateway_session, pcm, utterance
 
 
@@ -78,7 +78,7 @@ async def test_background_noise_during_thinking_does_not_discard_the_spoken_repl
     task = asyncio.create_task(call.run())
     await eventually(lambda: bool(ws.events))
     await utterance(ws)
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
     original_generation = call.generation
     audio = noise("white") + bytes(48000)
     for pos in range(0, len(audio), 1920):
@@ -90,7 +90,7 @@ async def test_background_noise_during_thinking_does_not_discard_the_spoken_repl
     call.transcribe.assert_awaited_once()
     call.speak.assert_awaited_once_with("I can hear you.", "warm")
     await ws.incoming.put({"type": "end"})
-    await asyncio.wait_for(task, 2)
+    await asyncio.wait_for(task, HANG_GUARD_SECONDS)
 
 
 async def test_empty_transcription_after_a_tentative_interrupt_keeps_the_pending_reply():
@@ -108,7 +108,7 @@ async def test_empty_transcription_after_a_tentative_interrupt_keeps_the_pending
     try:
         await eventually(lambda: bool(ws.events))
         await utterance(ws)
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         # Speech detection is tentative: a breath or handling noise can pass
         # VAD even though the transcription service returns no words.
         await utterance(ws)
@@ -118,7 +118,7 @@ async def test_empty_transcription_after_a_tentative_interrupt_keeps_the_pending
         call.agent.assert_awaited_once_with("你好")
     finally:
         await ws.incoming.put({"type": "end"})
-        await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
 
 
 async def test_empty_transcription_resumes_a_paused_clip_without_regenerating_it():
@@ -139,7 +139,7 @@ async def test_empty_transcription_resumes_a_paused_clip_without_regenerating_it
         await eventually(lambda: ws.events[-1]["type"] == "listening")
     finally:
         await ws.incoming.put({"type": "end"})
-        await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
 
 
 async def test_muting_a_partial_utterance_releases_paused_playback():
@@ -159,7 +159,7 @@ async def test_muting_a_partial_utterance_releases_paused_playback():
         call.transcribe.assert_awaited_once()
     finally:
         await ws.incoming.put({"type": "end"})
-        await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
 
 
 def test_noise_after_a_full_spoken_turn_does_not_inherit_speech_classification():

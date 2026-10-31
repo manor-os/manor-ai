@@ -31,15 +31,8 @@ def _oss_migration_root(tmp_path: Path) -> Path:
     shutil.copy2(ROOT / "packages/core/migrations/env.py", migration_root / "env.py")
 
     source_versions = ROOT / "packages/core/migrations/versions"
-    if (ROOT / ".ossexclude").exists():
-        from scripts import prepare_oss_release as prep
-
-        for rel_path in prep.OSS_PUBLIC_MIGRATION_PATHS:
-            target = versions / Path(rel_path).name
-            target.write_bytes(prep.public_file_bytes(ROOT / rel_path, rel_path))
-    else:
-        for source in sorted(source_versions.glob("*.py")):
-            shutil.copy2(source, versions / source.name)
+    for source in sorted(source_versions.glob("*.py")):
+        shutil.copy2(source, versions / source.name)
     return migration_root
 
 
@@ -304,35 +297,11 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
         with engine.begin() as connection:
             _seed_published_oss_data(connection)
 
-        if baseline_config is not None:
-            command.upgrade(baseline_config, "head")
-            with engine.begin() as connection:
-                connection.execute(sa.text("""
-                    INSERT INTO workflow_runs (id, workflow_id, entity_id, status)
-                    VALUES ('workflow_run_inflight', 'workflow_legacy', 'entity_legacy', 'running')
-                """))
-                connection.execute(sa.text("""
-                    INSERT INTO channel_configs (
-                        id, entity_id, channel_type, provider, status,
-                        credential_ref, credential_scheme
-                    ) VALUES (
-                        'channel_config_baseline', 'entity_legacy', 'telegram', 'telegram',
-                        'active', 'test-reference-only', 'vault_transit'
-                    )
-                """))
-            with engine.connect() as connection:
-                assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == (
-                    ScriptDirectory.from_config(baseline_config).get_current_head()
-                )
-                assert connection.scalar(sa.text(
-                    "SELECT content FROM messages WHERE id = 'message_legacy'"
-                )) == "Legacy response"
-                assert connection.scalar(sa.text(
-                    "SELECT status FROM workflow_runs WHERE id = 'workflow_run_inflight'"
-                )) == "running"
-
         # Historical capability grants require an operator-reviewed replacement.
-        command.upgrade(config, "20261004_03")
+        # A published-baseline database must complete that same reviewed
+        # cutover before it can represent an installed public release.
+        upgrade_config = baseline_config or config
+        command.upgrade(upgrade_config, "20261004_03")
         from packages.core.migrations import unified_approval
         from packages.core.migrations.unified_approval import preflight
         with engine.begin() as connection:
@@ -395,13 +364,13 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
         with monkeypatch.context() as patch:
             patch.setattr(unified_approval, 'apply', fail_after_writes)
             with pytest.raises(RuntimeError, match='injected cutover failure'):
-                command.upgrade(config, 'head')
+                command.upgrade(upgrade_config, 'head')
         with engine.connect() as connection:
             assert connection.scalar(sa.text('SELECT version_num FROM alembic_version')) == '20261004_03'
             assert 'approval_policy' not in {col['name'] for col in sa.inspect(connection).get_columns('chat_rooms')}
             assert connection.scalar(sa.text("SELECT status FROM hitl_requests WHERE id='legacy_approval'")) == 'pending'
             assert connection.scalar(sa.text("SELECT count(*) FROM audit_log WHERE action='approval_policy.migrated'")) == 0
-        command.upgrade(config, "head")
+        command.upgrade(upgrade_config, "head")
 
         with engine.connect() as connection:
             audit_count = connection.scalar(sa.text("SELECT count(*) FROM audit_log WHERE action='approval_policy.migrated'"))
@@ -414,9 +383,35 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
             assert migrated_operating['rules'][0]['approval_selectors'] == [
                 {'kind': 'action', 'action_key': 'communication.send'}]
             assert not preflight(connection)['operations']
-        command.upgrade(config, 'head')
+        command.upgrade(upgrade_config, 'head')
         with engine.connect() as connection:
             assert connection.scalar(sa.text("SELECT count(*) FROM audit_log WHERE action='approval_policy.migrated'")) == audit_count
+
+        if baseline_config is not None:
+            with engine.begin() as connection:
+                connection.execute(sa.text("""
+                    INSERT INTO workflow_runs (id, workflow_id, entity_id, status)
+                    VALUES ('workflow_run_inflight', 'workflow_legacy', 'entity_legacy', 'running')
+                """))
+                connection.execute(sa.text("""
+                    INSERT INTO channel_configs (
+                        id, entity_id, channel_type, provider, status,
+                        credential_ref, credential_scheme
+                    ) VALUES (
+                        'channel_config_baseline', 'entity_legacy', 'telegram', 'telegram',
+                        'active', 'test-reference-only', 'vault_transit'
+                    )
+                """))
+                assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == (
+                    ScriptDirectory.from_config(baseline_config).get_current_head()
+                )
+                assert connection.scalar(sa.text(
+                    "SELECT content FROM messages WHERE id = 'message_legacy'"
+                )) == "Legacy response"
+                assert connection.scalar(sa.text(
+                    "SELECT status FROM workflow_runs WHERE id = 'workflow_run_inflight'"
+                )) == "running"
+            command.upgrade(config, "head")
 
         with engine.connect() as connection:
             inspector = sa.inspect(connection)
@@ -446,12 +441,12 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
                 column["name"] for column in inspector.get_columns("chat_room_agent_runs")
             }
             assert {
-                "task_coordinator_runs", "task_plan_submissions", "runtime_file_commits",
-                "conversation_transcript_items",
+                "task_coordinator_runs", "runtime_file_commits",
+                "conversation_transcript_items", "task_run_journal",
+                "task_agent_child_runs",
             } <= set(inspector.get_table_names())
-            assert "rejection_reason" in {
-                column["name"] for column in inspector.get_columns("task_plan_submissions")
-            }
+            # 20261025_10 drops the retired planner's manual Plan submissions.
+            assert "task_plan_submissions" not in inspector.get_table_names()
             assert "engine" in {
                 column["name"] for column in inspector.get_columns("task_coordinator_runs")
             }

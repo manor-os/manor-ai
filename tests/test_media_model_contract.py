@@ -184,31 +184,12 @@ async def test_audio_inspection_uses_purpose_selected_model(monkeypatch, purpose
 
 
 @pytest.mark.asyncio
-async def test_suno_inspection_exposes_custom_mode_without_false_format_control(monkeypatch):
-    from packages.core.ai.tools import extended_tools
-    from packages.core.ai.tools.generate_file.model_contract import selected_media_model_contract
-    from packages.core.contracts.audio_generation import AudioGenerationRole
-
-    async def selected(*_args, **_kwargs):
-        return "suno/music", AudioGenerationRole.AUDIO
-
-    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", selected)
-    result = await selected_media_model_contract(
-        kind="audio", entity_id="entity-1", user_id="user-1", purpose="music",
-    )
-    schema = result["generation_schema"]
-    assert "lyrics" in schema and "instrumental" in schema
-    assert "response_format" not in schema
-    assert schema["duration_seconds"]["supported_as_provider_parameter"] is False
-
-
-@pytest.mark.asyncio
 async def test_audio_generation_rejects_changed_model_before_credentials(monkeypatch):
     from packages.core.ai.tools import extended_tools
     from packages.core.contracts.audio_generation import AudioGenerationRole
 
     async def selected(*_args, **_kwargs):
-        return "suno/music", AudioGenerationRole.AUDIO
+        return "google/lyria-3-pro-preview", AudioGenerationRole.AUDIO
 
     async def unexpected(*_args, **_kwargs):
         raise AssertionError("credentials must not be read after model change")
@@ -220,7 +201,7 @@ async def test_audio_generation_rejects_changed_model_before_credentials(monkeyp
         purpose="music", expected_model="google/lyria-3-clip-preview",
     ))
     assert result["code"] == "audio_model_changed_reinspect_required"
-    assert result["model"] == "suno/music"
+    assert result["model"] == "google/lyria-3-pro-preview"
 
 
 @pytest.mark.asyncio
@@ -308,7 +289,7 @@ async def test_audio_generation_checks_pinned_narration_model(monkeypatch):
     [
         ("image", None, "google/gemini-3.1-flash-image-preview", "openai/gpt-image-2", "error_code"),
         ("video", None, "bytedance/seedance-2.0", "bytedance/seedance-2.5", "error_code"),
-        ("audio", "music", "google/lyria-3-clip-preview", "suno/music", "code"),
+        ("audio", "music", "google/lyria-3-clip-preview", "google/lyria-3-pro-preview", "code"),
     ],
 )
 async def test_search_then_generate_rechecks_model_before_credentials(

@@ -74,6 +74,7 @@ const ALIASES: Readonly<Record<string, string>> = {
   postgres: "postgresql", raindropio: "raindrop",
   manormcpcalendar: "manor", manormcpadmin: "manor",
   manormcpfileengine: "manor",
+  minutes: "manor_mcp_minutes", manorminutes: "manor_mcp_minutes",
   manorcliworker: "manor",
 };
 

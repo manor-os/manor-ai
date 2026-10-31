@@ -13,6 +13,7 @@ import pytest
 from docx import Document as WordDocument
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.chat_room import (
@@ -25,10 +26,12 @@ from packages.core.models.chat_room import (
 from packages.core.models.document import Document
 from packages.core.services import entity_fs
 from packages.core.services.room_agent_runtime import room_audience_fingerprint
+from packages.core.services.room_file_storage import store_room_file_chunks
 from packages.core.services.room_file_read_tools import (
     _extractable_type,
     _safe_office_archive,
     execute_room_file_tool,
+    read_room_file_source_bytes,
     room_file_tool_schemas,
 )
 
@@ -47,7 +50,8 @@ async def _register(client: AsyncClient, name: str) -> tuple[dict[str, str], dic
 
 
 @pytest.mark.asyncio
-async def test_room_file_tools_only_read_common_group_attachments(client: AsyncClient, db_session):
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_room_file_tools_only_read_common_group_attachments(client: AsyncClient, db_session, chunked, monkeypatch):
     headers, owner = await _register(client, "room_tool_owner")
     _, guest = await _register(client, "room_tool_guest")
     created = await client.post("/api/v1/chat/rooms", headers=headers, json={
@@ -102,8 +106,14 @@ async def test_room_file_tools_only_read_common_group_attachments(client: AsyncC
         id=generate_ulid(), message_id=foreign_message.id, name="foreign.txt",
         mime_type="text/plain", size=7, content=b"foreign",
     )
+    if chunked:
+        visible_file.content = None
+        visible_file.chunk_count = 1
+        visible_file.content_sha256 = sha256(b"shared evidence").hexdigest()
     db_session.add_all([old_file, visible_file, foreign_file])
     await db_session.flush()
+    if chunked:
+        await store_room_file_chunks(db_session, visible_file, io.BytesIO(b"shared evidence"))
     fingerprint, _ = await room_audience_fingerprint(db_session, room_id)
     run = ChatRoomAgentRun(
         id=generate_ulid(), room_id=room_id, source_message_id=source.id,
@@ -123,9 +133,28 @@ async def test_room_file_tools_only_read_common_group_attachments(client: AsyncC
     assert read["content"] == "shared"
     assert read["content_is_untrusted"] is True
     assert read["next_offset"] == 6
+    monkeypatch.setattr(
+        "packages.core.services.room_file_read_tools.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+    await db_session.commit()  # Release room admission lock before the independent source-reader session.
+    source_bytes = await read_room_file_source_bytes(
+        room_id=room_id, run_id=run.id, expected_execution_revision=1, file_id=visible_file.id,
+    )
+    assert source_bytes is not None
+    assert source_bytes[1] == b"shared evidence"
     assert json.loads(await execute_room_file_tool(
         "room_read_file", {"file_id": visible_file.id, "offset": 6}, **scope,
     ))["content"] == " evidence"
+    monkeypatch.setattr("packages.core.services.room_file_read_tools._MAX_FILE_BYTES", 14)
+    capped = json.loads(await execute_room_file_tool(
+        "room_read_file", {"file_id": visible_file.id}, **scope,
+    ))
+    assert capped["preview_unavailable"] is True
+    await db_session.commit()
+    assert await read_room_file_source_bytes(
+        room_id=room_id, run_id=run.id, expected_execution_revision=1, file_id=visible_file.id,
+    ) is None
     for hidden_id in (old_file.id, foreign_file.id):
         hidden = json.loads(await execute_room_file_tool(
             "room_read_file", {"file_id": hidden_id}, **scope,

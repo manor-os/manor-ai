@@ -17,12 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime.interrupted_tool_calls import (
     runtime_answer_interrupted_calls as _answer_interrupted_calls,
+    runtime_stored_pending_result,
 )
 from packages.core.ai.runtime.run_state import RuntimeRunState, RuntimeRunStateVersionError
-from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
 from packages.core.constants.task import TaskStatus
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan
 from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.task import Task
 from packages.core.models.task_coordinator import (
@@ -54,7 +53,6 @@ TASK_COORDINATOR_OUTBOX_EVENT = "runtime.dispatch_task_coordinator"
 TASK_COORDINATOR_OUTBOX_VERSION = 1
 TASK_COORDINATOR_WAKE_PENDING = "task coordinator wake pending"
 TASK_COORDINATOR_AWAITING_ACK = "task coordinator execution awaiting acknowledgment"
-TASK_AGENT_LOOP_FLAG = "task_agent_loop"
 # A Task agent loop's parked wait (wait_until / wait_media_jobs) in its checkpoint.
 TASK_LOOP_WAIT_KEY = "task_loop_wait"
 _UNSET = durable_run.UNSET
@@ -128,25 +126,6 @@ def _require_selection(run: TaskCoordinatorRun, selection: CoordinatorRuntimeSel
         raise ValueError("Task coordinator factory selection changed; existing checkpoint cannot be rebound")
 
 
-def _require_owned_active_plan(run: TaskCoordinatorRun, plan: ExecutionPlan) -> None:
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
-
-    state = plan.dispatcher_state if isinstance(plan.dispatcher_state, dict) else {}
-    if (
-        plan.task_id != run.task_id
-        or plan.entity_id != run.entity_id
-        or plan.workspace_id != run.workspace_id
-        or plan.id != run.current_plan_id
-        or state.get(TASK_COORDINATOR_PLAN_VERSION_KEY) != TASK_COORDINATOR_PLAN_VERSION
-        or state.get(TASK_COORDINATOR_RUN_ID_KEY) != run.id
-    ):
-        raise ValueError("Task coordinator retry cannot adopt an active legacy or foreign Plan")
-
-
 AGENT_LOOP_RETRY_KEY = "retried_after"
 # Digest of the work list a host-forced stop of the agent loop last posted.
 AGENT_LOOP_POSTED_WORK_KEY = POSTED_WORK_KEY
@@ -204,6 +183,21 @@ def agent_loop_retry_checkpoint(checkpoint: Any) -> dict[str, Any] | None:
         return None
     retried = stopped.for_retry(slots)
     retried.messages = _answer_interrupted_calls(checkpoint)
+    stored = runtime_stored_pending_result(checkpoint)
+    if stored is not None and stored["child_evidence"]:
+        # A settled (or cancelled) delegation's children carry into the
+        # retried ledger with their call's result, merged once.
+        from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
+        from packages.core.ai.runtime.tool_results import RuntimeDelegatedSettlementToolResult
+
+        ledger = RuntimeToolEvidence()
+        ledger.restore_checkpoint_state(retried.tool_evidence or {})
+        ledger.observe_tool_result(
+            stored["name"], stored["id"], RuntimeDelegatedSettlementToolResult(stored["content"]),
+            stored["arguments"],
+        )
+        ledger.merge_child_observations(stored["id"], stored["child_evidence"], observe=False)
+        retried.tool_evidence = ledger.checkpoint_state()
     payload = retried.snapshot()
     payload[AGENT_LOOP_RETRY_KEY] = marker
     return payload
@@ -218,6 +212,9 @@ _AGENT_LOOP_REBIND_PHASES = frozenset({
     TaskCoordinatorPhase.WAITING_TIMER.value,
     TaskCoordinatorPhase.WAITING_JOB.value,
     TaskCoordinatorPhase.WAITING_HUMAN.value,
+    # Waiting on delegated child runs: they are rebound with it and the
+    # resumed loop parks on them again without a model round.
+    TaskCoordinatorPhase.WAITING_CHILD.value,
 })
 AGENT_LOOP_RESUMED_AFTER = "task_resumed"
 
@@ -259,54 +256,30 @@ def agent_loop_rebind_checkpoint(checkpoint: Any) -> dict[str, Any] | None:
     return kept
 
 
-async def initial_task_coordinator_engine(db: AsyncSession, task: Task) -> str:
-    """Choose the engine for a brand-new run from the task_agent_loop flag.
+AGENT_LOOP_RETRY_NOTE_MAX_CHARS = 2000
 
-    Called only when no run row exists for the Task. The result is written
-    into that row and never re-evaluated: a flag flip cannot move an
-    in-flight run to another engine.
+
+def _with_manual_retry_note(checkpoint: Any, task: Task, lifecycle_generation: str) -> Any:
+    """Hand the retried run the note its person wrote with this retry.
+
+    Only the retry that started this lifecycle counts: an older retry's note
+    stays on the Task's history and never reaches a later run.
     """
 
-    from packages.core.services import feature_flags
-    from packages.core.services.task_requester_identity import (
-        TaskRequesterIdentityError,
-        resolve_task_execution_user_id,
-    )
-
-    try:
-        # A savepoint keeps a failed lookup from aborting the caller's
-        # admission transaction; the existing engine is the safe answer.
-        async with db.begin_nested():
-            try:
-                user_id = await resolve_task_execution_user_id(db, task)
-            except TaskRequesterIdentityError:
-                user_id = None
-            enabled = await feature_flags.is_enabled(
-                db,
-                TASK_AGENT_LOOP_FLAG,
-                entity_id=str(task.entity_id or "") or None,
-                user_id=user_id,
-                fallback=False,
-            )
-    except Exception:
-        logger.exception(
-            "task_agent_loop flag evaluation failed for Task %s; using plan_dag", task.id,
-        )
-        return TaskCoordinatorEngine.PLAN_DAG.value
-    if enabled and not user_id:
-        # System-provenance Tasks (Strategist, scheduler) have no executing
-        # member. The agent loop needs one for its model, billing and
-        # delegation calls, so these stay on the Plan/Step coordinator.
-        logger.info(
-            "Task %s has no executing user; task_agent_loop is on but the run uses plan_dag",
-            task.id,
-        )
-        return TaskCoordinatorEngine.PLAN_DAG.value
-    return (
-        TaskCoordinatorEngine.AGENT_LOOP.value
-        if enabled
-        else TaskCoordinatorEngine.PLAN_DAG.value
-    )
+    details = task.details if isinstance(task.details, dict) else {}
+    retry = details.get("manual_retry")
+    if not isinstance(retry, dict) or retry.get("lifecycle_generation") != lifecycle_generation:
+        return checkpoint
+    note = str(retry.get("note") or "").strip()[:AGENT_LOOP_RETRY_NOTE_MAX_CHARS]
+    if not note:
+        return checkpoint
+    kept = dict(checkpoint) if isinstance(checkpoint, dict) else {}
+    marker = kept.get(AGENT_LOOP_RETRY_KEY)
+    if not isinstance(marker, dict):
+        # A retry with no transcript to continue starts from the brief.
+        marker = {"at": datetime.now(timezone.utc).isoformat(), "after": "unknown_stop"}
+    kept[AGENT_LOOP_RETRY_KEY] = {**marker, "note": note}
+    return kept
 
 
 async def ensure_task_coordinator_run(
@@ -326,37 +299,16 @@ async def ensure_task_coordinator_run(
 
     task_id = str(task.id or "")
     entity_id = str(task.entity_id or "")
-    workspace_id = str(task.workspace_id or "")
-    if not task_id or not entity_id or not workspace_id:
-        raise ValueError("Task coordinator requires a Workspace-scoped Task")
+    # None for a Task assigned directly to an Agent, outside any Workspace.
+    workspace_id = str(task.workspace_id) if task.workspace_id else None
+    if not task_id or not entity_id:
+        raise ValueError("Task coordinator requires an entity-scoped Task")
     if task.status != TaskStatus.IN_PROGRESS.value:
         raise ValueError("Task coordinator requires an in-progress Task")
     lifecycle_generation = task_execution_intent_generation(task)
 
-    # Task is already locked by the caller. Read Plan before Run to preserve
-    # Task -> Plan -> Run order used by Plan-cycle handoff and Step release.
-    active_plans = list((await db.execute(
-        select(ExecutionPlan)
-        .where(
-            ExecutionPlan.task_id == task_id,
-            ExecutionPlan.entity_id == entity_id,
-            ExecutionPlan.status.not_in(
-                tuple(status.value for status in PLAN_TERMINAL_STATUSES)
-            ),
-        )
-        .limit(2)
-    )).scalars().all())
-
-    existing_run_id = (await db.execute(
-        select(TaskCoordinatorRun.id).where(TaskCoordinatorRun.task_id == task_id)
-    )).scalar_one_or_none()
-    # The engine is frozen at creation. An existing row (including a retried
-    # lifecycle) keeps the engine it was created with.
-    engine = (
-        await initial_task_coordinator_engine(db, task)
-        if existing_run_id is None
-        else TaskCoordinatorEngine.PLAN_DAG.value
-    )
+    # Every Task runs as one agent loop. A run that cannot execute (no member
+    # to act as) stops itself with that reason; there is no other engine.
     statement = pg_insert(TaskCoordinatorRun).values(
         id=generate_ulid(),
         task_id=task_id,
@@ -366,7 +318,7 @@ async def ensure_task_coordinator_run(
         root_agent_id=selection.root.agent_id,
         selection_fingerprint=selection.stable_fingerprint(),
         lifecycle_generation=lifecycle_generation,
-        engine=engine,
+        engine=TaskCoordinatorEngine.AGENT_LOOP.value,
         phase=TaskCoordinatorPhase.READY.value,
         state_version=0,
     ).on_conflict_do_nothing(constraint="uq_task_coordinator_runs_task")
@@ -379,43 +331,50 @@ async def ensure_task_coordinator_run(
     )).scalar_one()
     if run.entity_id != entity_id or run.workspace_id != workspace_id:
         raise ValueError("Task coordinator Task/Workspace scope changed")
-    if len(active_plans) > 1:
-        raise ValueError("Task coordinator found multiple active Plans")
     if run.lifecycle_generation == lifecycle_generation:
         _require_selection(run, selection)
-        if active_plans:
-            _require_owned_active_plan(run, active_plans[0])
+        if run.state_version == 0 and not run.checkpoint:
+            # A retry that starts the Task's first run (nothing to reopen).
+            run.checkpoint = _with_manual_retry_note(run.checkpoint, task, lifecycle_generation)
         return run
 
     # A paused agent loop (ready, running or parked on a wait) is rebound to
-    # the new lifecycle with its checkpoint intact; a Plan/Step run must be
-    # stopped first.
+    # the new lifecycle with its checkpoint intact; a stopped one is retried.
     rebind = task_coordinator_run_rebinds_agent_loop(run)
+    prior_phase = run.phase
+    prior_wait = (run.checkpoint or {}).get(TASK_LOOP_WAIT_KEY) if isinstance(run.checkpoint, dict) else None
     if not task_coordinator_run_reopenable(run):
         raise ValueError("Task coordinator prior lifecycle is not stopped for retry")
     if claim_is_live(run):
         raise ValueError("Task coordinator prior lifecycle still has a live claim")
-    if active_plans:
-        _require_owned_active_plan(run, active_plans[0])
-        # The Plan and any parked child continuation still belong to the
-        # original factory identity. Never retarget them on retry.
-        _require_selection(run, selection)
-    else:
-        run.current_plan_id = None
-        run.checkpoint = (
-            agent_loop_rebind_checkpoint(run.checkpoint)
-            if rebind
-            # An agent loop retry continues its own transcript; the Plan/Step
-            # coordinator starts from a fresh decision transcript.
-            else agent_loop_retry_checkpoint(run.checkpoint)
-            if run.engine == TaskCoordinatorEngine.AGENT_LOOP.value
-            else None
-        )
-        run.root_subscription_id = selection.root.subscription_id
-        run.root_agent_id = selection.root.agent_id
-        run.selection_fingerprint = selection.stable_fingerprint()
+    from packages.core.services.task_agent_loop_hitl import (
+        lock_live_task_children,
+        rebind_task_lifecycle,
+    )
 
-    run.lifecycle_generation = lifecycle_generation
+    # Task -> Run -> child rows. A child still working for the old lifecycle
+    # must stop first (the execution intent retries until its owner exits).
+    children = await lock_live_task_children(db, task_id) if rebind else []
+    if any(claim_is_live(child) for child in children):
+        raise ValueError("Task coordinator prior lifecycle still has a delegated child with a live claim")
+    run.current_plan_id = None
+    run.checkpoint = (
+        agent_loop_rebind_checkpoint(run.checkpoint)
+        if rebind
+        # An agent loop retry continues its own transcript. A run closed out
+        # by the plan_dag retirement (migration 20261025_10) has no loop
+        # transcript: its retry starts the loop fresh on the same Task.
+        else agent_loop_retry_checkpoint(run.checkpoint)
+        if run.engine == TaskCoordinatorEngine.AGENT_LOOP.value
+        else None
+    )
+    run.checkpoint = _with_manual_retry_note(run.checkpoint, task, lifecycle_generation)
+    run.engine = TaskCoordinatorEngine.AGENT_LOOP.value
+    run.root_subscription_id = selection.root.subscription_id
+    run.root_agent_id = selection.root.agent_id
+    run.selection_fingerprint = selection.stable_fingerprint()
+
+    rebind_task_lifecycle(task, run, children)
     run.phase = TaskCoordinatorPhase.READY.value
     run.terminal_cleanup_at = None
     clear_run_claim_and_wake(run)
@@ -425,6 +384,21 @@ async def ensure_task_coordinator_run(
     await stage_task_coordinator_wake(
         db, task_id=task_id, reason="task_coordinator_lifecycle_retry",
     )
+    # A paused loop resumed with its transcript is woken; a stopped one is
+    # retried. Either row carries the new lifecycle.
+    from packages.core.models.task_run_journal import TaskRunJournalKind
+    from packages.core.services.task_run_journal import (
+        append_agent_loop_run_journal,
+        retry_payload,
+        wake_payload,
+    )
+
+    kind, payload = (
+        (TaskRunJournalKind.WAKE, wake_payload(prior_wait, resolution="task_resumed", task_resumed=True))
+        if rebind
+        else (TaskRunJournalKind.RETRY, retry_payload(prior_phase=prior_phase, reason="task_retry"))
+    )
+    await append_agent_loop_run_journal(db, run=run, kind=kind, payload=payload)
     return run
 
 
@@ -586,32 +560,12 @@ async def checkpoint_task_coordinator_run(
     expected_state_version: int,
     checkpoint: dict[str, Any] | None | object = _UNSET,
     phase: str | object = _UNSET,
-    current_plan_id: str | None | object = _UNSET,
 ) -> int | None:
-    """CAS a completed AgentLoop round and optional phase/Plan transition.
+    """CAS a completed AgentLoop round and optional phase transition.
 
     Returns the new version, or None after any claim/version loss. The caller
     must use strict round checkpointing and cease provider work on None.
     """
-
-    # Plan identity is immutable after creation. Resolve it before the Run
-    # lock so a caller already holding Task -> Plan never meets the inverse
-    # Run -> Plan order during a concurrent Plan cycle.
-    plan = None
-    if current_plan_id is not _UNSET and current_plan_id is not None:
-        plan = (await db.execute(
-            select(ExecutionPlan).where(ExecutionPlan.id == current_plan_id)
-        )).scalar_one_or_none()
-    apply = None
-    if current_plan_id is not _UNSET:
-        def apply(run: TaskCoordinatorRun) -> None:
-            if current_plan_id is not None and (
-                plan is None or plan.task_id != run.task_id
-                or plan.entity_id != run.entity_id
-                or plan.workspace_id != run.workspace_id
-            ):
-                raise ValueError("Task coordinator Plan identity is not in its Task/Workspace")
-            run.current_plan_id = current_plan_id
 
     return await durable_run.checkpoint_run(
         db,
@@ -622,7 +576,6 @@ async def checkpoint_task_coordinator_run(
         expected_state_version=expected_state_version,
         checkpoint=checkpoint,
         phase=phase,
-        apply=apply,
     )
 
 
@@ -664,33 +617,17 @@ async def release_task_coordinator_claim(
     )
 
 
-async def wake_task_coordinator_for_media_job(
-    db: AsyncSession,
-    job: Any,
-) -> TaskCoordinatorWake | None:
-    """Wake the Task run parked on this media job once all its jobs settled.
+async def _media_wait_settled(db: AsyncSession, run: Any, job: Any) -> dict[str, Any] | None:
+    """The run's job wait, when it lists this job and every listed job settled.
 
-    Called inside a job's terminal-status transaction, before its commit
-    (lock order MediaJob -> Run). Stages nothing unless the job's Task run is
-    WAITING_JOB on a wait that lists this job and every listed job is
-    terminal. A live owner is left alone: it re-reads the jobs under the Run
-    lock when it parks. Idempotent; a later re-finalization only re-stages.
+    ``run`` is a locked root run or child row in WAITING_JOB. None while a
+    live owner holds it (the owner re-reads the jobs under its lock when it
+    parks), when the wait does not list this job, or while another listed job
+    is still pending or processing.
     """
 
     from packages.core.models.media_job import MediaJob, MediaJobStatus
 
-    params = job.params if isinstance(getattr(job, "params", None), dict) else {}
-    task_id = str(params.get("task_id") or "").strip()
-    status = getattr(job, "status", None)
-    if not task_id or str(getattr(status, "value", status) or "") not in MediaJobStatus.terminal():
-        return None
-    run = await _locked_run(db, task_id)
-    if (
-        run is None
-        or run.phase != TaskCoordinatorPhase.WAITING_JOB.value
-        or run.entity_id != job.entity_id
-    ):
-        return None
     wait = (run.checkpoint or {}).get(TASK_LOOP_WAIT_KEY) if isinstance(run.checkpoint, dict) else None
     job_ids = wait.get("job_ids") if isinstance(wait, dict) else None
     if not isinstance(job_ids, list) or job.id not in job_ids:
@@ -706,4 +643,52 @@ async def wake_task_coordinator_for_media_job(
     )).scalar_one_or_none()
     if still_open is not None:
         return None
-    return await stage_task_coordinator_wake(db, task_id=task_id, reason="media_jobs_settled")
+    return wait
+
+
+async def wake_task_coordinator_for_media_job(
+    db: AsyncSession,
+    job: Any,
+) -> TaskCoordinatorWake | None:
+    """Wake the Task runs parked on this media job once all their jobs settled.
+
+    Called inside a job's terminal-status transaction, before its commit
+    (lock order MediaJob -> Run -> child rows). Stages nothing unless a run of
+    the job's Task (its root run, or a delegated child run) is WAITING_JOB on
+    a wait that lists this job and every listed job is terminal. A live owner
+    is left alone: it re-reads the jobs under its lock when it parks.
+    Idempotent; a later re-finalization only re-stages. Returns the root
+    run's wake.
+    """
+
+    from packages.core.models.media_job import MediaJobStatus
+    from packages.core.models.task_run_journal import TaskRunJournalKind
+    from packages.core.services.task_agent_child_wakeup import wake_task_agent_children_for_media_job
+    from packages.core.services.task_run_journal import append_agent_loop_run_journal, wake_payload
+
+    params = job.params if isinstance(getattr(job, "params", None), dict) else {}
+    task_id = str(params.get("task_id") or "").strip()
+    status = getattr(job, "status", None)
+    if not task_id or str(getattr(status, "value", status) or "") not in MediaJobStatus.terminal():
+        return None
+    run = await _locked_run(db, task_id)
+    if run is None or run.entity_id != job.entity_id:
+        return None
+    wake = None
+    wait = (
+        await _media_wait_settled(db, run, job)
+        if run.phase == TaskCoordinatorPhase.WAITING_JOB.value
+        else None
+    )
+    if wait is not None:
+        wake = await stage_task_coordinator_wake(db, task_id=task_id, reason="media_jobs_settled")
+    if wake is not None:
+        await append_agent_loop_run_journal(
+            db, run=run, kind=TaskRunJournalKind.WAKE,
+            payload=wake_payload(wait, resolution="media_jobs_settled", task_resumed=False),
+        )
+    await wake_task_agent_children_for_media_job(
+        db, job, task_id=task_id,
+        jobs_settled=lambda child, settled_job: _media_wait_settled(db, child, settled_job),
+    )
+    return wake

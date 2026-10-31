@@ -27,16 +27,15 @@ from packages.core.ai.runtime.control import (
     RuntimeToolSuspension,
 )
 from packages.core.ai.runtime.human_input import (
-    HUMAN_INPUT_MODE_END_TURN,
     HUMAN_INPUT_MODE_SUSPEND,
+    INPUT_FIELD_TYPES,
     REQUEST_INPUT_DEADLINE_HOURS,
     REQUEST_INPUT_JUSTIFICATION_SCHEMA,
-    REQUEST_INPUT_RESULT_KEY,
     REQUEST_INPUT_TOOL_NAME,
     human_input_answer_result,
     human_input_mode_from_kwargs,
-    input_request_from_tool_result,
     normalize_input_request,
+    runtime_request_input_refusal,
 )
 from packages.core.ai.runtime.tool_error_contract import tool_error_payload
 from packages.core.ai.runtime.tool_input_validation import (
@@ -45,7 +44,6 @@ from packages.core.ai.runtime.tool_input_validation import (
 )
 from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
 
-_FIELD_TYPES = ("boolean", "date", "number", "select", "text", "textarea")
 
 
 async def _request_input(
@@ -63,6 +61,11 @@ async def _request_input(
     invalid = validate_runtime_tool_arguments(arguments=arguments, tool_schema=REQUEST_INPUT_SCHEMA)
     if invalid is not None:
         return RuntimePreflightValidationError(invalid.to_tool_result(tool_name=REQUEST_INPUT_TOOL_NAME))
+    # The agentic loop already ran the full gate with its run's evidence; this
+    # handler also serves loops that call the registry directly.
+    refusal = runtime_request_input_refusal(arguments)
+    if refusal is not None:
+        return RuntimePreflightValidationError(refusal)
     try:
         payload = normalize_input_request(
             question=question, options=options, fields=fields, context=context, justification=justification,
@@ -83,20 +86,6 @@ async def _request_input(
             deadline_at=deadline,
             reason=HUMAN_INPUT_SUSPENSION_REASON,
             payload=payload,
-        )
-    if mode == HUMAN_INPUT_MODE_END_TURN:
-        return json.dumps(
-            {
-                "ok": True,
-                "status": HUMAN_INPUT_SUSPENSION_REASON,
-                REQUEST_INPUT_RESULT_KEY: payload,
-                "instruction": (
-                    "The question has been sent to the user and this run will pause "
-                    "until they answer. Stop calling tools now: end your reply by "
-                    "restating the question in one short paragraph and wait."
-                ),
-            },
-            ensure_ascii=False,
         )
     # No question was delivered and no effect occurred. Let the loop ask in
     # ordinary prose without relaxing failure handling for other serial tools.
@@ -126,18 +115,18 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
         "name": REQUEST_INPUT_TOOL_NAME,
         "description": (
             "Ask for user-only facts, material, or decisions; resume with the answer. "
-            "Ask only when it changes work; batch questions in `fields`. Check context "
+            "Ask only when it changes work; batch questions in `fields`; documents go in a "
+            "`file` field. Check context "
             "and authorized tools first; infer what you can. Include `justification`: human-only reason and "
-            "checks actually made. Handle tool errors, execution checks, file writes, and "
+            "checks made. Handle tool errors, execution checks, file writes, and "
             "acceptance validation yourself. For `file_review`, cite exact existing "
             "`file_refs` and ask for human judgment, not write verification. Rationale "
-            "does not prove execution or authorize action. For a missing tool, first use "
-            "`search_tools`, then any capability acquisition search/prepare/apply flow. "
-            "If still unbound, name the exact tool and purpose. Request a "
-            "user-reviewed update to this Agent's configuration or its deployment "
-            "binding in the current Workspace. Connect any required account separately. "
-            "A bare yes to this input question cannot create a binding; use the "
-            "typed configuration review and confirmation flow."
+            "does not prove execution or authorize action. Never ask for tool access or "
+            "Agent configuration; a person's yes cannot create a binding. For a missing "
+            "tool, use `search_tools`, then `acquire_capabilities` when offered; if "
+            "acquisition fails or is unavailable, stop as blocked naming the capability "
+            "and purpose (in a Task, complete_task(outcome=blocked)). For tools, only "
+            "ask to connect an external account."
         ),
         "parameters": {
             "type": "object",
@@ -149,17 +138,17 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
                 "options": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional short list of choices to pick from.",
+                    "description": "Choices to pick from.",
                 },
                 "fields": {
                     "type": "array",
-                    "description": "Optional structured fields to collect in one go.",
+                    "description": "Structured fields to collect at once.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
                             "label": {"type": "string"},
-                            "type": {"type": "string", "enum": list(_FIELD_TYPES)},
+                            "type": {"type": "string", "enum": list(INPUT_FIELD_TYPES)},
                             "required": {"type": "boolean"},
                             "options": {"type": "array", "items": {"type": "string"}},
                         },
@@ -168,7 +157,7 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
                 },
                 "context": {
                     "type": "string",
-                    "description": "One or two sentences on why you need this and what you have so far.",
+                    "description": "Why you ask and what you have so far, briefly.",
                 },
                 "justification": REQUEST_INPUT_JUSTIFICATION_SCHEMA,
             },
@@ -183,11 +172,9 @@ def get_tools() -> list[tuple[dict[str, Any], Any]]:
 
 
 __all__ = [
-    "REQUEST_INPUT_RESULT_KEY",
     "REQUEST_INPUT_SCHEMA",
     "REQUEST_INPUT_TOOL_NAME",
     "get_tools",
     "human_input_answer_result",
-    "input_request_from_tool_result",
     "normalize_input_request",
 ]

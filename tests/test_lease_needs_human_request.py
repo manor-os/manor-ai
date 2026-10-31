@@ -4,20 +4,16 @@
 无法 join 回 task/step，也无法复用去重。这些测试钉住接线后的行为。
 """
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
-from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
-from packages.core.ai.runtime.workspace_delegation_actions import _tool_arguments_hash
 from packages.core.constants.approvals import ApprovalStatus
 from packages.core.constants.execution import (
     COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
     WorkLeaseStatus,
 )
-from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.dispatcher.service import Dispatcher
 from packages.core.governance.approvals import (
     ApprovalOrigin,
@@ -31,7 +27,7 @@ from packages.core.governance.approvals import (
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.task import Conversation, Message
 from packages.core.models.worker import Worker, WorkLease
 from packages.core.models.workspace import Workspace
 from packages.core.services.runtime_authorization import AuthorizationRule
@@ -537,10 +533,15 @@ async def test_fallback_card_without_pending_action_carries_request_id(
 
 
 @pytest.mark.asyncio
-async def test_expired_lease_with_unsettled_effect_persists_reconciliation_request_and_card(
+async def test_need_human_after_unconfirmed_external_effect_fails_without_replay(
     db_session,
     monkeypatch,
 ):
+    """A pause after an unconfirmed external action has no resolver.
+
+    It must not become a waiting card (nothing can settle it) nor a retry
+    (that could repeat the action): the Step fails and says what to check.
+    """
     from packages.core.workspace_chat import notifiers as chat_notify
 
     posted: list[dict] = []
@@ -550,10 +551,7 @@ async def test_expired_lease_with_unsettled_effect_persists_reconciliation_reque
 
     monkeypatch.setattr(chat_notify, "_safe_post", _capture)
     fx = await _lease_fixture(db_session)
-    lease = await db_session.get(WorkLease, fx["lease_id"])
-    step = await db_session.get(ExecutionStep, fx["step_id"])
-    lease.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-    step.evidence_refs = [{
+    pending_effect = {
         "kind": "tool_effect",
         "effect": "pending",
         "fields": {
@@ -562,41 +560,34 @@ async def test_expired_lease_with_unsettled_effect_persists_reconciliation_reque
             "arguments_hash": "a" * 64,
             "intent_state": "started",
         },
-    }]
-    await db_session.commit()
+    }
 
-    assert await Dispatcher().expire_leases(db_session) >= 1
-    await db_session.commit()
-    db_session.expire_all()
+    await Dispatcher().lease_needs_human(
+        db_session,
+        fx["lease_id"],
+        prompt="Solve the CAPTCHA to continue",
+        evidence_refs=[pending_effect],
+    )
+    await db_session.flush()
 
     lease = await db_session.get(WorkLease, fx["lease_id"])
     step = await db_session.get(ExecutionStep, fx["step_id"])
-    request = (
-        await db_session.execute(
-            select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-        )
-    ).scalar_one()
-    assert lease.status == WorkLeaseStatus.EXPIRED.value
-    assert step.step_status == "waiting_human"
-    assert request.status == ApprovalStatus.PENDING.value
-    assert request.origin_kind == "lease"
-    assert request.dedup_key == f"lease:{fx['lease_id']}:effect_reconciliation"
-    assert request.hitl_type == "error"
-    assert "external action" in request.reason.lower()
-    assert "verify it with the provider" in request.reason.lower()
-
-    target_posts = [
-        item
+    assert lease.status == WorkLeaseStatus.FAILED.value
+    assert step.step_status == "failed"
+    assert step.attempt_count < step.max_attempts, "the action must not be replayed"
+    assert step.error["type"] == "ExternalEffectUnconfirmed"
+    assert step.error["worker_prompt"] == "Solve the CAPTCHA to continue"
+    assert "may or may not have happened" in step.error["message"]
+    assert step.error["failure"]["retryable"] is False
+    assert step.evidence_refs == [pending_effect]
+    requests = (await db_session.execute(
+        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
+    )).scalars().all()
+    assert requests == []
+    assert not any(
+        (item.get("pending_action") or {}).get("kind") == "effect_reconciliation"
         for item in posted
-        if (item.get("pending_action") or {}).get("approval_request_id") == request.id
-    ]
-    assert len(target_posts) == 1
-    card = target_posts[0]["pending_action"]
-    assert card["kind"] == "effect_reconciliation"
-    assert card["approval_request_id"] == request.id
-    assert "confirm_effect_not_applied" in card["options"]
-    assert card["payload"]["reconciliation"]["not_applied_allowed"] is True
-    assert "external action" in target_posts[0]["body"].lower()
+    )
 
 
 async def _register(client, username: str) -> dict:
@@ -611,106 +602,6 @@ async def _register(client, username: str) -> dict:
     )
     assert resp.status_code == 200
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
-
-
-async def _seed_direct_effect_reconciliation_card(
-    client,
-    db_session,
-    username: str,
-) -> tuple[dict, dict, str]:
-    headers = await _register(client, username)
-    workspace_response = await client.post(
-        "/api/v1/workspaces",
-        headers=headers,
-        json={"name": "Concurrent effect reconciliation WS"},
-    )
-    assert workspace_response.status_code in (200, 201), workspace_response.text
-    workspace = workspace_response.json()
-    fixture = await _lease_fixture(
-        db_session,
-        entity_id=workspace["entity_id"],
-        workspace_id=workspace["id"],
-    )
-    db_session.add(Task(
-        id=fixture["task_id"],
-        entity_id=fixture["entity_id"],
-        workspace_id=fixture["workspace_id"],
-        title="Publish exactly once",
-        status="in_progress",
-        priority=3,
-        task_type="general",
-        details={},
-    ))
-    await db_session.flush()
-
-    tool_name = "mcp__example__publish"
-    tool_call_id = "call-concurrent-publish"
-    arguments = {"title": "Launch", "body": "Ready"}
-    checkpoint = RuntimeAgentCheckpoint(
-        messages=[
-            {"role": "user", "content": "Publish it"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": '{"title":"Launch","body":"Ready"}',
-                    },
-                }],
-            },
-        ],
-        usage={},
-        rounds=1,
-        tool_calls_made=[],
-        pending_tool_call={
-            "id": tool_call_id,
-            "name": tool_name,
-            "arguments": arguments,
-        },
-    ).to_dict()
-    effect = {
-        "kind": "tool_effect",
-        "effect": "pending",
-        "fields": {
-            "tool": tool_name,
-            "tool_call_id": tool_call_id,
-            "arguments_hash": _tool_arguments_hash(arguments),
-            "effect_generation": 0,
-            "owner_step_id": fixture["step_id"],
-            "owner_plan_id": fixture["plan_id"],
-            "intent_state": "started",
-        },
-    }
-    await Dispatcher().lease_needs_human(
-        db_session,
-        fixture["lease_id"],
-        prompt="Verify whether the publish happened",
-        evidence_refs=[effect],
-        runtime_checkpoint=checkpoint,
-    )
-    await db_session.commit()
-
-    request = (await db_session.execute(
-        select(HitlRequest).where(
-            HitlRequest.origin_step_id == fixture["step_id"],
-            HitlRequest.context["pending_kind"].as_string()
-            == PendingActionKind.EFFECT_RECONCILIATION.value,
-        )
-    )).scalar_one()
-    card = (await db_session.execute(
-        select(Message)
-        .join(Conversation, Conversation.id == Message.conversation_id)
-        .where(
-            Conversation.entity_id == fixture["entity_id"],
-            Conversation.workspace_id == fixture["workspace_id"],
-            Message.pending_action["approval_request_id"].as_string()
-            == request.id,
-        )
-    )).scalar_one()
-    return headers, fixture, card.id
 
 
 async def _seed_lease_card(client, db_session, username: str, *, kind: str):
@@ -810,403 +701,6 @@ async def _resolve_card(client, headers, workspace_id, message_id, choice: str, 
     )
     assert resp.status_code == 200, resp.text
     return resp
-
-
-@pytest.mark.asyncio
-async def test_cancelling_direct_effect_reconciliation_terminalizes_without_dispatch(
-    client,
-    db_session,
-    monkeypatch,
-):
-    """The service-owned CANCEL terminal state must not trip the route's wakeup guard."""
-
-    headers = await _register(client, "direct_effect_cancel")
-    workspace_response = await client.post(
-        "/api/v1/workspaces",
-        headers=headers,
-        json={"name": "Direct effect cancel WS"},
-    )
-    assert workspace_response.status_code in (200, 201), workspace_response.text
-    workspace = workspace_response.json()
-    fixture = await _lease_fixture(
-        db_session,
-        entity_id=workspace["entity_id"],
-        workspace_id=workspace["id"],
-    )
-    db_session.add(Task(
-        id=fixture["task_id"],
-        entity_id=fixture["entity_id"],
-        workspace_id=fixture["workspace_id"],
-        title="Publish launch update",
-        status="in_progress",
-        priority=3,
-        task_type="general",
-        details={},
-    ))
-    await db_session.flush()
-
-    tool_name = "mcp__example__publish"
-    tool_call_id = "call-publish-1"
-    arguments = {"title": "Launch", "body": "Ready"}
-    checkpoint = RuntimeAgentCheckpoint(
-        messages=[
-            {"role": "user", "content": "Publish it"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": '{"title":"Launch","body":"Ready"}',
-                    },
-                }],
-            },
-        ],
-        usage={},
-        rounds=1,
-        tool_calls_made=[],
-        pending_tool_call={
-            "id": tool_call_id,
-            "name": tool_name,
-            "arguments": arguments,
-        },
-    ).to_dict()
-    effect = {
-        "kind": "tool_effect",
-        "effect": "pending",
-        "fields": {
-            "tool": tool_name,
-            "tool_call_id": tool_call_id,
-            "arguments_hash": _tool_arguments_hash(arguments),
-            "effect_generation": 0,
-            "owner_step_id": fixture["step_id"],
-            "owner_plan_id": fixture["plan_id"],
-            "intent_state": "started",
-        },
-    }
-    await Dispatcher().lease_needs_human(
-        db_session,
-        fixture["lease_id"],
-        prompt="Verify whether the publish happened",
-        evidence_refs=[effect],
-        runtime_checkpoint=checkpoint,
-    )
-    await db_session.commit()
-
-    request = (await db_session.execute(
-        select(HitlRequest).where(
-            HitlRequest.origin_step_id == fixture["step_id"],
-            HitlRequest.context["pending_kind"].as_string()
-            == PendingActionKind.EFFECT_RECONCILIATION.value,
-        )
-    )).scalar_one()
-    messages = list((await db_session.execute(
-        select(Message)
-        .join(Conversation, Conversation.id == Message.conversation_id)
-        .where(
-            Conversation.entity_id == fixture["entity_id"],
-            Conversation.workspace_id == fixture["workspace_id"],
-        )
-    )).scalars().all())
-    card = next(
-        message
-        for message in messages
-        if isinstance(message.pending_action, dict)
-        and message.pending_action.get("approval_request_id") == request.id
-    )
-    request_id = request.id
-    card_id = card.id
-
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.plans.wakeup import (
-        PLAN_CYCLE_OUTBOX_EVENT,
-        plan_cycle_outbox_dedupe_key,
-    )
-    from tests.test_plan_retries import _capture_plan_cycle_hints
-
-    plan_hints = _capture_plan_cycle_hints(monkeypatch)
-    response = await client.post(
-        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
-        headers=headers,
-        json={"choice": "cancel"},
-    )
-
-    assert response.status_code == 200, response.text
-    assert plan_hints == []
-    db_session.expire_all()
-    plan = await db_session.get(ExecutionPlan, fixture["plan_id"])
-    task = await db_session.get(Task, fixture["task_id"])
-    step = await db_session.get(ExecutionStep, fixture["step_id"])
-    request = await db_session.get(HitlRequest, request_id)
-    card = await db_session.get(Message, card_id)
-    pending_wake = (await db_session.execute(
-        select(RuntimeOutboxEvent.id).where(
-            RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
-            RuntimeOutboxEvent.aggregate_id == fixture["plan_id"],
-            RuntimeOutboxEvent.dedupe_key
-            == plan_cycle_outbox_dedupe_key(fixture["plan_id"]),
-            RuntimeOutboxEvent.delivered_at.is_(None),
-        )
-    )).scalar_one_or_none()
-    assert pending_wake is None
-    assert plan.status == "cancelled"
-    assert task.status == "cancelled"
-    assert step.step_status == "failed"
-    assert request.status == ApprovalStatus.DENIED.value
-    assert card.resolved_at is not None
-
-
-@pytest.mark.asyncio
-async def test_concurrent_identical_effect_reconciliation_projects_and_dispatches_once(
-    client,
-    db_session,
-    monkeypatch,
-):
-    """Two request sessions may replay the decision; one Message CAS owns output."""
-
-    headers, fixture, card_id = await _seed_direct_effect_reconciliation_card(
-        client,
-        db_session,
-        "concurrent_effect_reconciliation",
-    )
-    evidence_calls: list[str] = []
-    activity_calls: list[str] = []
-    from tests.test_plan_retries import (
-        _assert_exact_pending_plan_cycle_wake,
-        _capture_plan_cycle_hints,
-    )
-
-    plan_hints = _capture_plan_cycle_hints(monkeypatch)
-
-    async def _capture_evidence(*_args, **kwargs):
-        evidence_calls.append(str(kwargs["message_id"]))
-        return []
-
-    async def _capture_activity(*_args, **kwargs):
-        activity_calls.append(str(kwargs["message_id"]))
-
-    monkeypatch.setattr(
-        "apps.api.routers.workspace_chat._record_pending_action_resolution_evidence",
-        _capture_evidence,
-    )
-    monkeypatch.setattr(
-        "apps.api.routers.workspace_chat._record_pending_action_activity",
-        _capture_activity,
-    )
-
-    path = (
-        f"/api/v1/workspaces/{fixture['workspace_id']}"
-        f"/chat/messages/{card_id}/resolve"
-    )
-    first, second = await asyncio.gather(
-        client.post(
-            path,
-            headers=headers,
-            json={"choice": "confirm_effect_not_applied"},
-        ),
-        client.post(
-            path,
-            headers=headers,
-            json={"choice": "confirm_effect_not_applied"},
-        ),
-    )
-
-    assert [first.status_code, second.status_code] == [200, 200], [
-        first.text, second.text,
-    ]
-    assert [hint["plan_id"] for hint in plan_hints] == [fixture["plan_id"]]
-    await _assert_exact_pending_plan_cycle_wake(
-        db_session,
-        fixture["plan_id"],
-        plan_hints[0],
-    )
-    assert evidence_calls == [card_id]
-    assert activity_calls == [card_id]
-
-    db_session.expire_all()
-    card = await db_session.get(Message, card_id)
-    messages = list((await db_session.execute(
-        select(Message).where(Message.conversation_id == card.conversation_id)
-    )).scalars().all())
-    followups = [
-        message
-        for message in messages
-        if any(
-            isinstance(ref, dict)
-            and ref.get("type") == "message"
-            and ref.get("id") == card_id
-            for ref in (message.refs or [])
-        )
-    ]
-    assert card.resolved_at is not None
-    assert card.resolution["choice"] == "confirm_effect_not_applied"
-    assert len(followups) == 1
-
-
-@pytest.mark.asyncio
-async def test_expired_claim_rejects_not_applied_until_claim_is_released(
-    client,
-    db_session,
-    monkeypatch,
-):
-    """An expired lease with a live claim cannot honestly authorize a retry."""
-
-    headers = await _register(client, "expired_effect_claim")
-    workspace_response = await client.post(
-        "/api/v1/workspaces",
-        headers=headers,
-        json={"name": "Expired effect claim WS"},
-    )
-    assert workspace_response.status_code in (200, 201), workspace_response.text
-    workspace = workspace_response.json()
-    fixture = await _lease_fixture(
-        db_session,
-        entity_id=workspace["entity_id"],
-        workspace_id=workspace["id"],
-    )
-    db_session.add(Task(
-        id=fixture["task_id"],
-        entity_id=fixture["entity_id"],
-        workspace_id=fixture["workspace_id"],
-        title="Publish from an expired worker",
-        status="in_progress",
-        priority=3,
-        task_type="general",
-        details={},
-    ))
-    lease = await db_session.get(WorkLease, fixture["lease_id"])
-    step = await db_session.get(ExecutionStep, fixture["step_id"])
-    claim_id = generate_ulid()
-    lease.execution_claim_id = claim_id
-    lease.execution_claimed_at = datetime.now(timezone.utc)
-    lease.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-    effect_arguments = {"title": "Launch", "body": "Ready"}
-    step.runtime_checkpoint = RuntimeAgentCheckpoint(
-        messages=[
-            {"role": "user", "content": "Publish it"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": "call-expired-1",
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__example__publish",
-                        "arguments": '{"title":"Launch","body":"Ready"}',
-                    },
-                }],
-            },
-        ],
-        usage={},
-        rounds=1,
-        tool_calls_made=[],
-        pending_tool_call={
-            "id": "call-expired-1",
-            "name": "mcp__example__publish",
-            "arguments": effect_arguments,
-        },
-    ).to_dict()
-    step.evidence_refs = [{
-        "kind": "tool_effect",
-        "effect": "pending",
-        "fields": {
-            "tool": "mcp__example__publish",
-            "tool_call_id": "call-expired-1",
-            "arguments_hash": _tool_arguments_hash(effect_arguments),
-            "intent_state": "started",
-        },
-    }]
-    await db_session.commit()
-
-    from tests.test_plan_retries import (
-        _assert_exact_pending_plan_cycle_wake,
-        _capture_plan_cycle_hints,
-    )
-
-    plan_hints = _capture_plan_cycle_hints(monkeypatch)
-    assert await Dispatcher().expire_leases(db_session) >= 1
-    await db_session.commit()
-    expiry_wake = await _assert_exact_pending_plan_cycle_wake(
-        db_session,
-        fixture["plan_id"],
-    )
-    assert expiry_wake.payload["reason"] == "lease_expired"
-    expiry_generation = str(expiry_wake.payload["wake_generation"])
-    db_session.expire_all()
-
-    lease = await db_session.get(WorkLease, fixture["lease_id"])
-    request = (await db_session.execute(
-        select(HitlRequest).where(
-            HitlRequest.origin_step_id == fixture["step_id"],
-            HitlRequest.context["pending_kind"].as_string()
-            == PendingActionKind.EFFECT_RECONCILIATION.value,
-        )
-    )).scalar_one()
-    card = (await db_session.execute(
-        select(Message)
-        .join(Conversation, Conversation.id == Message.conversation_id)
-        .where(
-            Conversation.entity_id == fixture["entity_id"],
-            Conversation.workspace_id == fixture["workspace_id"],
-            Message.pending_action["approval_request_id"].as_string()
-            == request.id,
-        )
-    )).scalar_one()
-    request_id = request.id
-    card_id = card.id
-    assert lease.status == WorkLeaseStatus.EXPIRED.value
-    assert lease.execution_claim_id == claim_id
-    assert "confirm_effect_not_applied" in card.pending_action["options"]
-    assert (
-        card.pending_action["payload"]["reconciliation"]["not_applied_allowed"]
-        is False
-    )
-
-    rejected = await client.post(
-        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
-        headers=headers,
-        json={"choice": "confirm_effect_not_applied"},
-    )
-    assert rejected.status_code == 409, rejected.text
-    assert "not known to be quiescent" in rejected.json()["detail"]
-    db_session.expire_all()
-    lease = await db_session.get(WorkLease, fixture["lease_id"])
-    request = await db_session.get(HitlRequest, request_id)
-    card = await db_session.get(Message, card_id)
-    assert request.status == ApprovalStatus.PENDING.value
-    assert card.resolved_at is None
-    assert lease.execution_claim_id == claim_id
-
-    from packages.core.workers.execution_claim import release_execution_claim
-
-    assert await release_execution_claim(
-        db_session,
-        fixture["lease_id"],
-        claim_id=claim_id,
-    )
-    await db_session.commit()
-
-    resumed = await client.post(
-        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
-        headers=headers,
-        json={"choice": "confirm_effect_not_applied"},
-    )
-    assert resumed.status_code == 200, resumed.text
-    assert [hint["plan_id"] for hint in plan_hints] == [fixture["plan_id"]]
-    resumed_wake = await _assert_exact_pending_plan_cycle_wake(
-        db_session,
-        fixture["plan_id"],
-        plan_hints[0],
-    )
-    assert resumed_wake.payload["reason"] == "effect_reconciliation_resolved"
-    assert resumed_wake.payload["wake_generation"] != expiry_generation
-    db_session.expire_all()
-    plan = await db_session.get(ExecutionPlan, fixture["plan_id"])
-    task = await db_session.get(Task, fixture["task_id"])
-    assert plan.status == "running"
-    assert task.status == "in_progress"
 
 
 async def _reload_request(db_session, request_id: str) -> HitlRequest:
@@ -1747,14 +1241,14 @@ async def test_saved_allow_never_overrides_root_deny(db_session):
     scope = ApprovalScope(kind="account", id=workspace.entity_id, entity_id=workspace.entity_id)
     before = await read_approval_settings(db_session, scope, actor)
     await update_approval_policy(db_session, scope,
-        PolicyDraft(mode="automatic", user_rules=[action_rule("billing.charge", effect="deny")]),
+        PolicyDraft(mode="automatic", user_rules=[action_rule("workspace.order.create", effect="deny")]),
         before["version"], actor)
     await set_workspace_test_approval(db_session, entity_id=workspace.entity_id,
         workspace_id=workspace.id, actor_id=actor.id,
-        user_rules=[action_rule("billing.charge")])
+        user_rules=[action_rule("workspace.order.create")])
     decision = await resolve_approval(db_session, subject=ApprovalSubject(
         entity_id=workspace.entity_id, workspace_id=workspace.id, user_id=actor.id,
-        action_key="billing.charge", risk_level="high", kind="action"),
+        action_key="workspace.order.create", risk_level="high", kind="action"),
         origin=ApprovalOrigin(kind="step", step_id=generate_ulid()))
     assert decision.outcome == "deny" and decision.request is None
     assert await count_open_requests(db_session, workspace_id=workspace.id) == 0

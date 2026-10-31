@@ -32,5 +32,10 @@ Without separate written permission from Manor AI, you may not:
 ## Forks and Modified Versions
 
 If you distribute a fork or modified version, make it clear that it is not the
-official Manor AI product. Hosted or managed services based on Manor AI require
-a separate commercial agreement under the Manor Sustainable Use License 1.0.
+official Manor AI product. The Sustainable Use License 1.0 governs software
+use and distribution separately from trademark permission: providing the
+software to others is permitted only free of charge for non-commercial
+purposes under that license. Commercial hosted or managed services require a
+separate agreement. Preserve all required notices and identify modifications;
+this trademark policy does not add a blanket ban on permitted non-commercial
+distribution or hosting.

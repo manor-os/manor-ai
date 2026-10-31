@@ -154,3 +154,20 @@ async def test_master_chat_cannot_stage_after_workspace_becomes_inactive(db_sess
         await create_runtime_run(db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
                                  conversation_id=generate_ulid(), user_id=generate_ulid(),
                                  agent_id="master", execution_payload={})
+
+
+async def test_open_work_is_listed_by_the_name_people_know_it_by(db_session):
+    workspace = await workspace_fixture(db_session)
+    task = Task(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+                title="Prepare shared assets", status="cancelled")
+    plan = ExecutionPlan(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+                         task_id=task.id, status=ExecutionPlanStatus.RUNNING)
+    flow = WorkflowRun(id=generate_ulid(), workflow_id=generate_ulid(), entity_id=workspace.entity_id,
+                       workspace_id=workspace.id, status=WorkflowRunStatus.RUNNING,
+                       trigger_data={"_workflow_name": "Make a video"})
+    db_session.add_all([task, plan, flow])
+    await db_session.flush()
+
+    names = {row["id"]: row["name"] for row in await active_runs(db_session, workspace=workspace)}
+    assert names[plan.id] == "Prepare shared assets"
+    assert names[flow.id] == "Make a video"

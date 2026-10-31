@@ -235,7 +235,7 @@ async def test_api_connection_vault_account_authorization_and_real_dispatch(clie
     assert contexts[-1]["integration_account_id"] == accounts[1]
     leases = [e for e in audit.events if e.reason == "mcp_builtin._resolve_bearer_token:manor_pms"]
     assert len(leases) == 2
-    assert all(e.requester_kind == "agent" and e.requester_id == entity_id for e in leases)
+    assert all(e.requester_kind == "agent" and e.requester_id == owner_id for e in leases)
     assert len({e.credential_ref for e in leases}) == 2
 
     foreign_headers, foreign_id, foreign_entity = await _register(client, "pms_runtime_foreign")

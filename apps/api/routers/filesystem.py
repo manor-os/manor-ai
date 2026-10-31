@@ -18,6 +18,7 @@ Provides file browser operations for the frontend:
 All endpoints require JWT auth. Entity is resolved from the current user's token.
 Paths are relative to /mnt/manor/{entity_id}/.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -58,6 +59,10 @@ from packages.core.models.user import User
 from packages.core.services.actor_authorization import (
     AuthenticatedUserCredential,
     resolve_current_user_actor,
+)
+from packages.core.services.external_collaboration_access import (
+    COLLABORATOR_MEMBERSHIP_ROLE,
+    live_collaborator_grants,
 )
 from packages.core.services.permission_gate import ResourcePermissionGate
 from packages.core.services.filesystem_access import (
@@ -105,15 +110,28 @@ router = APIRouter(prefix="/api/v1/fs", tags=["filesystem"])
 
 
 _ACTIVE_PUBLIC_EXTENSIONS = {
-    ".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".css",
+    ".html",
+    ".htm",
+    ".svg",
+    ".xml",
+    ".xhtml",
+    ".js",
+    ".mjs",
+    ".css",
 }
 _ACTIVE_PUBLIC_MEDIA_TYPES = {
-    "text/html", "image/svg+xml", "application/xml", "text/xml",
-    "application/javascript", "text/javascript", "text/css",
+    "text/html",
+    "image/svg+xml",
+    "application/xml",
+    "text/xml",
+    "application/javascript",
+    "text/javascript",
+    "text/css",
 }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _require_fs():
     """Raise 503 if filesystem is not enabled."""
@@ -377,7 +395,6 @@ async def _clear_stale_avatar_url(avatar_url: str) -> None:
             logger.exception("stale avatar_url cleanup failed for %s", avatar_url)
 
 
-
 def _entity_root(entity_id: str) -> str:
     """Resolve and validate entity root path."""
     root = get_entity_root(entity_id)
@@ -496,6 +513,19 @@ async def _assert_path_readable(
         raise _file_not_found()
 
 
+async def _document_in_workspaces(db: AsyncSession, entity_id: str, rel_path: str, workspace_ids) -> bool:
+    from packages.core.services.document_access import document_workspace_ids
+
+    document = await db.scalar(
+        select(Document).where(
+            Document.entity_id == entity_id,
+            Document.fs_path == rel_path,
+            Document.is_trashed.is_(False),
+        ).limit(1)
+    )
+    return document is not None and bool(await document_workspace_ids(db, document) & set(workspace_ids))
+
+
 async def _assert_raw_file_openable(
     db: AsyncSession,
     entity_id: str,
@@ -513,6 +543,11 @@ async def _assert_raw_file_openable(
     access = await chat_upload_access(db, entity_id=entity_id, user_id=user.id, fs_path=rel_path)
     if access == "uploader":
         return
+    collaborator_ids = getattr(user, "_collaborator_workspace_ids", None)
+    if collaborator_ids is not None and not await _document_in_workspaces(db, entity_id, rel_path, collaborator_ids):
+        # Beyond their own uploads, an external collaborator opens only files
+        # of Documents linked to a Workspace their live grant covers.
+        raise HTTPException(403, "Access denied")
     if access is None and not is_user_visible_path(rel_path):
         raise HTTPException(403, "Access denied")
     await _assert_path_readable(db, entity_id, rel_path, user, credential=credential)
@@ -561,12 +596,32 @@ async def _optional_user_from_bearer(
     actor = await resolve_current_user_actor(db, credential)
     if not user or actor is None:
         return None
+    from packages.core.services.collaborator_session import (
+        collaborator_session_matches,
+        pin_session,
+        session_scope,
+    )
+    collaborator_scope = None
+    collaborator = actor.display_role == COLLABORATOR_MEMBERSHIP_ROLE
+    if not collaborator_session_matches(claims, collaborator=collaborator):
+        return None
+    pin_session(None, None, ())
+    if collaborator:
+        # Same gate as deps.get_current_user: the pinned Workspace, while the
+        # grant the session names is live there; a derived seat alone is no access.
+        collaborator_scope = session_scope(
+            claims, await live_collaborator_grants(db, user_id=actor.user_id, entity_id=actor.entity_id)
+        )
+        if not collaborator_scope:
+            return None
+        pin_session(actor.entity_id, actor.user_id, collaborator_scope)
     return (
         SimpleNamespace(
             id=actor.user_id,
             entity_id=actor.entity_id,
             role=actor.role,
             token_version=credential.token_version,
+            _collaborator_workspace_ids=collaborator_scope,
         ),
         credential,
     )
@@ -600,6 +655,7 @@ def _file_info(full_path: str, root: str) -> dict[str, Any]:
 
 # ── Models ───────────────────────────────────────────────────────────────────
 
+
 class WriteRequest(BaseModel):
     path: str
     content: str
@@ -627,6 +683,7 @@ class DeleteRequest(BaseModel):
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
 
 @router.get("/list")
 async def list_directory(
@@ -1138,7 +1195,6 @@ async def move_file(
     return {"status": "ok", "src": req.src, "dest": req.dest}
 
 
-
 @router.post("/delete")
 async def delete_file(
     req: DeleteRequest,
@@ -1205,7 +1261,6 @@ async def delete_file(
             _release_path_mutation_locks(lock_handles)
 
     return {"status": "ok", "path": req.path}
-
 
 
 @router.post("/upload")
@@ -1562,6 +1617,7 @@ async def lint_knowledge_base(
 # ── Raw file serving (avatars, uploads, etc.) ──
 # MUST be last — catch-all route pattern
 
+
 def _resolve_signed_entity_file(token: str) -> tuple[_Path, str, int]:
     """Validate a signed public-file token and resolve it to a local file."""
     _require_fs()
@@ -1596,11 +1652,76 @@ async def _assert_signed_entity_file_readable(
         raise HTTPException(403, "Invalid or expired file token")
     from packages.core.services.ai_file_permissions import guard_ai_file_read_access
 
+    if payload.get("source_kind") == "knowledge_document":
+        from packages.core.services.workspace_document_media import (
+            WorkspaceDocumentMediaError, readable_knowledge_document_media_path,
+        )
+
+        try:
+            await readable_knowledge_document_media_path(
+                db, entity_id=payload["entity_id"], user_id=payload["user_id"],
+                conversation_id=payload["conversation_id"], document_id=payload["document_id"],
+                expected_path=payload["path"], tool_name="signed_knowledge_document",
+            )
+        except WorkspaceDocumentMediaError:
+            raise _file_not_found() from None
+        return
+    if payload.get("source_kind") == "workspace_document":
+        from packages.core.models.task import Conversation
+        from packages.core.models.workspace import Workspace
+        from packages.core.services.ai_file_permissions import is_chat_upload_path
+
+        document = (
+            await db.execute(
+                select(Document).where(
+                    Document.id == payload["document_id"],
+                    Document.entity_id == payload["entity_id"],
+                    Document.fs_path == payload["path"],
+                    Document.is_trashed == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        workspace = (
+            await db.execute(
+                select(Workspace.id).where(
+                    Workspace.id == payload["workspace_id"],
+                    Workspace.entity_id == payload["entity_id"],
+                    Workspace.status.in_(("active", "paused")),
+                    Workspace.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        conversation = (
+            await db.execute(
+                select(Conversation.id).where(
+                    Conversation.id == payload["conversation_id"],
+                    Conversation.entity_id == payload["entity_id"],
+                    Conversation.workspace_id == payload["workspace_id"],
+                    Conversation.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+        if not document or not workspace or not conversation or is_chat_upload_path(payload["path"]):
+            raise _file_not_found()
+        denied = await guard_ai_file_read_access(
+            entity_id=payload["entity_id"],
+            user_id=payload["user_id"],
+            conversation_id=payload["conversation_id"],
+            workspace_id=payload["workspace_id"],
+            tool_name="signed_workspace_document",
+            paths=[payload["path"]],
+        )
+        if denied:
+            raise _file_not_found()
+        return
     if "conversation_id" in payload:
         denied = await guard_ai_file_read_access(
-            entity_id=payload["entity_id"], user_id=payload["user_id"],
-            conversation_id=payload["conversation_id"], workspace_id=payload.get("workspace_id"),
-            tool_name="signed_chat_attachment", paths=[payload["path"]],
+            entity_id=payload["entity_id"],
+            user_id=payload["user_id"],
+            conversation_id=payload["conversation_id"],
+            workspace_id=payload.get("workspace_id"),
+            tool_name="signed_chat_attachment",
+            paths=[payload["path"]],
         )
         if denied:
             raise _file_not_found()
@@ -1627,7 +1748,14 @@ def _signed_chat_file_payload(token: str) -> dict[str, Any] | None:
     payload = verify_file_access_token(token)
     if not payload:
         raise HTTPException(403, "Invalid or expired file token")
-    return payload if "conversation_id" in payload else None
+    return payload if "conversation_id" in payload and "source_kind" not in payload else None
+
+
+def _signed_workspace_document_payload(token: str) -> dict[str, Any] | None:
+    payload = verify_file_access_token(token)
+    if not payload:
+        raise HTTPException(403, "Invalid or expired file token")
+    return payload if payload.get("source_kind") in {"workspace_document", "knowledge_document"} else None
 
 
 @asynccontextmanager
@@ -1659,6 +1787,8 @@ async def head_signed_entity_file(
 ):
     """Allow media providers to preflight signed image URLs before GET."""
     payload = _signed_chat_file_payload(token)
+    if payload is None:
+        payload = _signed_workspace_document_payload(token)
     if payload:
         async with _signed_chat_file_read_boundary(token, payload, db) as snapshot:
             file_path = _Path(payload["path"])
@@ -1686,6 +1816,8 @@ async def serve_signed_entity_file(
 ):
     """Serve a short-lived signed file URL for external media providers."""
     payload = _signed_chat_file_payload(token)
+    if payload is None:
+        payload = _signed_workspace_document_payload(token)
     if payload:
         read_boundary = _signed_chat_file_read_boundary(token, payload, db)
         snapshot = await read_boundary.__aenter__()
@@ -1695,8 +1827,10 @@ async def serve_signed_entity_file(
             response_type, headers = _signed_file_response_metadata(file_path, content_type)
             headers["Cache-Control"] = "private, no-store"
             return _ReadLockedFileResponse(
-                path=snapshot.descriptor_path, media_type=response_type,
-                headers=headers, read_boundary=read_boundary,
+                path=snapshot.descriptor_path,
+                media_type=response_type,
+                headers=headers,
+                read_boundary=read_boundary,
             )
         except BaseException:
             await read_boundary.__aexit__(None, None, None)

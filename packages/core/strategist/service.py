@@ -40,7 +40,7 @@ from packages.core.constants.review import (
     ReviewRunStatus,
     ReviewSkipReason,
 )
-from packages.core.constants.task import TaskStatus
+from packages.core.constants.task import CancelSource, TaskStatus
 from packages.core.constants.workflow import WORKFLOW_RUN_OPEN_STATUSES
 from packages.core.models.base import generate_ulid
 from packages.core.models.goal import Goal
@@ -62,16 +62,14 @@ from packages.core.services.workspace_autonomy import workspace_allows_manual_wo
 from packages.core.services.workspace_work_reconciliation import (
     reconcile_active_work_batches,
     stale_reconciliation_results,
+    task_ids_with_open_human_requests,
 )
 from packages.core.services.workspace_readiness import (
     evaluate_workspace_blocking_setup,
     normalize_workspace_setup_task_key,
 )
 from packages.core.strategist.context import gather_context
-from packages.core.strategist.execution_presentation import (
-    execution_review_metadata,
-    format_execution_notes,
-)
+from packages.core.strategist.execution_presentation import execution_review_metadata
 from packages.core.strategist.prompt import generate_proposal
 from packages.core.strategist.proposal import (
     Proposal,
@@ -118,6 +116,7 @@ def _restrict_proposal_to_setup_work(
     proposal.automation_changes = []
     proposal.workflow_changes = []
     proposal.goal_changes = []
+    proposal.retry_task_ids = []
     return True
 
 
@@ -492,9 +491,8 @@ async def run_review(
       ``needs_decision`` result naming what blocks it. It is never dropped
       on the floor: somebody asked and is waiting for an answer.
 
-    Either way the block is announced once in workspace chat (see
-    ``_post_review_skip_notice``), so a suppressed review stops being
-    invisible.
+    A skipped review posts nothing to Workspace chat: an undecided card
+    only holds its own decision, never the conversation.
 
     ``review_run`` supplies the durable admission, execution lease, and
     atomic terminal receipt for either prompt path. Only
@@ -573,13 +571,6 @@ async def run_review(
                 active_batch["batch_id"],
                 len(active_batch["open_task_ids"]),
             )
-            await _post_review_skip_notice(
-                db,
-                workspace,
-                trigger=trigger,
-                fingerprint=_active_batch_fingerprint(active_batch),
-                body=_active_batch_skip_body(trigger, active_batch),
-            )
             await _finish_strategist_activity(
                 workspace,
                 message_id=activity_message_id,
@@ -619,13 +610,6 @@ async def run_review(
         conflict = open_proposal_conflict(
             ctx.open_proposed_tasks,
             open_items=ctx.open_proposed_items,
-        )
-        await _post_review_skip_notice(
-            db,
-            workspace,
-            trigger=trigger,
-            fingerprint=conflict["fingerprint"],
-            body=_open_proposals_skip_body(trigger, conflict),
         )
         await _finish_strategist_activity(
             workspace,
@@ -713,6 +697,7 @@ async def run_review(
     _suppress_meta_learning_proposals(proposal)
     _suppress_duplicate_completed_work_proposals(proposal, ctx)
     _suppress_capability_recovery_duplicates(proposal, ctx)
+    _suppress_open_task_follow_ups(proposal, ctx)
     _enforce_allowlists(proposal, ctx.allowed_service_keys)
     _enforce_proposal_shape(proposal, ctx)
     await _suppress_active_workflow_run_proposals(db, workspace, proposal)
@@ -801,13 +786,6 @@ async def run_review(
     if trigger.kind.suppressible:
         active_batch = await _active_work_batch_with_open_tasks(db, workspace)
         if active_batch:
-            await _post_review_skip_notice(
-                db,
-                workspace,
-                trigger=trigger,
-                fingerprint=_active_batch_fingerprint(active_batch),
-                body=_active_batch_skip_body(trigger, active_batch),
-            )
             await _finish_strategist_activity(
                 workspace,
                 message_id=activity_message_id,
@@ -859,22 +837,15 @@ async def run_review(
         proposal,
         blocking_setup_status,
     )
+    automatic_retries = await _retry_blocked_original_tasks(
+        db, workspace, proposal.retry_task_ids,
+    )
 
-    # The model's notes are strategy; these frozen execution facts come from
-    # the validated, Workspace-scoped observation, not from its prose. Do this
-    # after all Proposal shaping so a later note append cannot cut off facts.
+    # Frozen execution facts come from the validated, Workspace-scoped
+    # observation, not from the model's prose. They are review-record
+    # evidence; the owner's card shows only the summary and its decisions.
     execution_snapshot = getattr(ctx, "execution_snapshot", {}) or {}
     execution_review = execution_review_metadata(proposal, execution_snapshot)
-    execution_note = format_execution_notes(proposal, execution_snapshot)
-    if execution_note:
-        strategy_notes = proposal.notes
-        if strategy_notes:
-            label = "\n\nStrategy notes:\n"
-            budget = max(0, 1500 - len(execution_note) - len(label))
-            visible_strategy = strategy_notes[:budget]
-            proposal.notes = execution_note + (label + visible_strategy if visible_strategy else "")
-        else:
-            proposal.notes = execution_note
     if review_run is not None and execution_review is not None:
         review_run.briefing = {
             **(review_run.briefing or {}),
@@ -955,8 +926,10 @@ async def run_review(
     if governance.get("proposal_id"):
         pending_items = await _pending_item_digests(db, review_id=review_id)
 
+    # Nothing to decide means nothing to say, unless a person asked for this
+    # review and is waiting for its answer.
     should_post_proposal_card = bool(
-        new_task_ids or pending_items or proposal.notes
+        new_task_ids or pending_items or trigger.is_human_initiated
     )
     auto_approved_action_key = (
         governance.get("task_action_key")
@@ -995,6 +968,7 @@ async def run_review(
         await complete_review(db, review_run)
 
     await db.commit()
+    await _dispatch_automatic_task_retries(db, automatic_retries)
 
     if proposal_message is not None:
         await _publish_proposal_chat_message(workspace, proposal_message)
@@ -1043,6 +1017,8 @@ async def run_review(
         "summary": proposal.summary,
         "notes": proposal.notes,
     }
+    if automatic_retries:
+        result["retried_task_ids"] = [retry.task.id for retry in automatic_retries]
     if execution_review is not None:
         result["execution_review"] = execution_review
     if governance:
@@ -1146,7 +1122,6 @@ async def _wire_proposal_governance(
                 # flag a policy with no opinion
                 # would silently auto-approve every cohort.
                 requires_approval=False,
-                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1373,7 +1348,6 @@ async def _execute_workflow_run_items(
                 risk_level=item.risk_level,
                 kind="action",
                 requires_approval=False,
-                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1496,7 +1470,6 @@ async def _execute_experiment_items(
                 # Experiments intrinsically need a human unless a standing
                 # grant (an applicable approval policy rule) says otherwise.
                 requires_approval=False,
-                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1661,7 +1634,6 @@ async def _execute_change_items(
                 # Config changes intrinsically need a human unless a standing
                 # grant (an applicable approval policy rule) says otherwise.
                 requires_approval=False,
-                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -2043,7 +2015,7 @@ async def approve_proposal(
     """Approve a proposal cohort: its tasks AND its non-task items.
 
     Tasks with no predecessors flip to ``in_progress`` immediately, which
-    fires the Planner hook. Dependent tasks stay ``pending`` until their
+    starts their agent loop. Dependent tasks stay ``pending`` until their
     predecessors complete and ``workspace_operation_service`` releases them.
     ``only_task_ids`` lets the operator approve a subset (``[]`` = no tasks
     at all, ``None`` = every proposed task of the review); ``only_item_ids``
@@ -2103,13 +2075,12 @@ async def approve_proposal(
             details = await details_with_dependency_state(db, t, details)
         gate_status = str(details.get("dependency_status") or "completed")
         if dep_ids and gate_status != "completed":
-            # ``pending`` is approved-but-not-started. It does not trigger the
-            # Planner; the dependency gate releases it to ``in_progress`` later.
+            # ``pending`` is approved-but-not-started. It starts no run; the
+            # dependency gate releases it to ``in_progress`` later.
             next_status = "pending"
         else:
-            # Setting in_progress triggers plan_and_run_task via the hook
-            # in update_task() (fires when status == "in_progress" and
-            # task.owner_subscription_id is set).
+            # update_task() stages the Task's agent-loop start intent in the
+            # same transaction as the transition to in_progress.
             next_status = "in_progress"
         # Apply details first so the status-transition ledger event sees the
         # work-batch root (update_task re-applies the same dict afterwards).
@@ -2180,6 +2151,7 @@ async def reject_proposal(
         await update_task(
             db, t.id, entity_id,
             status="cancelled", details=details,
+            cancel_source=CancelSource.PROPOSAL.value,
         )
         cancelled.append(t.id)
         from packages.core.ledger.adapters import record_proposal_item_decision
@@ -2510,18 +2482,6 @@ async def _sync_proposal_cards_after_starter_cleanup(
                 ref for ref in (msg.refs or [])
                 if not (isinstance(ref, dict) and ref.get("id") in obsolete_task_ids)
             ]
-        db.add(Message(
-            id=generate_ulid(),
-            conversation_id=msg.conversation_id,
-            role="system",
-            content=(
-                "Workspace setup generated starter knowledge documents; "
-                f"{removed_count} duplicate proposal task(s) were marked obsolete."
-            ),
-            author_kind="system",
-            message_kind="system",
-            refs=[{"type": "message", "id": msg.id}],
-        ))
 
 
 def _prune_proposal_task_entries(entries: list, kept_ids: set[str]) -> list:
@@ -2822,6 +2782,303 @@ too; removing dependency edges would otherwise manufacture runnable work.
             proposal.notes,
             "Existing tasks are waiting for Agent configuration. Resolve their configuration requests and continue those tasks instead of creating duplicate recovery work.",
         )
+
+
+_OPEN_TASK_STATUSES = frozenset({
+    TaskStatus.IN_PROGRESS.value,
+    TaskStatus.WAITING_ON_CUSTOMER.value,
+    TaskStatus.BLOCKED.value,
+    TaskStatus.ON_HOLD.value,
+})
+_STALLED_TASK_STATUSES = frozenset({
+    TaskStatus.WAITING_ON_CUSTOMER.value,
+    TaskStatus.BLOCKED.value,
+    TaskStatus.ON_HOLD.value,
+})
+# Words that say what to do or point at "the task" rather than naming its
+# subject. A recovery item rarely repeats the original verb ("Write the growth
+# brief" → "Recover the existing growth brief task"), so compare subjects.
+_GENERIC_TASK_WORDS = frozenset({
+    "write", "draft", "create", "produce", "prepare", "make", "build",
+    "generate", "finish", "complete", "deliver", "delivery", "task", "tasks",
+    "existing", "original", "current", "previous", "new",
+})
+_FOLLOW_UP_INTENT_RE = re.compile(
+    r"\b(?:recover\w*|retr(?:y|ies|ied|ying)|re-?run\w*|repair\w*|unblock\w*"
+    r"|unstick\w*|resum(?:e|es|ed|ing)|restart\w*|reviv\w*|rescu\w*|salvag\w*"
+    r"|chas(?:e|es|ed|ing)|nudg\w*|follow[\s-]?up\w*|re-?ask\w*|verif\w*"
+    r"|stalled|stuck)\b",
+    re.IGNORECASE,
+)
+_FOLLOW_UP_SUBJECT_COVERAGE = 0.6
+
+
+def _subject_tokens(tokens: set[str]) -> set[str]:
+    """Title words that name the subject, singularised ("tickets" = "ticket")."""
+    return {
+        token[:-1] if len(token) > 3 and token.endswith("s") else token
+        for token in tokens - _GENERIC_TASK_WORDS
+    }
+
+
+def _open_workspace_tasks(ctx) -> dict[str, dict]:
+    """Task id → title/status/waiting for every open Task the review can see.
+
+    The Workspace-wide open Task read is the primary source; the execution
+    snapshot and stalled work batches add wait facts they observed.
+    """
+    open_tasks: dict[str, dict] = {}
+
+    def add(task_id, title, status, waiting) -> None:
+        status = str(status or "")
+        if not task_id or not (status in _OPEN_TASK_STATUSES or waiting):
+            return
+        entry = open_tasks.setdefault(str(task_id), {
+            "title": str(title or ""), "status": status, "waiting_on_human": False,
+        })
+        entry["title"] = entry["title"] or str(title or "")
+        entry["status"] = entry["status"] or status
+        entry["waiting_on_human"] = entry["waiting_on_human"] or bool(waiting)
+
+    for row in getattr(ctx, "open_tasks", None) or []:
+        if isinstance(row, dict):
+            add(row.get("task_id"), row.get("title"), row.get("status"), row.get("waiting_on_human"))
+    for fact in (getattr(ctx, "execution_snapshot", None) or {}).get("tasks", []):
+        add(fact.get("task_id"), fact.get("title"), fact.get("task_status"),
+            fact.get("waiting_on_human") or fact.get("observed_state") == "waiting_input")
+    for batch in getattr(ctx, "work_batch_reconciliation", None) or []:
+        rows = batch.get("stale_tasks") if isinstance(batch, dict) else None
+        for row in rows or []:
+            if isinstance(row, dict):
+                add(row.get("task_id"), row.get("title"), row.get("status"), row.get("waiting_on_human"))
+    return open_tasks
+
+
+def _open_task_target(
+    open_tasks: dict[str, dict], *, existing_task_id: str | None, title: str | None, text: str,
+    follow_up: bool = False,
+) -> str | None:
+    """The open Task this proposed item acts on, if any.
+
+    An explicit existing_task_id or a cited task id decides it. Otherwise an
+    item that reads as a follow-up (recover, retry, unblock, verify, ...; every
+    human request about an open Task's subject relays for it) acts on the open
+    Task whose subject its title names, and any item whose title restates a
+    stalled Task's title acts on that Task.
+    """
+    if existing_task_id and existing_task_id in open_tasks:
+        return existing_task_id
+    for task_id in open_tasks:
+        if task_id in text:
+            return task_id
+    proposed = _task_title_tokens(title)
+    proposed_subject = _subject_tokens(proposed)
+    follow_up = follow_up or bool(_FOLLOW_UP_INTENT_RE.search(text))
+    best: tuple[float, str] | None = None
+    for task_id, task in open_tasks.items():
+        tokens = _task_title_tokens(task["title"])
+        overlap = tokens & proposed
+        coverage = len(overlap) / max(len(tokens), 1)
+        stalled = task["waiting_on_human"] or task["status"] in _STALLED_TASK_STATUSES
+        if stalled and len(overlap) >= 2 and coverage >= _DUPLICATE_TITLE_COVERAGE:
+            score = coverage
+        elif follow_up:
+            subject = _subject_tokens(tokens)
+            shared = subject & proposed_subject
+            score = len(shared) / len(subject) if subject else 0.0
+            if len(shared) < min(2, len(subject)) or score < _FOLLOW_UP_SUBJECT_COVERAGE:
+                continue
+        else:
+            continue
+        if best is None or score > best[0]:
+            best = (score, task_id)
+    return best[1] if best else None
+
+
+def _suppress_open_task_follow_ups(proposal: Proposal, ctx) -> None:
+    """Repairing an open Task is an action on that Task, never a new Task.
+
+    A new Task or human request that recovers, retries, chases, re-asks or
+    verifies an open Task duplicates it, and its agent ends up re-asking the
+    original Task's questions. Drop such items (and their dependents):
+
+    * waiting on a person: its request card is already open; leave it.
+    * blocked: queue a retry of the original Task (``retry_task_ids``), which
+      the review performs itself; a technical failure is not the customer's.
+    * in progress or on hold: the original Task already owns the work.
+    """
+    open_tasks = _open_workspace_tasks(ctx)
+    if not open_tasks:
+        return
+    targeted: dict[str, str] = {}
+    dropped_ids: set[int] = set()
+    dropped_keys: set[str] = set()
+    for task in proposal.tasks:
+        target = _open_task_target(
+            open_tasks, existing_task_id=getattr(task, "existing_task_id", None), title=task.title,
+            text=" ".join(filter(None, (task.title, task.description, task.rationale))),
+        )
+        if target:
+            targeted[target] = open_tasks[target]["title"]
+            dropped_ids.add(id(task))
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    while True:
+        dependents = [task for task in proposal.tasks if id(task) not in dropped_ids
+                      and set(task.depends_on_task_keys or ()) & dropped_keys]
+        if not dependents:
+            break
+        for task in dependents:
+            dropped_ids.add(id(task))
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    kept_requests = []
+    for request in proposal.human_requests:
+        target = _open_task_target(
+            open_tasks, existing_task_id=None, title=request.question,
+            text=" ".join(filter(None, (request.question, request.context))), follow_up=True,
+        )
+        if target:
+            targeted[target] = open_tasks[target]["title"]
+        else:
+            kept_requests.append(request)
+    if not targeted:
+        return
+    proposal.tasks = [task for task in proposal.tasks if id(task) not in dropped_ids]
+    proposal.human_requests = kept_requests
+    waiting: dict[str, str] = {}
+    retry: dict[str, str] = {}
+    owned: dict[str, str] = {}
+    for task_id, title in targeted.items():
+        task = open_tasks[task_id]
+        if task["waiting_on_human"]:
+            waiting[task_id] = title
+        elif task["status"] == TaskStatus.BLOCKED.value:
+            retry[task_id] = title
+        else:
+            owned[task_id] = title
+    proposal.retry_task_ids = list(dict.fromkeys([*proposal.retry_task_ids, *retry]))[:5]
+
+    def titles(group: dict[str, str]) -> str:
+        return "; ".join(title or task_id for task_id, title in list(group.items())[:3])
+
+    logger.info(
+        "Strategist: suppressed follow-up work for %d open task(s): waiting=%s retry=%s owned=%s",
+        len(targeted), sorted(waiting), sorted(retry), sorted(owned),
+    )
+    if waiting:
+        proposal.notes = _append_note(
+            proposal.notes,
+            f"Waiting on your answer in Need Input, so no new work was proposed for: {titles(waiting)}.",
+        )
+    if retry:
+        proposal.notes = _append_note(
+            proposal.notes,
+            f"Blocked work is recovered on its own Task, not as a new Task: {titles(retry)}.",
+        )
+    if owned:
+        proposal.notes = _append_note(
+            proposal.notes,
+            f"Already open, so no new work was proposed for: {titles(owned)}.",
+        )
+
+
+_MAX_AUTOMATIC_TASK_RETRIES = 2
+
+
+async def _retry_blocked_original_tasks(
+    db: AsyncSession, workspace: Workspace, task_ids: list[str],
+) -> list:
+    """Retry each blocked Task on that Task, without asking anyone.
+
+    A technical failure is the platform's to recover, not the customer's. The
+    retry runs the same retry path and safety checks as a manual retry (open
+    delegated runs, dependencies, pinned inputs) with a system actor. A Task that is no longer blocked, has an open request,
+    waits on its configuration review or on predecessor output, already used
+    its automatic retries, or whose Workspace is not running automatically is
+    left as it is. Returns prepared retries to dispatch after commit.
+    """
+    from packages.core.services.task_capability_recovery import current_capability_blocker
+    from packages.core.services.task_retry_service import (
+        AUTOMATIC_RETRY_COUNT_KEY,
+        TaskRetryError,
+        prepare_task_retry,
+    )
+
+    if workspace.status != "active":
+        return []
+    retried: list = []
+    for task_id in task_ids:
+        task = (await db.execute(
+            select(Task)
+            .where(
+                Task.id == task_id,
+                Task.entity_id == workspace.entity_id,
+                Task.workspace_id == workspace.id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if (
+            task is None
+            or task.status != TaskStatus.BLOCKED.value
+            or current_capability_blocker(task) is not None
+        ):
+            continue
+        details = task.details if isinstance(task.details, dict) else {}
+        if int(details.get(AUTOMATIC_RETRY_COUNT_KEY) or 0) >= _MAX_AUTOMATIC_TASK_RETRIES:
+            logger.warning("Strategist: blocked task %s already used its automatic retries", task.id)
+            continue
+        if dependency_ids_from_details(details) and (
+            await details_with_dependency_state(db, task, details)
+        ).get("dependency_status") != "completed":
+            continue
+        if await task_ids_with_open_human_requests(
+            db, entity_id=workspace.entity_id, workspace_id=workspace.id, task_ids=[task.id],
+        ):
+            continue
+        try:
+            # A refused retry must leave no partial reset behind.
+            async with db.begin_nested():
+                retried.append(await prepare_task_retry(
+                    db, task=task, user_id=None, user_label="Manor AI", automatic=True,
+                ))
+        except TaskRetryError as exc:
+            logger.info("Strategist: blocked task %s is not safely retryable: %s", task.id, exc.detail)
+    if retried:
+        logger.info(
+            "Strategist: retried %d blocked task(s): %s",
+            len(retried), [result.task.id for result in retried],
+        )
+    return retried
+
+
+async def _dispatch_automatic_task_retries(db: AsyncSession, retries: list) -> None:
+    """Hand committed automatic retries to their runtime, as the Task retry API does."""
+    from packages.core.services.realtime import broadcast_task_runtime_update
+    from packages.core.services.task_retry_service import (
+        dispatch_task_retry,
+        mark_task_retry_dispatch_failed,
+    )
+
+    for result in retries:
+        try:
+            dispatch_task_retry(result)
+        except Exception as exc:
+            logger.warning("Strategist: automatic retry dispatch failed for task %s: %s", result.task.id, exc)
+            try:
+                await mark_task_retry_dispatch_failed(db, result=result, error=exc)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.error("Could not persist automatic retry dispatch failure: task=%s", result.task.id, exc_info=True)
+        try:
+            await broadcast_task_runtime_update(
+                result.task.entity_id, task_id=result.task.id, workspace_id=result.task.workspace_id,
+                event="task_retry_resolved",
+            )
+        except Exception:
+            logger.debug("Strategist: retry broadcast failed for task %s", result.task.id, exc_info=True)
 
 
 def _recent_completed_task_titles(ctx) -> list[tuple[set[str], datetime]]:
@@ -3214,19 +3471,7 @@ def _resolve_skip_name(name: str, ctx) -> float | int:
 
 # ── suppression bookkeeping ───────────────────────────────────────────
 
-_SKIP_NOTICE_META_KEY = "strategist_review_skip"
 _CONFLICT_SAMPLE_LIMIT = 10
-
-_TRIGGER_NOUNS: dict[ReviewTriggerKind, str] = {
-    ReviewTriggerKind.SCHEDULED: "scheduled review",
-    ReviewTriggerKind.EVENT: "automatic review",
-    ReviewTriggerKind.HUMAN_REQUESTED: "review you asked for",
-}
-
-
-def _trigger_noun(trigger: ReviewTrigger) -> str:
-    return _TRIGGER_NOUNS[trigger.kind]
-
 
 def open_proposal_conflict(
     open_tasks: list[Task],
@@ -3308,107 +3553,6 @@ def _fingerprint(kind: str, parts: list[str]) -> str:
         usedforsecurity=False,
     ).hexdigest()[:16]
     return f"{kind}:{digest}"
-
-
-def _active_batch_fingerprint(active_batch: dict) -> str:
-    return _fingerprint(
-        "active_work_batch",
-        [str(active_batch.get("batch_id") or "")]
-        + sorted(str(x) for x in (active_batch.get("open_task_ids") or [])),
-    )
-
-
-def _open_proposals_skip_body(trigger: ReviewTrigger, conflict: dict) -> str:
-    count = conflict["open_count"]
-    plural = "s" if count != 1 else ""
-    titles = [str(item.get("title") or "").strip() for item in conflict["proposals"]]
-    listed = "; ".join(t for t in titles[:3] if t)
-    lines = [
-        f"Skipped the {_trigger_noun(trigger)}: {count} proposal{plural} from the "
-        "last review " + ("are" if count != 1 else "is") + " still awaiting your decision."
-    ]
-    if listed:
-        lines.append(f"Waiting on: {listed}.")
-    lines.append(
-        "Approve or reject them and the next review runs on its own — or ask "
-        "me to start a fresh review and replace them."
-    )
-    return " ".join(lines)
-
-
-def _active_batch_skip_body(trigger: ReviewTrigger, active_batch: dict) -> str:
-    open_count = len(active_batch.get("open_task_ids") or [])
-    plural = "s" if open_count != 1 else ""
-    return (
-        f"Skipped the {_trigger_noun(trigger)}: the current work batch still has "
-        f"{open_count} task{plural} in flight. The next review runs once "
-        "they finish or are closed out."
-    )
-
-
-async def _post_review_skip_notice(
-    db: AsyncSession,
-    workspace: Workspace,
-    *,
-    trigger: ReviewTrigger,
-    fingerprint: str,
-    body: str,
-) -> bool:
-    """Announce a suppressed review in workspace chat, at most once per state.
-
-    Anti-spam: the notice carries the blocking state's fingerprint in the
-    message metadata, and we re-post only when that fingerprint differs
-    from the most recent notice. A cadence that keeps tripping over the
-    same three undecided proposals therefore says so once; approving one
-    of them (or a new cohort appearing) changes the fingerprint and earns
-    a fresh line.
-    """
-    try:
-        conv = await chat_service.ensure_main_conversation(
-            db, entity_id=workspace.entity_id, workspace_id=workspace.id,
-        )
-        last_meta = (await db.execute(
-            select(Message.meta)
-            .where(
-                Message.conversation_id == conv.id,
-                Message.meta[_SKIP_NOTICE_META_KEY].isnot(None),
-            )
-            .order_by(Message.id.desc())
-            .limit(1)
-        )).scalars().first()
-        previous = (
-            last_meta.get(_SKIP_NOTICE_META_KEY)
-            if isinstance(last_meta, dict) else None
-        )
-        if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
-            return False
-
-        await chat_service.post_message(
-            db,
-            entity_id=workspace.entity_id,
-            workspace_id=workspace.id,
-            body=body,
-            # Same informational variant the policy-blocked proposal card
-            # uses: a proposal-plane message with no buttons attached.
-            message_kind="proposal",
-            author_kind="agent",
-            refs=[{"type": "workspace", "id": workspace.id}],
-            pending_action=None,
-            meta={
-                _SKIP_NOTICE_META_KEY: {
-                    "fingerprint": fingerprint,
-                    "trigger_kind": trigger.kind.value,
-                },
-            },
-        )
-        await db.commit()
-        return True
-    except Exception:  # noqa: BLE001 — a missing notice must not fail a review
-        logger.warning(
-            "Strategist: failed to post skip notice for workspace %s",
-            workspace.id, exc_info=True,
-        )
-        return False
 
 
 async def _active_work_batch_with_open_tasks(
@@ -4336,6 +4480,9 @@ async def _notify_proposal_users(
     auto_approved_action_key: str | None,
 ) -> None:
     """Notify entity users after the Proposal card transaction commits."""
+    if not task_ids and not items:
+        # A reply to a requested review has nothing for anyone else to decide.
+        return
     try:
         from packages.core.database import async_session
         from packages.core.models.user import User
@@ -4508,7 +4655,12 @@ async def _post_proposal_chat(
             "Started by an explicitly authorized automation."
         )
     )
-    if policy_denied:
+    # The owner sees Manor AI's summary and the decisions it needs. Notes are
+    # the model's reasoning for the review record, never card text.
+    has_decisions = bool(task_ids or proposal.tasks or items)
+    if not has_decisions:
+        body_lines = [proposal.summary]
+    elif policy_denied:
         body_lines = [f"📋 Strategist proposal blocked by governance policy — {proposal.summary}"]
     elif auto_approved:
         body_lines = [f"📋 Strategist proposal auto-approved — {proposal.summary}"]
@@ -4520,16 +4672,11 @@ async def _post_proposal_chat(
             body_lines.append(_proposal_task_body_line(entry))
             if entry.get("rationale"):
                 body_lines.append(f"      _{entry['rationale']}_")
-    elif not items:
-        body_lines.append("\n_(no actionable tasks this cycle)_")
     if items:
         body_lines.append("")
         for item in items:
             kind_label = str(item.get("kind") or "item").replace("_", " ")
             body_lines.append(f"  • [{kind_label}] {item.get('summary') or ''}".rstrip())
-    if proposal.notes:
-        body_lines.append("")
-        body_lines.append(f"📝 Notes: {proposal.notes}")
     # Informational footers, kept as data so the card renders them without
     # fishing them back out of the body.
     footnotes: list[str] = []
@@ -4584,8 +4731,11 @@ async def _post_proposal_chat(
             "source": "standing_approval" if auto_approved_action_key else "authorized_automation",
             "reason": auto_approve_reason,
         }
-    else:
+    elif has_decisions:
         approval = {"status": "not_required", "source": "none"}
+    else:
+        # A plain reply to the person who asked for the review: no approval chip.
+        approval = None
 
     # Auto-approved and policy-denied cards carry no ``pending_action`` at
     # all, yet they render the same task list. ``meta["proposal"]`` is the
@@ -4594,7 +4744,6 @@ async def _post_proposal_chat(
         "proposal": {
             "review_id": proposal.review_id,
             "summary": proposal.summary,
-            "notes": proposal.notes,
             "tasks": task_entries,
             "items": items,
             "footnotes": footnotes,

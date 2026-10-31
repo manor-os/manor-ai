@@ -17,7 +17,9 @@ from packages.core.services.task_execution import task_execution_intent_generati
 from packages.core.strategist import context as strategist_context, prompt
 from packages.core.strategist.context import StrategistContext
 from packages.core.strategist.proposal import Proposal
-from packages.core.strategist.service import _suppress_capability_recovery_duplicates
+from packages.core.strategist.service import (
+    _suppress_capability_recovery_duplicates, _suppress_open_task_follow_ups,
+)
 
 
 @pytest.fixture
@@ -398,3 +400,188 @@ def test_pending_and_blocked_outcomes_are_not_rendered_as_still_running(context)
     assert "Recorded in_progress (consult execution evidence for activity)" in rendered
     for status in context.recent_proposal_outcomes:
         assert f"task_id=task-{status} status={status}" in rendered
+
+
+def _work(key, title, **extra):
+    return {"task_key": key, "title": title, "owner_service_key": "content", "deliverables": [{
+        "name": "out", "kind": "value", "shape": "TextResult", "acceptance": "Done.", "usage": "Read.",
+    }], **extra}
+
+
+def test_task_waiting_on_review_gets_no_recovery_work_and_points_at_its_card(context):
+    # 2026-10-21: a recovery Task re-asked the open review card three times.
+    context.execution_snapshot["tasks"].append({
+        "task_id": "task-W", "title": "Write the weekly growth brief", "task_status": "waiting_on_customer",
+        "observed_state": "blocked", "plan_id": None, "current_blocker": None, "waiting_on_human": True,
+    })
+    proposal = Proposal.model_validate({"review_id": "review-1", "summary": "Next steps.", "tasks": [
+        _work("recover", "Recover the existing growth brief task and verify delivery", existing_task_id="task-W"),
+        _work("publish", "Publish the approved brief", depends_on_task_keys=["recover"]),
+        _work("pricing", "Research competitor pricing"),
+    ]})
+
+    _suppress_open_task_follow_ups(proposal, context)
+
+    assert [task.task_key for task in proposal.tasks] == ["pricing"]
+    assert "Need Input" in proposal.notes and "Write the weekly growth brief" in proposal.notes
+
+
+def test_listing_waiting_on_approval_card_is_not_re_asked_or_chased(context):
+    # Unrelated scenario: legacy prompt path, a shop listing parked on an approval card.
+    context.execution_snapshot = {}
+    context.work_batch_reconciliation = [{"stale_tasks": [{
+        "task_id": "01LISTING", "title": "Publish holiday product listing update",
+        "status": "blocked", "waiting_on_human": True,
+    }, {"task_id": "01STUCK", "title": "Sync inventory counts", "status": "blocked", "waiting_on_human": False}]}]
+    proposal = Proposal.model_validate({"review_id": "review-1", "summary": "Next steps.", "tasks": [
+        _work("chase", "Unblock the storefront task", description="Get Task 01LISTING moving again."),
+        _work("retry_sync", "Retry the inventory sync"),
+        _work("email", "Write the holiday product email campaign"),
+    ], "human_requests": [{
+        "request_key": "approve", "request_kind": "decision",
+        "question": "Please approve the holiday product listing update.",
+    }]})
+
+    _suppress_open_task_follow_ups(proposal, context)
+
+    # The blocked sync is retried on its own Task, not as a new one.
+    assert [task.task_key for task in proposal.tasks] == ["email"]
+    assert proposal.retry_task_ids == ["01STUCK"]
+    assert proposal.human_requests == []
+    assert "Publish holiday product listing update" in proposal.notes
+    assert "Sync inventory counts" in proposal.notes
+
+
+def test_recovery_of_waiting_task_outside_recent_snapshot_is_dropped(context):
+    # 2026-10-21 prod: "Recover the existing growth brief task and verify
+    # delivery" with no existing_task_id; the waiting Task had aged out of the
+    # 15-row snapshot and shares only 2 of its 3 title words with the proposal.
+    context.open_tasks = [
+        {"task_id": "01BRIEF", "title": "Write the growth brief",
+         "status": "waiting_on_customer", "waiting_on_human": True},
+        {"task_id": "01CAL", "title": "Write the content calendar", "status": "in_progress",
+         "waiting_on_human": False},
+    ]
+    proposal = Proposal.model_validate({"review_id": "review-1", "summary": "Next steps.", "tasks": [
+        _work("recover", "Recover the existing growth brief task and verify delivery"),
+        _work("calendar", "Write the content calendar for November"),
+        _work("pricing", "Research competitor pricing"),
+    ], "human_requests": [{
+        "request_key": "brief", "request_kind": "review",
+        "question": "Can you review the growth brief draft?",
+    }]})
+
+    _suppress_open_task_follow_ups(proposal, context)
+
+    # A next-period Task that is not a follow-up keeps running alongside.
+    assert [task.task_key for task in proposal.tasks] == ["calendar", "pricing"]
+    assert proposal.human_requests == []
+    assert proposal.retry_task_ids == []
+    assert "Need Input" in proposal.notes and "Write the growth brief" in proposal.notes
+
+
+def test_follow_up_on_running_task_is_dropped_without_retry(context):
+    # Unrelated scenario: a support Workspace whose ticket triage is running.
+    context.open_tasks = [{"task_id": "01TRIAGE", "title": "Triage overdue support tickets",
+                           "status": "in_progress", "waiting_on_human": False}]
+    proposal = Proposal.model_validate({"review_id": "review-1", "summary": "Next steps.", "tasks": [
+        _work("verify", "Verify the overdue ticket triage finished"),
+        _work("faq", "Draft FAQ answers for billing questions"),
+    ]})
+
+    _suppress_open_task_follow_ups(proposal, context)
+
+    assert [task.task_key for task in proposal.tasks] == ["faq"]
+    assert proposal.retry_task_ids == []
+    assert "Already open" in proposal.notes
+
+
+@pytest.mark.asyncio
+async def test_review_retries_blocked_task_itself_beyond_recent_window(db_session, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import func, select
+    from tests.approval_settings_test_utils import initialize_test_approval_owners
+
+    from packages.core.constants.task_actors import TaskActor, task_actor_from_meta
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.models.task import TaskLog
+    from packages.core.services.task_execution import (
+        TASK_EXECUTION_OUTBOX_EVENT, task_execution_intent_dedupe_key,
+    )
+    from packages.core.models.user import User, UserMembership
+    from packages.core.services.task_execution_origin import MANUAL_EXECUTION_KEY
+    from packages.core.services.task_retry_service import AUTOMATIC_RETRY_COUNT_KEY
+    from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+    from packages.core.strategist import service
+
+    workspace = Workspace(id=generate_ulid(), entity_id=generate_ulid(), name="Open work", status="active")
+    agent_id = generate_ulid()
+    db_session.add_all([
+        workspace,
+        User(id=workspace.entity_id, entity_id=workspace.entity_id, email=f"{workspace.entity_id}@example.test",
+             password_hash="fixture", role="owner", status="active"),
+        UserMembership(user_id=workspace.entity_id, entity_id=workspace.entity_id, role="owner", status="active"),
+        Agent(id=agent_id, entity_id=workspace.entity_id, name="Ops Agent", status="active"),
+        AgentSubscription(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+                          agent_id=agent_id, service_key="ops", status="active"),
+    ])
+    now = datetime.now(timezone.utc)
+
+    def task(title, status, *, days_ago):
+        return Task(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id, title=title,
+                    status=status, task_type="general", details={}, owner_service_key="ops",
+                    created_at=now - timedelta(days=days_ago), status_changed_at=now - timedelta(days=days_ago))
+
+    # Both open Tasks are older than the 15 most recent Tasks the snapshot reads.
+    brief = task("Write the growth brief", "waiting_on_customer", days_ago=3)
+    sync = task("Sync inventory counts", "blocked", days_ago=3)
+    db_session.add_all([brief, sync, *(task(f"Post update {n}", "completed", days_ago=1) for n in range(16))])
+    await db_session.flush()
+    await initialize_test_approval_owners(db_session, workspace, user_id=workspace.entity_id)
+    await db_session.commit()
+
+    async def fake_generate_proposal(ctx, *, review_id, db=None):
+        assert brief.id not in {row["task_id"] for row in ctx.execution_snapshot.get("tasks", [])}
+        return Proposal.model_validate({"review_id": review_id, "summary": "Next steps.", "tasks": [
+            _work("recover", "Recover the existing growth brief task and verify delivery", owner_service_key="ops"),
+            _work("retry_sync", "Retry the inventory counts sync", owner_service_key="ops"),
+            _work("newsletter", "Draft the November newsletter", owner_service_key="ops"),
+        ]})
+
+    monkeypatch.setattr(service, "generate_proposal", fake_generate_proposal)
+    monkeypatch.setattr(service, "_post_proposal_chat", AsyncMock(return_value=None))
+
+    result = await service.run_review(db_session, workspace.id, trigger="manual")
+
+    created = (await db_session.scalars(select(Task.title).where(
+        Task.workspace_id == workspace.id, Task.id.not_in([brief.id, sync.id]), Task.status != "completed",
+    ))).all()
+    assert created == ["Draft the November newsletter"]
+    # The platform retried the blocked Task itself: nobody was asked.
+    assert result["retried_task_ids"] == [sync.id]
+    await db_session.refresh(sync)
+    assert sync.status == "in_progress"
+    assert sync.details[AUTOMATIC_RETRY_COUNT_KEY] == 1
+    assert MANUAL_EXECUTION_KEY not in sync.details
+    assert await db_session.scalar(select(RuntimeOutboxEvent.id).where(
+        RuntimeOutboxEvent.dedupe_key == task_execution_intent_dedupe_key(
+            sync.id, task_execution_intent_generation(sync)),
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+    ))
+    retry_log = (await db_session.scalars(select(TaskLog).where(
+        TaskLog.task_id == sync.id, TaskLog.log_type == "manual_retry",
+    ))).one()
+    assert retry_log.meta["automatic"] is True
+    assert task_actor_from_meta(retry_log.meta) is TaskActor.SYSTEM
+    assert await db_session.scalar(select(func.count()).select_from(HitlRequest).where(
+        HitlRequest.origin_task_id.in_([brief.id, sync.id]))) == 0
+
+    # Automatic retries are bounded; a waiting Task is never retried.
+    sync.status = "blocked"
+    sync.details = {**sync.details, AUTOMATIC_RETRY_COUNT_KEY: 2}
+    await db_session.commit()
+    workspace = await db_session.get(Workspace, workspace.id)
+    assert await service._retry_blocked_original_tasks(db_session, workspace, [sync.id, brief.id]) == []

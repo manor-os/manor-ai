@@ -135,6 +135,16 @@ class ActionFacts(PolicyModel):
     impact: ApprovalImpact = 'unknown'
     risk_level: Literal['low', 'medium', 'high'] = 'medium'
     targets: list[ApprovalTarget] = Field(default_factory=list, max_length=1000)
+    # ``leaf_only`` actions route, ask or hand off; only an explicit
+    # action/resource rule for the exact key applies to them.
+    gate: Literal['policy', 'leaf_only'] = 'policy'
+    # Other keys the same action was named by (a plan step's raw tool name):
+    # explicit action/resource rules on them still apply.
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    # Keys whose explicit rules may only restrict (deny/ask), never allow:
+    # a relay judged as the operation it guards keeps its own key here, so an
+    # allow on the relay's generic key cannot approve the guarded operation.
+    restrict_only_keys: list[str] = Field(default_factory=list, max_length=8)
 
 
 class TargetDecision(PolicyModel):
@@ -152,24 +162,11 @@ class PolicyEvaluation(TargetDecision):
     target_decisions: list[TargetDecision] = Field(default_factory=list)
 
 
-ACTION_CATALOG = [
-    {'category': 'read', 'action_key': 'tool.read_file.read', 'label': 'Read a file', 'impact': 'read'},
-    {'category': 'browser', 'action_key': 'chrome.browser.interact', 'label': 'Use browser', 'impact': 'reversible'},
-    {'category': 'files', 'action_key': 'workspace.file.create', 'label': 'Create a file', 'impact': 'reversible'},
-    {'category': 'files', 'action_key': 'workspace.file.modify', 'label': 'Edit a file', 'impact': 'reversible'},
-    {'category': 'communication', 'action_key': 'external_message.send', 'label': 'Send an external message', 'impact': 'external'},
-    {'category': 'publishing', 'action_key': 'social_post.publish', 'label': 'Publish a social post', 'impact': 'external'},
-    {'category': 'deletion', 'action_key': 'workspace.file.delete', 'label': 'Delete a file', 'impact': 'destructive'},
-    {'category': 'automation', 'action_key': 'workspace.automation.create', 'label': 'Create an automation', 'impact': 'external'},
-    {'category': 'workspace', 'action_key': 'workspace.operation.draft', 'label': 'Draft a workspace change', 'impact': 'reversible'},
-]
-
-
 def _matches(rule: ApprovalRule, facts: ActionFacts, target: ApprovalTarget | None) -> bool:
     selector = rule.selector
     if isinstance(selector, CategorySelector):
         return selector.category == facts.category
-    if selector.action_key != facts.action_key:
+    if selector.action_key != facts.action_key and selector.action_key not in facts.aliases:
         return False
     if isinstance(selector, ResourceSelector):
         return bool(target and selector.account_id == target.account_id
@@ -208,6 +205,12 @@ def evaluate_policy(chain: ResolvedPolicyChain, facts: ActionFacts) -> PolicyEva
             if snapshot is None:
                 continue
             for rule in snapshot.policy.rules:
+                # A leaf_only fact is judged only by explicit action/resource rules.
+                if facts.gate == 'leaf_only' and rule.selector.kind == 'category':
+                    continue
+                if (rule.effect == 'allow' and rule.selector.kind != 'category'
+                        and rule.selector.action_key in facts.restrict_only_keys):
+                    continue
                 if _matches(rule, facts, target):
                     precision = {'category': 1, 'action': 2, 'resource': 3}[rule.selector.kind]
                     matches.append((rule.effect == 'deny', precision, locality, rule.effect == 'ask', rule.id, rule, snapshot))
@@ -216,6 +219,11 @@ def evaluate_policy(chain: ResolvedPolicyChain, facts: ActionFacts) -> PolicyEva
             decisions.append(TargetDecision(target=target, outcome=rule.effect, reason_code='approval.rule',
                 rule_id=rule.id, scope=owner.scope, policy_revision=owner.revision, source='rule',
                 reason_params={'inherited': owner is chain.root and chain.local is not None}))
+        elif facts.gate == 'leaf_only' and facts.impact != 'unknown':
+            # A leaf_only fact with an unknown effect gets the mode baseline.
+            decisions.append(TargetDecision(target=target, outcome='allow', reason_code='approval.leaf_only',
+                reason_params={'mode': mode_owner.policy.mode, 'impact': facts.impact},
+                scope=mode_owner.scope, policy_revision=mode_owner.revision, source='mode'))
         else:
             decisions.append(TargetDecision(target=target, outcome=_baseline(mode_owner.policy.mode, facts),
                 reason_code='approval.unknown_impact' if facts.impact == 'unknown' else 'approval.mode',
@@ -223,3 +231,18 @@ def evaluate_policy(chain: ResolvedPolicyChain, facts: ActionFacts) -> PolicyEva
                 scope=mode_owner.scope, policy_revision=mode_owner.revision, source='mode'))
     result = max(decisions, key=lambda item: {'allow': 0, 'ask': 1, 'deny': 2}[item.outcome])
     return PolicyEvaluation(**result.model_dump(), target_decisions=decisions)
+
+
+def __getattr__(name: str):
+    # ACTION_CATALOG moved to action_effects (derived from the declarations);
+    # this module keeps re-exporting the same object. Lazy: action_effects
+    # imports this module's category/impact types.
+    if name == 'ACTION_CATALOG':
+        from packages.core.governance.action_effects import ACTION_CATALOG
+
+        return ACTION_CATALOG
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), 'ACTION_CATALOG'})

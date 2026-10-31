@@ -31,14 +31,14 @@ def _rule(effect, selector, id="rule"):
 @pytest.mark.parametrize("origin_kind", ["step", "tool_call", "operation"])
 @pytest.mark.asyncio
 async def test_existing_pending_is_not_released_by_automatic_mode(monkeypatch, origin_kind):
-    req = SimpleNamespace(status=ApprovalStatus.PENDING, reason="review this content", matched_rule="old-ask", action_key="message.send", resource_id=None, context={})
+    req = SimpleNamespace(status=ApprovalStatus.PENDING, reason="review this content", matched_rule="old-ask", action_key="external_message.send", resource_id=None, context={})
     monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=PolicyDecision(True, reason="mode.automatic")))
     monkeypatch.setattr(approvals, "_find_open_request", AsyncMock(return_value=req))
     monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=req))
     mint = AsyncMock()
     monkeypatch.setattr(approvals, "_create_pending_request", mint)
     result = await approvals.resolve_approval(
-        None, subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+        None, subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind=origin_kind, step_id="step", conversation_id="conv"),
         permission_decision=PermissionDecision.allow(),
     )
@@ -53,7 +53,7 @@ async def test_current_hard_deny_precedes_existing_grant(monkeypatch):
     lookup = AsyncMock(return_value=SimpleNamespace(status=ApprovalStatus.GRANTED))
     monkeypatch.setattr(approvals, "_find_open_request", lookup)
     result = await approvals.resolve_approval(None,
-        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind="tool_call", conversation_id="conv"),
         permission_decision=PermissionDecision.allow())
     assert result.outcome == ApprovalOutcome.DENY
@@ -80,7 +80,9 @@ def test_same_file_facts_across_execution_surfaces(mode, operation, expected):
     assert evaluate_policy(_chain(mode), facts).outcome == expected
 
 
-def test_unknown_effect_follows_the_inherited_mode():
+def test_unknown_effect_follows_the_inherited_mode(monkeypatch):
+    # Production fallback for an undeclared key (tests run the strict contract).
+    monkeypatch.delenv("MANOR_STRICT_EFFECT_CONTRACT", raising=False)
     # "Run automatically" means it; "Confirm by risk" still asks for an
     # effect it cannot show routine.
     facts = action_facts(action_key="provider.custom_action", risk_level="low")
@@ -146,14 +148,14 @@ def test_online_workspace_schema_rejects_retired_fields(field):
 @pytest.mark.parametrize("status", ["denied", "consumed", "expired"])
 @pytest.mark.asyncio
 async def test_same_operation_cannot_replay_after_terminal_decision(monkeypatch, status):
-    req = SimpleNamespace(status=status, action_key="message.send", resource_id=None,
+    req = SimpleNamespace(status=status, action_key="external_message.send", resource_id=None,
         context={"args_hash": "same"}, reason="decision", matched_rule="old")
     monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=PolicyDecision(True)))
     monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=req))
     mint = AsyncMock()
     monkeypatch.setattr(approvals, "_create_pending_request", mint)
     result = await approvals.resolve_approval(None,
-        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind="tool_call", operation_id="run:call", args_hash="same"),
         permission_decision=PermissionDecision.allow())
     assert result.outcome == ApprovalOutcome.DENY
@@ -162,12 +164,12 @@ async def test_same_operation_cannot_replay_after_terminal_decision(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_same_operation_changed_payload_cannot_use_grant(monkeypatch):
-    req = SimpleNamespace(status="granted", action_key="message.send", resource_id=None,
+    req = SimpleNamespace(status="granted", action_key="external_message.send", resource_id=None,
         context={"args_hash": "old"}, reason="decision", matched_rule="old")
     monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=PolicyDecision(True)))
     monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=req))
     result = await approvals.resolve_approval(None,
-        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind="tool_call", operation_id="run:call", args_hash="changed"),
         permission_decision=PermissionDecision.allow())
     assert result.outcome == ApprovalOutcome.DENY
@@ -175,7 +177,7 @@ async def test_same_operation_changed_payload_cannot_use_grant(monkeypatch):
 
 
 def test_identical_arguments_from_new_user_run_have_distinct_identity():
-    subject = approvals.ApprovalSubject(entity_id="e", action_key="message.send")
+    subject = approvals.ApprovalSubject(entity_id="e", action_key="external_message.send")
     first = approvals.ApprovalOrigin(kind="tool_call", operation_id="runtime:run1:call:call1", args_hash="same")
     second = approvals.ApprovalOrigin(kind="tool_call", operation_id="runtime:run2:call:call1", args_hash="same")
     assert approvals.dedup_key_for(subject, first) != approvals.dedup_key_for(subject, second)
@@ -206,7 +208,7 @@ async def test_reads_and_business_control_do_not_skip_policy(monkeypatch, tool_n
 
 @pytest.mark.asyncio
 async def test_new_independent_requirement_does_not_reuse_old_grant(monkeypatch):
-    old = SimpleNamespace(status="granted", action_key="message.send", resource_id=None,
+    old = SimpleNamespace(status="granted", action_key="external_message.send", resource_id=None,
         context={"args_hash": "same", "approval_requirements": []}, reason="review", matched_rule="old")
     new = SimpleNamespace(status="pending", reason="new review", matched_rule="new")
     explanation = {"outcome": "ask", "rule_id": "new", "scope": {"kind": "account", "id": "e"}, "source": "rule"}
@@ -215,13 +217,70 @@ async def test_new_independent_requirement_does_not_reuse_old_grant(monkeypatch)
     mint = AsyncMock(return_value=new)
     monkeypatch.setattr(approvals, "_create_pending_request", mint)
     result = await approvals.resolve_approval(SimpleNamespace(flush=AsyncMock()),
-        subject=approvals.ApprovalSubject(entity_id="e", workspace_id="ws", action_key="message.send"),
+        subject=approvals.ApprovalSubject(entity_id="e", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind="tool_call", operation_id="run:call", args_hash="same"),
         permission_decision=PermissionDecision.allow())
     assert old.status == "expired"
     assert result.outcome == ApprovalOutcome.NEEDS_HUMAN
     assert result.request is new
     assert mint.await_args.kwargs["origin"].context["approval_requirements"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("policy", "existing", "expected"), [
+    (PolicyDecision(False, True, "review", "ask", {"outcome": "ask", "rule_id": "ask"}), None, "undecided"),
+    (PolicyDecision(True, reason="mode.automatic"), None, None),
+    (PolicyDecision(False, True, "new review", "new", {"outcome": "ask", "rule_id": "new", "source": "rule"}),
+     "granted-old-requirements", "undecided"),
+    (PolicyDecision(True, reason="mode.automatic"), "granted", "undecided"),
+    (PolicyDecision(False, reason="root deny"), None, "refused"),
+], ids=["ask", "allow", "changed-grant", "one-time-grant", "deny"])
+async def test_gate_preview_decides_without_writing(monkeypatch, policy, existing, expected):
+    # A batch schedule previews each call's gate before running any of them:
+    # the same decision, but no request is minted, expired or claimed.
+    from packages.core.ai.runtime import approval_service, envelope
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.services import runtime_authorization
+    from packages.core import database
+
+    arguments = {"path": "plan.md", "content": "x"}
+    action = classify_runtime_tool("write_file", arguments).action
+    request = None if existing is None else SimpleNamespace(
+        status="granted", action_key=action.action_key, resource_id=action.resource_id,
+        context={"args_hash": approval_service.approval_args_hash(arguments, tool_name="write_file"),
+                 "approval_requirements": [] if existing == "granted-old-requirements" else ["x"]},
+        reason="review", matched_rule="old", hitl_type="authorize",
+    )
+
+    @asynccontextmanager
+    async def session():
+        yield SimpleNamespace()  # no commit/flush/add: any write raises
+
+    monkeypatch.setattr(database, "async_session", session)
+    monkeypatch.setattr(runtime_authorization, "authorize_runtime_action", AsyncMock(return_value=PermissionDecision.allow()))
+    monkeypatch.setattr(envelope, "runtime_effective_tool_scope", lambda **kwargs: SimpleNamespace(searchable_tool_names=lambda: {"write_file"}))
+    monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=policy))
+    monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=request))
+    mint = AsyncMock()
+    monkeypatch.setattr(approvals, "_create_pending_request", mint)
+    monkeypatch.setattr(approvals, "_operation_requirements", lambda *args, **kwargs: ["x"])
+
+    result = await approval_service.guard_runtime_tool_action(
+        name="write_file", arguments=dict(arguments), entity_id="e", user_id="u",
+        workspace_id=None, conversation_id="conv",
+        classification=classify_runtime_tool("write_file", arguments),
+        operation_id="runtime:run:call:one", preview=True,
+    )
+
+    if expected == "undecided":
+        assert result == approval_service.RUNTIME_GATE_PREVIEW_UNDECIDED
+    elif expected == "refused":
+        assert "blocked_by_governance" in result
+    else:
+        assert result is None
+    mint.assert_not_awaited()
+    if request is not None:
+        assert request.status == "granted"
 
 
 @pytest.mark.asyncio
@@ -234,25 +293,25 @@ async def test_task_constraints_keep_every_ask_and_later_deny_wins():
              "approval_selectors": [{"kind": "category", "category": "communication"}]}
             for key in ("legal-review", "content-review")]
     decision = await service._check_task_runtime_rules(db_for(asks), task_id="task",
-        action_key="message.send", risk_level="low")
+        action_key="external_message.send", risk_level="low")
     assert {item["rule_id"] for item in decision.explanation["target_decisions"]} == {"legal-review", "content-review"}
     denied = await service._check_task_runtime_rules(db_for([*asks, {
         "rule_key": "blocked", "rule_type": "deny",
-        "approval_selectors": [{"kind": "action", "action_key": "message.send"}],
-    }]), task_id="task", action_key="message.send", risk_level="low")
+        "approval_selectors": [{"kind": "action", "action_key": "external_message.send"}],
+    }]), task_id="task", action_key="external_message.send", risk_level="low")
     assert denied.allowed is False and denied.pause_for_hitl is False
 
 
 @pytest.mark.asyncio
 async def test_task_ask_adds_to_current_account_requirement(monkeypatch):
-    root_rule = _rule("ask", {"kind": "action", "action_key": "message.send"}, id="account-review")
+    root_rule = _rule("ask", {"kind": "action", "action_key": "external_message.send"}, id="account-review")
     monkeypatch.setattr("packages.core.governance.approval_policy_service.load_policy_chain", AsyncMock(return_value=_chain(rules=[root_rule])))
     task_explanation = {"outcome": "ask", "rule_id": "task-review", "source": "constraint",
         "scope": {"kind": "task", "id": "task"}, "reason_code": "task.rule"}
     monkeypatch.setattr(service, "_check_task_runtime_rules", AsyncMock(return_value=PolicyDecision(False, True,
         "task review", "task-review", task_explanation)))
     decision = await service.check_step_policy(None, entity_id="entity", workspace_id=None,
-        kind="tool", action_key="message.send", risk_level="low", task_id="task")
+        kind="tool", action_key="external_message.send", risk_level="low", task_id="task")
     assert {item["rule_id"] for item in decision.explanation["target_decisions"]} == {"account-review", "task-review"}
     assert len(approvals._consent_requirements(decision)) == 2
 
@@ -266,7 +325,7 @@ async def test_exact_origin_preauthorization_does_not_skip_explicit_policy_rule(
     mint = AsyncMock(return_value=SimpleNamespace(reason="review", matched_rule="explicit-review"))
     monkeypatch.setattr(approvals, "_create_pending_request", mint)
     result = await approvals.resolve_approval(None,
-        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+        subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
         origin=approvals.ApprovalOrigin(kind="tool_call", operation_id="runtime:run:call:one"),
         permission_decision=PermissionDecision.allow(), policy_hitl_preauthorized=True)
     assert result.outcome == ApprovalOutcome.NEEDS_HUMAN
@@ -277,12 +336,12 @@ async def test_exact_origin_preauthorization_does_not_skip_explicit_policy_rule(
 @pytest.mark.parametrize("review_change", ["type", "declared", "explicit", "content"])
 async def test_new_human_review_cannot_reuse_ordinary_or_older_review_grant(monkeypatch, review_change):
     decision = PolicyDecision(True, explanation={"outcome": "allow", "source": "mode"})
-    subject = approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send")
+    subject = approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send")
     old_payload = {"diff": {"before": 1, "after": 2}}
     old_type = "review" if review_change == "content" else "authorize"
     old_requirements = approvals._operation_requirements(decision, subject,
         hitl_type=old_type, payload=old_payload if review_change == "content" else None, require_explicit_approval=False)
-    old = SimpleNamespace(status="granted", action_key="message.send", resource_id=None,
+    old = SimpleNamespace(status="granted", action_key="external_message.send", resource_id=None,
         context={"args_hash": "same", "approval_requirements": old_requirements}, reason="old", matched_rule="old")
     monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=decision))
     monkeypatch.setattr(approvals, "_find_operation_request", AsyncMock(return_value=old))
@@ -350,13 +409,12 @@ async def test_provider_preflight_expires_grant_on_new_requirement_before_claim(
 
 @pytest.mark.asyncio
 async def test_manual_step_retry_has_new_intent_but_automatic_retry_cannot_replay(monkeypatch):
-    from apps.api.routers.plans import _reset_step_for_retry
-    from packages.core.plans.step_reset import reset_step_to_retry_ready, step_approval_operation_id
+    from packages.core.dispatcher.step_state import renew_step_approval_intent, step_approval_operation_id
     step = SimpleNamespace(id="step", plan_id="plan", approval_operation_revision=0,
         params={}, step_status="failed", attempt_count=1)
     original = step_approval_operation_id(step)
     assert original == "step:plan:step"
-    consumed = SimpleNamespace(status="consumed", action_key="message.send", resource_id=None,
+    consumed = SimpleNamespace(status="consumed", action_key="external_message.send", resource_id=None,
         context={"args_hash": "same"}, reason="spent", matched_rule="mode")
     monkeypatch.setattr(approvals, "_policy_decision", AsyncMock(return_value=PolicyDecision(False, True,
         "review", "mode", {"outcome": "ask", "source": "mode"})))
@@ -365,16 +423,16 @@ async def test_manual_step_retry_has_new_intent_but_automatic_retry_cannot_repla
     monkeypatch.setattr(approvals, "_find_operation_request", lookup)
     mint = AsyncMock(return_value=SimpleNamespace(reason="new review", matched_rule="mode"))
     monkeypatch.setattr(approvals, "_create_pending_request", mint)
-    reset_step_to_retry_ready(step)
+    # An automatic retry does not renew the intent, so it keeps the spent id.
     assert step_approval_operation_id(step) == original
     async def resolve():
         return await approvals.resolve_approval(None,
-            subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="message.send"),
+            subject=approvals.ApprovalSubject(entity_id="entity", workspace_id="ws", action_key="external_message.send"),
             origin=approvals.ApprovalOrigin(kind="step", step_id=step.id, plan_id=step.plan_id,
                 operation_id=step_approval_operation_id(step), args_hash="same"),
             permission_decision=PermissionDecision.allow())
     assert (await resolve()).outcome == ApprovalOutcome.DENY
-    _reset_step_for_retry(step, user=SimpleNamespace(id="user"))
+    renew_step_approval_intent(step)
     assert step.approval_operation_revision == 1
     assert step_approval_operation_id(step) == f"{original}:intent:1"
     assert (await resolve()).outcome == ApprovalOutcome.NEEDS_HUMAN

@@ -64,7 +64,14 @@ def build_retry_context(
     target: str,
     *,
     explicit_checkpoint: bool = False,
+    added_step_ids=(),
 ) -> dict:
+    """Plan a retry of ``steps`` from ``target`` over prior ``results``.
+
+    ``added_step_ids`` are nodes the definition gained after the failed
+    attempt. One on the taken path before ``target`` never ran, so it runs
+    first and leads into the checkpoint instead of being skipped.
+    """
     from packages.core.services.workflow_service import entry_step_id
 
     steps = [step for step in steps if step.get("id") and step.get("type") != "note"]
@@ -101,8 +108,12 @@ def build_retry_context(
 
     invalidated = reachable_ids(declared, [target])
     entries = {target} | (frontier - invalidated)
+    added = frontier & ancestors & set(added_step_ids)
+    # The checkpoint and anything else an added node leads into start from it.
+    for sid in added:
+        entries -= reachable_ids(declared, [sid]) - {sid}
     if explicit_checkpoint:
-        entries -= ancestors
+        entries -= ancestors - added
         scope = reachable_ids(declared, entries)
         missing_dependencies = {
             str(dep) for step in steps if step["id"] in scope

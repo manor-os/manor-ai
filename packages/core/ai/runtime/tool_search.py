@@ -811,7 +811,7 @@ async def _runtime_approval_policy_deny_matcher(
             classification = classify_runtime_tool(name, {})
             if classification.effect in {RuntimeToolEffect.ORCHESTRATOR, RuntimeToolEffect.CONTROL}:
                 return False  # the execution gate does not policy-check these either
-            action, impact = runtime_policy_action_for_classification(classification)
+            action, _impact = runtime_policy_action_for_classification(classification)
             if workspace_policy is not None and not decide(
                 workspace_policy, kind=action.kind, action_key=action.action_key,
                 risk_level=action.risk_level, resource_id=action.resource_id,
@@ -821,7 +821,8 @@ async def _runtime_approval_policy_deny_matcher(
             facts = action_facts(
                 action_key=action.action_key, capability_id=action.capability_id,
                 resource_kind=action.resource_kind, resource_id=action.resource_id,
-                operation=action.operation, risk_level=action.risk_level, impact=impact,
+                operation=action.operation, risk_level=action.risk_level,
+                **action.policy_effect(),
             )
             return evaluate_policy(chain, facts).outcome == "deny"
         except Exception:
@@ -1683,6 +1684,61 @@ async def runtime_execute_search_tools_handler(
                     can_acquire=can_acquire and policy_known,
                     policy_blocks=policy_blocks,
                 )
+    discovery_user_id = runtime_context.user_id or user_id
+    discovery_entity_id = runtime_context.entity_id or entity_id
+    if discovery_user_id and discovery_entity_id and visible_matches:
+        from packages.core.services.runtime_authorization.collaborator import (
+            collaborator_tool_offered,
+            is_runtime_collaborator,
+            workspace_bound_mcp_tool,
+        )
+
+        try:
+            # The gate cached this for the search_tools call itself.
+            collaborator = await is_runtime_collaborator(discovery_user_id, discovery_entity_id)
+            bound_mcp: set[str] = set()
+            invocable_skills: set[str] = set()
+            mcp_names = {
+                name for match in visible_matches
+                if (name := str(match.get("name") or "")).startswith("mcp__")
+            }
+            skill_ids = {
+                skill_id for match in visible_matches
+                if match.get("kind") == "skill" and (skill_id := str(match.get("skill_id") or ""))
+            }
+            discovery_workspace_id = runtime_context.workspace_id
+            if collaborator and (mcp_names or skill_ids) and isinstance(discovery_workspace_id, str):
+                from packages.core.database import async_session
+                from packages.core.services.collaborator_scope import skills_invocable_in_workspace
+
+                async with async_session() as collaborator_db:
+                    for name in sorted(mcp_names):
+                        if await workspace_bound_mcp_tool(
+                            collaborator_db, entity_id=discovery_entity_id,
+                            workspace_id=discovery_workspace_id, tool_name=name,
+                        ):
+                            bound_mcp.add(name)
+                    # The same rule as the gate's check of an invoked skill_id.
+                    invocable_skills = await skills_invocable_in_workspace(
+                        collaborator_db, skill_ids,
+                        entity_id=discovery_entity_id, workspace_id=discovery_workspace_id,
+                    )
+        except Exception:
+            # Exposure only: the runtime authorization gate still decides each call.
+            logger.warning("Collaborator check unavailable for tool discovery", exc_info=True)
+            collaborator = False
+        if collaborator:
+            # Offer an external collaborator only tools their gate can admit;
+            # authorization still decides each concrete call.
+            visible_matches = [
+                match for match in visible_matches
+                if (
+                    str(match.get("skill_id") or "") in invocable_skills
+                    if match.get("kind") == "skill"
+                    else str(match.get("name") or "") in bound_mcp
+                    or collaborator_tool_offered(str(match.get("name") or ""))
+                )
+            ]
     payload = runtime_search_tools_payload(
         not_in_scope=not_in_scope,
         matches=visible_matches,

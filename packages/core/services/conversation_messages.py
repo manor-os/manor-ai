@@ -135,7 +135,11 @@ async def _publish_workspace_chat_message_event(
             r = await _get_redis()
             if r:
                 await r.publish("manor:ws_broadcast", json.dumps({
+                    # Workspace-scoped: an entity target would reach members
+                    # who cannot read the Workspace and miss its collaborators.
+                    "target": "workspace",
                     "entity_id": event_entity_id,
+                    "workspace_id": event_workspace_id,
                     "event": "workspace_chat_message",
                     "data": {
                         "workspace_id": event_workspace_id,

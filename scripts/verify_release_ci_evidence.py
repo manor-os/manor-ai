@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 RUN_ID_RE = re.compile(r"[1-9][0-9]*\Z")
@@ -58,6 +59,17 @@ def belongs_to_repository(run: dict[str, Any], repository: str) -> bool:
     return True
 
 
+def matching_branch(run: dict[str, Any], args: argparse.Namespace) -> bool:
+    head_branch = run.get("head_branch")
+    if not isinstance(head_branch, str):
+        return False
+    if getattr(args, "merge_queue", False):
+        # GitHub tests a merge group on a read-only queue branch, then moves
+        # the target branch to that exact commit.
+        return head_branch.startswith(f"gh-readonly-queue/{args.branch}/")
+    return head_branch == args.branch
+
+
 def matching_identity(run: Any, args: argparse.Namespace) -> bool:
     if not isinstance(run, dict):
         return False
@@ -66,7 +78,7 @@ def matching_identity(run: Any, args: argparse.Namespace) -> bool:
         and isinstance(run.get("head_sha"), str)
         and SHA_RE.fullmatch(run["head_sha"]) is not None
         and run.get("event") in args.events
-        and run.get("head_branch") == args.branch
+        and matching_branch(run, args)
         and belongs_to_repository(run, args.repository)
     )
 
@@ -94,9 +106,10 @@ def validate_candidate_trees(args: argparse.Namespace) -> None:
 
 
 def runs_for_candidate(args: argparse.Namespace, candidate_sha: str) -> list[dict[str, Any]]:
-    query = (
-        f"repos/{args.repository}/actions/workflows/{args.workflow}/runs"
-        f"?branch={args.branch}&head_sha={candidate_sha}&per_page=100"
+    # Queue branches are unique per merge group, so filter those by event.
+    selector = {"event": "merge_group"} if getattr(args, "merge_queue", False) else {"branch": args.branch}
+    query = f"repos/{args.repository}/actions/workflows/{args.workflow}/runs?" + urlencode(
+        {**selector, "head_sha": candidate_sha, "per_page": 100}
     )
     runs = gh_json(query).get("workflow_runs")
     if not isinstance(runs, list):
@@ -137,6 +150,10 @@ def select_run(args: argparse.Namespace) -> dict[str, Any]:
         selected, pending = select_run_once(args)
         if selected is not None:
             return selected
+        if not pending and getattr(args, "merge_queue", False):
+            # A merge group finishes before its commit lands, so a missing run
+            # means this push did not come from the queue.
+            fail("no merge queue run exists for the release source.")
         if time.monotonic() >= deadline:
             if pending:
                 fail("matching CI evidence did not complete before the release evidence timeout.")
@@ -161,7 +178,10 @@ def main() -> None:
     parser.add_argument("--workflow", default="ci.yml")
     parser.add_argument("--branch", required=True)
     parser.add_argument("--repository", required=True)
-    parser.add_argument("--event", dest="events", action="append", default=["push"])
+    parser.add_argument(
+        "--event", dest="events", action="append", choices=("push", "workflow_dispatch"),
+        help="Accepted event; repeat to allow both. Defaults to push when omitted.",
+    )
     parser.add_argument("--expected-run-id")
     parser.add_argument(
         "--candidate-sha",
@@ -173,7 +193,17 @@ def main() -> None:
     parser.add_argument("--poll-interval-seconds", type=float, default=15)
     parser.add_argument("--gate-name", default="Python regression gate")
     parser.add_argument("--github-output")
+    parser.add_argument(
+        "--merge-queue",
+        action="store_true",
+        help="Accept only the merge group run that tested this exact commit for --branch.",
+    )
     args = parser.parse_args()
+    args.events = args.events or ["push"]
+    if args.merge_queue:
+        if args.candidate_shas or args.expected_run_id:
+            fail("merge queue evidence must name only the exact source SHA.")
+        args.events = ["merge_group"]
 
     if not SHA_RE.fullmatch(args.source_sha):
         fail("source SHA must be a full lowercase Git SHA.")
@@ -182,7 +212,11 @@ def main() -> None:
         fail("candidate SHA must be a full lowercase Git SHA.")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.workflow):
         fail("workflow must be a workflow file name.")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.branch):
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*", args.branch)
+        or ".." in args.branch
+        or any(part.endswith((".", ".lock")) for part in args.branch.split("/"))
+    ):
         fail("branch name is invalid.")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         fail("repository must be an owner/name value.")

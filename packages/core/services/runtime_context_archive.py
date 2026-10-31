@@ -1,16 +1,51 @@
 """Cold transcript access for one authorized Runtime scope, outside model context."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from packages.core.ai.runtime.context_window import classify_context_messages, context_digest
+from packages.core.ai.runtime.control import RuntimeContextWriterFenced
+from packages.core.database_runtime import DatabaseFailureKind
 from packages.core.models.agent_delegation_session import AgentContextArchive
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_run import RuntimeRun
+
+logger = logging.getLogger(__name__)
+
+# Backoff before each retry of a write that failed on a transient database fault.
+_TRANSIENT_RETRY_DELAYS_SECONDS = (0.2, 0.6)
+
+
+def _owns_run(run: RuntimeRun | None, owner: str | None) -> bool:
+    """The lease is the run's exclusivity: a claim waits until it expires.
+
+    The row ``version`` is not: legitimate mid-turn updates bump it, and
+    fencing on it made healthy turns fail as if another worker took over.
+    """
+    return (
+        run is not None and owner is not None and run.lease_owner == owner
+        and run.status in {"running", "resuming"}
+        and run.lease_expires_at is not None
+        and run.lease_expires_at > datetime.now(timezone.utc)
+    )
+
+
+async def _with_transient_retry(write):
+    """Run one idempotent write, retrying only transient database faults."""
+    for delay in (*_TRANSIENT_RETRY_DELAYS_SECONDS, None):
+        try:
+            return await write()
+        except Exception as exc:
+            if delay is None or DatabaseFailureKind.from_exception(exc) is None:
+                raise
+            logger.warning("runtime context write retrying after transient database fault", exc_info=True)
+            await asyncio.sleep(delay)
 
 CONTEXT_ARCHIVE_TOOL = {
     "type": "function", "function": {
@@ -58,7 +93,7 @@ async def runtime_context_archive_callbacks(*, run_id: str, entity_id: str, user
         run = (await db.execute(select(RuntimeRun).where(RuntimeRun.id == run_id, *scope))).scalar_one_or_none()
         if run is None:
             raise ValueError("Context archive scope does not match its Runtime run.")
-        version, owner = run.version, run.lease_owner
+        owner = run.lease_owner
         previous = (await db.execute(select(RuntimeRun.context_state).where(
             *scope, RuntimeRun.id != run_id, RuntimeRun.created_at <= run.created_at,
             RuntimeRun.status == "completed",
@@ -69,14 +104,15 @@ async def runtime_context_archive_callbacks(*, run_id: str, entity_id: str, user
         previous_checkpoint = (previous or {}).get("checkpoint")
 
     async def archive(messages: list[dict]) -> str:
+        return await _with_transient_retry(lambda: _archive(messages))
+
+    async def _archive(messages: list[dict]) -> str:
         async with async_session() as db:
             run = (await db.execute(select(RuntimeRun).where(
                 RuntimeRun.id == run_id, *scope,
             ).with_for_update())).scalar_one_or_none()
-            if (run is None or run.version != version or run.lease_owner != owner
-                or run.status not in {"running", "resuming"}
-                or not run.lease_expires_at or run.lease_expires_at <= datetime.now(timezone.utc)):
-                raise RuntimeError("Runtime context writer no longer owns the active run.")
+            if not _owns_run(run, owner):
+                raise RuntimeContextWriterFenced("Runtime context writer no longer owns the active run.")
             history = [dict(m) for m in messages if m.get("role") not in {"system", "developer"}]
             digest = context_digest(history)
             archive_id = generate_ulid()
@@ -103,14 +139,16 @@ async def runtime_context_archive_callbacks(*, run_id: str, entity_id: str, user
                            if m.get("role") == "user" and str(m.get("content", "")).startswith(CHECKPOINT_PREFIX)), None)
         if checkpoint is None:
             return
-        async with async_session() as db:
-            run = (await db.execute(select(RuntimeRun).where(RuntimeRun.id == run_id, *scope).with_for_update())).scalar_one_or_none()
-            if (run is None or run.version != version or run.lease_owner != owner
-                or run.status not in {"running", "resuming"}
-                or not run.lease_expires_at or run.lease_expires_at <= datetime.now(timezone.utc)):
-                raise RuntimeError("Runtime context writer no longer owns the active run.")
-            # This never changes rounds, approvals, pending tools or execution state.
-            run.context_state = {"version": 1, "checkpoint": checkpoint}
-            await db.commit()
+
+        async def write() -> None:
+            async with async_session() as db:
+                run = (await db.execute(select(RuntimeRun).where(RuntimeRun.id == run_id, *scope).with_for_update())).scalar_one_or_none()
+                if not _owns_run(run, owner):
+                    raise RuntimeContextWriterFenced("Runtime context writer no longer owns the active run.")
+                # This never changes rounds, approvals, pending tools or execution state.
+                run.context_state = {"version": 1, "checkpoint": checkpoint}
+                await db.commit()
+
+        await _with_transient_retry(write)
 
     return archive, read, save_checkpoint, previous_checkpoint

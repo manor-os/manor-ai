@@ -32,6 +32,7 @@ from packages.core.ai.tools.video_edit_tools import (
 from packages.core.ai.runtime.video_edit_sessions import (
     append_video_edit_session_event,
     assert_video_edit_session_owner,
+    delete_video_edit_session,
     new_video_edit_session,
     video_edit_session_events,
 )
@@ -50,6 +51,7 @@ def test_video_edit_tool_contract_has_approval_gated_operations():
         "prepare",
         "push_assets",
         "write_files",
+        "patch_files",
         "sync",
         "status",
         "events",
@@ -65,40 +67,231 @@ def test_video_edit_tool_contract_has_approval_gated_operations():
     assert parameters["properties"]["quality"]["default"] == "high"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("requested,expected", [(1, "1"), (2, "2"), (99, "2")])
-async def test_render_worker_limit_keeps_fresh_isolated_sandbox(tmp_path, monkeypatch, requested, expected):
-    from packages.core.ai.tools import video_edit_tools
+@pytest.fixture
+def local_runner(monkeypatch):
+    """A fake runner behind every client, in local coordination mode."""
     from packages.core.config import get_settings
+    from packages.core.services import sandbox_sdk
+    from sandbox_entry_fakes import FakeRunner
 
-    calls = {}
+    runner = FakeRunner()
+    settings = get_settings()
+    monkeypatch.setattr(sandbox_sdk, "SandboxClient", runner.client_class)
+    monkeypatch.setattr(settings, "SANDBOX_SERVICE_URL", "http://sandbox.test")
+    monkeypatch.setattr(settings, "SANDBOX_COORDINATION_MODE", "local")
+    monkeypatch.setattr(settings, "SANDBOX_API_TOKEN", "runner-secret")
+    return runner
 
-    class Client:
-        async def create_from_builtin(self, **kwargs):
-            calls["create"] = kwargs
-            return SimpleNamespace(sandbox_id="fresh-render")
 
-        async def exec(self, **kwargs):
-            calls["exec"] = kwargs
-            return SimpleNamespace(exit_code=0, stdout='{"status":"ok","files":[]}', stderr="")
+def _video_context(**overrides):
+    values = {
+        "entity_id": "entity-1", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "sandbox_binding_key": "conversation-1",
+        "runtime_run_id": None, "runtime_tool_call_id": None, "task_id": None,
+        "parent_skill": None, "workspace_id": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
-        async def destroy(self, sandbox_id):
-            calls["destroy"] = sandbox_id
 
-        async def close(self):
-            pass
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_cpus,reports_config,requested,expected",
+    [
+        # The runner's effective config: the 4-CPU ask clamped to its host.
+        (1, True, 2, "1"),  # staging runner: 1 vCPU
+        (2, True, 1, "1"),  # prod runner: 2 vCPU
+        (2, True, 99, "2"),
+        (16, True, 2, "2"),  # a large host is capped at two workers
+        # A runner that reports only its host on /health.
+        (1, False, 2, "1"),
+        (2, False, 2, "2"),
+        # A runner that reports neither gets the smallest runner's share.
+        (None, False, 2, "1"),
+    ],
+)
+async def test_render_worker_limit_keeps_fresh_isolated_sandbox(
+    tmp_path, local_runner, host_cpus, reports_config, requested, expected,
+):
+    """Regression: render workers never exceed the CPUs the container got (#1128)."""
+    from packages.core.ai.tools import video_edit_tools
 
-    monkeypatch.setattr(get_settings(), "SANDBOX_SERVICE_URL", "http://sandbox.test")
-    monkeypatch.setattr(video_edit_tools, "_video_sandbox_client", lambda **_kwargs: Client())
+    local_runner.host_cpus = host_cpus
+    local_runner.reports_config = reports_config
+    local_runner.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
+        exit_code=0, stdout='{"status":"ok","files":[]}', stderr="",
+    )
     await video_edit_tools._run_video_sandbox(
         project_dir=tmp_path, operation="render", sandbox_id="authoring-session",
-        upload_sources=False, render_workers=requested,
+        upload_sources=False, render_workers=requested, context=_video_context(),
     )
-    assert calls["exec"]["sandbox_id"] == "fresh-render"
-    assert calls["exec"]["command"].endswith("--workers " + expected)
-    assert calls["create"]["config"]["network"] == "none"
-    assert calls["create"]["config"]["pids_limit"] == 512
-    assert calls["destroy"] == "fresh-render"
+    [created] = local_runner.created
+    [execution] = [call for name, call in local_runner.calls if name == "exec"]
+    assert execution["sandbox_id"] == created["sandbox_id"] != "authoring-session"
+    # Render trusts the review that ran the same strict check on this hash.
+    assert execution["command"].endswith("--workers " + expected + " --reviewed")
+    # Named, so Stop can kill the render itself.
+    assert execution["execution_id"].startswith("manor-")
+    assert created["config"]["network"] == "none"
+    assert created["config"]["pids_limit"] == 512
+    # The same ceilings everywhere: the runner fits memory and CPUs to its
+    # host (Docker refuses --cpus above the host's count).
+    assert created["config"]["memory"] == "4g"
+    assert created["config"]["cpus"] == 4.0
+    assert created["config"]["workdir_tmpfs_size"] == "2g"
+    assert created["config"]["exec_timeout"] == 1800
+    assert local_runner.destroyed == [created["sandbox_id"]]
+    assert local_runner.live() == set()
+
+
+# ── A failed call is settled by its write trace, never by its error text ──
+
+
+@pytest.fixture
+def render_call(tmp_path, monkeypatch):
+    """The real handler on a legacy session (no source sync), sandbox faked."""
+    from packages.core.ai.tools import video_edit_tools
+    from packages.core.services import entity_fs
+
+    project_dir = tmp_path / "Videos" / "promo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "index.html").write_text("<main>video</main>", encoding="utf-8")
+    state = {"session_id": "s1", "sandbox_id": "sb", "project_path": "Videos/promo",
+             "legacy_external_authoring": True, "events": [], "last_event_seq": 0}
+
+    async def session(**_kwargs):
+        return state
+
+    async def nothing(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", lambda: None)
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity: str(tmp_path))
+    monkeypatch.setattr(video_edit_tools, "_resolve_owned_video_session", session)
+    monkeypatch.setattr(video_edit_tools, "_ensure_video_session_sandbox", nothing)
+    monkeypatch.setattr(video_edit_tools, "save_video_edit_session", nothing)
+
+    async def call(run_sandbox, **arguments):
+        monkeypatch.setattr(video_edit_tools, "_run_video_sandbox", run_sandbox)
+        state["last_review_sha256"] = _project_source_sha256(project_dir)
+        arguments = {
+            "operation": "render", "session_id": "s1", "project_path": "Videos/promo",
+            "review_sha256": state["last_review_sha256"], **arguments,
+        }
+        return arguments, await video_edit_tools._video_edit_handler(entity_id="entity-1", **arguments)
+
+    return SimpleNamespace(call=call, project_dir=project_dir)
+
+
+def _state(arguments, result) -> str:
+    from packages.core.ai.runtime.receipts import runtime_tool_effect_state
+
+    return runtime_tool_effect_state("video_edit", arguments, result).value
+
+
+async def _no_mp4(**_kwargs):
+    return 1, {"status": "error", "code": "render_failed"}, {}, "boom"
+
+
+async def _mp4(**_kwargs):
+    return 0, {"status": "ok"}, {"renders/final.mp4": b"mp4 bytes"}, ""
+
+
+@pytest.mark.asyncio
+async def test_a_failure_before_the_first_write_is_none(render_call):
+    from packages.core.ai.tools import video_edit_tools
+
+    arguments, result = await render_call.call(_no_mp4, review_sha256="0" * 64)
+    assert json.loads(result)["error"] == "review_required"
+    assert _state(arguments, result) == "none"
+    refused = await video_edit_tools._video_edit_handler(entity_id="entity-1", operation="explode")
+    assert _state({"operation": "explode"}, refused) == "none"
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_completed_writes_only_is_confirmed_with_them_listed(render_call):
+    arguments, result = await render_call.call(_no_mp4)
+    payload = json.loads(result)
+    assert payload["error"] == "render_failed"
+    assert not (render_call.project_dir / "renders/final.mp4").exists()
+    # The renders directory it created is the only change, and it completed.
+    assert payload["details"]["written_files"] == [{"fs_path": "Videos/promo/renders"}]
+    assert "uncertain_targets" not in payload["details"]
+    assert _state(arguments, result) == "confirmed"
+    # Identical JSON from anywhere else proves nothing.
+    assert _state(arguments, str(result)) == "unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_a_write_cut_off_mid_way_stays_unconfirmed_until_a_host_read_reconciles_it(
+    render_call, monkeypatch,
+):
+    import hashlib
+
+    from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
+    from packages.core.ai.tools import video_edit_tools
+
+    async def register(**_kwargs):
+        raise RuntimeError("Knowledge projection unavailable")
+
+    monkeypatch.setattr(video_edit_tools, "_register_artifact", register)
+    arguments, result = await render_call.call(_mp4)
+    digest = hashlib.sha256(b"mp4 bytes").hexdigest()
+    payload = json.loads(result)
+    assert payload["error"] == "operation_failed"
+    assert payload["details"]["uncertain_targets"] == [
+        {"fs_path": "Videos/promo/renders/final.mp4", "sha256": digest},
+    ]
+    assert _state(arguments, result) == "unconfirmed"
+
+    ledger = RuntimeToolEvidence()
+    ledger.observe_tool_result("video_edit", "render", result, arguments)
+    assert ledger.unconfirmed_calls[0]["targets"] == [
+        {"fs_path": "Videos/promo/renders/final.mp4", "sha256": digest},
+    ]
+    ledger.observe_tool_result("read_file", "read", json.dumps({
+        "path": "Videos/promo/renders/final.mp4", "resolved_path": "Videos/promo/renders/final.mp4",
+        "source_sha256": digest, "size": 9,
+    }), {"path": "Videos/promo/renders/final.mp4"})
+    assert ledger.unconfirmed_calls == [] and ledger.effect_state == "confirmed"
+
+
+def test_every_video_edit_write_is_inside_the_write_trace():
+    """Guard the class: a write outside _tracked_write would let a failure after
+    it be settled as "none". Every write primitive in the module sits in a
+    ``with _tracked_write(...)`` block (or is the tracked mkdir helper itself)."""
+    import ast
+
+    from packages.core.ai.tools import video_edit_tools
+
+    source = Path(video_edit_tools.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    writes = {
+        "write_bytes", "write_text", "mkdir", "copy2", "copy", "move", "rmtree", "unlink",
+        "rename", "write_entity_file_atomic", "write_file", "_register_artifact",
+    }
+    # Session-record and Sandbox-mirror helpers that are not Workspace effects.
+    exempt_functions = {"_tracked_mkdir", "_upload_sandbox_sources"}
+    untracked = []
+
+    def visit(node, function: str, tracked: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function, tracked = node.name, False
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(item.context_expr, ast.Call)
+            and getattr(item.context_expr.func, "id", "") == "_tracked_write"
+            for item in node.items
+        ):
+            tracked = True
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name in writes and not tracked and function not in exempt_functions:
+                untracked.append(f"{function}:{node.lineno}:{name}")
+        for child in ast.iter_child_nodes(node):
+            visit(child, function, tracked)
+
+    visit(tree, "<module>", False)
+    assert untracked == []
 
 
 @pytest.mark.asyncio
@@ -176,6 +369,16 @@ def test_video_edit_paths_accept_entity_fs_urls_and_reject_traversal():
         assert "traversal" in str(exc).lower()
     else:
         raise AssertionError("path traversal should be rejected")
+
+    # A public URL is not an entity file: it used to become the made-up path
+    # "google/fonts/main/..." (local eval 2026-10-17). It is refused with the
+    # supported route instead.
+    with pytest.raises(ValueError, match="does not download URLs") as refused:
+        _normalize_entity_relative_path(
+            "https://raw.githubusercontent.com/google/fonts/main/ofl/longcang/LongCang-Regular.ttf",
+            entity_id="acme",
+        )
+    assert "manor push" in str(refused.value)
 
     assert _normalize_project_file_path("compositions/scene-01.html") == ("compositions/scene-01.html")
     for blocked in ("renders/final.mp4", "snapshots/frame.png", "hyperframes.json"):
@@ -388,6 +591,7 @@ def test_video_edit_session_events_are_ordered_and_owner_scoped():
         entity_id="entity-1",
         user_id="user-1",
         conversation_id="conversation-1",
+        agent_id="agent-1",
         workspace_id="workspace-1",
         project_path="Videos/demo",
     )
@@ -401,16 +605,20 @@ def test_video_edit_session_events_are_ordered_and_owner_scoped():
 
     assert [event["seq"] for event in video_edit_session_events(state)] == [1, 2]
     assert [event["seq"] for event in video_edit_session_events(state, after_seq=1)] == [2]
-    assert_video_edit_session_owner(
-        state,
-        entity_id="entity-1",
-        user_id="user-1",
-        conversation_id="conversation-1",
-    )
+    owner = {"entity_id": "entity-1", "user_id": "user-1", "conversation_id": "conversation-1"}
+    assert_video_edit_session_owner(state, **owner)
+    # The session is the user's, in any of their conversations: conversation
+    # and acting agent are recorded for attribution, not checked.
+    assert state["agent_id"] == "agent-1" and state["conversation_id"] == "conversation-1"
+    assert_video_edit_session_owner(state, **{**owner, "conversation_id": "conversation-2"})
+    assert_video_edit_session_owner(state, **{**owner, "conversation_id": None})
     for owner_kwargs in (
-        {"entity_id": "entity-2", "user_id": "user-1", "conversation_id": "conversation-1"},
-        {"entity_id": "entity-1", "user_id": "user-2", "conversation_id": "conversation-1"},
-        {"entity_id": "entity-1", "user_id": "user-1", "conversation_id": "conversation-2"},
+        {**owner, "entity_id": "entity-2"},
+        {**owner, "user_id": "user-2"},
+        # An empty side is never a wildcard: a user-less caller owns nothing
+        # of a user's, and nobody without an entity owns anything.
+        {**owner, "user_id": None},
+        {**owner, "entity_id": ""},
     ):
         try:
             assert_video_edit_session_owner(state, **owner_kwargs)
@@ -418,6 +626,33 @@ def test_video_edit_session_events_are_ordered_and_owner_scoped():
             pass
         else:
             raise AssertionError("cross-owner Video Edit session access should be rejected")
+
+    # A user-less session is owned only by the same user-less principal.
+    userless = new_video_edit_session(
+        sandbox_id="sbx-2", entity_id="entity-1", user_id=None, conversation_id="U01TASK",
+        agent_id="agent-1", project_path="Videos/demo",
+    )
+    # A user-less session is owned per task by its workspace entity.
+    assert_video_edit_session_owner(userless, entity_id="entity-1", user_id="", conversation_id="U01TASK")
+    for caller in (
+        {"entity_id": "entity-1", "user_id": "user-1", "conversation_id": "U01TASK"},
+        {"entity_id": "entity-1", "user_id": "", "conversation_id": "U01OTHER"},
+        {"entity_id": "entity-1", "user_id": "", "conversation_id": ""},
+    ):
+        with pytest.raises(PermissionError):
+            assert_video_edit_session_owner(userless, **caller)
+    # A record from before the strict owner binding (it allowed an empty user
+    # or conversation) cannot prove its owner.
+    legacy = {key: value for key, value in state.items() if key != "agent_id"}
+    legacy["version"] = 1
+    with pytest.raises(PermissionError, match="call start again"):
+        assert_video_edit_session_owner(legacy, **owner)
+    # A session needs an owner: a user, or (user-less) a task.
+    with pytest.raises(PermissionError):
+        new_video_edit_session(
+            sandbox_id="sbx-3", entity_id="entity-1", user_id=None, conversation_id="",
+            agent_id="agent-1", project_path="Videos/demo",
+        )
 
 
 def test_sandbox_project_upload_is_bounded_and_concurrent(tmp_path: Path):
@@ -474,6 +709,9 @@ def test_builtin_video_edit_skill_and_sandbox_runtime_are_pinned():
     assert "HyperFrames" not in instructions
     assert "hyperframes_project" not in instructions
     assert "approval" in instructions.lower()
+    # W1a (2026-10-14): a used-up review budget still exports the passed revision
+    # with exceptions; it is never escalated to someone who could raise the cap.
+    assert "delivered with exceptions" in instructions
     assert 'video_edit(operation="start"' in instructions
     assert 'video_edit(operation="push_assets"' in instructions
     assert 'video_edit(operation="write_files"' in instructions
@@ -498,7 +736,7 @@ def test_builtin_video_edit_skill_and_sandbox_runtime_are_pinned():
     assert "def touch(self)" in sandbox_backend
     assert '"/sandbox/{sandbox_id}/touch"' in sandbox_routes
     assert "async def touch(self, sandbox_id" in sandbox_client
-    assert "le=1800" in sandbox_models
+    assert "le=3600" in sandbox_models
 
     bundle = _video_sandbox_bundle()
     runner = bundle["scripts/video_runtime.py"]
@@ -510,7 +748,7 @@ def test_builtin_video_edit_skill_and_sandbox_runtime_are_pinned():
     # Worker admission is exercised by test_video_runtime_resources; the
     # sandbox must receive that exact runtime rather than a stale bundled copy.
     assert runner == (skill_dir / "scripts/video_runtime.py").read_text(encoding="utf-8")
-    assert 'str(max(1, min(workers, 2)))' in runner
+    assert 'str(max(1, min(workers, 4)))' in runner
     assert "deadline = time.monotonic() + 1740" in runner
     assert "timeout=max(1, int(deadline - time.monotonic() - 60))" in runner
     assert '"ffprobe"' in runner
@@ -526,135 +764,56 @@ def test_builtin_video_edit_skill_and_sandbox_runtime_are_pinned():
     assert 'rel.parts[:2] == ("assets", "vendor")' in runner
 
 
-def test_video_edit_handler_keeps_one_sandbox_for_authoring_status_and_close(
+def _video_runtime_exec(dead_containers: set[str], counts: dict[str, int]):
+    """The video runtime's commands, answered from the fake container's files."""
+
+    def handle(sandbox_id, command, container):
+        files = container["files"]
+        if command == "test -d /skill/project":
+            dead = sandbox_id in dead_containers
+            # The directory exists once created, or once a file was put in it.
+            exists = container.get("project_dir") or any(path.startswith("/skill/project/") for path in files)
+            return SimpleNamespace(
+                stdout="", stderr="Error response from daemon: No such container" if dead else "",
+                exit_code=1 if dead or not exists else 0,
+            )
+        if command == "mkdir -p /skill/project":
+            container["project_dir"] = True
+            return SimpleNamespace(stdout="", stderr="", exit_code=0)
+        if command.endswith("video_runtime.py probe"):
+            counts["probe"] += 1
+            return SimpleNamespace(stdout=json.dumps({
+                "status": "ok", "operation": "probe",
+                "runtime": {"renderer": "/usr/local/bin/hyperframes", "browser": "/usr/bin/chromium"},
+            }), stderr="", exit_code=0)
+        if command.endswith("video_runtime.py manifest"):
+            manifest = [
+                {"path": path.removeprefix("/skill/project/"), "size_bytes": len(content),
+                 "sha256": hashlib.sha256(content).hexdigest()}
+                for path, content in sorted(files.items()) if path.startswith("/skill/project/")
+            ]
+            return SimpleNamespace(stdout=json.dumps({"status": "ok", "operation": "manifest", "files": manifest}),
+                                   stderr="", exit_code=0)
+        if command.startswith("rm -f -- "):
+            files.pop(command.removeprefix("rm -f -- ").strip("'"), None)
+            return SimpleNamespace(stdout="", stderr="", exit_code=0)
+        raise AssertionError(f"unexpected command: {command}")
+
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_video_edit_handler_keeps_one_sandbox_for_authoring_status_and_close(
     tmp_path: Path,
     monkeypatch,
+    local_runner,
 ):
-    import asyncio
-
     from packages.core.ai.tools import video_edit_tools
-    from packages.core import config as core_config
-    from packages.core.services import entity_fs, sandbox_sdk
+    from packages.core.services import entity_fs
 
-    sandboxes: dict[str, dict[str, bytes]] = {}
     dead_containers: set[str] = set()
-    calls = {"create": 0, "probe": 0, "touch": 0, "destroy": 0}
-
-    class FakeSandboxClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def create_from_builtin(self, **kwargs):
-            calls["create"] += 1
-            sandbox_id = f"sbx-{calls['create']}"
-            sandboxes[sandbox_id] = {}
-            return SimpleNamespace(sandbox_id=sandbox_id)
-
-        async def touch(self, sandbox_id):
-            calls["touch"] += 1
-            if sandbox_id not in sandboxes:
-                from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
-
-                raise SandboxNotFoundError("missing")
-            return SimpleNamespace(
-                status="ready",
-                active_command=None,
-                created_at=1.0,
-                last_used_at=2.0,
-                expires_at=3602.0,
-            )
-
-        async def write_file(self, sandbox_id, path, content, mkdir=True):
-            sandboxes[sandbox_id][path] = content.encode("utf-8")
-            return SimpleNamespace(path=path, written=True)
-
-        async def write_file_base64(
-            self,
-            sandbox_id,
-            path,
-            content_base64,
-            mkdir=True,
-        ):
-            sandboxes[sandbox_id][path] = base64.b64decode(content_base64)
-            return SimpleNamespace(path=path, written=True)
-
-        async def exec(self, sandbox_id, command, timeout=60, workdir=None):
-            if command == "test -d /skill/project":
-                return SimpleNamespace(
-                    stdout="",
-                    stderr=(
-                        "Error response from daemon: No such container"
-                        if sandbox_id in dead_containers else ""
-                    ),
-                    exit_code=1 if sandbox_id in dead_containers else 0,
-                )
-            if command.endswith("video_runtime.py probe"):
-                calls["probe"] += 1
-                return SimpleNamespace(
-                    stdout=json.dumps(
-                        {
-                            "status": "ok",
-                            "operation": "probe",
-                            "runtime": {
-                                "renderer": "/usr/local/bin/hyperframes",
-                                "browser": "/usr/bin/chromium",
-                                "animation": "/usr/local/lib/node_modules/gsap/dist/gsap.min.js",
-                            },
-                        }
-                    ),
-                    stderr="",
-                    exit_code=0,
-                )
-            if command.endswith("video_runtime.py manifest"):
-                files = []
-                for path, content in sorted(sandboxes[sandbox_id].items()):
-                    if not path.startswith("/skill/project/"):
-                        continue
-                    rel = path.removeprefix("/skill/project/")
-                    files.append(
-                        {
-                            "path": rel,
-                            "size_bytes": len(content),
-                            "sha256": hashlib.sha256(content).hexdigest(),
-                        }
-                    )
-                payload = {
-                    "status": "ok",
-                    "operation": "manifest",
-                    "files": files,
-                }
-                return SimpleNamespace(
-                    stdout=json.dumps(payload),
-                    stderr="",
-                    exit_code=0,
-                )
-            if command.startswith("rm -f -- "):
-                path = command.removeprefix("rm -f -- ").strip("'")
-                sandboxes[sandbox_id].pop(path, None)
-                return SimpleNamespace(stdout="", stderr="", exit_code=0)
-            raise AssertionError(f"unexpected command: {command}")
-
-        async def read_file_base64(self, sandbox_id, path, max_size):
-            content = sandboxes[sandbox_id][path]
-            return SimpleNamespace(
-                content_base64=base64.b64encode(content).decode("ascii"),
-                size=len(content),
-            )
-
-        async def destroy(self, sandbox_id):
-            calls["destroy"] += 1
-            sandboxes.pop(sandbox_id, None)
-            dead_containers.discard(sandbox_id)
-
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
-    monkeypatch.setattr(
-        core_config,
-        "get_settings",
-        lambda: SimpleNamespace(SANDBOX_SERVICE_URL="http://sandbox"),
-    )
+    counts = {"probe": 0}
+    local_runner.exec_handler = _video_runtime_exec(dead_containers, counts)
     monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", lambda: str(tmp_path))
     monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity_id: str(tmp_path))
 
@@ -666,31 +825,23 @@ def test_video_edit_handler_keeps_one_sandbox_for_authoring_status_and_close(
 
     monkeypatch.setattr(entity_fs, "write_entity_file_atomic", fake_atomic_write)
 
-    started = json.loads(
-        asyncio.run(
-            video_edit_tools._video_edit_handler(
-                entity_id="entity-1",
-                user_id="user-1",
-                operation="start",
-                project_path="Videos/session-demo",
-                conversation_id="conversation-session-demo",
-            )
-        )
-    )
+    async def call(**arguments):
+        return json.loads(await video_edit_tools._video_edit_handler(
+            entity_id="entity-1", user_id="user-1",
+            conversation_id="conversation-session-demo", **arguments,
+        ))
+
+    started = await call(operation="start", project_path="Videos/session-demo")
     assert started["status"] == "ready"
     session_id = started["session_id"]
+    [first] = local_runner.created
+    # Created through the entry point with the video runtime's resources.
+    assert first["skill_name"] == "video-edit-runtime"
+    assert first["config"]["memory"] == "4g" and first["config"]["network"] == "none"
 
-    updated = json.loads(
-        asyncio.run(
-            video_edit_tools._video_edit_handler(
-                entity_id="entity-1",
-                user_id="user-1",
-                operation="write_files",
-                session_id=session_id,
-                files={"BRIEF.md": "# Demo", "index.html": "<main>demo</main>"},
-                conversation_id="conversation-session-demo",
-            )
-        )
+    updated = await call(
+        operation="write_files", session_id=session_id,
+        files={"BRIEF.md": "# Demo", "index.html": "<main>demo</main>"},
     )
     assert updated["status"] == "source_updated"
     assert updated["source_saved"] is True
@@ -709,125 +860,227 @@ def test_video_edit_handler_keeps_one_sandbox_for_authoring_status_and_close(
     assert "STORYBOARD.md" in updated["missing_project_contract"]
     assert "*.motion.json" in updated["missing_project_contract"]
     assert (tmp_path / "Videos/session-demo/BRIEF.md").read_text() == "# Demo"
-    assert calls["create"] == 1
-    assert calls["probe"] == 1
+    assert len(local_runner.created) == 1
+    assert counts["probe"] == 1
 
-    unchanged_contract = json.loads(asyncio.run(video_edit_tools._video_edit_handler(
-        entity_id="entity-1", user_id="user-1", operation="write_files", session_id=session_id,
+    unchanged_contract = await call(
+        operation="write_files", session_id=session_id,
         files={"hook.html": "<section>Another scene edit</section>"},
-        conversation_id="conversation-session-demo",
-    )))
+    )
     assert unchanged_contract["source_saved"] is True
     assert unchanged_contract["contract_valid"] is False
     assert "repair_strategy" not in unchanged_contract
     assert unchanged_contract["contract_violations"] == updated["contract_violations"]
     assert (tmp_path / "Videos/session-demo/hook.html").is_file()
 
-    status = json.loads(
-        asyncio.run(
-            video_edit_tools._video_edit_handler(
-                entity_id="entity-1",
-                user_id="user-1",
-                operation="status",
-                session_id=session_id,
-                after_event_seq=0,
-                conversation_id="conversation-session-demo",
-            )
-        )
-    )
+    status = await call(operation="status", session_id=session_id, after_event_seq=0)
     assert status["status"] == "active"
     assert status["sandbox"]["status"] == "ready"
     assert status["authoring_contract"] == started["authoring_contract"]
     assert status["contract_violations"] == updated["contract_violations"]
-    assert calls["create"] == 1
+    assert len(local_runner.created) == 1
 
     # The service still remembers the session, but Docker killed its container.
-    dead_containers.add("sbx-1")
-    recovered = json.loads(
-        asyncio.run(
-            video_edit_tools._video_edit_handler(
-                entity_id="entity-1",
-                user_id="user-1",
-                operation="status",
-                session_id=session_id,
-                after_event_seq=status["event_cursor"],
-                conversation_id="conversation-session-demo",
-            )
-        )
-    )
+    dead_containers.add(first["sandbox_id"])
+    recovered = await call(operation="status", session_id=session_id, after_event_seq=status["event_cursor"])
     assert recovered["status"] == "active"
     assert recovered["recovered"] is True
     assert recovered["authoring_contract"] == started["authoring_contract"]
     assert recovered["contract_violations"] == updated["contract_violations"]
-    assert calls["create"] == 2
-    assert calls["probe"] == 2
+    assert len(local_runner.created) == 2
+    assert counts["probe"] == 2
+    # What was left of the dead container is destroyed, not abandoned.
+    assert local_runner.destroyed == [first["sandbox_id"]]
     assert recovered["events"][-1]["message"].startswith("Sandbox session recovered")
     assert recovered["events"][-1]["data"]["authoring_contract_version"] == started["authoring_contract"]["version"]
     assert "authoring_contract" not in recovered["events"][-1]["data"]
 
-    synchronized = json.loads(asyncio.run(video_edit_tools._video_edit_handler(
-        entity_id="entity-1", user_id="user-1", operation="sync", session_id=session_id,
-        conversation_id="conversation-session-demo",
-    )))
+    synchronized = await call(operation="sync", session_id=session_id)
     assert synchronized["status"] == "synchronized"
     assert synchronized["authoring_contract"] == started["authoring_contract"]
     assert synchronized["contract_valid"] is False
     assert synchronized["contract_violations"] == updated["contract_violations"]
 
-    closed = json.loads(
-        asyncio.run(
-            video_edit_tools._video_edit_handler(
-                entity_id="entity-1",
-                user_id="user-1",
-                operation="close",
-                session_id=session_id,
-                conversation_id="conversation-session-demo",
-            )
-        )
-    )
+    # The user's session is theirs from any conversation, without its id.
+    elsewhere = json.loads(await video_edit_tools._video_edit_handler(
+        entity_id="entity-1", user_id="user-1", conversation_id="conversation-elsewhere",
+        operation="status", after_event_seq=0,
+    ))
+    assert elsewhere["status"] == "active" and elsewhere["session_id"] == session_id
+
+    closed = await call(operation="close", session_id=session_id)
     assert closed["status"] == "closed"
-    assert calls["destroy"] == 2
+    assert len(local_runner.destroyed) == 2
+    assert local_runner.live() == set()
+
+
+@pytest.mark.asyncio
+async def test_patch_files_is_all_or_nothing_and_invalidates_the_review(tmp_path: Path, monkeypatch, local_runner):
+    from packages.core.ai.tools import video_edit_tools
+    from packages.core.services import entity_fs
+
+    local_runner.exec_handler = _video_runtime_exec(set(), {"probe": 0})
+    monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", lambda: str(tmp_path))
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    def fake_atomic_write(entity_id, rel_path, data, **kwargs):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return str(target)
+
+    monkeypatch.setattr(entity_fs, "write_entity_file_atomic", fake_atomic_write)
+
+    async def raw_call(**arguments):
+        return await video_edit_tools._video_edit_handler(
+            entity_id="entity-1", user_id="user-1", conversation_id="conversation-patch", **arguments,
+        )
+
+    started = json.loads(await raw_call(operation="start", project_path="Videos/patch-demo"))
+    session_id = started["session_id"]
+    project = tmp_path / "Videos/patch-demo"
+    html = "<main>\n<h1 id='t'>Old title</h1>\n<p class='c'>red</p><p class='c'>red</p>\n</main>"
+    storyboard = "# Storyboard\n\n00:00 Hook - old copy\n"
+    written = json.loads(await raw_call(
+        operation="write_files", session_id=session_id,
+        files={"index.html": html, "STORYBOARD.md": storyboard},
+    ))
+    [container] = [local_runner.containers[c["sandbox_id"]] for c in local_runner.created]
+
+    def sandbox_text(rel_path: str) -> str:
+        return container["files"][f"/skill/project/{rel_path}"].decode("utf-8")
+
+    # A missing match in the second file fails the call before anything is written.
+    arguments = {"operation": "patch_files", "session_id": session_id, "patches": [
+        {"path": "index.html", "edits": [{"old_text": "Old title", "new_text": "New title"}]},
+        {"path": "STORYBOARD.md", "edits": [{"old_text": "no such text", "new_text": "x"}]},
+    ]}
+    missing = await raw_call(**arguments)
+    payload = json.loads(missing)
+    assert payload["error"] == "patch_text_not_found"
+    assert payload["details"]["path"] == "STORYBOARD.md" and payload["details"]["edit_index"] == 0
+    assert _state(arguments, missing) == "none"
+    assert sandbox_text("index.html") == html and (project / "index.html").read_text() == html
+
+    ambiguous = json.loads(await raw_call(operation="patch_files", session_id=session_id, patches=[
+        {"path": "index.html", "edits": [{"old_text": "red", "new_text": "blue"}]},
+    ]))
+    assert ambiguous["error"] == "patch_text_ambiguous" and ambiguous["details"]["match_count"] == 2
+    absent = json.loads(await raw_call(operation="patch_files", session_id=session_id, patches=[
+        {"path": "scene.css", "edits": [{"old_text": "a", "new_text": "b"}]},
+    ]))
+    assert absent["error"] == "patch_target_not_found"
+    assert sandbox_text("index.html") == html
+
+    # The current source was reviewed and approved.
+    state = await video_edit_tools.load_video_edit_session(session_id)
+    approved = written["source_sha256"]
+    state["last_review_sha256"] = approved
+    await video_edit_tools.save_video_edit_session(state)
+
+    arguments = {"operation": "patch_files", "session_id": session_id, "patches": [
+        {"path": "index.html", "edits": [
+            {"old_text": "Old title", "new_text": "New title"},
+            {"old_text": "red", "new_text": "blue", "replace_all": True},
+        ]},
+        {"path": "STORYBOARD.md", "edits": [{"old_text": "old copy", "new_text": "new copy"}]},
+    ]}
+    patched_result = await raw_call(**arguments)
+    patched = json.loads(patched_result)
+    expected_html = html.replace("Old title", "New title").replace("red", "blue")
+    expected_storyboard = storyboard.replace("old copy", "new copy")
+    assert patched["status"] == "source_updated" and patched["written_files"] == ["index.html", "STORYBOARD.md"]
+    assert _state(arguments, patched_result) == _state(
+        {"operation": "write_files", "session_id": session_id, "files": {}}, json.dumps(written),
+    )
+    for rel_path, text, replacements in (
+        ("index.html", expected_html, 3), ("STORYBOARD.md", expected_storyboard, 1),
+    ):
+        assert sandbox_text(rel_path) == text
+        assert (project / rel_path).read_text() == text
+        [entry] = [item for item in patched["patched_files"] if item["path"] == rel_path]
+        assert entry["replacements"] == replacements
+        assert entry["size_bytes"] == len(text.encode())
+        assert entry["sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert patched["source_sha256"] != approved
+    assert patched["source_revision"] == written["source_revision"] + 1
+
+    # The approval was for the pre-patch source: render requires a new review.
+    rendered = json.loads(await raw_call(operation="render", session_id=session_id, review_sha256=approved))
+    assert rendered["error"] == "source_changed_after_review"
+    assert rendered["details"]["current_sha256"] == patched["source_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_video_session_never_takes_the_owners_container_back(tmp_path: Path, monkeypatch, local_runner):
+    """One session container per user: a start replaces the previous session,
+    and a record of it that survived (a failed delete, a stale cache entry)
+    must not rebuild a container on the user's scope -- that would destroy
+    the current session's container and the two would take turns."""
+
+    from packages.core.ai.tools import video_edit_tools
+    from packages.core.services import entity_fs
+
+    local_runner.exec_handler = _video_runtime_exec(set(), {"probe": 0})
+    monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", lambda: str(tmp_path))
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    async def call(conversation_id, **arguments):
+        return json.loads(await video_edit_tools._video_edit_handler(
+            entity_id="entity-1", user_id="user-1", conversation_id=conversation_id, **arguments,
+        ))
+
+    first = await call("conversation-a", operation="start", project_path="Videos/one")
+    stale = await video_edit_tools.load_video_edit_session(first["session_id"])
+    second = await call("conversation-b", operation="start", project_path="Videos/two")
+    [old_container, current_container] = [created["sandbox_id"] for created in local_runner.created]
+    # Start in another conversation replaced the user's session.
+    assert local_runner.live() == {current_container}
+
+    # The record survived (a failed delete, a stale cache entry) and is even
+    # written again: saving it never makes it the owner's session again.
+    await video_edit_tools.save_video_edit_session(stale)
+    revived = await call("conversation-a", operation="status", session_id=first["session_id"])
+    assert "replaced by a newer session" in revived["message"]
+    assert local_runner.live() == {current_container}
+    assert len(local_runner.created) == 2
+
+    current = await call("conversation-a", operation="status", session_id=second["session_id"])
+    assert current["status"] == "active" and current["recovered"] is False
+
+    # Even with no record left to retire (expired after a day), the user's
+    # one session container is replaced by their next start, wherever it is.
+    await delete_video_edit_session(
+        await video_edit_tools.load_video_edit_session(second["session_id"])
+    )
+    third = await call("conversation-c", operation="start", project_path="Videos/three")
+    third_container = local_runner.created[-1]["sandbox_id"]
+    assert local_runner.live() == {third_container}
+    await call("conversation-c", operation="close", session_id=third["session_id"])
+    assert local_runner.live() == set()
 
 
 @pytest.mark.asyncio
 async def test_video_edit_start_retries_only_container_loss_during_initial_injection(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, local_runner,
 ):
     from packages.core.ai.tools import video_edit_tools
-    from packages.core import config as core_config
     from packages.core.services.sandbox_sdk.exceptions import SandboxRuntimeError
 
-    attempts = 0
-
-    class FakeClient:
-        async def create_from_builtin(self, **_kwargs):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise SandboxRuntimeError(
-                    "File injection failed: container is not running"
-                )
-            return SimpleNamespace(sandbox_id="new-sandbox")
-
-        async def exec(self, **_kwargs):
-            return SimpleNamespace(
-                exit_code=0,
-                stderr="",
-                stdout=json.dumps({"status": "ok", "runtime": {"browser": "/usr/bin/chromium"}}),
-            )
-
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(
-        core_config, "get_settings",
-        lambda: SimpleNamespace(SANDBOX_SERVICE_URL="http://sandbox"),
+    local_runner.create_failures.append(SandboxRuntimeError("File injection failed: container is not running"))
+    local_runner.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
+        exit_code=0, stderr="",
+        stdout=json.dumps({"status": "ok", "runtime": {"browser": "/usr/bin/chromium"}}),
     )
-    monkeypatch.setattr(video_edit_tools, "_video_sandbox_client", lambda **_kwargs: FakeClient())
-    sandbox_id, metrics = await video_edit_tools._create_video_session_sandbox(tmp_path)
-    assert sandbox_id == "new-sandbox"
-    assert attempts == 2
+    sandbox_id, metrics = await video_edit_tools._create_video_session_sandbox(tmp_path, _video_context())
+    assert [call["source"] for name, call in local_runner.calls if name == "create"] == ["builtin", "builtin"]
+    assert local_runner.live() == {sandbox_id}
     assert metrics["source_files"] == 0
+
+    # Any other create failure is reported, never retried.
+    local_runner.create_failures.append(SandboxRuntimeError("image pull failed"))
+    with pytest.raises(video_edit_tools.VideoEditRuntimeUnavailable, match="image pull failed"):
+        await video_edit_tools._create_video_session_sandbox(tmp_path, _video_context(agent_id="agent-2"))
 
 
 _FOREIGN_CANVAS = "Workspaces/_by_id/folder-other/Videos/private/CANVAS.md"
@@ -893,7 +1146,7 @@ async def test_push_assets_reference_rejection_precedes_the_sandbox(monkeypatch,
     (tmp_path / project).mkdir(parents=True)
     state = new_video_edit_session(
         sandbox_id="sbx-1", entity_id="entity-1", user_id="user-1",
-        conversation_id="conversation-1", workspace_id="ws-1", project_path=project,
+        conversation_id="conversation-1", agent_id=None, workspace_id="ws-1", project_path=project,
     )
 
     async def load(session_id):
@@ -937,6 +1190,9 @@ def test_reference_proof_requires_an_unapplied_rejection_and_is_lost_by_serializ
         RuntimeNoEffectToolResult.video_reference_unavailable(text)
     with pytest.raises(ValueError):
         RuntimeNoEffectToolResult.video_reference_denied(str(unavailable))
+    # write_files proves a no-op only for its own read-only source_paths preflight.
+    assert proof.matches_call("video_edit", {"operation": "write_files", "source_paths": {"index.html": "a.html"}})
+    assert not proof.matches_call("video_edit", {"operation": "write_files", "files": {"index.html": "x"}})
 
 
 _DENIAL_JSON = json.dumps({
@@ -1099,8 +1355,8 @@ async def test_unusable_reference_is_a_proven_no_effect_rejection(monkeypatch, t
     if operation == "push_assets":
         (tmp_path / project).mkdir(parents=True)
         state = new_video_edit_session(
-            sandbox_id="sbx-1", entity_id="entity-1", user_id="", conversation_id=None,
-            workspace_id="ws-1", project_path=project,
+            sandbox_id="sbx-1", entity_id="entity-1", user_id="", conversation_id="U01TASKREF",
+            agent_id=None, workspace_id="ws-1", project_path=project,
         )
 
         async def load(session_id):
@@ -1112,7 +1368,7 @@ async def test_unusable_reference_is_a_proven_no_effect_rejection(monkeypatch, t
         arguments["project_path"] = project
     before = sorted(str(path) for path in tmp_path.rglob("*"))
     result = await video_edit_tools._video_edit_handler(
-        entity_id="entity-1", user_id="", workspace_id="ws-1", **arguments,
+        entity_id="entity-1", user_id="", workspace_id="ws-1", conversation_id="U01TASKREF", **arguments,
     )
 
     after = sorted(str(path) for path in tmp_path.rglob("*"))
@@ -1174,11 +1430,523 @@ def test_no_effect_reference_rejections_come_only_from_the_read_only_preflight()
                 if owner in effects:
                     effects[owner].setdefault("first_effect", node.lineno)
                     effects[owner]["first_effect"] = min(effects[owner]["first_effect"], node.lineno)
-    assert set(effects) == {"_start_video_session", "_push_video_session_assets"}
+    assert set(effects) == {"_start_video_session", "_push_video_session_assets", "_read_video_source_paths"}
     for owner, lines in effects.items():
+        if owner == "_read_video_source_paths":
+            # write_files(source_paths) reads before its caller's first effect.
+            assert "first_effect" not in lines, owner
+            continue
         assert lines["preflight"] < lines["first_effect"], owner
     # Nothing else in the codebase raises the carriers.
     for module in (REPO_ROOT / "packages").rglob("*.py"):
         if module != path:
             text = module.read_text(encoding="utf-8")
             assert not any(f"raise {carrier}" in text for carrier in carriers), module
+
+
+def test_video_containers_are_admitted_in_the_callers_per_user_sandbox_scope() -> None:
+    """Video Edit uses the one per-user scope resolver (sandbox-user-conversation):
+    a human user's authoring session is their dedicated ``user:video-edit``
+    role container in every conversation; a group room run and user-less work
+    keep containers of their own scope; a render is never registered."""
+
+    from packages.core.ai.runtime.sandbox import runtime_room_binding_key
+    from packages.core.ai.tools.video_edit_tools import _video_sandbox_identity
+    from packages.core.services.sandbox_session_service import SandboxLifetime, sandbox_reuse_scope
+
+    def scope_of(context, lifetime=SandboxLifetime.SESSION, purpose="video-session"):
+        owner, bundle, binding = _video_sandbox_identity(context, lifetime=lifetime, purpose=purpose)
+        return owner, sandbox_reuse_scope(bundle, binding, owner)
+
+    human = SimpleNamespace(entity_id="ent", user_id="user-1", conversation_id="conv-a", sandbox_binding_key=None)
+    assert scope_of(human)[1] == (True, "user:video-edit")
+    assert scope_of(SimpleNamespace(**{**vars(human), "conversation_id": "conv-b"}))[1] == (True, "user:video-edit")
+    assert scope_of(human, SandboxLifetime.ONE_SHOT, "video-render")[1] == (False, None)
+
+    room_key = runtime_room_binding_key("01ROOMRUN0000000000000000A")
+    room = SimpleNamespace(entity_id="ent", user_id="user-1", conversation_id="room-conv", sandbox_binding_key=room_key)
+    assert scope_of(room)[1] == (True, f"conversation:{room_key}:video-edit")
+
+    userless = SimpleNamespace(
+        entity_id="ent", user_id="", conversation_id=None, sandbox_binding_key="task-key-1",
+        runtime_envelope=SimpleNamespace(workspace_id="ws-9"),
+    )
+    owner, scope = scope_of(userless)
+    assert owner.workspace_id == "ws-9"
+    assert scope == (True, "conversation:task-key-1:video-edit")
+
+    # A scheduled Workflow has neither a chat nor a Task row. Its trusted
+    # run identity must reach the same sandbox admission and owner checks.
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    for user_id in ("user-1", None):
+        workflow = runtime_tool_call_context_from_kwargs(
+            {"_workflow_run_id_from_context": "01M51P1YJSCBPQ2EYY261CJDMY"},
+            entity_id="ent", user_id=user_id,
+            runtime_envelope=SimpleNamespace(workspace_id="ws-9"),
+        )
+        owner, scope = scope_of(workflow)
+        assert workflow.conversation_id is None and workflow.task_id is None
+        assert owner.user_id == (user_id or "")
+        if user_id:
+            assert scope == (True, "user:video-edit")
+        else:
+            assert owner.workspace_id == "ws-9"
+            assert scope == (True, f"conversation:{workflow.sandbox_binding_key}:video-edit")
+
+
+@pytest.mark.asyncio
+async def test_write_files_source_paths_copy_generated_text_under_reference_acl(monkeypatch, tmp_path):
+    """A builder Skill's saved page is copied by path: re-typing a 40 KB page
+    through the model truncates it and left EP.04 without a project source."""
+    from packages.core.ai.tools import video_edit_tools
+
+    page = "<!doctype html>" + "x" * 40_000
+    (tmp_path / "Workspaces").mkdir()
+    (tmp_path / "Workspaces" / "page.html").write_text(page, encoding="utf-8")
+    (tmp_path / "Workspaces" / "frame.png").write_bytes(b"\x89PNG\xff\xfe")
+    checked = []
+
+    async def preflight(*, raw_paths, **_kwargs):
+        checked.extend(raw_paths)
+        return [str(value) for value in raw_paths]
+
+    monkeypatch.setattr(video_edit_tools, "_preflight_reference_paths", preflight)
+    context = SimpleNamespace(user_id="user-1", workspace_id="ws-1")
+    kwargs = dict(entity_id="entity-1", entity_root=tmp_path, context=context, workspace_base_dir="")
+
+    copied = await video_edit_tools._read_video_source_paths({"index.html": "Workspaces/page.html"}, **kwargs)
+    assert copied == {"index.html": page}
+    assert checked == ["Workspaces/page.html"]
+
+    refused = await video_edit_tools._read_video_source_paths({"index.html": "Workspaces/frame.png"}, **kwargs)
+    assert "UTF-8" in json.loads(refused)["message"]
+
+
+@pytest.mark.asyncio
+async def test_render_releases_the_authoring_sandbox_before_its_own(tmp_path, monkeypatch):
+    """Both sandboxes are sized to the whole runner: on a 2 GB staging runner
+    the pair starved Chromium and EP.04's render died in its preflight check."""
+    from packages.core.ai.tools import video_edit_tools
+
+    project_dir = tmp_path / "Videos" / "promo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "index.html").write_text("<main>video</main>", encoding="utf-8")
+    approved = video_edit_tools._project_source_sha256(project_dir)
+    order = []
+
+    async def ensure(state, **_kwargs):
+        order.append(("ensure", state["sandbox_id"]))
+        return {"status": "ready"}, False
+
+    async def sync(**_kwargs):
+        order.append(("sync",))
+
+    async def release(state, context):
+        order.append(("release", state["sandbox_id"]))
+
+    async def run_sandbox(**kwargs):
+        order.append(("render", kwargs["operation"]))
+        return 0, {"status": "ok"}, {"renders/final.mp4": b"mp4"}, ""
+
+    async def register(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(video_edit_tools, "_ensure_video_session_sandbox", ensure)
+    monkeypatch.setattr(video_edit_tools, "_sync_video_session_to_entity", sync)
+    monkeypatch.setattr(video_edit_tools, "_release_video_session_sandbox", release)
+    monkeypatch.setattr(video_edit_tools, "_run_video_sandbox", run_sandbox)
+    async def save(_state):
+        return None
+
+    monkeypatch.setattr(video_edit_tools, "_register_artifact", register)
+    monkeypatch.setattr(video_edit_tools, "save_video_edit_session", save)
+    monkeypatch.setattr(video_edit_tools, "append_video_edit_session_event", lambda *_a, **_k: None)
+    await video_edit_tools._render_project(
+        project_dir=project_dir, project_rel="Videos/promo", entity_root=tmp_path,
+        entity_id="entity-1", context=SimpleNamespace(user_id="user-1"),
+        review_sha256=approved, output_name="final.mp4", quality="high",
+        session_state={"sandbox_id": "authoring", "last_review_sha256": approved, "session_id": "ved_1", "events": [{}], "last_event_seq": 0},
+    )
+
+    assert order == [("ensure", "authoring"), ("sync",), ("release", "authoring"), ("render", "render")]
+
+
+@pytest.mark.asyncio
+async def test_releasing_the_authoring_sandbox_discards_it_through_the_session_service(monkeypatch):
+    """The release is the scope's own discard (registry entry and container),
+    never a direct client: the next session operation rebuilds it."""
+    from packages.core.ai.tools import video_edit_tools
+
+    discarded = []
+
+    async def discard(context, sandbox_id):
+        discarded.append((context.user_id, sandbox_id))
+        return "destroyed"
+
+    monkeypatch.setattr(video_edit_tools, "_discard_video_session_sandbox", discard)
+    context = SimpleNamespace(user_id="user-1")
+    await video_edit_tools._release_video_session_sandbox({"sandbox_id": "authoring"}, context)
+    await video_edit_tools._release_video_session_sandbox({"sandbox_id": ""}, context)
+    assert discarded == [("user-1", "authoring")]
+
+
+def test_render_uploads_only_the_assets_the_page_names(tmp_path):
+    """EP.04 carried 282 MB of unused staged references into a 1.5 GB render sandbox.
+
+    Picture book 01M58KZRHR9WJG0GMFZJEFPTTY built its narration and one scene's
+    path in script; the render left them out and its audio mix failed.
+    """
+    from packages.core.ai.tools import video_edit_tools
+
+    refs = tmp_path / "assets" / "references"
+    refs.mkdir(parents=True)
+    for name in (
+        "used.mp4", "unused-old-take.mp4", "Noto.ttf", "海报.png", "dup-1234abcd.mp4",
+        "norm-zh-s01.wav", "norm-zh-s06.wav", "s04-bg.png", "music-all-s01-s06.wav",
+    ):
+        (refs / name).write_bytes(b"x")
+    (tmp_path / "index.html").write_text(
+        '<video src="assets/references/used.mp4"></video><img src="assets/references/%E6%B5%B7%E6%8A%A5.png">'
+        "<script>for(let i=1;i<=6;i++){vo.src='assets/references/norm-zh-s0'+i+'.wav';}"
+        "bg.src=`./assets/references/s0${n}-bg.png`;</script>",
+        encoding="utf-8",
+    )
+    (tmp_path / "style.css").write_text("@font-face{src:url('assets/references/Noto.ttf')}", encoding="utf-8")
+    (tmp_path / "BRIEF.md").write_text("notes", encoding="utf-8")
+
+    files = video_edit_tools._project_source_files(tmp_path)
+    kept = {p.relative_to(tmp_path).as_posix() for p in video_edit_tools._render_source_files(tmp_path, files)}
+
+    assert kept == {
+        "BRIEF.md", "index.html", "style.css",
+        "assets/references/used.mp4", "assets/references/Noto.ttf", "assets/references/海报.png",
+        "assets/references/norm-zh-s01.wav", "assets/references/norm-zh-s06.wav",
+        "assets/references/s04-bg.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_restaging_identical_bytes_reuses_the_reference(tmp_path, monkeypatch):
+    """The same clip staged under another path spelling must not become a -hash copy."""
+    from packages.core.ai.tools import video_edit_tools
+
+    monkeypatch.setattr(video_edit_tools, "_tracked_mkdir", lambda path: path.mkdir(parents=True, exist_ok=True))
+    entity = tmp_path / "entity"
+    (entity / "a").mkdir(parents=True)
+    (entity / "b").mkdir(parents=True)
+    (entity / "a" / "clip.mp4").write_bytes(b"same")
+    (entity / "b" / "clip.mp4").write_bytes(b"same")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    first = await video_edit_tools._stage_references(entity_root=entity, project_dir=project, rel_paths=["a/clip.mp4"])
+    again = await video_edit_tools._stage_references(entity_root=entity, project_dir=project, rel_paths=["b/clip.mp4"])
+    assert first[0]["project_path"] == again[0]["project_path"] == "assets/references/clip.mp4"
+    assert sorted(p.name for p in (project / "assets" / "references").iterdir()) == ["clip.mp4"]
+
+    (entity / "b" / "clip.mp4").write_bytes(b"different")
+    other = await video_edit_tools._stage_references(entity_root=entity, project_dir=project, rel_paths=["b/clip.mp4"])
+    assert other[0]["project_path"] != "assets/references/clip.mp4"
+
+
+def _composition(tmp_path, *, duration: float, width: int = 1080, height: int = 1920):
+    (tmp_path / "index.html").write_text(
+        f'<main data-composition-id="r" data-start="0" data-duration="{duration}" '
+        f'data-width="{width}" data-height="{height}"></main>',
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    ("duration", "width", "height", "memory", "cpus"),
+    [
+        (109.1, 1080, 1920, "10776m", 8.0),  # measured: 10.7 GB peak at 4 workers
+        (15, 1080, 1920, "4096m", 4.0),  # short clips get the floor
+        (109.1, 720, 1280, "5927m", 4.0),  # fewer pixels, less memory
+        (900, 1080, 1920, "14336m", 8.0),  # capped at VIDEO_RENDER_MAX_MEMORY_MB
+    ],
+)
+def test_render_size_request_follows_the_composition(tmp_path, duration, width, height, memory, cpus):
+    from packages.core.ai.tools import video_edit_tools
+
+    request = video_edit_tools._render_size_request(_composition(tmp_path, duration=duration, width=width, height=height))
+    assert (request["memory"], request["cpus"], request["pids_limit"]) == (memory, cpus, 1536)
+
+
+@pytest.mark.asyncio
+async def test_render_pool_is_used_only_when_it_can_serve(monkeypatch):
+    from contextlib import asynccontextmanager
+    from packages.core import database
+    from packages.core.ai.tools import video_edit_tools
+    from packages.core.config import get_settings
+
+    found = {"runner": None}
+
+    class Session:
+        async def scalar(self, _query):
+            return found["runner"]
+
+    @asynccontextmanager
+    async def session():
+        yield Session()
+
+    monkeypatch.setattr(database, "async_session", session)
+    monkeypatch.setattr(get_settings(), "VIDEO_RENDER_RUNNER_POOL", "", raising=False)
+    assert await video_edit_tools._render_runner_pool() == "default"
+
+    monkeypatch.setattr(get_settings(), "VIDEO_RENDER_RUNNER_POOL", "render", raising=False)
+    monkeypatch.setattr(get_settings(), "SANDBOX_AUTOSCALE_FLEETS_JSON", "", raising=False)
+    # Nothing would ever serve a ticket there: stay on the default pool.
+    assert await video_edit_tools._render_runner_pool() == "default"
+
+
+def _finished(*, stdout: str, exit_code: int = 0) -> SimpleNamespace:
+    """A started command's status when it has already ended."""
+
+    return SimpleNamespace(
+        status="completed" if exit_code == 0 else "failed", terminal=True, exit_code=exit_code,
+        stdout=stdout, stderr="", events=[], next_sequence=0, outcome=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_render_pool_render_asks_for_its_size_and_runs_four_workers_on_eight_cpus(tmp_path, monkeypatch):
+    from packages.core.ai.tools import video_edit_tools
+
+    project = _composition(tmp_path, duration=109.1)
+    admitted_with = {}
+
+    async def admit(context, *, session, pool=None, config_overrides=None):
+        admitted_with.update(session=session, pool=pool, config=config_overrides)
+        return SimpleNamespace(sandbox_id="render-1", container_config={"cpus": 8.0})
+
+    commands = []
+
+    class Client:
+        async def start_exec(self, **kwargs):
+            commands.append(kwargs["command"])
+            return _finished(stdout='{"status":"ok","files":[]}')
+
+        async def close(self):
+            pass
+
+    async def client_for(_sandbox_id, *, timeout):
+        return Client()
+
+    async def pool():
+        return "render"
+
+    async def discard(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(video_edit_tools, "_render_runner_pool", pool)
+    monkeypatch.setattr(video_edit_tools, "_admit_video_sandbox", admit)
+    monkeypatch.setattr(video_edit_tools, "_video_sandbox_client", client_for)
+    monkeypatch.setattr(video_edit_tools, "_upload_sandbox_sources", discard)
+    import packages.core.services.sandbox_session_service as sessions
+    monkeypatch.setattr(sessions, "discard_one_shot_sandbox", discard, raising=False)
+
+    await video_edit_tools._run_video_sandbox_once(
+        project_dir=project, operation="render", context=_video_context(), render_workers=4,
+    )
+    assert admitted_with == {
+        "session": False,
+        "pool": "render",
+        "config": {"memory": "10776m", "cpus": 8.0, "pids_limit": 1536, "workdir_tmpfs_size": "10776m"},
+    }
+    assert "--workers 4 --reviewed" in commands[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("render_pool,one_shot", [("render", True), ("default", False)])
+async def test_a_review_leaves_the_authoring_session_only_for_a_render_pool(
+    tmp_path, monkeypatch, render_pool, one_shot,
+):
+    """2026-10-19 staging: a 109 s review timed out (900 s) in the 1-CPU session."""
+
+    from packages.core.ai.tools import video_edit_tools
+
+    project = _composition(tmp_path, duration=109.1)
+    admitted, executed, discarded = [], [], []
+
+    async def admit(context, *, session, pool=None, config_overrides=None):
+        admitted.append((session, pool, config_overrides))
+        return SimpleNamespace(sandbox_id="review-1", container_config={"cpus": 8.0})
+
+    class Client:
+        async def start_exec(self, **kwargs):
+            executed.append((kwargs["sandbox_id"], kwargs["command"]))
+            return _finished(stdout='{"status":"ok","files":[]}')
+
+        async def touch(self, _sandbox_id):
+            pass
+
+        async def close(self):
+            pass
+
+    async def client_for(_sandbox_id, *, timeout):
+        return Client()
+
+    async def pool():
+        return render_pool
+
+    async def upload(**_kwargs):
+        return None
+
+    async def discard(sandbox_id, *_args, **_kwargs):
+        discarded.append(sandbox_id)
+
+    monkeypatch.setattr(video_edit_tools, "_render_runner_pool", pool)
+    monkeypatch.setattr(video_edit_tools, "_admit_video_sandbox", admit)
+    monkeypatch.setattr(video_edit_tools, "_video_sandbox_client", client_for)
+    monkeypatch.setattr(video_edit_tools, "_upload_sandbox_sources", upload)
+    import packages.core.services.sandbox_session_service as sessions
+    monkeypatch.setattr(sessions, "discard_one_shot_sandbox", discard, raising=False)
+
+    await video_edit_tools._run_video_sandbox_once(
+        project_dir=project, operation="review", context=_video_context(),
+        sandbox_id="session-1", upload_sources=False, snapshot_times=[1.0, 5.0],
+    )
+
+    assert "review --snapshot-times 1,5" in executed[0][1]
+    if one_shot:
+        assert admitted == [(False, "render", {"memory": "10776m", "cpus": 8.0, "pids_limit": 1536, "workdir_tmpfs_size": "10776m"})]
+        assert executed[0][0] == "review-1" and discarded == ["review-1"]
+    else:
+        assert admitted == [] and discarded == []
+        assert executed[0][0] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_session_reopens_to_the_reviewed_hash_and_still_renders(tmp_path: Path, monkeypatch, local_runner):
+    """2026-10-19 eval 01M5AQ5KWVG3DFPYY6VC7NKTNF: produce reviewed and closed its
+    session; render then found no session, and start + review of the untouched
+    durable copy returned another hash, so the approved hash could never render.
+
+    The durable copy after close must be exactly the reviewed source, and a
+    closed session's last reviewed hash still renders from it.
+    """
+    from packages.core.ai.tools import video_edit_tools
+    from packages.core.services import entity_fs
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "video_runtime_under_test", REPO_ROOT / "packages/core/ai/skills/video-edit/scripts/video_runtime.py",
+    )
+    video_runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(video_runtime)
+    base = _video_runtime_exec(set(), {"probe": 0})
+
+    def runtime(sandbox_id, command, container):
+        files = container["files"]
+        project = "/skill/project/"
+        if command.endswith("video_runtime.py manifest"):
+            # The runtime's manifest: its own source rules, over the container's files.
+            listed = {
+                path: content for path, content in files.items()
+                if not path.startswith(project) or (
+                    path.removeprefix(project) not in video_runtime.SOURCE_EXCLUDED_FILES
+                    and not set(Path(path.removeprefix(project)).parts) & video_runtime.SOURCE_EXCLUDED_DIRS
+                    and Path(path.removeprefix(project)).parts[:2] != ("assets", "vendor")
+                )
+            }
+            return base(sandbox_id, command, {**container, "files": listed})
+        operation = next((name for name in ("review", "render") if f"video_runtime.py {name}" in command), "")
+        if not operation:
+            return base(sandbox_id, command, container)
+        # What a run writes into the project besides its output: the
+        # engine config and vendored GSAP, and HyperFrames' own history.
+        files[project + "hyperframes.json"] = files.get(project + "video.json", b"{}")
+        files[project + "assets/vendor/gsap.min.js"] = b"gsap"
+        files[project + ".hyperframes/history-id"] = sandbox_id.encode()
+        output = "snapshots/manor-review/frame-1.png" if operation == "review" else "renders/final.mp4"
+        files[project + output] = b"output"
+        return SimpleNamespace(stdout=json.dumps({
+            "status": "ok", "operation": operation, "review_passed": True, "files": [output],
+        }), stderr="", exit_code=0)
+
+    local_runner.exec_handler = runtime
+    monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", lambda: str(tmp_path))
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    def fake_atomic_write(entity_id, rel_path, data, **kwargs):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return str(target)
+
+    async def default_pool():
+        return "default"
+
+    async def register(*, abs_path, **_kwargs):
+        return {"file": abs_path.name}
+
+    async def no_probe(_path):
+        return {}
+
+    async def readable(*, raw_paths, **_kwargs):
+        return [str(value) for value in raw_paths]
+
+    monkeypatch.setattr(video_edit_tools, "_preflight_reference_paths", readable)
+    monkeypatch.setattr(entity_fs, "write_entity_file_atomic", fake_atomic_write)
+    monkeypatch.setattr(video_edit_tools, "_render_runner_pool", default_pool)
+    monkeypatch.setattr(video_edit_tools, "_register_artifact", register)
+    monkeypatch.setattr(video_edit_tools, "_probe_render", no_probe)
+    monkeypatch.setattr(video_edit_tools, "_video_project_feedback", lambda _dir: {
+        "missing_project_contract": [], "contract_valid": True, "contract_violations": [],
+    })
+    (tmp_path / "Inputs").mkdir()
+    (tmp_path / "Inputs/music.mp3").write_bytes(b"music")
+
+    async def call(**arguments):
+        return json.loads(await video_edit_tools._video_edit_handler(
+            entity_id="entity-1", user_id="user-1", conversation_id="conversation-reopen", **arguments,
+        ))
+
+    started = await call(operation="start", project_path="Videos/reopen", reference_paths=["Inputs/music.mp3"])
+    session_id = started["session_id"]
+    await call(operation="write_files", session_id=session_id, files={
+        "BRIEF.md": "# Brief", "STORYBOARD.md": "# Board", "video.json": '{"fps": 30}',
+        "package.json": "{}", "index.html": "<main></main>", "index.motion.json": "[]",
+    })
+    reviewed = await call(operation="review", session_id=session_id)
+    approved = reviewed["review_sha256"]
+    closed = await call(operation="close", session_id=session_id)
+    assert closed["status"] == "closed", json.dumps(closed)
+
+    # Exactly the reviewed source is durable, under the runtime's own source rules.
+    project_dir = tmp_path / "Videos/reopen"
+    assert video_edit_tools._project_source_sha256(project_dir) == approved
+    assert video_edit_tools._HASH_EXCLUDED_DIRS == video_runtime.SOURCE_EXCLUDED_DIRS
+    assert video_edit_tools._HASH_EXCLUDED_FILES == video_runtime.SOURCE_EXCLUDED_FILES
+    (project_dir / "hyperframes.json").write_text('{"stale": true}')
+    assert video_edit_tools._project_source_sha256(project_dir) == approved
+
+    # Reopened from the durable copy with nothing changed: the same hash, even
+    # when the step passes its inputs again -- the original reference and the
+    # review frame the previous step returned.
+    frame = "Videos/reopen/snapshots/manor-review/frame-1.png"
+    again = await call(
+        operation="start", project_path="Videos/reopen", reference_paths=["Inputs/music.mp3", frame],
+    )
+    assert (await call(operation="review", session_id=again["session_id"]))["review_sha256"] == approved
+
+    # Source another tool saved straight into the durable project reaches the
+    # session before its review, so the reviewed sandbox holds what is hashed.
+    (project_dir / "assets/bg.png").write_bytes(b"background")
+    changed = await call(operation="review", session_id=again["session_id"])
+    assert changed["review_sha256"] != approved
+    [live] = [container for container in local_runner.containers.values()]
+    assert live["files"]["/skill/project/assets/bg.png"] == b"background"
+    (project_dir / "assets/bg.png").unlink()
+    await call(operation="write_files", session_id=again["session_id"], delete_paths=["assets/bg.png"])
+    assert (await call(operation="review", session_id=again["session_id"]))["review_sha256"] == approved
+    await call(operation="close", session_id=again["session_id"])
+
+    # The closed session's approved hash renders from the durable copy.
+    rendered = await call(operation="render", session_id=session_id, review_sha256=approved)
+    assert rendered["status"] == "completed", rendered
+    assert rendered["source_sha256"] == approved

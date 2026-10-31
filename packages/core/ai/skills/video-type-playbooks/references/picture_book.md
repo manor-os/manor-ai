@@ -33,6 +33,7 @@
 - 前景遮罩边缘有白边：羽化不足或遮罩过大。
 - 用字体轮廓做描边动画冒充手写：笔顺错乱。
 - 字幕时间估算偏差累积：每段以该段配音的实测起点重新对齐。
+- 同一张插画放两层（邮票缩略 + 场景背景、模糊底图 + 前景）：同一文件里两个 `<img>` 的 src、data-start、data-duration 全相同会让严格审阅报 duplicate_media_discovery_risk 而失败；只保留一个 `<img>`，另一层用 `<div>` 的 CSS `background-image`。
 
 ## 验收清单
 - [ ] `probe_media`：1920×1080、30fps，时长 ≥ 最后一个词结束 + 1s。

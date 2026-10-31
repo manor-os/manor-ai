@@ -12,6 +12,7 @@ import type {
 } from "../../lib/agentInitiativeTypes";
 import { formatDateLong } from "../../lib/format";
 import { t } from "../../lib/i18n";
+import { useIsCollaborator } from "../../lib/collaboratorSession";
 import { closeDetail, openDetail } from "../../stores/detail";
 import {
   IconArrowLeft,
@@ -84,10 +85,12 @@ export function conversationInitiativeItems(
 }
 
 export function useConversationInitiativesQuery(conversationId?: string | null) {
+  // Agent initiatives are a company surface an external collaborator can't open.
+  const collaborator = useIsCollaborator();
   return useQuery({
     queryKey: ["agent-initiatives", "conversation", conversationId],
     queryFn: () => api.agentInitiatives.listForConversation(conversationId as string),
-    enabled: Boolean(conversationId),
+    enabled: Boolean(conversationId) && !collaborator,
     staleTime: 30_000,
   });
 }

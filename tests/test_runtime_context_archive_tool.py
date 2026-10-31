@@ -143,3 +143,51 @@ async def test_compacted_tool_result_does_not_bait_read_context_archive(monkeypa
     assert archived, "oversized results should still be archived"
     assert "read_context_archive" not in observed
     assert "_context_archive" not in observed
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_archive_is_reported_to_the_model_not_the_user(monkeypatch):
+    observed = ""
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        nonlocal observed
+        if any(message.get("role") == "tool" for message in messages):
+            observed = next(
+                message["content"]
+                for message in reversed(messages)
+                if message.get("role") == "tool"
+            )
+            return "done", None, {"prompt": 10, "completion": 1, "total": 11}
+        return (
+            "",
+            [{"id": "call_1", "name": "get_entity_info", "arguments": {}}],
+            {"prompt": 10, "completion": 1, "total": 11},
+        )
+
+    async def fake_executor(name, args):
+        return json.dumps({"profile": "x" * 8000, "notes": ["y" * 200 for _ in range(20)]})
+
+    archive_calls = []
+
+    async def archive(messages):
+        archive_calls.append(messages)
+        raise RuntimeError("invalid input syntax for type json")
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_chat_completion_with_tools)
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="find tools",
+        tools=[_schema("get_entity_info")],
+        tool_executor=fake_executor,
+        on_context_compacted=archive,
+        max_rounds=3,
+    )
+
+    # The turn continues; the model sees what happened and decides.
+    assert archive_calls, "the oversized result must reach the archive"
+    assert result.content == "done"
+    assert not result.error
+    assert "could not be kept" in observed
+    assert "invalid input syntax" not in observed

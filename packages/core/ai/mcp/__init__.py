@@ -40,7 +40,6 @@ from . import (
     lark,
     replicate,
     elevenlabs,
-    suno,
     tavily,
     apify,
     alpaca_market_data,
@@ -107,7 +106,6 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     # AI generation / research APIs (api_key auth)
     "replicate": replicate,
     "elevenlabs": elevenlabs,
-    "suno": suno,
     "tavily": tavily,
     "apify": apify,
     "alpaca_market_data": alpaca_market_data,

@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import contextvars
+import re
 from typing import Optional
 
 _locale_var: contextvars.ContextVar[str] = contextvars.ContextVar("locale", default="en")
@@ -35,6 +36,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "scheduled",
         "task.status.in_progress": "in progress",
         "task.status.waiting_on_customer": "waiting for the user",
+        "push.task_hitl_requested.title": "Input needed",
+        "push.task_hitl_requested.body": "A task is waiting for your input.",
+        "push.task_succeeded.title": "Task completed",
+        "push.task_succeeded.body": "A task you own finished successfully.",
+        "push.task_failed.title": "Task failed",
+        "push.task_failed.body": "A task failed and may need review.",
         "task.status.on_hold": "on hold",
         "task.status.blocked": "blocked",
         "task.status.completed": "completed",
@@ -51,6 +58,30 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "error.rate_limited": "Too many requests, please try again later",
         "error.validation": "Validation error",
         "error.internal": "Internal server error",
+        "workflow.failure.platform_error": (
+            "Step \"{step}\" failed because of an internal Manor platform error. This is a platform "
+            "problem, not a permission issue: no approval or setting change will fix it. "
+            "Retry the run after the problem is fixed."
+        ),
+        "workflow.failure.context_budget_exceeded": (
+            "Step \"{step}\" stopped because the agent's working context grew past its limit "
+            "before the model could be called. No model provider failed. Retry the run after the "
+            "problem is fixed, or shorten this step's input."
+        ),
+        "workflow.failure.workflow_project_conflict": (
+            "\"{step}\" could not save its work: another run changed this project while this one "
+            "was working. Start again from the latest version."
+        ),
+        "workflow.failure.workflow_project_failed": "\"{step}\" could not open or save this project.",
+        "workflow.failure.workflow_project_state_validation_failed": (
+            "\"{step}\" produced project data in the wrong shape, so it was not saved."
+        ),
+        "workflow.failure.technical": "\"{step}\" stopped. The technical details are below.",
+        "workflow.failure.replaced": "Replaced by a newer version",
+        "workflow.failure.interrupted": (
+            "\"{step}\" was interrupted when Manor restarted. Retry to continue from this step; "
+            "work it already finished is reused."
+        ),
         "task.created": "Task created successfully",
         "task.updated": "Task updated",
         "task.deleted": "Task deleted",
@@ -87,6 +118,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": " in {seconds}s",
         "plan.log.completed_heading": "## Task Completed",
         "plan.log.partial_heading": "## Work so far (not accepted as finished)",
+        "plan.log.delivered_with_exceptions_heading": "## Delivered — not every acceptance check passed",
+        "plan.log.acceptance_exceptions_heading": "### Acceptance criteria not met or not verified",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## Delivered — some changes could not be confirmed",
+        "plan.log.unconfirmed_effects_heading": "### Changes that could not be confirmed",
+        "plan.log.unconfirmed_effect_line": "{call} may have changed {targets}; this could not be confirmed",
+        "plan.log.unconfirmed_effect_unknown_target": "something it did not report",
         "plan.log.other_changes_heading": "### Other changes",
         "plan.log.host_stop_summary": "The Task stopped before it was finished. What it produced so far:",
         "plan.log.effect.task_create": "Created a Task",
@@ -153,6 +190,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **Task complete — {subject}**",
         "task.execution.plan_needs_attention": "**Task needs attention — {subject}**",
         "task.execution.plan_failed": "✗ **Task failed — {subject}**\n\nReason: {error}",
+        "task.execution.task_completed_by": "{agent_name} completed “{subject}”",
+        "task.execution.task_completed": "Completed “{subject}”",
         "task.execution.completed_meta": "Completed {details}.",
         "task.execution.completed_step_count": "{done}/{total} steps",
         "task.execution.completed_duration": "finished in {duration}",
@@ -162,6 +201,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.needs_attention": "**Needs attention**",
         "task.execution.unknown_error": "unknown error",
         "task.execution.step_completed": "✅ **Completed: {label}**{agent_part}{time_part}",
+        "workflow.run.failed": "{title} failed: {error}",
+        "workflow.run.error_details": "(The full error is in the run details.)",
+        "workflow.run.cancelled": "{title} was cancelled.",
+        "workflow.retry.required_change_default": "Retry this step. If the problem above names something to change, change it first.",
+        "workflow.input.please_provide": "Please confirm or fill in: {fields}",
+        "workflow.input.list_separator": ", ",
+        "workflow.input.title_default": "Information needed",
+        "workflow.result.completed": "{name} completed.",
+        "workflow.result.completed_with_title": "{name} completed: {title}",
         "task.execution.by_agent": " by **{agent_name}**",
         "task.execution.in_duration": " in {duration}",
         "task.execution.what_produced": "**What was produced**",
@@ -202,6 +250,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "已排期",
         "task.status.in_progress": "执行中",
         "task.status.waiting_on_customer": "等待用户回复",
+        "push.task_hitl_requested.title": "需要你的输入",
+        "push.task_hitl_requested.body": "有一个任务正在等待你的输入。",
+        "push.task_succeeded.title": "任务已完成",
+        "push.task_succeeded.body": "你负责的一个任务已成功完成。",
+        "push.task_failed.title": "任务失败",
+        "push.task_failed.body": "有一个任务失败，可能需要检查。",
         "task.status.on_hold": "已暂停",
         "task.status.blocked": "已阻塞",
         "task.status.completed": "已完成",
@@ -218,6 +272,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "error.rate_limited": "请求过于频繁，请稍后再试",
         "error.validation": "验证错误",
         "error.internal": "内部服务器错误",
+        "workflow.failure.platform_error": (
+            "「{step}」步骤因 Manor 平台内部错误失败。这是平台问题，不是权限问题，"
+            "授权或修改设置都无法解决。请在问题修复后重试本次运行。"
+        ),
+        "workflow.failure.context_budget_exceeded": (
+            "「{step}」步骤失败：智能体的工作上下文超出了上限，模型还没有被调用，"
+            "并不是模型服务商出错。请在问题修复后重试，或缩短该步骤的输入。"
+        ),
+        "workflow.failure.workflow_project_conflict": (
+            "「{step}」没能保存结果：本次运行期间，另一次运行更新了这个项目。请从最新版本重新开始。"
+        ),
+        "workflow.failure.workflow_project_failed": "「{step}」无法打开或保存这个项目。",
+        "workflow.failure.workflow_project_state_validation_failed": "「{step}」生成的项目数据格式不对，没有保存。",
+        "workflow.failure.technical": "「{step}」已停止，技术细节见下方。",
+        "workflow.failure.replaced": "已被更新的版本取代",
+        "workflow.failure.interrupted": "「{step}」在 Manor 重启时被中断。点重试即可从这一步继续，已完成的部分会被复用。",
         "task.created": "任务创建成功",
         "task.updated": "任务已更新",
         "task.deleted": "任务已删除",
@@ -254,6 +324,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": "，耗时 {seconds} 秒",
         "plan.log.completed_heading": "## 任务已完成",
         "plan.log.partial_heading": "## 当前成果（尚未验收为完成）",
+        "plan.log.delivered_with_exceptions_heading": "## 已交付——部分验收项未通过",
+        "plan.log.acceptance_exceptions_heading": "### 未满足或未能验证的验收标准",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## 已交付——部分改动未能确认",
+        "plan.log.unconfirmed_effects_heading": "### 未能确认的改动",
+        "plan.log.unconfirmed_effect_line": "{call} 可能已更改 {targets}；无法确认",
+        "plan.log.unconfirmed_effect_unknown_target": "未报告的内容",
         "plan.log.other_changes_heading": "### 其他变更",
         "plan.log.host_stop_summary": "任务在完成前停止了。目前已产出的内容：",
         "plan.log.effect.task_create": "创建了任务",
@@ -320,6 +396,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **任务完成 — {subject}**",
         "task.execution.plan_needs_attention": "**任务需要关注 — {subject}**",
         "task.execution.plan_failed": "✗ **任务失败 — {subject}**\n\n原因：{error}",
+        "task.execution.task_completed_by": "{agent_name} 完成了「{subject}」",
+        "task.execution.task_completed": "已完成「{subject}」",
         "task.execution.completed_meta": "已完成：{details}。",
         "task.execution.completed_step_count": "{done}/{total} 个步骤",
         "task.execution.completed_duration": "用时 {duration}",
@@ -329,6 +407,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.needs_attention": "**需要关注**",
         "task.execution.unknown_error": "未知错误",
         "task.execution.step_completed": "✅ **已完成：{label}**{agent_part}{time_part}",
+        "workflow.run.failed": "「{title}」没有完成：{error}",
+        "workflow.run.error_details": "（完整报错在运行详情里。）",
+        "workflow.run.cancelled": "「{title}」已取消。",
+        "workflow.retry.required_change_default": "直接点「重试」从这一步继续；如果上面的原因写明了需要修改的地方，先改好再重试。",
+        "workflow.input.please_provide": "请确认或补充：{fields}",
+        "workflow.input.list_separator": "、",
+        "workflow.input.title_default": "需要补充的信息",
+        "workflow.result.completed": "「{name}」已完成",
+        "workflow.result.completed_with_title": "「{name}」已完成：{title}",
         "task.execution.by_agent": "，执行者：**{agent_name}**",
         "task.execution.in_duration": "，用时 {duration}",
         "task.execution.what_produced": "**生成的产物**",
@@ -369,6 +456,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "programada",
         "task.status.in_progress": "en curso",
         "task.status.waiting_on_customer": "esperando respuesta del usuario",
+        "push.task_hitl_requested.title": "Se necesita tu respuesta",
+        "push.task_hitl_requested.body": "Una tarea está esperando tu respuesta.",
+        "push.task_succeeded.title": "Tarea completada",
+        "push.task_succeeded.body": "Una tarea que te pertenece terminó correctamente.",
+        "push.task_failed.title": "Tarea fallida",
+        "push.task_failed.body": "Una tarea falló y puede necesitar revisión.",
         "task.status.on_hold": "en pausa",
         "task.status.blocked": "bloqueada",
         "task.status.completed": "completada",
@@ -414,6 +507,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": " en {seconds} s",
         "plan.log.completed_heading": "## Tarea completada",
         "plan.log.partial_heading": "## Trabajo realizado hasta ahora (aún no aceptado como terminado)",
+        "plan.log.delivered_with_exceptions_heading": "## Entregado — no se superaron todas las comprobaciones de aceptación",
+        "plan.log.acceptance_exceptions_heading": "### Criterios de aceptación no cumplidos o no verificados",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## Entregado — algunos cambios no se pudieron confirmar",
+        "plan.log.unconfirmed_effects_heading": "### Cambios que no se pudieron confirmar",
+        "plan.log.unconfirmed_effect_line": "{call} puede haber cambiado {targets}; no se pudo confirmar",
+        "plan.log.unconfirmed_effect_unknown_target": "algo que no informó",
         "plan.log.other_changes_heading": "### Otros cambios",
         "plan.log.host_stop_summary": "La tarea se detuvo antes de terminar. Lo que produjo hasta ahora:",
         "plan.log.effect.task_create": "Creó una tarea",
@@ -480,6 +579,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **Tarea completada — {subject}**",
         "task.execution.plan_needs_attention": "**La tarea requiere atención — {subject}**",
         "task.execution.plan_failed": "✗ **Tarea fallida — {subject}**\n\nMotivo: {error}",
+        "task.execution.task_completed_by": "{agent_name} completó «{subject}»",
+        "task.execution.task_completed": "Completado: «{subject}»",
         "task.execution.completed_meta": "Completado: {details}.",
         "task.execution.completed_step_count": "{done}/{total} pasos",
         "task.execution.completed_duration": "finalizado en {duration}",
@@ -529,6 +630,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "planifiée",
         "task.status.in_progress": "en cours",
         "task.status.waiting_on_customer": "en attente de l'utilisateur",
+        "push.task_hitl_requested.title": "Votre réponse est requise",
+        "push.task_hitl_requested.body": "Une tâche attend votre réponse.",
+        "push.task_succeeded.title": "Tâche terminée",
+        "push.task_succeeded.body": "Une tâche dont vous êtes responsable s'est terminée avec succès.",
+        "push.task_failed.title": "Échec de la tâche",
+        "push.task_failed.body": "Une tâche a échoué et doit peut-être être vérifiée.",
         "task.status.on_hold": "en pause",
         "task.status.blocked": "bloquée",
         "task.status.completed": "terminée",
@@ -581,6 +688,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": " en {seconds} s",
         "plan.log.completed_heading": "## Tâche terminée",
         "plan.log.partial_heading": "## Travail réalisé jusqu’ici (pas encore validé comme terminé)",
+        "plan.log.delivered_with_exceptions_heading": "## Livré — tous les contrôles d’acceptation ne sont pas passés",
+        "plan.log.acceptance_exceptions_heading": "### Critères d’acceptation non remplis ou non vérifiés",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## Livré — certaines modifications n’ont pas pu être confirmées",
+        "plan.log.unconfirmed_effects_heading": "### Modifications non confirmées",
+        "plan.log.unconfirmed_effect_line": "{call} a peut-être modifié {targets} ; cela n’a pas pu être confirmé",
+        "plan.log.unconfirmed_effect_unknown_target": "un élément non signalé",
         "plan.log.other_changes_heading": "### Autres modifications",
         "plan.log.host_stop_summary": "La tâche s’est arrêtée avant d’être terminée. Ce qu’elle a produit jusqu’ici :",
         "plan.log.effect.task_create": "A créé une tâche",
@@ -647,6 +760,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **Tâche terminée — {subject}**",
         "task.execution.plan_needs_attention": "**La tâche nécessite votre attention — {subject}**",
         "task.execution.plan_failed": "✗ **Échec de la tâche — {subject}**\n\nMotif : {error}",
+        "task.execution.task_completed_by": "{agent_name} a terminé « {subject} »",
+        "task.execution.task_completed": "Terminé : « {subject} »",
         "task.execution.completed_meta": "Terminé : {details}.",
         "task.execution.completed_step_count": "{done}/{total} étapes",
         "task.execution.completed_duration": "terminé en {duration}",
@@ -696,6 +811,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "予定済み",
         "task.status.in_progress": "実行中",
         "task.status.waiting_on_customer": "ユーザーの回答待ち",
+        "push.task_hitl_requested.title": "入力が必要です",
+        "push.task_hitl_requested.body": "タスクがあなたの入力を待っています。",
+        "push.task_succeeded.title": "タスクが完了しました",
+        "push.task_succeeded.body": "担当のタスクが正常に完了しました。",
+        "push.task_failed.title": "タスクが失敗しました",
+        "push.task_failed.body": "タスクが失敗しました。確認が必要かもしれません。",
         "task.status.on_hold": "一時停止中",
         "task.status.blocked": "ブロック中",
         "task.status.completed": "完了",
@@ -732,6 +853,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": "（{seconds} 秒）",
         "plan.log.completed_heading": "## タスク完了",
         "plan.log.partial_heading": "## これまでの成果（完了として未承認）",
+        "plan.log.delivered_with_exceptions_heading": "## 納品済み — 一部の受け入れチェックは未達",
+        "plan.log.acceptance_exceptions_heading": "### 未達または未検証の受け入れ基準",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## 納品済み — 一部の変更は確認できませんでした",
+        "plan.log.unconfirmed_effects_heading": "### 確認できなかった変更",
+        "plan.log.unconfirmed_effect_line": "{call} が {targets} を変更した可能性があります（確認できませんでした）",
+        "plan.log.unconfirmed_effect_unknown_target": "報告されていない対象",
         "plan.log.other_changes_heading": "### その他の変更",
         "plan.log.host_stop_summary": "タスクは完了前に停止しました。ここまでの成果：",
         "plan.log.effect.task_create": "タスクを作成",
@@ -798,6 +925,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **タスク完了 — {subject}**",
         "task.execution.plan_needs_attention": "**確認が必要なタスク — {subject}**",
         "task.execution.plan_failed": "✗ **タスク失敗 — {subject}**\n\n理由：{error}",
+        "task.execution.task_completed_by": "{agent_name} が「{subject}」を完了しました",
+        "task.execution.task_completed": "「{subject}」を完了しました",
         "task.execution.completed_meta": "完了：{details}。",
         "task.execution.completed_step_count": "{done}/{total} ステップ",
         "task.execution.completed_duration": "所要時間 {duration}",
@@ -807,6 +936,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.needs_attention": "**確認が必要**",
         "task.execution.unknown_error": "不明なエラー",
         "task.execution.step_completed": "✅ **完了：{label}**{agent_part}{time_part}",
+        "workflow.run.failed": "「{title}」は完了しませんでした：{error}",
+        "workflow.run.error_details": "（詳しいエラーは実行の詳細にあります。）",
+        "workflow.run.cancelled": "「{title}」はキャンセルされました。",
+        "workflow.retry.required_change_default": "このステップを再試行してください。上の原因に変更点が書かれていれば、先に直してから再試行してください。",
+        "workflow.input.please_provide": "確認または入力してください：{fields}",
+        "workflow.input.list_separator": "、",
+        "workflow.input.title_default": "必要な情報",
+        "workflow.result.completed": "「{name}」が完了しました",
+        "workflow.result.completed_with_title": "「{name}」が完了しました：{title}",
         "task.execution.by_agent": "、担当：**{agent_name}**",
         "task.execution.in_duration": "、所要時間 {duration}",
         "task.execution.what_produced": "**生成された成果物**",
@@ -847,6 +985,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "geplant",
         "task.status.in_progress": "in Bearbeitung",
         "task.status.waiting_on_customer": "wartet auf den Nutzer",
+        "push.task_hitl_requested.title": "Eingabe erforderlich",
+        "push.task_hitl_requested.body": "Eine Aufgabe wartet auf deine Eingabe.",
+        "push.task_succeeded.title": "Aufgabe abgeschlossen",
+        "push.task_succeeded.body": "Eine deiner Aufgaben wurde erfolgreich abgeschlossen.",
+        "push.task_failed.title": "Aufgabe fehlgeschlagen",
+        "push.task_failed.body": "Eine Aufgabe ist fehlgeschlagen und muss möglicherweise überprüft werden.",
         "task.status.on_hold": "pausiert",
         "task.status.blocked": "blockiert",
         "task.status.completed": "abgeschlossen",
@@ -876,6 +1020,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": " in {seconds} s",
         "plan.log.completed_heading": "## Aufgabe abgeschlossen",
         "plan.log.partial_heading": "## Bisherige Ergebnisse (noch nicht als abgeschlossen bestätigt)",
+        "plan.log.delivered_with_exceptions_heading": "## Geliefert – nicht alle Abnahmeprüfungen bestanden",
+        "plan.log.acceptance_exceptions_heading": "### Nicht erfüllte oder nicht geprüfte Abnahmekriterien",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## Geliefert – einige Änderungen konnten nicht bestätigt werden",
+        "plan.log.unconfirmed_effects_heading": "### Nicht bestätigte Änderungen",
+        "plan.log.unconfirmed_effect_line": "{call} hat möglicherweise {targets} geändert; das konnte nicht bestätigt werden",
+        "plan.log.unconfirmed_effect_unknown_target": "etwas nicht Gemeldetes",
         "plan.log.other_changes_heading": "### Weitere Änderungen",
         "plan.log.host_stop_summary": "Die Aufgabe wurde vor dem Abschluss beendet. Bisher erstellt:",
         "plan.log.effect.task_create": "Aufgabe erstellt",
@@ -942,6 +1092,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **Aufgabe abgeschlossen — {subject}**",
         "task.execution.plan_needs_attention": "**Aufgabe erfordert Aufmerksamkeit — {subject}**",
         "task.execution.plan_failed": "✗ **Aufgabe fehlgeschlagen — {subject}**\n\nGrund: {error}",
+        "task.execution.task_completed_by": "{agent_name} hat „{subject}“ abgeschlossen",
+        "task.execution.task_completed": "„{subject}“ abgeschlossen",
         "task.execution.completed_meta": "Abgeschlossen: {details}.",
         "task.execution.completed_step_count": "{done}/{total} Schritte",
         "task.execution.completed_duration": "abgeschlossen in {duration}",
@@ -991,6 +1143,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.status.scheduled": "đã lên lịch",
         "task.status.in_progress": "đang thực hiện",
         "task.status.waiting_on_customer": "đang chờ người dùng",
+        "push.task_hitl_requested.title": "Cần bạn nhập thông tin",
+        "push.task_hitl_requested.body": "Một tác vụ đang chờ thông tin từ bạn.",
+        "push.task_succeeded.title": "Tác vụ đã hoàn thành",
+        "push.task_succeeded.body": "Một tác vụ do bạn phụ trách đã hoàn thành thành công.",
+        "push.task_failed.title": "Tác vụ thất bại",
+        "push.task_failed.body": "Một tác vụ đã thất bại và có thể cần xem lại.",
         "task.status.on_hold": "tạm dừng",
         "task.status.blocked": "bị chặn",
         "task.status.completed": "đã hoàn thành",
@@ -1020,6 +1178,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "plan.log.duration": " trong {seconds} giây",
         "plan.log.completed_heading": "## Tác vụ đã hoàn tất",
         "plan.log.partial_heading": "## Kết quả đến hiện tại (chưa được xác nhận là hoàn tất)",
+        "plan.log.delivered_with_exceptions_heading": "## Đã bàn giao — chưa đạt mọi kiểm tra nghiệm thu",
+        "plan.log.acceptance_exceptions_heading": "### Tiêu chí nghiệm thu chưa đạt hoặc chưa kiểm chứng",
+        "plan.log.delivered_with_unconfirmed_effects_heading": "## Đã bàn giao — một số thay đổi chưa thể xác nhận",
+        "plan.log.unconfirmed_effects_heading": "### Thay đổi chưa thể xác nhận",
+        "plan.log.unconfirmed_effect_line": "{call} có thể đã thay đổi {targets}; không thể xác nhận",
+        "plan.log.unconfirmed_effect_unknown_target": "nội dung không được báo cáo",
         "plan.log.other_changes_heading": "### Thay đổi khác",
         "plan.log.host_stop_summary": "Nhiệm vụ đã dừng trước khi hoàn tất. Những gì đã tạo ra đến nay:",
         "plan.log.effect.task_create": "Đã tạo nhiệm vụ",
@@ -1086,6 +1250,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "task.execution.plan_completed": "✅ **Đã hoàn thành tác vụ — {subject}**",
         "task.execution.plan_needs_attention": "**Tác vụ cần chú ý — {subject}**",
         "task.execution.plan_failed": "✗ **Tác vụ thất bại — {subject}**\n\nLý do: {error}",
+        "task.execution.task_completed_by": "{agent_name} đã hoàn thành “{subject}”",
+        "task.execution.task_completed": "Đã hoàn thành “{subject}”",
         "task.execution.completed_meta": "Đã hoàn thành: {details}.",
         "task.execution.completed_step_count": "{done}/{total} bước",
         "task.execution.completed_duration": "hoàn thành trong {duration}",
@@ -1130,6 +1296,21 @@ def set_locale(locale: str) -> None:
 def get_locale() -> str:
     """Return the current request's locale."""
     return _locale_var.get()
+
+
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def text_locale(text: str) -> str | None:
+    """``zh``/``ja`` for Chinese/Japanese text, else None (use the current locale)."""
+    sample = str(text or "")[:400]
+    if _KANA_RE.search(sample):
+        return "ja"
+    letters = sum(1 for char in sample if char.isalpha())
+    if letters and len(_CJK_RE.findall(sample)) * 3 >= letters:
+        return "zh"
+    return None
 
 
 def t(key: str, locale: Optional[str] = None, **kwargs: object) -> str:

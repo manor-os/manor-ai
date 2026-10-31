@@ -116,6 +116,10 @@ const SCHEMA: Record<string, Field[]> = {
       hint: "On by default. The Workflow fails unless the publisher has observed the external postcondition.",
     },
   ],
+  workflow_effect_deadline: [
+    { key: "deadline_at", label: "Deadline", kind: "text", hint: "Timezone-aware ISO timestamp or a Workflow binding." },
+    { key: "action_keys", label: "Restricted action keys", kind: "json", hint: "Trusted Runtime action keys that may no longer begin after the deadline." },
+  ],
   image: [
     { key: "model", label: "Model", kind: "model", modelRole: "image", hint: "Image model from your catalog. Blank = the account default." },
     { key: "prompt", label: "Prompt", kind: "textarea", hint: "What to generate. Insert a parameter below to use upstream data, e.g. {{scene}}." },
@@ -221,7 +225,7 @@ const SCHEMA: Record<string, Field[]> = {
     { key: "duration_seconds", label: "Duration (s)", kind: "number", hint: "For timer waits — ≤90s runs inline; longer waits pause and resume automatically." },
     { key: "message", label: "Message", kind: "text", hint: "Shown while approval / event waits are paused." },
     { key: "response_variable", label: "Response variable", kind: "text", hint: "Stores the user's decision or response for downstream nodes." },
-    { key: "collection_fields", label: "Information to collect", kind: "json", hint: '[{"key":"artist_name","label":"Artist name","required":true}]. Input waits ask again for any missing fields.' },
+    { key: "collection_fields", label: "Information to collect", kind: "json", hint: '[{"key":"artist_name","label":"Artist name","required":true,"default":"{{analysis.artist}}"}]. Input waits ask again for any missing fields. A default binding prefills the answer for confirmation; suggestions offer alternative one-click answers. Unresolved bindings are dropped.' },
     { key: "fields_per_round", label: "Questions per round", kind: "number", hint: "How many missing fields to ask for at a time. Default: 3." },
     { key: "output_var", label: "Collected information variable", kind: "text", hint: "The complete answers become available to later nodes under this name." },
     { key: "options", label: "Choices", kind: "json", hint: "Approval choices shown in the originating Chat, for example [\"approve\", \"revise\", \"cancel\"]." },

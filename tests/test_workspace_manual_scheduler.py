@@ -127,6 +127,35 @@ async def test_automatic_schedule_still_skips_paused_workspace(manual_schedule):
 
 
 @pytest.mark.asyncio
+async def test_automatic_workflow_schedule_runs_while_workspace_is_paused(
+    manual_schedule,
+    monkeypatch,
+):
+    from packages.core.services import workflow_service
+
+    state = manual_schedule
+    state.job.execution_type = "workflow"
+    state.job.execution_target = {"workflow_id": generate_ulid()}
+    state.job.enabled = True
+    await state.db.flush()
+    start = AsyncMock(return_value=SimpleNamespace(id=generate_ulid()))
+    monkeypatch.setattr(workflow_service, "start_workflow", start)
+
+    dispatch, _run_id = await scheduler_tasks._dispatch_job(
+        state.db,
+        state.job,
+        state.now,
+        manual=False,
+        occurrence_key="every:independent-workflow-occurrence",
+    )
+
+    assert dispatch["kind"] == "workflow"
+    assert start.await_args.kwargs["trigger_source"] == "schedule"
+    assert start.await_args.kwargs["workspace_id"] == state.workspace.id
+    scheduler_tasks._preflight_scheduled_job_credits.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("trigger_type,key", [("cron", "manual:request"), ("manual", "cron:request")])
 async def test_disabled_child_rejects_incomplete_manual_origin(manual_schedule, trigger_type, key):
     state = manual_schedule

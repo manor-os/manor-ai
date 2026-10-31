@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("cold OAuth login returns to consent after one sign-in under StrictMode", async ({ page }) => {
-  await page.route("**/api/v1/oauth/clients/pms-fixture", route => route.fulfill({ json: {
+  await page.route("**/api/v1/oauth/clients/pms-fixture?*", route => route.fulfill({ json: {
     client_id: "pms-fixture", name: "PMS Fixture", redirect_uris: ["https://pms.example/auth/callback"], allowed_scopes: ["openid", "profile", "email"],
   } }));
   await page.goto("/e2e/fixtures/oauth-login.html");

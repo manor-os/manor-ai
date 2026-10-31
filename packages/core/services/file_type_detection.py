@@ -115,7 +115,9 @@ def _resolve_detected_extension(declared_ext: str | None, sniffed_ext: str | Non
         return declared_ext
     if declared_ext == "diagram" and sniffed_ext in {"json", "txt"}:
         return declared_ext
-    if declared_ext in _PRESERVE_DECLARED_TEXT_EXTS and sniffed_ext == "txt":
+    # "csv" only means the first line has a comma: Markdown prose without a
+    # heading matches too, so it never overrides a declared text type.
+    if declared_ext in _PRESERVE_DECLARED_TEXT_EXTS and sniffed_ext in {"txt", "csv"}:
         return declared_ext
     return sniffed_ext or declared_ext
 
@@ -123,6 +125,7 @@ def _resolve_detected_extension(declared_ext: str | None, sniffed_ext: str | Non
 def _detect_extension(path: str) -> str | None:
     try:
         with open(path, "rb") as f:
+            f.seek(0)  # /dev/fd on macOS shares the snapshot's file offset.
             head = f.read(_TEXT_SNIFF_BYTES + 1)
     except OSError:
         return None
@@ -271,6 +274,7 @@ def _validate_json_file(path: str) -> bool | None:
         if os.path.getsize(path) > _MAX_JSON_VALIDATION_BYTES:
             return None
         with open(path, encoding="utf-8") as f:
+            f.seek(0)  # /dev/fd on macOS shares the snapshot's file offset.
             json.load(f)
     except OSError:
         return None

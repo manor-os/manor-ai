@@ -1,5 +1,26 @@
 
-FROM python:3.12-slim
+# Keep the exporter aligned with .github/actions/setup-test-python/action.yml.
+# Pin its multi-platform manifest as well as its version; it is build-only.
+FROM ghcr.io/astral-sh/uv:0.11.12@sha256:3a59a3cdd5f7c217faa36e32dbc7fddbb0412889c2a0a5229f6d790e5a019dd7 AS uv
+FROM python:3.12-slim AS python-dependencies
+WORKDIR /build
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_PYTHON_DOWNLOADS=never
+COPY pyproject.toml uv.lock ./
+COPY docker/python-build-requirements.txt ./
+# Export the base runtime closure (including dependency extras), not dev or
+# optional first-party feature extras. A stale lock must fail, never re-resolve.
+RUN uv export --locked --no-dev --no-default-groups --no-emit-project \
+      --no-annotate --no-header --format requirements.txt --output-file runtime-requirements.txt && \
+    python -m pip download --no-cache-dir --require-hashes --no-deps --only-binary=:all: \
+      --dest tool-wheels -r python-build-requirements.txt && \
+    python -m pip install --no-index --find-links=tool-wheels --require-hashes --no-deps \
+      -r python-build-requirements.txt
+# Preserve the project's metadata/console scripts; application sources still
+# live in /app below. Build isolation must not fetch an unpinned backend.
+RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir project-wheels .
+
+FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
@@ -7,12 +28,15 @@ WORKDIR /app
 # Poppler + Tesseract provide the bounded OCR fallback for image-only PDFs.
 # tini is PID 1 (see ENTRYPOINT): it reaps zombies and forwards SIGTERM to
 # entrypoint.sh, which traps it to unmount JuiceFS cleanly before exit.
+# The display fonts are the faces animated lyric and caption styles name.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini curl ripgrep fuse3 ffmpeg \
     libreoffice-impress libreoffice-writer libreoffice-calc \
     poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
     fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
-    fonts-liberation fonts-noto-core fonts-noto-cjk fonts-roboto && \
+    fonts-liberation fonts-noto-core fonts-noto-cjk fonts-roboto \
+    fonts-bebas-neue fonts-league-spartan fonts-courier-prime fonts-dancingscript \
+    fonts-kaushanscript fonts-comfortaa fonts-ebgaramond && \
     rm -rf /var/lib/apt/lists/* && \
     ARCH=$(dpkg --print-architecture) && \
     curl -sSL "https://github.com/juicedata/juicefs/releases/download/v1.2.3/juicefs-1.2.3-linux-${ARCH}.tar.gz" \
@@ -22,14 +46,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY docker/fontconfig/70-manor-office-fonts.conf /etc/fonts/conf.d/70-manor-office-fonts.conf
 RUN fc-cache -f
 
-# Install Python deps
-COPY pyproject.toml .
-RUN for attempt in 1 2 3; do \
-      pip install --no-cache-dir --default-timeout=300 --retries=8 . && exit 0; \
-      echo "pip install attempt ${attempt} failed; retrying..."; \
-      sleep 10; \
-    done; \
-    exit 1
+# Install exactly the target-active locked wheels. Do not allow an sdist's
+# build isolation or a project install to resolve a second dependency graph.
+COPY pyproject.toml uv.lock ./
+COPY --from=python-dependencies /build/runtime-requirements.txt /usr/local/share/manor/runtime-requirements.txt
+COPY --from=python-dependencies /build/tool-wheels/pip-*.whl /tmp/manor-pip-wheels/
+COPY --from=python-dependencies /build/project-wheels/ /tmp/manor-project-wheels/
+RUN python -m pip install --no-index --no-deps /tmp/manor-pip-wheels/*.whl && \
+    python -m pip install --no-cache-dir --default-timeout=300 --retries=8 \
+      --require-hashes --no-deps --only-binary=:all: \
+      -r /usr/local/share/manor/runtime-requirements.txt && \
+    python -m pip install --no-index --no-deps /tmp/manor-project-wheels/*.whl && \
+    python -m pip check && \
+    rm -rf /tmp/manor-pip-wheels /tmp/manor-project-wheels
 
 # Copy source
 COPY alembic.ini .
@@ -38,6 +67,11 @@ COPY packages/ packages/
 COPY apps/__init__.py apps/__init__.py
 COPY apps/api/ apps/api/
 COPY scripts/ scripts/
+
+# Fail the image build if an installation path bypasses the selected lock.
+RUN python scripts/verify_runtime_dependencies.py \
+      --requirements /usr/local/share/manor/runtime-requirements.txt \
+      --project /app/pyproject.toml --expected-pip-version 26.2.1
 
 # Entrypoint mounts JuiceFS then runs the main command
 COPY docker/entrypoint.sh /entrypoint.sh

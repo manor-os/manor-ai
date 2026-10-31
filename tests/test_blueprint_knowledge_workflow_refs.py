@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from packages.core.blueprints.exporter import ExportContext, ExportError, export_workspace
+from packages.core.blueprints.exporter import ExportContext, ExportError, export_workspace, list_exportable_knowledge_documents
 from packages.core.blueprints.installer import InstallError, InstallMode, install_blueprint, _materialize_workflow_document_refs
 from packages.core.blueprints.knowledge_files import create_starter_file
 from packages.core.blueprints.payload import PayloadError, validate_payload
@@ -48,6 +48,28 @@ def payload():
             "steps": [{"id": "read", "type": "tool", "config": {"tool": "read_file", "arguments": {"knowledge_document_key": "watchlist"}}, "next": ["done"]},
                       {"id": "done", "type": "end", "config": {}, "next": []}]}],
     })
+
+
+@pytest.mark.unit
+def test_initial_file_template_is_portable_without_a_live_renderer():
+    from packages.core.blueprints.knowledge_templates import normalize_knowledge_template
+
+    data = payload()
+    starter = data["embedded"]["knowledge_packs"][0]["starter_documents"][0]
+    starter["template"] = {"id": "creator-watchlist", "mode": "initial_file", "version": 1}
+    validate_payload(data)
+    for invalid in ({"id": ""}, {"version": 0}, {"version": True}, {"renderer": "live-data"}):
+        malformed = copy.deepcopy(data)
+        malformed["embedded"]["knowledge_packs"][0]["starter_documents"][0]["template"].update(invalid)
+        with pytest.raises(PayloadError):
+            validate_payload(malformed)
+    # Legacy raw live-projection payloads normalize before persistence; the
+    # new initial-file contract must not reject their historical spelling.
+    starter["template"] = {"id": 42, "mode": " live_projection ", "renderer": " ledger ", "version": 1}
+    validate_payload(data)
+    assert normalize_knowledge_template(starter["template"]) == {
+        "id": "42", "mode": "live_projection", "renderer": "ledger", "version": 1,
+    }
 
 
 def test_document_refs_preserve_runtime_templates_and_reject_missing_fixed_ids():
@@ -126,6 +148,96 @@ async def test_install_native_read_reexport_and_second_install(db_session, entit
         await export_workspace(db_session, workspace_id=installed.workspace_id, title="Template test", context=ExportContext(knowledge_pack_mode="inline_text", knowledge_document_ids=frozenset()))
     denied = json.loads(await _read_file(entity_id, workspace_id=installed2.workspace_id, **args))
     assert "error" in denied
+
+
+async def test_initial_support_handoff_excludes_runtime_content_and_unmarked_artifacts(
+    db_session, entity_id, fs_settings, isolated_test_redis,
+):
+    from packages.core.constants.blueprints import BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES
+
+    initial = "# Support handoff\n\n## Open tickets\n\n## Next shift\n"
+    data = payload()
+    data["embedded"]["knowledge_packs"] = [{
+        "slug": "support", "title": "Support", "mode": "inline_text", "starter_documents": [{
+            "key": "handoff", "path": "support/handoff.md", "body_md": initial,
+            "template": {"id": "support-handoff", "mode": "initial_file", "version": 1},
+        }],
+    }]
+    workflow_spec = data["recipe"]["workflows"][0]
+    workflow_spec.update(slug="read-handoff", name="Read support handoff")
+    workflow_spec["steps"][0]["config"]["arguments"] = {"knowledge_document_key": "handoff"}
+    data["recipe"]["operating_model"]["app_view"] = {
+        "title": "Support handoff", "hero": "workflow:read-handoff",
+        "order": ["workflow:read-handoff"], "targets": {"workflow:read-handoff": "workflow:read-handoff"},
+    }
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=data, mode=InstallMode.LIVE)
+    await db_session.commit()
+    workflow = (await db_session.scalars(select(WorkflowDefinition).where(WorkflowDefinition.workspace_id == installed.workspace_id))).one()
+    read_step = next(step for step in workflow.steps if step["id"] == "read")
+    doc = await db_session.get(Document, read_step["config"]["arguments"]["document_id"])
+    assert doc.metadata_["blueprint_initial_body_md"] == initial
+    current = "Private ticket evidence.\n" + "x" * BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES
+    doc.metadata_ = {**doc.metadata_, "content_text": current, "artifact": {"storage_scope": "artifact"}}
+    doc.file_size = len(current.encode())
+    write_entity_file_atomic(entity_id, doc.fs_path, current.encode())
+    original_metadata = copy.deepcopy(doc.metadata_)
+    ordinary = Document(
+        entity_id=entity_id, name="incident-output.md", mime_type="text/markdown",
+        visibility="workspace", classification="public", quarantine_status="clean",
+        metadata_={"content_text": "Unmarked runtime incident", "artifact": {"storage_scope": "artifact"}},
+    )
+    db_session.add(ordinary)
+    await db_session.flush()
+    group = (await db_session.scalars(select(DocumentGroup).where(DocumentGroup.workspace_id == installed.workspace_id))).one()
+    db_session.add(DocumentGroupMember(document_id=ordinary.id, group_id=group.id))
+    await db_session.commit()
+
+    selected = ExportContext(knowledge_pack_mode="inline_text", knowledge_document_ids=frozenset({doc.id}))
+    candidates = await list_exportable_knowledge_documents(db_session, entity_id=entity_id, workspace_id=installed.workspace_id)
+    assert [item["id"] for item in candidates] == [doc.id]
+    assert candidates[0]["file_size"] == len(initial.encode())
+    exported = await export_workspace(db_session, installed.workspace_id, title="Support", context=selected)
+    [starter] = exported["embedded"]["knowledge_packs"][0]["starter_documents"]
+    assert starter["body_md"] == initial
+    assert starter["template"] == data["embedded"]["knowledge_packs"][0]["starter_documents"][0]["template"]
+    assert "Private ticket evidence" not in json.dumps(exported)
+    with pytest.raises(ExportError, match="unavailable or ineligible"):
+        await export_workspace(db_session, installed.workspace_id, title="Support", context=ExportContext(
+            knowledge_pack_mode="inline_text", knowledge_document_ids=frozenset({doc.id, ordinary.id}),
+        ))
+    with pytest.raises(ExportError, match="not included"):
+        await export_workspace(db_session, installed.workspace_id, title="Support", context=ExportContext(
+            knowledge_pack_mode="inline_text", knowledge_document_ids=frozenset(),
+        ))
+
+    # Declaring an initial file must never fall back to its current runtime body.
+    missing_body = copy.deepcopy(original_metadata)
+    missing_body.pop("blueprint_initial_body_md")
+    invalid_metadata = [missing_body, {**original_metadata, "blueprint_initial_body_md": ""}]
+    for changes in ({"renderer": "live-data"}, {"version": 0}):
+        invalid_metadata.append({
+            **original_metadata, "blueprint_template": {**original_metadata["blueprint_template"], **changes},
+        })
+    orphaned_initial = {**original_metadata, "content_text": "Current runtime row", "artifact": {}}
+    orphaned_initial.pop("blueprint_template")
+    invalid_metadata.extend([orphaned_initial, {**orphaned_initial, "blueprint_template": None}])
+    for invalid in invalid_metadata:
+        doc.metadata_ = invalid
+        await db_session.flush()
+        assert not await list_exportable_knowledge_documents(db_session, entity_id=entity_id, workspace_id=installed.workspace_id)
+        with pytest.raises(ExportError, match="unavailable or ineligible"):
+            await export_workspace(db_session, installed.workspace_id, title="Support", context=selected)
+    doc.metadata_ = original_metadata
+    doc.visibility = "private"
+    await db_session.flush()
+    assert not await list_exportable_knowledge_documents(db_session, entity_id=entity_id, workspace_id=installed.workspace_id)
+    with pytest.raises(ExportError, match="unavailable or ineligible"):
+        await export_workspace(db_session, installed.workspace_id, title="Support", context=selected)
+    doc.visibility = "workspace"
+    await db_session.flush()
+    await db_session.refresh(doc)
+    assert doc.metadata_ == original_metadata
+    assert Path(fs_settings.MANOR_FS_ROOT, entity_id, doc.fs_path).read_bytes() == current.encode()
 
 
 async def test_document_reference_cannot_borrow_another_workspaces_starter(db_session, entity_id):

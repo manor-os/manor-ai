@@ -153,6 +153,18 @@ def load_workspace_operation_guide(slug: str) -> tuple[str, str]:
     return _guide(markdown, config_text, json.dumps(contract, sort_keys=True, separators=(",", ":")))
 
 
+def load_workspace_operation_preload_guide(slug: str) -> tuple[str, str]:
+    """Render a bounded prompt prelude while preserving the full Skill on demand."""
+    guide, digest = load_workspace_operation_guide(slug)
+    _, config_text = _skill_source(slug)
+    summary = str(json.loads(config_text).get("preload_summary") or "").strip()
+    if not summary:
+        return guide, digest
+    header, catalog = guide.split("\n", 1)
+    catalog_start = catalog.index("Supported tool catalog")
+    return f"{header}\n{summary}\n\n{catalog[catalog_start:]}", digest
+
+
 def _matches(text: str, terms: list[str]) -> bool:
     return any(
         term in text if not term.isascii() else re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text)
@@ -219,7 +231,7 @@ def render_workspace_operation_skills(ctx: Any) -> str | None:
     selected: list[str] = []
     loaded = [{"slug": "workspace-operations", "fingerprint": root_digest}]
     for slug in select_workspace_operation_guides(getattr(ctx, "active_user_message", None), configs):
-        guide, digest = load_workspace_operation_guide(slug)
+        guide, digest = load_workspace_operation_preload_guide(slug)
         selected.append(guide)
         loaded.append({"slug": slug, "fingerprint": digest})
     ctx.runtime_workspace_operation_skills = loaded

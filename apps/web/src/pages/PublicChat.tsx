@@ -184,6 +184,7 @@ export default function PublicChat() {
   const lastActivityAtRef = useRef(Date.now());
   const sendingRef = useRef(false);
   const resumeAttemptedForTokenRef = useRef<string | null>(null);
+  const recoveredMissingSessionRef = useRef(false);
   const requestFence = useRef(createPublicChatRequestFence()).current;
   const cancelAudio = useRef<() => void>(() => {});
   const [audioGeneration, setAudioGeneration] = useState(0);
@@ -198,6 +199,13 @@ export default function PublicChat() {
     token, sessionId, fence: requestFence, headers: authHeaders,
     onInvalidate: clearSensitiveView,
     onDisconnected: startNewPublicChat,
+    onSessionMissing: () => {
+      // Once per page load, so a session that keeps 404ing cannot loop.
+      if (recoveredMissingSessionRef.current) return false;
+      recoveredMissingSessionRef.current = true;
+      startNewPublicChat();
+      return true;
+    },
   });
   const residentDrafts = useResidentMaintenanceDrafts({
     token, sessionId, fence: requestFence, headers: authHeaders,
@@ -209,6 +217,8 @@ export default function PublicChat() {
   const shellStyle = isEmbedded
     ? { ...styles.embedContainer, ...embeddedThemeVariables(true) }
     : styles.container;
+  // Scopes the host-site button colors in index.css to the embedded widget.
+  const shellClassName = isEmbedded ? "public-chat-embed" : undefined;
   const cardStyle = isEmbedded ? { ...styles.card, ...styles.embedCard } : styles.card;
   const chatCardStyle = isEmbedded
     ? { ...styles.card, ...styles.embedCard, display: "flex", flexDirection: "column" as const }
@@ -310,11 +320,18 @@ export default function PublicChat() {
   const startChat = useCallback(async (userOverride?: PublicChatUser | null, fresh = false) => {
     if (!token) return;
     const effectiveUser = userOverride ?? currentUser;
-    const storedSessionId = fresh ? null : getStoredSessionId(token);
-    // A remembered ID alone must never reload a resident-private conversation.
-    if (storedSessionId && !await resident.check(storedSessionId)) {
-      setSessionId(storedSessionId); setStarted(true);
-      return;
+    let storedSessionId = fresh ? null : getStoredSessionId(token);
+    if (storedSessionId) {
+      const access = await resident.check(storedSessionId);
+      if (access === "missing") {
+        // The server dropped this conversation; reusing the ID would 404 forever.
+        forgetStoredSessionId(token);
+        storedSessionId = null;
+      } else if (access !== "allowed") {
+        // A remembered ID alone must never reload a resident-private conversation.
+        setSessionId(storedSessionId); setStarted(true);
+        return;
+      }
     }
     const effectiveName = info?.login_required
       ? displayNameForUser(effectiveUser)
@@ -824,7 +841,7 @@ export default function PublicChat() {
 
   if (!info) {
     return (
-      <div style={shellStyle}>
+      <div className={shellClassName} style={shellStyle}>
         <div style={cardStyle}>
           <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
             {customerText("status.loading")}
@@ -836,7 +853,7 @@ export default function PublicChat() {
 
   if (info.login_required && !authChecked) {
     return (
-      <div style={shellStyle}>
+      <div className={shellClassName} style={shellStyle}>
         <div style={cardStyle}>
           <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
             {customerText("status.loading")}
@@ -851,7 +868,7 @@ export default function PublicChat() {
     const isVerify = customerAuthMode === "verify";
     const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
     return (
-      <div style={shellStyle}>
+      <div className={shellClassName} style={shellStyle}>
         <WebchatPageLayout {...publicPageProps}>
         <div style={cardStyle}>
           <div style={{ padding: "30px 24px" }}>
@@ -1018,7 +1035,7 @@ export default function PublicChat() {
     const currentUserName = displayNameForUser(currentUser);
     const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
     return (
-      <div style={shellStyle}>
+      <div className={shellClassName} style={shellStyle}>
         <WebchatPageLayout {...publicPageProps}>
         <div style={cardStyle}>
           <div style={{ textAlign: "center", padding: "32px 24px" }}>
@@ -1070,7 +1087,7 @@ export default function PublicChat() {
   // Chat screen
   const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
   return (
-    <div style={shellStyle}>
+    <div className={shellClassName} style={shellStyle}>
       <WebchatPageLayout {...publicPageProps}>
       <div style={chatCardStyle}>
         {/* Header */}

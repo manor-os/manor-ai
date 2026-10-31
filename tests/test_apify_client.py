@@ -489,9 +489,11 @@ async def test_mismatched_run_and_unbounded_dataset_fail_closed(monkeypatch):
 
 def test_normalization_filters_utc_window_dedupes_and_keeps_real_media_types():
     items = [
-        {"url": "https://instagram.com/reel/R1/", "type": "Video", "timestamp": "2026-09-17T05:00:00-07:00"},
+        {"url": "https://instagram.com/reel/R1/", "type": "Video", "timestamp": "2026-09-17T05:00:00-07:00",
+         "likesCount": 1520, "commentsCount": 0, "videoViewCount": 9000, "videoPlayCount": 21000},
         {"url": "https://www.instagram.com/reel/R1/", "type": "Video", "timestamp": "2026-09-17T12:00:00Z"},
-        {"url": "https://instagram.com/p/P1/", "type": "Image", "timestamp": "2026-09-03T12:00:00Z"},
+        {"url": "https://instagram.com/p/P1/", "type": "Image", "timestamp": "2026-09-03T12:00:00Z",
+         "likesCount": -1, "commentsCount": True},
         {"url": "https://instagram.com/p/P2/", "type": "Sidecar", "timestamp": "2026-09-10T12:00:00Z"},
         {"url": "https://instagram.com/p/P3/", "type": "Video", "timestamp": "2026-09-10T12:00:00Z"},
         {"url": "https://instagram.com/p/Old/", "timestamp": "2026-09-03T11:59:59Z"},
@@ -500,6 +502,9 @@ def test_normalization_filters_utc_window_dedupes_and_keeps_real_media_types():
     ]
     result = normalize_items(profile(), items)
     assert [item["media_type"] for item in result["items"]] == ["reel", "image", "carousel", "video"]
+    assert result["items"][0]["metrics"] == {"likes": 1520, "comments": 0, "views": 9000, "plays": 21000}
+    # Hidden like counts (-1) and malformed values stay unknown rather than zero.
+    assert result["items"][1]["metrics"] == {"likes": None, "comments": None, "views": None, "plays": None}
     coverage = result["coverage"]
     assert coverage["duplicate_count"] == 1
     assert coverage["out_of_window_count"] == 2

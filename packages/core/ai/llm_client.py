@@ -3,7 +3,8 @@ Shared HTTP client and chat-completion helper for LLM API calls.
 
 - get_llm_client(): reuse a single AsyncClient; closed on app shutdown.
 - chat_completion(): single function for chat completions (used by orchestrator).
-- Retries on 429 with exponential back-off (honours Retry-After header).
+- Retries transient provider failures (no response, dropped stream, 429,
+  5xx) within one attempt cap and time budget; see ``provider_retry``.
 
 Ported from manor-multi-agent/apps/llm_client.py with config inlined (no
 external config module dependency).
@@ -27,6 +28,17 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
+from packages.core.ai import provider_retry
+from packages.core.ai.provider_retry import (
+    LLMEmptyResponseError,
+    LLMRequestDeadlineExceeded,
+    LLMStreamProviderError,
+    LLMStreamStalled,
+    ProviderRetryState,
+    classify_provider_failure,
+    note_provider_failure,
+)
+from packages.core.services.model_provider_adapters import native_chat_adapter_for_base_url
 
 from packages.core.services.model_gateway import (
     GENERIC_SK_PROVIDERS,
@@ -142,6 +154,87 @@ def _resolve_llm_model(raw: str) -> str:
     return raw.strip() if raw else DEFAULT_LLM_MODEL
 
 
+# Reasoning effort for calls that carry tools; ``none`` restores single-pass
+# tool decisions where the model allows it. ``medium``: on a 21-case graded
+# eval (3 runs, gpt-5.6-terra) it answered 20.7/21 vs 18.3 at low, with ~8%
+# fewer prompt tokens (fewer wasted rounds) and the same latency.
+_TOOL_REASONING_EFFORT = (os.getenv("LLM_TOOL_REASONING_EFFORT") or "medium").strip().lower()
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# Thinking budget for tool calls on budget-controlled models.
+_TOOL_REASONING_BUDGET_TOKENS = int(os.getenv("LLM_TOOL_REASONING_BUDGET_TOKENS") or 2048)
+# Gateways that accept the unified ``reasoning`` request object.
+_UNIFIED_REASONING_GATEWAYS = frozenset({"vercel", "openrouter"})
+
+
+def _apply_tool_reasoning_effort(
+    payload: Dict[str, Any], *, model: str, tools: List[Dict[str, Any]], base_url: str,
+) -> None:
+    """Make a tool call reason when its model could otherwise skip it.
+
+    Without reasoning the model decides in a single pass whether to look
+    something up; on staging it answered current-fact and own-document
+    questions from memory instead of calling its tools. The effort comes from
+    the gateway catalogs (:func:`tool_reasoning_effort`). A route owned by a
+    provider-native adapter keeps that provider's own reasoning semantics,
+    which the catalogs do not describe (Kimi K3 natively always reasons at
+    max). A caller's explicit effort is never replaced. A route that rejects
+    reasoning with tools is downgraded to ``none`` once and remembered
+    (``_TOOL_REASONING_DOWNGRADED_ROUTES``).
+    """
+    if (not tools or "reasoning_effort" in payload or "reasoning" in payload
+            or native_chat_adapter_for_base_url(base_url)):
+        return
+    effort = tool_reasoning_effort(model)
+    if effort:
+        payload["reasoning_effort"] = effort
+        return
+    if _TOOL_REASONING_EFFORT == "none" or _provider_from_base_url(base_url) not in _UNIFIED_REASONING_GATEWAYS:
+        return
+    # Models controlled by a switch or a thinking budget rather than effort
+    # levels: the gateways translate the unified reasoning object into each
+    # provider's native form (an Anthropic thinking budget, a Qwen switch).
+    from packages.core.services.model_pricing import cached_reasoning_controls
+
+    controls = cached_reasoning_controls(model)
+    if controls["efforts"]:
+        return  # effort levels without none: the model always reasons
+    budget = controls["budget"]
+    if budget:
+        payload["reasoning"] = {
+            "enabled": True,
+            "max_tokens": max(budget["min"], min(budget["max"], _TOOL_REASONING_BUDGET_TOKENS)),
+        }
+    elif controls["toggle"]:
+        payload["reasoning"] = {"enabled": True}
+
+
+def tool_reasoning_effort(model: str | None) -> str | None:
+    """The effort to request for a tool call, from what the model accepts.
+
+    Read from the synced gateway catalogs, so a new model needs no code. Only
+    a model whose reasoning can be switched off (its catalog lists ``none``)
+    gets an effort: that is where a tool call may otherwise run without
+    reasoning. A model that always reasons keeps its provider default (Kimi
+    K3 defaults to max; requesting ``low`` would only weaken it). The
+    configured effort is used when listed, else the nearest listed one. None
+    when no catalog lists an effort control for the model.
+    """
+    from packages.core.services.model_pricing import cached_reasoning_efforts
+
+    supported = cached_reasoning_efforts(model)
+    if not supported or "none" not in supported:
+        return None
+    wanted = _TOOL_REASONING_EFFORT
+    if wanted in supported:
+        return wanted
+    rank = {effort: index for index, effort in enumerate(_EFFORT_ORDER)}
+    known = sorted((effort for effort in supported if effort in rank), key=rank.__getitem__)
+    if not known or wanted not in rank:
+        return None
+    stronger = [effort for effort in known if rank[effort] >= rank[wanted]]
+    return stronger[0] if stronger else known[-1]
+
+
 def _apply_chat_completion_compatibility(
     payload: Dict[str, Any],
     *,
@@ -150,10 +243,8 @@ def _apply_chat_completion_compatibility(
 ) -> None:
     """Apply model-specific Chat Completions compatibility defaults.
 
-    GPT-5.6 defaults to medium reasoning, while function tools on the Chat
-    Completions endpoint require effective reasoning ``none``. Manor's agent
-    runtime still uses Chat Completions, so make that endpoint constraint
-    explicit without changing reasoning for ordinary text-only calls.
+    Tool-turn reasoning is applied after the native adapter, see
+    :func:`_apply_tool_reasoning_effort`.
 
     GPT-6 Astra does not accept ``temperature`` on OpenAI, Vercel AI Gateway,
     or OpenRouter. Omit Manor's generic sampling default for both plain and
@@ -166,8 +257,6 @@ def _apply_chat_completion_compatibility(
         payload.pop("temperature", None)
         if payload.get("reasoning_effort") == "none":
             payload["reasoning_effort"] = "low"
-    if tools and (bare_model == "gpt-5.6" or bare_model.startswith("gpt-5.6-")):
-        payload.setdefault("reasoning_effort", "none")
 
 
 # Wall-clock time of the first real model-output SSE frame of the call in
@@ -488,6 +577,20 @@ def _base_url_matches_model(base_url: str, model_id: str) -> bool:
     return _provider_matches_model(base_provider, model_provider)
 
 
+def _byok_owner_pays_bound_call(metadata: Dict[str, Any]) -> bool:
+    """Whether a saved key may serve the bound billing context's calls.
+
+    When another company pays (a client delivery trial), only keys resolved
+    for that payer (``_byok_entity_id``) may be used; anything else falls
+    back to the platform route, charged to the payer.
+    """
+    bound = _billing_ctx_var.get()
+    payer = getattr(bound, "payer_entity_id", None) if bound is not None else None
+    if not payer or payer == bound.entity_id:
+        return True
+    return metadata.get("_byok_entity_id") == payer
+
+
 def _metadata_allows_native_byok(metadata: Optional[Dict[str, Any]], key: str) -> bool:
     """Return whether a saved native BYOK credential can serve this request.
 
@@ -498,6 +601,11 @@ def _metadata_allows_native_byok(metadata: Optional[Dict[str, Any]], key: str) -
     """
     if not metadata:
         return True
+    if not _byok_owner_pays_bound_call(metadata):
+        logger.warning(
+            "Ignoring native BYOK key because its owner does not pay for this call; using the platform route."
+        )
+        return False
     model_id = _metadata_model_id(metadata)
     model_provider = _model_provider_prefix(model_id)
     if not model_provider:
@@ -688,6 +796,10 @@ async def resolve_llm_routing_for_model(
 
     model_id = str(model or "").strip()
     if metadata:
+        bound = _billing_ctx_var.get()
+        if bound is not None and not bound.payer_entity_id and bound.workspace_id:
+            # Pin the payer before choosing a key so the owner check applies.
+            await billing_context_payer(bound)
         user_key = metadata.get("llm_api_key") or metadata.get("api_key")
         if user_key and str(user_key).strip():
             key = _sanitize_api_key(str(user_key), "metadata.llm_api_key")
@@ -834,6 +946,64 @@ def get_llm_stream_idle_timeout() -> float:
 
 
 DEFAULT_LLM_STREAM_RESPONSE_TIMEOUT = 60.0
+#: Request sent -> first model output (token, reasoning or tool-call delta).
+#: Hidden reasoning happens before the first token. Workers keep the bound
+#: they had before (60 s to start + 180 s idle); chat gets a shorter one.
+DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT = 120.0
+DEFAULT_WORKER_LLM_STREAM_FIRST_TOKEN_TIMEOUT = 240.0
+#: Ceiling on one streaming request even while it keeps making progress.
+DEFAULT_LLM_STREAM_MAX_DURATION = 900.0
+#: Ceiling on one buffered (non-streaming) request, body upload included.
+#: The longest successful buffered call in the 2026-10-17 eval took 327 s.
+DEFAULT_LLM_REQUEST_DEADLINE = 600.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """``name`` as seconds, else ``default``; ``<= 0`` disables the bound."""
+    raw = os.getenv(name)
+    try:
+        return float(raw) if raw not in (None, "") else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _is_worker_role() -> bool:
+    return (os.getenv("MANOR_SERVICE_ROLE") or "").strip().lower().startswith("worker")
+
+
+def get_llm_stream_first_token_timeout() -> float:
+    """Max seconds from sending a streaming request to its first model output."""
+    default = (
+        DEFAULT_WORKER_LLM_STREAM_FIRST_TOKEN_TIMEOUT if _is_worker_role()
+        else DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT
+    )
+    return _env_seconds("LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS", default)
+
+
+def get_llm_stream_max_duration() -> float:
+    """Max seconds one streaming request may run, however steadily it streams."""
+    return _env_seconds("LLM_STREAM_MAX_DURATION_SECONDS", default=DEFAULT_LLM_STREAM_MAX_DURATION)
+
+
+def get_llm_request_deadline() -> float:
+    """Max wall-clock seconds for one buffered request.
+
+    httpx's ``LLM_TIMEOUT`` bounds each socket read and write, not the
+    request: a body that uploads a little at a time, or a response that
+    trickles keep-alive bytes, never trips it. One buffered fallback in the
+    2026-10-17 eval ran 52 minutes before a WriteTimeout.
+    """
+    return _env_seconds("LLM_REQUEST_DEADLINE_SECONDS", default=DEFAULT_LLM_REQUEST_DEADLINE)
+
+
+def _llm_route_label(url: str) -> str:
+    """``<source>:<host>`` for logs, e.g. ``byok:apitokengate.com``."""
+    try:
+        host = httpx.URL(url).host or "-"
+    except Exception:  # noqa: BLE001 - logging only
+        host = "-"
+    source = "byok" if _is_byok_call.get(False) else (_llm_route_provider.get("") or "platform")
+    return f"{source}:{host}"
 
 
 def get_llm_stream_response_timeout() -> float:
@@ -856,10 +1026,6 @@ def get_llm_stream_response_timeout() -> float:
         return float(DEFAULT_LLM_STREAM_RESPONSE_TIMEOUT)
 
 
-class LLMStreamProviderError(RuntimeError):
-    """The provider answered the stream with an error frame instead of chunks."""
-
-
 def _raise_on_stream_error_chunk(chunk: Any) -> None:
     """Surface an SSE error frame at once instead of waiting for the stream to end.
 
@@ -875,15 +1041,19 @@ def _raise_on_stream_error_chunk(chunk: Any) -> None:
     # populated error (or an explicit error event) is a failure.
     if not error and chunk.get("type") != "error":
         return
+    code = None
+    error_type = None
     if isinstance(error, dict):
         message = str(error.get("message") or error.get("type") or "provider error")
+        code = error.get("code")
+        error_type = str(error.get("type") or "") or None
         metadata = error.get("metadata")
         raw = metadata.get("raw") if isinstance(metadata, dict) else None
         if raw:
             message = f"{message}: {_compact_provider_error_text(str(raw), limit=600)}"
     else:
         message = str(error or "provider error")
-    raise LLMStreamProviderError(message)
+    raise LLMStreamProviderError(message, code=code, error_type=error_type)
 
 
 def _should_skip_buffered_stream_fallback(stream_error: BaseException) -> bool:
@@ -895,14 +1065,88 @@ def _should_skip_buffered_stream_fallback(stream_error: BaseException) -> bool:
     origin timeout and can honour a 524 Retry-After of minutes, which is how
     a failed turn stays open with keepalives instead of ending.
     """
-    if isinstance(stream_error, LLMStreamProviderError):
+    if isinstance(stream_error, (LLMStreamProviderError, LLMStreamStalled)):
         return True
     return isinstance(stream_error, TimeoutError) and "stalled" in str(stream_error)
 
 
+class LLMStreamStartTimeout(TimeoutError):
+    """The streaming response sent no headers within the start bound.
+
+    Not retried as a stream: gateways have been seen holding a rejected
+    streaming request open (an OpenRouter 400 took the full read timeout),
+    so the buffered request is what surfaces the real status.
+    """
+
+
+def _defers_to_cooperative_backoff(failure: Any) -> bool:
+    """A long 429 is the goal runner's to wait out (LLMRateLimited), not ours."""
+    return (
+        failure.status == 429
+        and failure.retry_after is not None
+        and failure.retry_after > _COOPERATIVE_BACKOFF_SECS
+    )
+
+
+def _stream_output_reached_consumer(stream_handler: Any, *, text: bool, tool_drafts: bool) -> bool:
+    """Whether a failed stream showed anything to someone.
+
+    Streamed text or a tool-call draft only counts when the handler does not
+    withhold it: a handler that discards every event (streaming purely for
+    its deadlines) saw nothing a retried call could repeat.
+    """
+    return (
+        text and provider_retry.stream_event_reaches_consumer(stream_handler, "text_delta")
+    ) or (
+        tool_drafts and provider_retry.stream_event_reaches_consumer(stream_handler, "tool_call_draft")
+    )
+
+
+def _stream_failure_uses_buffered_fallback(stream_error: BaseException, *, emitted: bool) -> bool:
+    """Decide what a failed streaming attempt does next.
+
+    ``False`` re-raises: a transient failure before anything reached the
+    caller is retried by the call-level loop (``_call_with_provider_retry``)
+    as a fresh stream, and anything else surfaces. ``True`` keeps the
+    buffered fallback for stream-specific rejections, and for failures after
+    streamed text, which the caller has just withdrawn with ``text_reset``.
+    """
+    if emitted:
+        provider_retry.mark_output_committed()
+    elif provider_retry.current_retry_state() is not None and not isinstance(
+        stream_error, LLMStreamStartTimeout,
+    ):
+        failure = classify_provider_failure(stream_error)
+        if failure.transient and not _defers_to_cooperative_backoff(failure):
+            return False
+    return not _should_skip_buffered_stream_fallback(stream_error)
+
+
+@dataclass(frozen=True)
+class _StreamWatch:
+    """What the stream deadlines and the stall log need about one request."""
+
+    started_at: float  # event-loop clock when the request was sent
+    model: str
+    route: str
+
+
+_STREAM_WATCH_ATTR = "_manor_stream_watch"
+
+
 @asynccontextmanager
 async def _open_llm_stream(client: httpx.AsyncClient, url: str, *, headers: Dict[str, str], json: Dict[str, Any]):
-    """Open a streaming POST with a bound on how long the response may take to start."""
+    """Open a streaming POST with a bound on how long the response may take to start.
+
+    The yielded response carries a ``_StreamWatch`` (request start, model,
+    route) so ``_iter_stream_lines_with_idle_timeout`` measures the
+    first-token and total deadlines from when the request was sent.
+    """
+    watch = _StreamWatch(
+        started_at=asyncio.get_running_loop().time(),
+        model=str((json or {}).get("model") or "-"),
+        route=_llm_route_label(url),
+    )
     manager = client.stream("POST", url, headers=headers, json=json)
     timeout = get_llm_stream_response_timeout()
     try:
@@ -916,9 +1160,13 @@ async def _open_llm_stream(client: httpx.AsyncClient, url: str, *, headers: Dict
             await manager.__aexit__(None, None, None)
         except Exception:  # noqa: BLE001 - best-effort release after a cancel
             pass
-        raise TimeoutError(
+        raise LLMStreamStartTimeout(
             f"LLM streaming response did not start within {timeout:.0f}s"
         ) from exc
+    try:
+        setattr(response, _STREAM_WATCH_ATTR, watch)
+    except (AttributeError, TypeError):  # test doubles without attributes
+        pass
     try:
         yield response
     except BaseException as exc:
@@ -1089,11 +1337,23 @@ class LLMBillingContext:
     """Credits consumed in this request but not necessarily visible in the
     ledger yet. Non-durable automatic billing uses this local counter while
     its write is pending."""
+    payer_entity_id: Optional[str] = None
+    """Who pays for calls in this context; ``entity_id`` stays the data
+    owner. Pinned on first use (``billing_context_payer``) so a delivery
+    phase change mid-context cannot move later calls to another payer."""
+    in_flight_entity_id: Optional[str] = None
+    """The entity whose shared in-flight counter holds ``in_flight_credits``."""
 
 _billing_ctx_var: contextvars.ContextVar[Optional[LLMBillingContext]] = contextvars.ContextVar(
     "llm_billing_ctx", default=None,
 )
 _entity_in_flight_credits: dict[str, int] = {}
+# Whether the provider call being gated was routed to a native BYOK key, set
+# around the preflight of a routed call. In a sponsored trial the route, not
+# the context's byok flag, decides whether the provider's credits are gated.
+_routed_call_byok_var: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar(
+    "llm_routed_call_byok", default=None,
+)
 _entity_in_flight_lock = threading.Lock()
 
 # What the agent loop sent in the current provider call, so automatic billing
@@ -1150,6 +1410,9 @@ def _apply_prompt_cache_key(payload: Dict[str, Any], *, model: str, base_url: st
 # reasoning_effort="none" with a bare "Upstream error: 400", which failed every
 # capability-matcher call; later requests on the route leave it out.
 _REASONING_EFFORT_REJECTED_ROUTES: set[tuple[str, str]] = set()
+# (base_url, model) routes that rejected a reasoning effort with tools and
+# accepted the same request at ``none``; later tool calls there go at ``none``.
+_TOOL_REASONING_DOWNGRADED_ROUTES: set[tuple[str, str]] = set()
 
 
 def _reasoning_effort_route(base_url: str, payload: Dict[str, Any]) -> tuple[str, str]:
@@ -1157,8 +1420,20 @@ def _reasoning_effort_route(base_url: str, payload: Dict[str, Any]) -> tuple[str
 
 
 def _apply_reasoning_effort_route(payload: Dict[str, Any], *, base_url: str) -> None:
-    if "reasoning_effort" in payload and _reasoning_effort_route(base_url, payload) in _REASONING_EFFORT_REJECTED_ROUTES:
-        payload.pop("reasoning_effort")
+    route = _reasoning_effort_route(base_url, payload)
+    if route in _REASONING_EFFORT_REJECTED_ROUTES:
+        payload.pop("reasoning_effort", None)
+        payload.pop("reasoning", None)
+    elif payload.get("reasoning_effort") not in {None, "none"} and payload.get("tools") \
+            and route in _TOOL_REASONING_DOWNGRADED_ROUTES:
+        payload["reasoning_effort"] = "none"
+
+
+def _tool_reasoning_downgrade(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    """The same tool call at reasoning ``none``, when it reasoned at all."""
+    if not payload.get("tools") or payload.get("reasoning_effort") in {None, "none"}:
+        return None
+    return {**payload, "reasoning_effort": "none"}
 
 
 def _is_prompt_cache_key_rejection(exc: httpx.HTTPStatusError) -> bool:
@@ -1182,8 +1457,12 @@ async def llm_billing_context(
     conversation_id: Optional[str] = None,
     source: str = "system",
     byok: bool = False,
+    payer_entity_id: Optional[str] = None,
 ):
     """Context manager: every LLM call within this scope auto-records usage.
+
+    ``payer_entity_id`` is an already resolved payer; without it the payer
+    is resolved and pinned at the first credit check.
 
     Usage:
         async with llm_billing_context("entity_123", source="strategist"):
@@ -1193,7 +1472,7 @@ async def llm_billing_context(
     ctx = LLMBillingContext(
         entity_id=entity_id, user_id=user_id, agent_id=agent_id,
         workspace_id=workspace_id, conversation_id=conversation_id,
-        source=source, byok=byok,
+        source=source, byok=byok, payer_entity_id=payer_entity_id,
     )
     # Restore the *previous* value on exit via set(prev) rather than
     # reset(token). A ContextVar Token is bound to the context that called
@@ -1209,11 +1488,12 @@ async def llm_billing_context(
     finally:
         _billing_ctx_var.set(prev)
 
-# Retry settings for transient LLM provider errors.
+# Retry settings for transient LLM provider errors. Classification and the
+# total time budget (LLM_TRANSIENT_RETRY_BUDGET_SECONDS) live in
+# provider_retry; these cap one model call's attempts and shape its backoff.
 _MAX_RETRIES = 5          # up to 5 retries (6 total attempts)
-_BASE_DELAY  = 1.0        # seconds before first retry
+_BASE_DELAY  = 2.0        # backoff ceiling before the first retry (jittered)
 _MAX_DELAY   = 30.0       # cap on exponential back-off
-_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 524})
 
 # Threshold above which a 429 Retry-After is handled cooperatively by
 # raising LLMRateLimited instead of sleeping in-process.
@@ -1267,6 +1547,17 @@ def _model_supports_image_input(model: str) -> bool | None:
     if modalities is None:
         return None
     return "image" in modalities
+
+
+def model_accepts_image_input(model: str | None) -> bool | None:
+    """Whether the model a completion call for ``model`` uses accepts images.
+
+    Resolves exactly as the completion entrypoints do (alias, then the default
+    primary model when none is named). ``None`` means the model is not
+    classified: callers must send the image and let the provider decide, never
+    treat an unknown model as text-only.
+    """
+    return _model_supports_image_input(_resolve_llm_model(str(model or "").strip() or get_llm_model()))
 
 
 def _log_vision_model_route(
@@ -1440,8 +1731,8 @@ def _looks_like_binary_blob(value: str) -> bool:
 
 def _sanitize_llm_value(value: Any, *, path: Tuple[str, ...] = ()) -> Tuple[Any, int]:
     if isinstance(value, str):
-        # Preserve multimodal `image_url.url` blocks; these are intentionally binary.
-        if len(path) >= 2 and path[-2:] == ("image_url", "url"):
+        # Preserve multimodal `image_url.url` and `input_audio.data` blocks; these are intentionally binary.
+        if len(path) >= 2 and path[-2:] in {("image_url", "url"), ("input_audio", "data")}:
             return value, 0
         if _looks_like_binary_blob(value):
             return (
@@ -1784,6 +2075,39 @@ def _fix_image_mime_types(messages: List[Dict[str, Any]]) -> None:
                     break
     if fixed:
         logger.info("Fixed %d image data URL MIME type(s) in message history", fixed)
+
+
+def _audio_parts_for_base_url(messages: List[Dict[str, Any]], base_url: str) -> List[Dict[str, Any]]:
+    """Messages with OpenAI ``input_audio`` parts in the shape this route accepts.
+
+    OpenRouter and OpenAI-compatible provider endpoints take ``input_audio``
+    as is. The Vercel AI Gateway rejects it and takes the same bytes as a
+    ``file`` part with a media type instead.
+    """
+    host = (urlparse(str(base_url or "")).hostname or "").lower()
+    if not host.endswith("ai-gateway.vercel.sh"):
+        return messages
+    adapted: List[Dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(
+            isinstance(part, dict) and part.get("type") == "input_audio" for part in content
+        ):
+            adapted.append(message)
+            continue
+        parts: List[Any] = []
+        for part in content:
+            audio = part.get("input_audio") if isinstance(part, dict) and part.get("type") == "input_audio" else None
+            if isinstance(audio, dict):
+                audio_format = str(audio.get("format") or "mp3").lower()
+                media_type = "audio/mpeg" if audio_format == "mp3" else f"audio/{audio_format}"
+                parts.append({"type": "file", "file": {
+                    "data": audio.get("data") or "", "media_type": media_type, "filename": f"audio.{audio_format}",
+                }})
+            else:
+                parts.append(part)
+        adapted.append({**message, "content": parts})
+    return adapted
 
 
 def _rewrap_tool_calls_to_openai(
@@ -2329,14 +2653,35 @@ async def _post_chat_with_reasoning_retry(
                 )
                 return await _post_with_response_format_retry(url, headers, retry_payload)
         if (
-            "reasoning_effort" in payload
+            ("reasoning_effort" in payload or "reasoning" in payload)
             and exc.response is not None
             and exc.response.status_code in {400, 422}
         ):
+            downgraded = _tool_reasoning_downgrade(payload)
+            # Only an error about reasoning is worth a second shape; any other
+            # rejection keeps the single existing retry below.
+            if downgraded is not None and "reasoning" in (exc.response.text or "").lower():
+                # A route that refuses reasoning with tools may still accept
+                # the single-pass call; remember it so later calls go straight
+                # there. A model without ``none`` falls through to omitting it.
+                try:
+                    response = await _post_with_retry(url, headers, downgraded)
+                except httpx.HTTPStatusError:
+                    response = None
+                if response is not None:
+                    route = _reasoning_effort_route(url, payload)
+                    _TOOL_REASONING_DOWNGRADED_ROUTES.add(route)
+                    logger.warning(
+                        "%s: %s rejected reasoning_effort=%s with tools; using none (%s)",
+                        call_type, route[1], payload.get("reasoning_effort"), route[0],
+                    )
+                    return response
             # Remembered only when the same request succeeds without it: a
             # model that requires the parameter (gpt-5.6 tool calls) failing
             # for another reason must not lose it on later calls.
-            retry_payload = {key: value for key, value in payload.items() if key != "reasoning_effort"}
+            retry_payload = {
+                key: value for key, value in payload.items() if key not in {"reasoning_effort", "reasoning"}
+            }
             try:
                 response = await _post_chat_with_reasoning_retry(url, headers, retry_payload, call_type=call_type)
             except httpx.HTTPStatusError as retry_error:
@@ -2516,6 +2861,10 @@ def _openai_content_to_anthropic_blocks(content: Any) -> List[Dict[str, Any]]:
 
         if block_type in {"image", "tool_result", "tool_use"}:
             blocks.append(block)
+            continue
+
+        if block_type == "input_audio":
+            blocks.append({"type": "text", "text": "[Audio omitted: this model cannot listen to audio.]"})
             continue
 
         text = block.get("text")
@@ -2840,11 +3189,11 @@ async def _anthropic_messages_completion(
     response_format_fallback = None
     if stream_handler is not None:
         streamed_any_text = False
+        tool_drafts = _ToolCallDraftEmitter(stream_handler)
         try:
             client = await get_llm_client()
             content_parts: List[str] = []
             tool_call_parts: Dict[int, Dict[str, Any]] = {}
-            tool_drafts = _ToolCallDraftEmitter(stream_handler)
             raw_usage: Dict[str, Any] = {}
             finish_reason = ""
             response_model = wire_model
@@ -2971,7 +3320,7 @@ async def _anthropic_messages_completion(
                 content=streamed_completion_text,
             )
             if _is_empty_provider_response(content, finish_reason, usage):
-                raise RuntimeError(
+                raise LLMEmptyResponseError(
                     "empty Anthropic streaming response (no content, finish_reason, or usage)"
                 )
             _record_llm_call(
@@ -2993,7 +3342,12 @@ async def _anthropic_messages_completion(
             format_retry = _unsupported_response_format_retry(stream_error, payload)
             if format_retry is not None:
                 payload, response_format_fallback = format_retry
-            if _should_skip_buffered_stream_fallback(stream_error):
+            emitted = _stream_output_reached_consumer(
+                stream_handler, text=streamed_any_text, tool_drafts=tool_drafts.emitted,
+            )
+            if not _stream_failure_uses_buffered_fallback(
+                stream_error, emitted=emitted,
+            ):
                 logger.warning(
                     "%s Anthropic stream path failed, skipping buffered fallback: %s",
                     call_type,
@@ -3075,6 +3429,11 @@ class _ToolCallDraftEmitter:
     def __init__(self, handler: _StreamHandler) -> None:
         self._handler = handler
         self._sent: Dict[int, Tuple[int, float]] = {}
+
+    @property
+    def emitted(self) -> bool:
+        """A draft reached the caller; a retried call would show a second one."""
+        return bool(self._sent)
 
     async def update(self, index: int, entry: Dict[str, Any]) -> None:
         if self._handler is None or not entry.get("name"):
@@ -3211,12 +3570,60 @@ def ensure_billing_context(entity_id: str, source: str = "system", **kwargs) -> 
 
 
 class CreditExhaustedError(Exception):
-    """Raised when an entity's AI credit balance is exhausted."""
-    def __init__(self, message: str, plan: str = "", limit: float = 0, current: float = 0):
+    """Raised when an entity's AI credit balance is exhausted.
+
+    ``kind`` is ``"trial_credit"`` when the provider paying for a client
+    delivery trial cannot cover the call; the customer cannot fix that by
+    buying credits or upgrading.
+    """
+    def __init__(
+        self, message: str, plan: str = "", limit: float = 0, current: float = 0,
+        *, kind: str = "credit",
+    ):
         super().__init__(message)
         self.plan = plan
         self.limit = limit
         self.current = current
+        self.kind = kind
+
+
+def _trial_credit_exhausted(**kwargs: Any) -> CreditExhaustedError:
+    from packages.core.services.credit_reservations import TRIAL_CREDIT_MESSAGE
+
+    return CreditExhaustedError(TRIAL_CREDIT_MESSAGE, kind="trial_credit", **kwargs)
+
+
+async def billing_context_payer(ctx: LLMBillingContext, *, db: Any | None = None) -> str:
+    """Return who pays for calls in ``ctx``, pinning it on the context.
+
+    ``db`` is reused for the lookup when given; otherwise a short session is
+    opened. A trial whose provider is gone raises a ``trial_credit``
+    ``CreditExhaustedError`` rather than billing the customer.
+    """
+    if ctx.payer_entity_id:
+        return ctx.payer_entity_id
+    from packages.core.services.billing_payer import (
+        TrialSponsorUnavailable,
+        resolve_billing_payer,
+        trial_provider_pays_enabled,
+    )
+
+    if not ctx.workspace_id or not trial_provider_pays_enabled():
+        return ctx.entity_id
+    try:
+        if db is not None:
+            payer = await resolve_billing_payer(db, entity_id=ctx.entity_id, workspace_id=ctx.workspace_id)
+        else:
+            from packages.core.database import async_session
+
+            async with async_session() as own:
+                payer = await resolve_billing_payer(
+                    own, entity_id=ctx.entity_id, workspace_id=ctx.workspace_id,
+                )
+    except TrialSponsorUnavailable as exc:
+        raise _trial_credit_exhausted() from exc
+    ctx.payer_entity_id = payer.entity_id
+    return payer.entity_id
 
 
 class CreditCheckUnavailableError(RuntimeError):
@@ -3287,13 +3694,19 @@ def _get_entity_in_flight_credits(entity_id: str | None) -> int:
         return int(_entity_in_flight_credits.get(entity_id, 0) or 0)
 
 
+def _in_flight_entity_id(billing: LLMBillingContext) -> str:
+    # Credits already counted stay on the entity they were counted for.
+    return billing.in_flight_entity_id or billing.payer_entity_id or billing.entity_id
+
+
 def _track_in_flight_credits(billing: LLMBillingContext, usage: dict, model: str | None, *, byok: bool) -> int:
     if byok:
         return 0
     credits = _usage_to_credit_estimate(usage, model)
     if credits > 0:
+        billing.in_flight_entity_id = _in_flight_entity_id(billing)
         billing.in_flight_credits += credits
-        _add_entity_in_flight_credits(billing.entity_id, credits)
+        _add_entity_in_flight_credits(billing.in_flight_entity_id, credits)
     return credits
 
 
@@ -3304,8 +3717,30 @@ def release_billing_in_flight(billing: LLMBillingContext | None = None) -> None:
     credits = int(getattr(billing, "in_flight_credits", 0) or 0)
     if credits <= 0:
         return
+    in_flight_entity_id = _in_flight_entity_id(billing)
     billing.in_flight_credits = 0
-    _release_entity_in_flight_credits(billing.entity_id, credits)
+    billing.in_flight_entity_id = None
+    _release_entity_in_flight_credits(in_flight_entity_id, credits)
+
+
+def _log_credit_check_failure(message: str, *args: Any, exc: BaseException) -> None:
+    """Separate database admission/availability outages from genuine credit
+    errors in logs; both still fail closed with credit_check_unavailable."""
+    from packages.core.database_runtime import DatabaseFailureKind, database_request_id
+
+    kind = DatabaseFailureKind.from_exception(exc)
+    if kind is DatabaseFailureKind.BUSY:
+        logger.warning(
+            "credit_check_database_busy request_id=%s exception_type=%s: " + message,
+            database_request_id.get(), type(exc).__name__, *args, exc_info=True,
+        )
+    elif kind is not None:
+        logger.warning(
+            "credit_check_database_unavailable request_id=%s exception_type=%s: " + message,
+            database_request_id.get(), type(exc).__name__, *args, exc_info=True,
+        )
+    else:
+        logger.warning(message, *args, exc_info=True)
 
 
 async def _preflight_credit_check(*, session_factory: Any | None = None) -> None:
@@ -3323,10 +3758,19 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
         return
 
     from packages.core.constants.plans import ai_credit_limits_enabled, is_cloud
+    routed_byok = _routed_call_byok_var.get()
+    pinned_payer = getattr(billing, "payer_entity_id", None)
+    sponsored_context = bool(pinned_payer) and pinned_payer != billing.entity_id
+    byok_call = (
+        routed_byok
+        # A sponsored trial follows the route: the provider's byok flag must
+        # not exempt a call that fell back to the platform at its expense.
+        if routed_byok is not None and sponsored_context
+        else getattr(billing, "byok", False) or _is_byok_call.get(False)
+    )
     tenant_credit_check = (
         is_cloud()
-        and not getattr(billing, "byok", False)
-        and not _is_byok_call.get(False)
+        and not byok_call
         and ai_credit_limits_enabled()
     )
     if not billing.workspace_id and not tenant_credit_check:
@@ -3355,10 +3799,10 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                 except CreditExhaustedError:
                     raise
                 except Exception as exc:
-                    logger.warning(
+                    _log_credit_check_failure(
                         "Workspace budget check failed for %s",
                         billing.workspace_id,
-                        exc_info=True,
+                        exc=exc,
                     )
                     raise CreditCheckUnavailableError(
                         "credit_check_unavailable: Unable to verify workspace "
@@ -3368,6 +3812,11 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
             if not tenant_credit_check:
                 return
 
+            # Credits, auto-recharge and the in-flight projection are the
+            # payer's: the provider during a client delivery trial.
+            payer_id = await billing_context_payer(billing, db=db)
+            sponsored = payer_id != billing.entity_id
+
             # Auto-recharge is threshold-based, not only "already exhausted".
             # Run it before the gate so balances below the user's configured
             # threshold can top up without making the next LLM call fail first.
@@ -3375,14 +3824,15 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                 from packages.core.services.billing_service import (
                     check_and_auto_recharge,
                 )
-                if await check_and_auto_recharge(db, billing.entity_id):
-                    await db.commit()
-                else:
-                    await db.rollback()
+                await check_and_auto_recharge(db, payer_id)
+                # Commit either way: a failed attempt's PaymentLog drives the
+                # retry cooldown, and rolling it back made every preflight
+                # call Stripe again with the declining card.
+                await db.commit()
             except Exception:
                 logger.debug("auto-recharge threshold check failed (non-blocking)", exc_info=True)
 
-            result = await check(db, billing.entity_id, "ai_budget_usd")
+            result = await check(db, payer_id, "ai_budget_usd")
             if result.allowed and result.limit is not None:
                 try:
                     from packages.core.services.billing_service import CREDITS_PER_USD
@@ -3390,7 +3840,7 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                     minimum_credits = max(_env_int("LLM_PREFLIGHT_MIN_CREDITS", 1), 0)
                     in_flight_credits = max(
                         int(getattr(billing, "in_flight_credits", 0) or 0),
-                        _get_entity_in_flight_credits(billing.entity_id),
+                        _get_entity_in_flight_credits(payer_id),
                     )
                     projected_current = float(result.current or 0) + (
                         float(in_flight_credits + minimum_credits) / max(CREDITS_PER_USD, 1)
@@ -3400,9 +3850,9 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                             from packages.core.services.billing_service import (
                                 check_and_auto_recharge,
                             )
-                            if await check_and_auto_recharge(db, billing.entity_id):
+                            if await check_and_auto_recharge(db, payer_id):
                                 await db.commit()
-                                result = await check(db, billing.entity_id, "ai_budget_usd")
+                                result = await check(db, payer_id, "ai_budget_usd")
                                 if result.limit is None:
                                     return
                                 projected_current = float(result.current or 0) + (
@@ -3412,6 +3862,12 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                             logger.debug("auto-recharge attempt for in-flight usage failed", exc_info=True)
                         if projected_current < float(result.limit or 0):
                             return
+                        if sponsored:
+                            raise _trial_credit_exhausted(
+                                plan=result.plan,
+                                limit=int(float(result.limit or 0) * CREDITS_PER_USD),
+                                current=int(projected_current * CREDITS_PER_USD),
+                            )
                         raise CreditExhaustedError(
                             (
                                 f"You've used all {int(float(result.limit or 0) * CREDITS_PER_USD):,} "
@@ -3438,7 +3894,7 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                     from packages.core.services.billing_service import (
                         check_and_auto_recharge,
                     )
-                    recharged = await check_and_auto_recharge(db, billing.entity_id)
+                    recharged = await check_and_auto_recharge(db, payer_id)
                     if recharged:
                         await db.commit()
                 except Exception:
@@ -3448,9 +3904,13 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
                     # Re-run the gate against the freshly-credited balance.
                     # If still over, the recharge wasn't enough — fall
                     # through to raise so the caller sees a clean error.
-                    result = await check(db, billing.entity_id, "ai_budget_usd")
+                    result = await check(db, payer_id, "ai_budget_usd")
 
                 if not result.allowed:
+                    if sponsored:
+                        raise _trial_credit_exhausted(
+                            plan=result.plan, limit=result.limit or 0, current=result.current or 0,
+                        )
                     raise CreditExhaustedError(
                         result.message,
                         plan=result.plan,
@@ -3462,11 +3922,19 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
     except Exception as exc:
         # Cloud mode must fail closed: if we cannot verify balance,
         # do not allow billable AI execution to continue.
-        logger.warning("Pre-flight credit check failed (blocking): %s", exc, exc_info=True)
+        _log_credit_check_failure("Pre-flight credit check failed (blocking): %s", exc, exc=exc)
         raise CreditCheckUnavailableError(
             "credit_check_unavailable: Unable to verify credit balance right "
             "now. Please try again shortly."
         ) from exc
+
+
+async def _preflight_routed_call(routing: "ResolvedLLMRouting") -> None:
+    token = _routed_call_byok_var.set(routing.source == "byok")
+    try:
+        await _preflight_credit_check()
+    finally:
+        _routed_call_byok_var.reset(token)
 
 
 async def assert_credit_available(
@@ -3838,13 +4306,15 @@ def _schedule_billing_record(
     """Fire-and-forget LLM-usage write. Persists token totals + cost +
     workspace/agent/user dimensions to ``token_usage_logs`` and the
     credit ledger via ``record_llm_usage``."""
+    in_flight_entity_id = _in_flight_entity_id(billing)
+
     def _release_reserved() -> None:
         if reserved_credits > 0:
             billing.in_flight_credits = max(
                 0,
                 int(getattr(billing, "in_flight_credits", 0) or 0) - int(reserved_credits),
             )
-            _release_entity_in_flight_credits(billing.entity_id, reserved_credits)
+            _release_entity_in_flight_credits(in_flight_entity_id, reserved_credits)
 
     attribution = _context_attribution_var.get()
     if attribution and not any(
@@ -3856,6 +4326,13 @@ def _schedule_billing_record(
         try:
             from packages.core.database import async_session
             from packages.core.services.usage_service import record_llm_usage
+            if billing.payer_entity_id is None:
+                # A context whose credit check was skipped (BYOK, no Workspace
+                # budget) pins its payer on first use, so later calls agree.
+                try:
+                    await billing_context_payer(billing)
+                except CreditExhaustedError:
+                    pass  # record_llm_usage refuses and logs the charge
             async with async_session() as db:
                 await record_llm_usage(
                     db, entity_id=billing.entity_id,
@@ -3863,6 +4340,8 @@ def _schedule_billing_record(
                     workspace_id=billing.workspace_id,
                     conversation_id=billing.conversation_id,
                     usage=usage, duration_ms=duration_ms, source=billing.source,
+                    # None resolves the Workspace's payer at write time.
+                    payer_entity_id=billing.payer_entity_id,
                 )
                 await db.commit()
         finally:
@@ -3999,18 +4478,43 @@ def _sse_data_line_is_heartbeat(line: str) -> bool:
 
 
 async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
-    """Yield meaningful SSE data lines and time out when only heartbeats arrive.
+    """Yield meaningful SSE data lines; raise ``LLMStreamStalled`` when progress stops.
+
+    Three deadlines, each disabled by a value ``<= 0``:
+
+    - first token: from sending the request to the first model output
+      (``LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS``);
+    - idle: between model outputs (``LLM_STREAM_IDLE_TIMEOUT_SECONDS``);
+    - max duration: the whole stream (``LLM_STREAM_MAX_DURATION_SECONDS``).
 
     Providers and gateways commonly keep an otherwise stalled stream alive with
-    blank lines or ``: keep-alive`` comments.  Those transport heartbeats are
-    not model progress and must not reset the user-facing idle timeout.
+    blank lines, ``: keep-alive`` comments or empty deltas. Those heartbeats
+    are not model progress and reset none of the deadlines.
     """
 
-    timeout = get_llm_stream_idle_timeout()
-    iterator = response.aiter_lines().__aiter__()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout if timeout > 0 else None
+    watch = getattr(response, _STREAM_WATCH_ATTR, None)
+    started = watch.started_at if isinstance(watch, _StreamWatch) else loop.time()
+    first_token_timeout = get_llm_stream_first_token_timeout()
+    idle_timeout = get_llm_stream_idle_timeout()
+    max_duration = get_llm_stream_max_duration()
+    ceiling = started + max_duration if max_duration > 0 else None
+    progress_at: Optional[float] = None
+    iterator = response.aiter_lines().__aiter__()
+
+    def _next_deadline() -> Tuple[Optional[float], str]:
+        if progress_at is None:
+            candidates = [(started + first_token_timeout, "first_token")] if first_token_timeout > 0 else []
+        else:
+            candidates = [(progress_at + idle_timeout, "idle")] if idle_timeout > 0 else []
+        if ceiling is not None:
+            candidates.append((ceiling, "max_duration"))
+        if not candidates:
+            return None, ""
+        return min(candidates, key=lambda item: item[0])
+
     while True:
+        deadline, phase = _next_deadline()
         try:
             if deadline is not None:
                 remaining = deadline - loop.time()
@@ -4022,9 +4526,11 @@ async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"LLM streaming response stalled for {timeout:.0f}s without a chunk"
-            ) from exc
+            raise _stream_stalled(response, watch, phase, loop.time() - started, {
+                "first_token": first_token_timeout,
+                "idle": idle_timeout,
+                "max_duration": max_duration,
+            }[phase]) from exc
         stripped = (line or "").strip()
         if (
             not stripped.startswith("data:")
@@ -4035,18 +4541,71 @@ async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
         if _stream_first_output_at.get() is None:
             _stream_first_output_at.set(time.time())
         yield line
-        if timeout > 0:
-            deadline = loop.time() + timeout
+        progress_at = loop.time()
+
+
+#: "stalled" stays in every message: older callers match on it.
+_STALL_MESSAGES = {
+    "first_token": "LLM streaming response stalled: no model output within {limit:.0f}s of the request",
+    "idle": "LLM streaming response stalled for {limit:.0f}s without a chunk",
+    "max_duration": "LLM streaming response stalled: still open past its {limit:.0f}s ceiling",
+}
+
+
+def _stream_stalled(response: Any, watch: Any, phase: str, elapsed: float, limit: float) -> LLMStreamStalled:
+    """Build the stall error and log what is known about the stalled stream."""
+    received = getattr(response, "num_bytes_downloaded", None)
+    bytes_received = received if isinstance(received, int) else None
+    model = watch.model if isinstance(watch, _StreamWatch) else "-"
+    route = watch.route if isinstance(watch, _StreamWatch) else "-"
+    logger.warning(
+        "LLM stream stalled [stalled_stream]: phase=%s model=%s route=%s elapsed_s=%.1f "
+        "limit_s=%.0f bytes_received=%s",
+        phase, model, route, elapsed, limit, "-" if bytes_received is None else bytes_received,
+    )
+    return LLMStreamStalled(
+        _STALL_MESSAGES[phase].format(limit=limit),
+        phase=phase,
+        elapsed=elapsed,
+        bytes_received=bytes_received,
+    )
+
+
+async def _post_within_deadline(
+    client: Any, url: str, *, headers: Dict[str, str], payload: Dict[str, Any],
+) -> httpx.Response:
+    """One buffered POST, bounded as a whole by ``get_llm_request_deadline``."""
+    deadline = get_llm_request_deadline()
+    if deadline <= 0:
+        return await client.post(url, headers=headers, json=payload)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        return await asyncio.wait_for(client.post(url, headers=headers, json=payload), timeout=deadline)
+    except asyncio.TimeoutError as exc:
+        elapsed = loop.time() - started
+        logger.warning(
+            "LLM request deadline exceeded [request_deadline]: model=%s route=%s elapsed_s=%.1f limit_s=%.0f",
+            payload.get("model") or "-", _llm_route_label(url), elapsed, deadline,
+        )
+        raise LLMRequestDeadlineExceeded(
+            f"LLM request did not complete within {deadline:.0f}s",
+            request=httpx.Request("POST", url),
+        ) from exc
+
 
 async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> httpx.Response:
     """
-    POST to `url` with automatic retry on transient provider/proxy failures,
-    connect failures, and ReadTimeout.
-    Honours Retry-After only on HTTP 429; other retryable statuses use
-    exponential back-off: 1 s, 2 s, 4 s ... capped at _MAX_DELAY.
-    Cloudflare 524 is retried once. Retrying a timed-out origin for minutes
-    (or honouring its Retry-After) just multiplies the hang.
-    Raises the last exception if all retries are exhausted.
+    POST to `url`, retrying transient provider/proxy failures.
+
+    What counts as transient, the backoff (exponential with jitter, honouring
+    a short 429 Retry-After), the attempt cap and the time budget all come
+    from ``provider_retry``, and are shared with the call-level stream retry
+    of the same model call, so the two loops never multiply. A long 429
+    raises LLMRateLimited for cooperative backoff; Cloudflare 524 is retried
+    once, since a generation past the proxy's limit fails the same way again.
+    Raises the last exception once the failure is permanent or the budget is
+    spent.
     """
     if not (headers.get("Authorization") or headers.get("x-api-key") or headers.get("X-API-Key")):
         raise LLMAuthConfigurationError("Refusing to send LLM request without an auth header.")
@@ -4065,74 +4624,136 @@ async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str,
             headers[k] = v.encode("ascii", errors="ignore").decode("ascii")
 
     client = await get_llm_client()
-    delay = _BASE_DELAY
+    state = provider_retry.current_retry_state() or _new_provider_retry_state()
 
-    for attempt in range(_MAX_RETRIES + 1):
+    while True:
         try:
-            response = await client.post(url, headers=headers, json=payload)
-        except (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.ReadTimeout,
-            # RemoteProtocolError covers "peer closed connection without sending
-            # complete message body" — common when an upstream proxy or the LLM
-            # provider tears down the connection mid-response.  Retrying with
-            # exponential back-off usually succeeds on the next attempt.
-            httpx.RemoteProtocolError,
-        ) as e:
-            if attempt < _MAX_RETRIES:
-                logger.warning(
-                    "LLM request failed to reach provider (%s, attempt %d/%d); retrying in %.1fs",
-                    e.__class__.__name__,
-                    attempt + 1,
-                    _MAX_RETRIES + 1,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, _MAX_DELAY)
-                continue
-            raise
-        if response.status_code not in _RETRYABLE_HTTP_STATUSES:
+            response = await _post_within_deadline(client, url, headers=headers, payload=payload)
+        except httpx.TransportError as e:
+            failure = classify_provider_failure(e)
+            delay = state.retry_delay(failure)
+            if delay is None:
+                raise
+            logger.warning(
+                "LLM request failed to reach provider (%s, attempt %d/%d); retrying in %.1fs",
+                failure.reason or e.__class__.__name__,
+                state.attempts,
+                state.max_attempts,
+                delay,
+            )
+            await state.wait(delay, failure)
+            continue
+        if response.status_code not in provider_retry.TRANSIENT_HTTP_STATUSES:
             response.raise_for_status()
             return response
-
-        # --- 429 / transient gateway handling ---
-        retry_after = response.headers.get("Retry-After")
-        wait = delay
-        if (
-            response.status_code == 429
-            and retry_after
-            and retry_after.replace(".", "", 1).isdigit()
-        ):
-            wait = float(retry_after)
+        failure = provider_retry.classify_response(response)
 
         # Cooperative backoff: if the provider is telling us to wait longer
         # than a worker should idle, raise LLMRateLimited so the goal runner
         # can release the lease and reschedule rather than pinning a worker
         # in asyncio.sleep. Only applies to 429.
-        if response.status_code == 429 and wait > _COOPERATIVE_BACKOFF_SECS:
+        if _defers_to_cooperative_backoff(failure):
             logger.warning(
                 "HTTP 429 from provider with Retry-After=%.1fs > %ds; "
                 "raising LLMRateLimited for cooperative backoff",
-                wait, _COOPERATIVE_BACKOFF_SECS,
+                failure.retry_after, _COOPERATIVE_BACKOFF_SECS,
             )
             await response.aclose()
-            raise LLMRateLimited(wait)
+            raise LLMRateLimited(failure.retry_after)
 
-        retry_limit = 1 if response.status_code == 524 else _MAX_RETRIES
-        if attempt < retry_limit:
-            logger.warning(
-                "HTTP %s from provider (attempt %d/%d); retrying in %.1fs",
-                response.status_code, attempt + 1, retry_limit + 1, wait,
-            )
-            await asyncio.sleep(wait)
-            delay = min(delay * 2, _MAX_DELAY)
-        else:
-            # Final attempt also failed -- raise it
+        delay = state.retry_delay(failure)
+        if delay is None:
             response.raise_for_status()
+        logger.warning(
+            "HTTP %s from provider (attempt %d/%d); retrying in %.1fs",
+            response.status_code, state.attempts, state.max_attempts, delay,
+        )
+        await state.wait(delay, failure)
 
-    # Should not be reached; satisfy type checker
-    raise RuntimeError("Unexpected exit from retry loop")  # pragma: no cover
+
+def _new_provider_retry_state() -> ProviderRetryState:
+    return ProviderRetryState(
+        max_attempts=max(_MAX_RETRIES, 0) + 1,
+        base_delay=_BASE_DELAY,
+        max_delay=_MAX_DELAY,
+    )
+
+
+def _provider_failure_public_label(failure: Any) -> str:
+    return failure.label if failure is not None else "no response"
+
+
+async def _call_with_provider_retry(attempt: Callable[[], Awaitable[Any]], *, call_type: str) -> Any:
+    """Run one model call, re-running it after a transient provider failure.
+
+    ``attempt`` returns the call's normal result tuple, whose last element is
+    the usage dict; a failed attempt records its classified failure through
+    ``note_provider_failure`` before returning. The loop re-runs an attempt
+    only when that failure is transient, nothing from it reached the caller,
+    and the shared budget allows; otherwise the failure is finalised so the
+    caller can tell an outage (retried, then given up) from a configuration
+    problem.
+    """
+    state = _new_provider_retry_state()
+    token = provider_retry.enter_retry_state(state)
+    try:
+        while True:
+            state.failure = None
+            result = await attempt()
+            usage = result[-1] if isinstance(result, tuple) and result else None
+            failure = state.failure
+            if failure is None or not isinstance(usage, dict) or not usage.get("error"):
+                return result
+            delay = None if state.output_committed else state.retry_delay(failure)
+            if delay is None:
+                return _finalize_provider_failure(result, state, failure)
+            logger.warning(
+                "%s transient provider failure (%s%s, attempt %d/%d); retrying the call in %.1fs",
+                call_type, _provider_failure_public_label(failure),
+                f", {failure.reason}" if failure.reason else "", state.attempts,
+                state.max_attempts, delay,
+            )
+            await state.wait(delay, failure)
+    finally:
+        provider_retry.exit_retry_state(token)
+
+
+def _finalize_provider_failure(result: Tuple[Any, ...], state: ProviderRetryState, failure: Any) -> Tuple[Any, ...]:
+    """Type a transient failure the caller is about to see.
+
+    Permanent failures keep their existing contract (BYOK owners are told to
+    check their settings). A transient one says so, with the attempt count
+    and the time spent, and never sends the owner to their settings.
+    """
+    if not failure.transient:
+        return result
+    usage = dict(result[-1])
+    summary = state.summary()
+    usage["error_transient"] = True
+    usage["error_attempts"] = state.attempts
+    usage["error_elapsed_seconds"] = int(round(state.elapsed_seconds()))
+    usage["error"] = f"{usage.get('error') or ''}\n[transient provider failure {summary}]".strip()[:1200]
+    if usage.get("error_code") == _byok_provider_error_code():
+        detail = str(usage.get("error_public_detail") or "").strip()
+        if detail:
+            usage["error_public_detail"] = f"{detail} {summary}"
+    elif not usage.get("error_code"):
+        from packages.core.ai.runtime.output_policy import LLM_PROVIDER_UNAVAILABLE_ERROR_CODE
+
+        usage["error_code"] = LLM_PROVIDER_UNAVAILABLE_ERROR_CODE
+        usage["error_public_detail"] = f"{_provider_failure_public_label(failure)} {summary}"
+    logger.warning(
+        "LLM call gave up on transient provider failure (%s%s) %s",
+        _provider_failure_public_label(failure),
+        f", {failure.reason}" if getattr(failure, "reason", None) else "", summary,
+    )
+    return (*result[:-1], usage)
+
+
+def _byok_provider_error_code() -> str:
+    from packages.core.ai.runtime.output_policy import BYOK_PROVIDER_ERROR_CODE
+
+    return BYOK_PROVIDER_ERROR_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -4153,10 +4774,39 @@ async def chat_completion(
     """
     Call the configured LLM chat-completions API.  Returns (content, usage_dict).
 
-    Retries on 429; on non-retryable failure returns ("", EMPTY_USAGE).
-    usage_dict includes "finish_reason" key alongside token counts.
-    If metadata is provided, user-level API key and base URL take priority.
+    Transient provider failures are retried (see ``_call_with_provider_retry``);
+    on a failure that is permanent or outlasts the retry budget returns
+    ("", usage) with the error typed in usage. usage_dict includes
+    "finish_reason" key alongside token counts. If metadata is provided,
+    user-level API key and base URL take priority.
     """
+    return await _call_with_provider_retry(
+        lambda: _chat_completion_attempt(
+            messages,
+            temperature=temperature,
+            response_format=response_format,
+            max_tokens=max_tokens,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            stream_handler=stream_handler,
+            metadata=metadata,
+        ),
+        call_type="chat_completion",
+    )
+
+
+async def _chat_completion_attempt(
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float = 0.7,
+    response_format: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    stream_handler: _StreamHandler = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> tuple[str, Dict[str, Any]]:
+    """One attempt of :func:`chat_completion`."""
     requested_model = _resolve_llm_model(model or get_llm_model())
     resolved_model = _resolve_vision_model_if_needed(requested_model, messages)
     metadata_for_call = _route_metadata_for_resolved_model(metadata, requested_model, resolved_model)
@@ -4172,7 +4822,7 @@ async def chat_completion(
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.
-    await _preflight_credit_check()
+    await _preflight_routed_call(routing)
     try:
         _validate_llm_key_model_compatibility(api_key, base_url, resolved_model)
     except LLMAuthConfigurationError as exc:
@@ -4186,7 +4836,9 @@ async def chat_completion(
     # Strip provider prefix when calling the provider directly (not OpenRouter)
     wire_model = normalize_model_for_provider(resolved_model, base_url)
 
-    sanitized_messages = _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=resolved_model)
+    sanitized_messages = _audio_parts_for_base_url(
+        _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=resolved_model), base_url,
+    )
     payload: Dict[str, Any] = {
         "model": wire_model,
         "messages": sanitized_messages,
@@ -4304,7 +4956,7 @@ async def chat_completion(
                 usage["finish_reason"] = finish_reason
                 _attach_reasoning_to_usage(usage, "".join(reasoning_parts))
                 if _is_empty_provider_response(content, finish_reason, usage):
-                    raise RuntimeError("empty streaming LLM response (no content, finish_reason, or usage)")
+                    raise LLMEmptyResponseError("empty streaming LLM response (no content, finish_reason, or usage)")
                 _backfill_streamed_usage(usage, messages=sanitized_messages, content=content)
                 _record_llm_call(
                     call_type="chat_completion",
@@ -4324,7 +4976,12 @@ async def chat_completion(
                 format_retry = _unsupported_response_format_retry(stream_error, payload)
                 if format_retry is not None:
                     payload, response_format_fallback = format_retry
-                if _should_skip_buffered_stream_fallback(stream_error):
+                emitted = _stream_output_reached_consumer(
+                    stream_handler, text=streamed_any_text, tool_drafts=False,
+                )
+                if not _stream_failure_uses_buffered_fallback(
+                    stream_error, emitted=emitted,
+                ):
                     logger.warning(
                         "chat_completion stream path failed, skipping buffered fallback: %s",
                         stream_error,
@@ -4369,6 +5026,7 @@ async def chat_completion(
                 success=False,
                 error=detail,
             )
+            note_provider_failure(LLMEmptyResponseError(detail))
             return "", _failure_usage(resolved_model, detail)
         _record_llm_call(
             call_type="chat_completion",
@@ -4413,6 +5071,7 @@ async def chat_completion(
         if fallback_result is not None:
             return fallback_result
         logger.exception("chat_completion failed: %s", detail)
+        note_provider_failure(e)
         # Return empty content (callers like supervisor prefer empty over
         # canned text) but propagate the error in the usage dict so it
         # can surface in run-detail / debug surfaces.
@@ -4449,6 +5108,39 @@ async def chat_completion_with_tools(
     metadata: Optional[Dict[str, Any]] = None,
     max_tokens: Optional[int] = None,
 ) -> Tuple[str, Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    """Tool-calling completion; transient provider failures are retried.
+
+    See :func:`_chat_completion_with_tools_attempt` for the result contract
+    and :func:`_call_with_provider_retry` for the retry policy.
+    """
+    return await _call_with_provider_retry(
+        lambda: _chat_completion_with_tools_attempt(
+            messages,
+            tools,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            model=model,
+            stream_handler=stream_handler,
+            metadata=metadata,
+            max_tokens=max_tokens,
+        ),
+        call_type="chat_completion_with_tools",
+    )
+
+
+async def _chat_completion_with_tools_attempt(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    *,
+    temperature: float = 0.7,
+    tool_choice: Optional[Any] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    stream_handler: _StreamHandler = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
+) -> Tuple[str, Optional[List[Dict[str, Any]]], Dict[str, Any]]:
     """
     Call the LLM with function/tool definitions (OpenAI-compatible function calling).
 
@@ -4460,7 +5152,8 @@ async def chat_completion_with_tools(
 
     Falls back to regular text completion (tool_calls=None) if:
       - The model/provider does not return tool_calls (graceful degradation)
-    Retries on 429 with exponential back-off.
+    A failed attempt records its classified failure (``note_provider_failure``)
+    so the caller's retry loop can decide whether to run it again.
     """
     requested_model = _resolve_llm_model(model or get_llm_model())
     model = _resolve_vision_model_if_needed(requested_model, messages)
@@ -4478,7 +5171,7 @@ async def chat_completion_with_tools(
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.
-    await _preflight_credit_check()
+    await _preflight_routed_call(routing)
     try:
         _validate_llm_key_model_compatibility(api_key, base_url, model)
     except LLMAuthConfigurationError as exc:
@@ -4489,7 +5182,9 @@ async def chat_completion_with_tools(
 
     wire_model = normalize_model_for_provider(model, base_url)
 
-    sanitized_messages = _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=model)
+    sanitized_messages = _audio_parts_for_base_url(
+        _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=model), base_url,
+    )
     normalized_tools = _normalize_tools_for_llm(tools)
     effective_max_tokens = max_tokens if max_tokens is not None else _DEFAULT_TOOL_CALL_MAX_TOKENS
     payload: Dict[str, Any] = {
@@ -4512,6 +5207,7 @@ async def chat_completion_with_tools(
         model_id=model,
         base_url=base_url,
     )
+    _apply_tool_reasoning_effort(payload, model=model, tools=normalized_tools, base_url=base_url)
     provider_block = _openrouter_provider_block(base_url)
     if provider_block:
         payload["provider"] = provider_block
@@ -4556,6 +5252,7 @@ async def chat_completion_with_tools(
         request_headers = _llm_request_headers(api_key, base_url)
         if stream_handler is not None or _llm_stream_transport_enabled():
             streamed_any_text = False
+            tool_drafts = _ToolCallDraftEmitter(stream_handler)
             try:
                 client = await get_llm_client()
                 stream_payload: Dict[str, Any] = {
@@ -4567,7 +5264,6 @@ async def chat_completion_with_tools(
                 usage["model"] = model
                 content_parts: List[str] = []
                 tool_call_parts: Dict[int, Dict[str, Any]] = {}
-                tool_drafts = _ToolCallDraftEmitter(stream_handler)
                 reasoning_parts: List[str] = []
                 finish_reason = ""
                 async with _open_llm_stream(
@@ -4708,7 +5404,7 @@ async def chat_completion_with_tools(
                     return content, parsed_tool_calls, usage
 
                 if _is_empty_provider_response(content, finish_reason, usage):
-                    raise RuntimeError("empty streaming LLM response (no content, finish_reason, or usage)")
+                    raise LLMEmptyResponseError("empty streaming LLM response (no content, finish_reason, or usage)")
 
                 logger.info(
                     "chat_completion_with_tools(stream): text-only (no tool_calls). finish_reason=%r content_len=%d content_preview=%s",
@@ -4733,7 +5429,12 @@ async def chat_completion_with_tools(
                 format_retry = _unsupported_response_format_retry(stream_error, payload)
                 if format_retry is not None:
                     payload, response_format_fallback = format_retry
-                if _should_skip_buffered_stream_fallback(stream_error):
+                emitted = _stream_output_reached_consumer(
+                    stream_handler, text=streamed_any_text, tool_drafts=tool_drafts.emitted,
+                )
+                if not _stream_failure_uses_buffered_fallback(
+                    stream_error, emitted=emitted,
+                ):
                     logger.warning(
                         "chat_completion_with_tools stream path failed, skipping buffered fallback: %s",
                         stream_error,
@@ -4819,6 +5520,7 @@ async def chat_completion_with_tools(
                 success=False,
                 error=detail,
             )
+            note_provider_failure(LLMEmptyResponseError(detail))
             return _failure_message(detail, model=model), None, _failure_usage(model, detail)
         logger.info(
             "chat_completion_with_tools: text-only (no tool_calls). finish_reason=%r content_len=%d content_preview=%s",
@@ -4883,6 +5585,9 @@ async def chat_completion_with_tools(
                     model_id=fallback,
                     base_url=base_url,
                 )
+                _apply_tool_reasoning_effort(
+                    fallback_payload, model=fallback, tools=normalized_tools, base_url=base_url,
+                )
                 fb_response = await _post_with_response_format_retry(
                     f"{base_url}/chat/completions",
                     headers=dict(request_headers),
@@ -4919,6 +5624,7 @@ async def chat_completion_with_tools(
                 logger.warning("Fallback model also failed: %s", fb_err)
 
         logger.exception("chat_completion_with_tools failed: %s", detail)
+        note_provider_failure(e)
         full_detail = (
             f"{detail}\n"
             f"request: messages={len(sanitized_messages)} tools={len(normalized_tools)} "
@@ -4960,6 +5666,7 @@ async def chat_completion_with_tools(
         if fallback_result is not None:
             return fallback_result
         logger.exception("chat_completion_with_tools timed out: %s", e)
+        note_provider_failure(e)
         return (
             "The request timed out. Please try again -- large tool sets can take longer to process.",
             None,
@@ -4995,6 +5702,7 @@ async def chat_completion_with_tools(
         if fallback_result is not None:
             return fallback_result
         logger.exception("chat_completion_with_tools failed: %s", e)
+        note_provider_failure(e)
         return (
             _failure_message(f"{type(e).__name__}: {e}", model=model),
             None,

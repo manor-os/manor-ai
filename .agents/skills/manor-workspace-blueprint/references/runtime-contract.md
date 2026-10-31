@@ -20,6 +20,7 @@ of feeding them into the runtime round-trip comparison.
 | --- | --- | --- |
 | Workspace shell | kind, operating context, primary work, operating model, safe settings | Exported from Workspace; installed into Workspace columns/settings |
 | Usage guide | optional creator-authored instructions for the installed Workspace | Exported in `manifest.usage_guide`; installed as a Workspace-local snapshot under `settings._blueprint.usage_guide`. It opens after installation and remains available from the header only when the author provides text. It is presentation copy and does not change runtime execution. |
+| Release notes | optional text (at most 1000 characters) telling installers what a new version brings | `manifest.release_notes`; listing copy outside the content fingerprint, so editing it alone moves no version. When an official Blueprint's version moves, the notes go into the update notification sent to installers who are behind. Notes unchanged since the previous release are not resent; the notification names the changed sections instead. Not installed into the Workspace. |
 | Agents | the executable agent definition: prompt/config, tool bindings, and external requirements | Exported and installed when embedded or declared as a requirement |
 | Subscriptions | a Workspace deployment binding from a service key to an Agent; it is not a user account, Task owner, or provider credential | Exported and installed by service key/agent slug; source subscription IDs are replaced |
 | Skills | embedded skill content and external skill requirements | Exported and installed |
@@ -154,6 +155,19 @@ references carrying both a local path and ID must be reduced to the exact ID
 before export. Starter file creation never overwrites an occupied path; ordinary
 transaction rollback removes only its exact new inode, while an uncertain commit
 retains bytes for reconciliation. Existing operator edits are never reset.
+
+An explicit `template: {id, mode: "initial_file", version}` makes `body_md` the
+reviewed seed for new copies; it has no renderer. Installation stores that body
+in `Document.metadata_.blueprint_initial_body_md`, separately from live file
+content. Re-export uses only the frozen body, including when later writes mark
+the file as an artifact. Ordinary artifacts remain excluded. Invalid template
+metadata, a missing/blank seed, or an orphaned seed without its template must
+not fall back to current content. Explicit selection and the existing safety,
+Workspace ownership and size gates still apply. Template configuration updates
+and reviewed upgrade/revert never overwrite current bytes; changing mode or
+path through upgrade is blocked where it would replace live content. Existing
+`live_projection` templates retain their renderer contract and raw-payload
+normalization; installed metadata is normalized before export selection.
 
 ## Packaged built-in Skill identity
 

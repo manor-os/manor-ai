@@ -17,7 +17,7 @@ async def publish_platform_blueprints() -> None:
     published_blueprints: list[dict[str, str]] = []
 
     async with async_session() as db:
-        # Built-in Skills ship in the image. K8s disables API startup side
+        # Built-in Skills ship in the image. Cloud disables API startup side
         # effects, so this post-rollout job is where a deploy's Skill changes
         # reach the database; chat turns only verify them once per process.
         # Same transaction as the Blueprints: a failed publish writes nothing.

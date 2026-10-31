@@ -1,10 +1,10 @@
-"""Plan receipts localize their framing without altering execution evidence."""
+"""Step receipts localize their framing without altering execution evidence."""
 from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
 
-from packages.core.i18n import TRANSLATIONS, _locale_var, t
+from packages.core.i18n import TRANSLATIONS, t
 from packages.core.workspace_chat import notifiers
 
 
@@ -20,49 +20,6 @@ STEPS = [
     },
     {"key": "optional_check", "status": "skipped", "depends_on": []},
 ]
-
-
-@pytest.mark.parametrize("locale", LOCALES)
-@pytest.mark.asyncio
-async def test_completion_localizes_both_projections_and_preserves_artifact_contract(monkeypatch, locale):
-    post = AsyncMock()
-    completion = AsyncMock()
-    monkeypatch.setattr(notifiers, "_safe_post", post)
-    monkeypatch.setattr(notifiers, "_safe_post_completion", completion)
-    steps = deepcopy(STEPS)
-    await notifiers.notify_plan_completed(
-        entity_id="entity", workspace_id="workspace", plan_id="plan", task_id="task",
-        task_title=TITLE, duration_seconds=12.5, cost_usd=0.012, steps=steps, locale=locale,
-    )
-
-    post.assert_awaited_once()
-    completion.assert_awaited_once()
-    thread = post.await_args.kwargs
-    main = completion.await_args.kwargs
-    for payload in (thread, main):
-        body = payload["body"]
-        assert body.startswith(t("task.execution.plan_completed", locale=locale, subject=TITLE))
-        assert SUMMARY in body
-        assert f"[English-report.md](/viewer/{DOCUMENT_ID})" in body
-        assert t("task.execution.files_saved", locale=locale) in body
-        assert t("task.execution.step_skipped", locale=locale) in body
-        assert "12.5s" in body and "$0.012" in body
-        assert payload["refs"] == [{"type": "plan", "id": "plan"}, {"type": "task", "id": "task"}]
-        assert payload["attachments"] == [{
-            "name": "English-report.md", "type": "knowledge", "fileType": "md",
-            "document_id": DOCUMENT_ID, "openUrl": f"/viewer/{DOCUMENT_ID}",
-        }]
-        assert payload["entity_id"] == "entity" and payload["workspace_id"] == "workspace"
-        if locale != "en":
-            assert "Task complete" not in body
-            assert "What was completed" not in body
-            assert "Files and outputs saved" not in body
-    assert t("task.execution.parallel_layer", locale=locale, layer=1) in thread["body"]
-    assert "thread_ref_kind" not in main
-    assert thread["thread_ref_id"] == "plan"
-    assert thread["meta"] == {"feedback_target_kind": "none"}
-    assert main["meta"] == {"feedback_target_kind": "task_completion"}
-    assert steps == STEPS
 
 
 @pytest.mark.parametrize("locale", LOCALES)
@@ -126,29 +83,6 @@ async def test_failed_step_keeps_retry_routing_and_original_error(monkeypatch, l
 
 @pytest.mark.parametrize("locale", LOCALES)
 @pytest.mark.asyncio
-async def test_plan_failure_and_held_receipts_preserve_issue_and_localize_defaults(monkeypatch, locale):
-    post = AsyncMock()
-    monkeypatch.setattr(notifiers, "_safe_post", post)
-    scope = dict(entity_id="entity", workspace_id="workspace", plan_id="0123456789", locale=locale)
-    await notifiers.notify_plan_failed(**scope, error=None)
-    body = post.await_args.kwargs["body"]
-    assert t("task.execution.plan_label", locale=locale, plan_id="01234567") in body
-    assert t("task.execution.unknown_error", locale=locale) in body
-    if locale != "en":
-        assert "Task failed" not in body and "unknown error" not in body
-    post.reset_mock()
-    await notifiers.notify_plan_needs_attention(**scope, task_title=TITLE, issue=SUMMARY, steps=deepcopy(STEPS))
-    assert post.await_count == 2
-    for call in post.await_args_list:
-        body = call.kwargs["body"]
-        assert body.startswith(t("task.execution.plan_needs_attention", locale=locale, subject=TITLE))
-        assert SUMMARY in body
-        if locale != "en":
-            assert "Task needs attention" not in body
-
-
-@pytest.mark.parametrize("locale", LOCALES)
-@pytest.mark.asyncio
 async def test_human_input_translates_wrapper_only_and_preserves_card_origin(monkeypatch, locale):
     post = AsyncMock()
     monkeypatch.setattr(notifiers, "_safe_post", post)
@@ -172,19 +106,6 @@ async def test_human_input_translates_wrapper_only_and_preserves_card_origin(mon
     assert action == original
     await notifiers.notify_step_needs_human(**scope, prompt="", pending_action={"kind": "needs_input"})
     assert post.await_args.kwargs["body"] == t("task.execution.needs_input_title", locale=locale, step_key="write_report")
-
-
-def test_omitted_locale_stays_english_despite_ambient_locale_and_later_calls_do_not_rewrite_receipts():
-    token = _locale_var.set("zh")
-    try:
-        kwargs = dict(plan_id="plan", task_title=TITLE, duration_seconds=1, cost_usd=None, steps=deepcopy(STEPS))
-        original = notifiers._render_plan_completion_summary(**kwargs)
-        assert original.startswith(f"✅ **Task complete — {TITLE}**")
-        translated = notifiers._render_plan_completion_summary(**kwargs, locale="ja")
-        assert "Task complete" not in translated
-        assert original.startswith(f"✅ **Task complete — {TITLE}**")
-    finally:
-        _locale_var.reset(token)
 
 
 @pytest.mark.parametrize("locale", LOCALES)

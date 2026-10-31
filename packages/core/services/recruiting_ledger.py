@@ -35,6 +35,7 @@ from packages.core.services.workspace_artifacts import (
     resolve_workspace_artifact_directory,
 )
 from packages.core.services.workspace_ledger import (
+    LEDGER_PROVENANCE_FIELDS,
     LedgerStorage,
     WorkspaceLedgerError,
     ensure_ledger_location,
@@ -371,7 +372,10 @@ async def read_recruiting_ledger(
 
 
 def _idempotency_payload(event: RecruitingLedgerEvent) -> dict[str, Any]:
-    payload = event.model_dump(mode="json", exclude={"event_id", "recorded_at"})
+    payload = event.model_dump(
+        mode="json",
+        exclude={"event_id", "recorded_at", *LEDGER_PROVENANCE_FIELDS},
+    )
     for ref in payload.get("evidence_refs") or []:
         ref.pop("verified_at", None)
     return payload

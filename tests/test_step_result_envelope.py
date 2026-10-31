@@ -4,8 +4,6 @@ The envelope's guarantee is that ``build_step_result_envelope`` never raises
 and always yields a dict that validates against the envelope schema — which
 makes dispatcher output validation a tautology for envelope-shaped steps.
 """
-import json
-
 import pytest
 from jsonschema import Draft202012Validator
 
@@ -16,30 +14,12 @@ from packages.core.contracts.envelope import (
     is_step_result_envelope_schema,
     step_result_envelope_schema,
 )
-from packages.core.contracts.linker import repair_plan
 from packages.core.contracts.shapes import get_shape
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
-from packages.core.plans.schema import PlanStep
-from packages.core.plans.service import (
-    _resolve_output_shapes,
-    _step_from_pydantic,
-    plan_contract_gaps,
-)
 
 
 def _validate(envelope) -> None:
     Draft202012Validator(step_result_envelope_schema()).validate(envelope)
-
-
-def _llm_step(key, kind="llm", output_shape=None, params=None):
-    p = {"prompt": "do the thing"}
-    if params:
-        p.update(params)
-    return PlanStep(key=key, kind=kind, service_key="content_creation", output_shape=output_shape, params=p)
-
-
-def _plan_row():
-    return type("_PlanRow", (), {"id": "p", "entity_id": "e", "workspace_id": None})()
 
 
 # ── constructor battery: any input → valid envelope, never raises ─────
@@ -167,82 +147,6 @@ def test_step_result_shape_is_registered():
     assert shape.normalize(raw) == build_step_result_envelope(raw)
 
 
-# ── linker: unshaped llm/subagent steps default to the envelope ────────
-
-def test_repair_defaults_unshaped_llm_step_to_step_result():
-    steps = [{"key": "a", "kind": "subagent", "output_shape": None, "input_refs": []}]
-    repaired, remaining = repair_plan(steps)
-    assert repaired[0]["output_shape"] == "StepResult"
-    assert remaining == []
-
-
-def test_repair_keeps_field_inference_over_default():
-    steps = [
-        {"key": "a", "kind": "llm", "output_shape": None, "input_refs": []},
-        {"key": "b", "kind": "llm", "output_shape": "TextResult", "input_refs": [("a", "drafts")]},
-    ]
-    repaired, _ = repair_plan(steps)
-    assert next(s for s in repaired if s["key"] == "a")["output_shape"] == "DraftPack"
-
-
-def test_repair_leaves_action_steps_unshaped():
-    steps = [{"key": "a", "kind": "action", "output_shape": None, "input_refs": []}]
-    repaired, _ = repair_plan(steps)
-    assert repaired[0]["output_shape"] is None
-
-
-def test_plan_contract_gaps_clean_for_unshaped_llm_steps():
-    steps = [
-        _llm_step("a", kind="subagent"),
-        _llm_step("b", params={"prompt": "use ${{ steps.a.result.outputs.text }} when ${{ steps.a.result.status }}"}),
-    ]
-    assert plan_contract_gaps(steps) == []
-
-
-def test_ref_outside_envelope_fields_is_still_a_gap():
-    steps = [
-        _llm_step("a"),
-        _llm_step("b", params={"prompt": "use ${{ steps.a.result.content }}"}),
-    ]
-    gaps = plan_contract_gaps(steps)
-    assert any(g.step_key == "b" and g.kind == "dangling_reference" for g in gaps)
-
-
-# ── materialization: envelope schema, receipt strip, explicit shapes ───
-
-def test_step_from_pydantic_defaults_to_envelope_schema():
-    ps = _llm_step("a", kind="subagent")
-    shapes = _resolve_output_shapes([ps])
-    step = _step_from_pydantic(_plan_row(), ps, max_attempts=3, output_shape=shapes.get("a"))
-    assert step.expected_output_schema == step_result_envelope_schema()
-
-
-def test_step_from_pydantic_strips_receipt_fields_from_surviving_custom_schema():
-    custom = {
-        "type": "object",
-        "required": ["tweet_id", "platform", "post_text"],
-        "properties": {
-            "tweet_id": {"type": "string"},
-            "platform": {"type": "string"},
-            "post_text": {"type": "string"},
-        },
-    }
-    ps = _llm_step("a", kind="subagent").model_copy(update={"expected_output_schema": custom})
-    step = _step_from_pydantic(_plan_row(), ps, max_attempts=3, output_shape=None)
-    assert step.expected_output_schema["required"] == ["post_text"]
-    # Properties are kept — only the requirement is dropped.
-    assert "tweet_id" in step.expected_output_schema["properties"]
-    # The source schema is not mutated.
-    assert custom["required"] == ["tweet_id", "platform", "post_text"]
-
-
-def test_step_from_pydantic_explicit_artifact_shape_unchanged():
-    ps = _llm_step("a", output_shape="ArtifactResult")
-    step = _step_from_pydantic(_plan_row(), ps, max_attempts=3, output_shape="ArtifactResult")
-    assert "files" in step.expected_output_schema["properties"]
-    assert step.expected_output_schema.get("$id") != STEP_RESULT_ENVELOPE_ID
-
-
 # ── dispatcher coercion: envelope steps can never fail validation ──────
 
 @pytest.mark.parametrize("garbage", _BATTERY, ids=[f"case_{i}" for i in range(len(_BATTERY))])
@@ -254,29 +158,3 @@ def test_coerce_step_output_for_envelope_schema_always_validates(garbage):
 def test_coerce_step_output_non_envelope_schema_unchanged():
     schema = {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}
     assert coerce_step_output_for_schema(schema, None) is None
-
-
-# ── planner prompt + JSON hint ─────────────────────────────────────────
-
-def test_planner_prompt_requires_an_explicit_output_contract_per_agent_step():
-    from packages.core.ai.runtime.planning import runtime_planner_system_prompt
-
-    prompt = runtime_planner_system_prompt(
-        subscriptions=[],
-        agents_by_id={},
-        allowed_service_keys=[],
-    )
-    assert "Each llm/subagent declares output_shape OR an exact expected_output_schema" in prompt
-    assert "Do not use generic StepResult" in prompt
-    assert "expected_output_schema" in prompt
-    assert "it never guesses missing fields or shapes" in prompt
-    assert "Runtime owns approval/credit/evidence gates" in prompt
-    assert "steps.KEY.result.FIELD" in prompt
-    # Explicit specialized shapes remain available.
-    assert "ArtifactResult" in prompt
-
-
-def test_plan_json_hint_exposes_exact_step_output_schema():
-    from packages.core.ai.runtime.planning import RUNTIME_PLAN_JSON_HINT
-
-    assert "expected_output_schema" in json.dumps(RUNTIME_PLAN_JSON_HINT)

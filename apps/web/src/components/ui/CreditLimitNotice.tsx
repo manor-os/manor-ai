@@ -1,7 +1,7 @@
 import { useNavigate } from "react-router-dom";
 import type { PlanLimitDetail } from "../../lib/api";
 import { t } from "../../lib/i18n";
-import { planLimitOffersCredits, planLimitTitle } from "../../lib/planLimit";
+import { planLimitOffersCredits, planLimitOffersUpgrade, planLimitTitle } from "../../lib/planLimit";
 import { useConfigStore } from "../../stores/config";
 
 interface Props {
@@ -11,9 +11,12 @@ interface Props {
 
 export default function CreditLimitNotice({ detail, compact = false }: Props) {
   const navigate = useNavigate();
+  // A provider-paid trial stop is not about the viewer's plan: no plan line,
+  // no upgrade, and the viewer's own unlimited credits do not cover it.
+  const offersUpgrade = planLimitOffersUpgrade(detail?.kind);
   // Only the server's loaded config can say credits are unlimited; the
   // local default must not turn a real credit stop into "unlimited".
-  const creditsUnlimited = useConfigStore((s) => s.loaded && s.ai_credits_unlimited);
+  const creditsUnlimited = useConfigStore((s) => s.loaded && s.ai_credits_unlimited) && offersUpgrade;
   const message =
     detail?.message ||
     t("component.upgrade_prompt.default_message");
@@ -75,7 +78,7 @@ export default function CreditLimitNotice({ detail, compact = false }: Props) {
           <div style={{ fontSize: 12, lineHeight: 1.5, color: "#883a35" }}>
             {message}
           </div>
-          {(detail?.limit != null || detail?.current != null || detail?.plan) && (
+          {offersUpgrade && (detail?.limit != null || detail?.current != null || detail?.plan) && (
             <div style={{ fontSize: 11, marginTop: 6, color: "#a23e38" }}>
               {detail?.plan
                 ? t("component.credit_limit_notice.plan_suffix").replace("{plan}", detail.plan)

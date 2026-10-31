@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 from types import SimpleNamespace
@@ -10,7 +11,14 @@ from unittest.mock import AsyncMock
 import pytest
 from PIL import Image
 
-from packages.core.ai.agentic_loop import _file_image_observation
+from packages.core.ai import agentic_loop as loop_module
+from packages.core.ai.agentic_loop import (
+    FILE_VISUAL_HISTORY_MAX_BYTES,
+    _file_image_observation,
+    _file_visual_context_tail,
+    _remember_file_visual_observation,
+)
+from packages.core.ai.runtime.file_images import FILE_IMAGE_DELIVERY_CONTRACT
 from packages.core.ai.tools import file_tools, sandbox_tools
 
 
@@ -67,7 +75,7 @@ async def test_rendered_page_is_a_visual_observation_with_safe_text_result(
     assert "Untrusted" in observation["content"][0]["text"]
     assert observation["content"][1]["image_url"]["url"] == f"data:{mime};base64,{encoded}"
     assert encoded not in safe_result
-    assert json.loads(safe_result)["image"]["delivery"] == "ephemeral_multimodal"
+    assert json.loads(safe_result)["image"]["delivered"] is True
 
 
 @pytest.mark.asyncio
@@ -110,6 +118,94 @@ async def test_visual_projection_rejects_mismatched_file_signature(client):
     assert observation is None
     assert json.loads(safe_result)["image"]["reason"] == "invalid_image_signature"
     assert "base64" not in safe_result
+
+
+def _tool(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {"name": name, "description": name, "parameters": {"type": "object", "properties": {}}},
+    }
+
+
+def _image_read(name: str, raw: bytes) -> str:
+    return json.dumps({
+        "path": name, "resolved_path": name,
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "image": {
+            "data_url": "data:image/png;base64," + base64.b64encode(raw).decode(),
+            "bytes": len(raw),
+            "delivery": FILE_IMAGE_DELIVERY_CONTRACT,
+        },
+    })
+
+
+@pytest.mark.asyncio
+async def test_file_images_remain_available_for_a_later_multiturn_comparison(monkeypatch):
+    first, second = image_bytes("PNG"), image_bytes("PNG") + b"second"
+    calls: list[list[dict]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "", [{"id": "first", "name": "read_file", "arguments": {"path": "product-front.png"}}], {}
+        if len(calls) == 2:
+            return "", [{"id": "second", "name": "read_file", "arguments": {"path": "invoice-page.png"}}], {}
+        return "comparison complete", None, {}
+
+    async def execute(_name, args):
+        return _image_read(args["path"], first if args["path"] == "product-front.png" else second)
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_completion)
+    result = await loop_module.agentic_loop(
+        system_prompt="Compare supplied product and invoice images.", user_message="compare",
+        tools=[_tool("read_file")], tool_executor=execute, max_rounds=4,
+        metadata={"context_window_tokens": 64_000},
+    )
+
+    assert result.content == "comparison complete"
+    third_request = calls[2]
+    images = [block for message in third_request for block in (message.get("content") if isinstance(message.get("content"), list) else []) if block.get("type") == "image_url"]
+    assert len(images) == 2
+    assert any("product-front.png" in str(message.get("content")) for message in third_request)
+    assert any("invoice-page.png" in str(message.get("content")) for message in third_request)
+    assert all("data:image/png;base64" not in str(message.get("content")) for message in result.messages)
+
+
+def test_file_visual_tail_evicts_oldest_images_when_request_budget_is_small():
+    observation = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
+    history = [
+        {"identity": "older", "path": "product-front.png", "document_id": "product-doc", "bytes": 10, "observation": observation},
+        {"identity": "newer", "path": "invoice-page.png", "document_id": "invoice-doc", "bytes": 10, "observation": observation},
+    ]
+    tail = _file_visual_context_tail(history, base_messages=[], tools=[], output_reserve=1_000, window=10_000)
+    assert len([message for message in tail if isinstance(message.get("content"), list)]) == 1
+    assert "invoice-page.png" in " ".join(str(message.get("content")) for message in tail)
+
+
+def test_file_visual_tail_reports_when_no_image_fits_the_request_budget():
+    observation = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
+    tail = _file_visual_context_tail(
+        [{"identity": "invoice", "path": "invoice-page.png", "document_id": "invoice-doc", "bytes": 10, "observation": observation}],
+        base_messages=[], tools=[], output_reserve=1_000, window=8_000,
+    )
+    assert len(tail) == 1
+    assert "no image can fit" in tail[0]["content"]
+    assert _file_visual_context_tail(
+        [], base_messages=[], tools=[], output_reserve=1_000, window=8_000,
+    ) == []
+
+
+def test_file_visual_history_deduplicates_and_evicts_to_its_decoded_byte_limit():
+    history = []
+    observation = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
+    for index, sha in enumerate(("a" * 64, "b" * 64, "a" * 64)):
+        _remember_file_visual_observation(history, observation, json.dumps({
+            "document_id": f"document-{index}", "resolved_path": f"invoice-{index}.png",
+            "source_sha256": sha,
+            "image": {"bytes": FILE_VISUAL_HISTORY_MAX_BYTES // 2 + 1},
+        }))
+    assert [entry["identity"] for entry in history] == ["a" * 64]
+    assert history[0]["document_id"] == "document-2"
 
 
 @pytest.mark.asyncio

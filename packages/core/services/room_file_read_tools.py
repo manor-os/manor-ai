@@ -30,6 +30,7 @@ from packages.core.models.document import Document
 from packages.core.models.user import User
 from packages.core.services.entity_fs import EntityFilesystemError, open_entity_file_snapshot
 from packages.core.services.text_extraction import extract_text
+from packages.core.services.room_file_storage import RoomFileStorageError, copy_room_file_content
 
 
 _MAX_FILES = 30
@@ -303,7 +304,8 @@ async def _read_room_file(
     document = None
     if row.document_id is not None:
         if (
-            row.content is not None or not row.document_entity_id or not row.source_run_id
+            row.content is not None or row.chunk_count is not None
+            or not row.document_entity_id or not row.source_run_id
             or not row.content_sha256
             or re.fullmatch(r"[0-9a-f]{64}", row.content_sha256.lower()) is None
         ):
@@ -327,7 +329,7 @@ async def _read_room_file(
             != row.mime_type.split(";", 1)[0].strip().lower()
         ):
             return {"error": "room_file_unavailable"}
-    elif row.content is None or len(row.content) != row.size:
+    elif row.chunk_count is None and (row.content is None or len(row.content) != row.size):
         return {"error": "room_file_unavailable"}
     file_type = _extractable_type(row.name, row.mime_type)
     if file_type is None or row.size > _MAX_FILE_BYTES:
@@ -368,11 +370,12 @@ async def _read_room_file(
             # copy has a fixed basename and disappears after extraction.
             with tempfile.TemporaryDirectory(prefix="manor-room-read-") as directory:
                 snapshot = Path(directory) / f"attachment.{file_type}"
-                snapshot.write_bytes(row.content)
+                with snapshot.open("xb") as target:
+                    await copy_room_file_content(db, row, target)
                 if file_type in {"docx", "xlsx", "xlsm", "pptx"} and not _safe_office_archive(snapshot):
                     return {**result, "preview_unavailable": True}
                 text = await extract_text(str(snapshot), mime_type=row.mime_type, file_type=file_type)
-    except EntityFilesystemError:
+    except (EntityFilesystemError, RoomFileStorageError):
         return {"error": "room_file_unavailable"}
     except Exception:
         return {**result, "preview_unavailable": True}
@@ -442,12 +445,17 @@ async def read_room_file_source_bytes(
         if not 0 < attachment.size <= _MAX_FILE_BYTES:
             return None
         if attachment.document_id is None:
-            data = attachment.content
-            if data is None or len(data) != attachment.size:
+            try:
+                with tempfile.TemporaryFile() as target:
+                    await copy_room_file_content(db, attachment, target)
+                    target.seek(0)
+                    data = target.read(_MAX_FILE_BYTES + 1)
+            except (OSError, RoomFileStorageError):
                 return None
         else:
             if (
-                attachment.content is not None or not attachment.document_entity_id
+                attachment.content is not None or attachment.chunk_count is not None
+                or not attachment.document_entity_id
                 or not attachment.source_run_id or not attachment.content_sha256
                 or re.fullmatch(r"[0-9a-f]{64}", attachment.content_sha256.lower()) is None
             ):

@@ -659,7 +659,11 @@ async def get_automation_health(
     """Per enabled automation: schedule digest, 30-day run counts from one
     grouped ledger aggregation, failure streak, revision, experiment."""
     workspace = await _require_workspace(db, workspace_id, user.entity_id)
-    if workspace.status != "active":
+    from packages.core.services.workspace_autonomy import (
+        workspace_allows_configured_work,
+    )
+
+    if not workspace_allows_configured_work(workspace):
         return {"automations": []}
 
     jobs = (await db.execute(
@@ -674,6 +678,19 @@ async def get_automation_health(
             WorkflowBinding.enabled.is_(True),
         ).order_by(WorkflowBinding.created_at)
     )).scalars().all()
+
+    if workspace.status == "paused":
+        # Keep this projection aligned with scheduler admission: paused
+        # Workspaces expose only deployments whose own enabled state governs
+        # execution. Strategist and Goal-derived jobs remain lifecycle-owned.
+        from packages.core.services.scheduler_service import (
+            scheduled_job_is_workspace_independent,
+        )
+
+        jobs = [
+            job for job in jobs
+            if await scheduled_job_is_workspace_independent(db, job)
+        ]
 
     # One grouped ledger scan for every automation's last-30d run events.
     since = datetime.now(timezone.utc) - timedelta(days=30)

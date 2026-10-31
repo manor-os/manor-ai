@@ -26,11 +26,12 @@ import TabSwitcher from "../components/ui/TabSwitcher";
 import SmartToolbar from "../components/ui/SmartToolbar";
 import ClientDeliveries from "./clients/ClientDeliveries";
 import { ContactForm, ProfileForm, RecordForm, OwnerField, label, lifecycles, stages, options, profileOf, type CrmRecord, type RecordData, type RecordKind } from "./clients/CrmForms";
+import { getPreferredTimeZone } from "../lib/format";
 
 const pageSize = 25;
 const sections = ["profile", "contacts", "activities", "opportunities", "followups", "delivery"];
 const message = (e:unknown)=>e instanceof Error ? e.message : t("status.error");
-const dateTime = (value:string)=>new Date(value).toLocaleString();
+const dateTime = (value:string)=>new Date(value).toLocaleString(undefined, { timeZone: getPreferredTimeZone() });
 const money = (amount:string,currency:string)=>crmMoney([amount],currency);
 function FilterSelect({title,value,onChange,options:entries}:{title:string;value:string;onChange:(v:string)=>void;options:{value:string;label:string}[]}) {
   return <div className="space-y-1.5"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">{title}</p><Select ariaLabel={title} value={value} onChange={onChange} options={entries} /></div>;

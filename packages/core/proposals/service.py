@@ -1,10 +1,11 @@
 """Proposal / ProposalItem persistence + decision bookkeeping (M7).
 
-The v1 shape: on the strategist_review_v2 path each persisted proposed
-``Task`` also gets a ``proposal_items`` row (kind="task"). The item layer
-never drives execution in v1 — the existing Task status flow does — it
-records the governed decision (who approved/rejected what, why, and
-which execution root it became) so M9/M10 can build on it.
+Every review, on either prompt path, persists one Proposal with an item per
+proposed ``Task`` and per non-task entry (human request, experiment,
+workflow run, configuration change). Task items record the governed
+decision (who approved/rejected what, why, and which execution root it
+became); the Task status flow still drives their execution. Approved
+change items are applied by ``change_executor.apply_change_item``.
 
 All functions are AsyncSession-first and flush (never commit); callers
 own the transaction, matching the strategist service conventions.

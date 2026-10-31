@@ -2,7 +2,7 @@ import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useState, useMemo, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { relativeTime } from "../lib/format";
+import { getPreferredTimeZone, relativeTime } from "../lib/format";
 import { t } from "../lib/i18n";
 import {
   isInternalFilePermissionMessage,
@@ -173,7 +173,7 @@ function MessagePanel({
 
   const formatTime = (ts?: string) => {
     if (!ts) return "";
-    try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
+    try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() }); } catch { return ""; }
   };
   const responseSurfaceSubmissionReceipts = useMemo(
     () => collectResponseSurfaceSubmissionReceipts(messages),

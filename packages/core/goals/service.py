@@ -189,6 +189,27 @@ async def _workspace_allows_goal_schedules(
 
 # ── CRUD ──────────────────────────────────────────────────────────────
 
+def refuse_collaborator_external_measurement(source: object, *, entity_id: str, previous: object = None) -> None:
+    """While a collaborator acts, a Goal they set is measured from Workspace evidence.
+
+    A measurement source backed by a credentialed integration runs the
+    company's connection and writes its readings into the Workspace; a
+    collaborator may keep one a member set, never set or change one (403).
+    """
+    if source == previous or not source:
+        return
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    if not collaborators_acting_now(entity_id):
+        return
+    from packages.core.goals.scheduling import measurement_source_requires_external_provider
+
+    if measurement_source_requires_external_provider(source):
+        from fastapi import HTTPException
+
+        raise HTTPException(403, "External collaborators cannot measure Goals through company integrations")
+
+
 async def create_goal(
     db: AsyncSession,
     *,
@@ -214,6 +235,7 @@ async def create_goal(
     the owning Workspace runtime is enabled (entity-level Goals are not
     runtime-gated).
     """
+    refuse_collaborator_external_measurement(measurement_source, entity_id=entity_id)
     workspace = await lock_workspace_for_goal_mutation(
         db,
         workspace_id=workspace_id,
@@ -367,6 +389,10 @@ async def update_goal(
     goal = await lock_goal_for_mutation(db, goal_id, entity_id=entity_id)
     if not goal:
         return None
+    if "measurement_source" in fields:
+        refuse_collaborator_external_measurement(
+            fields["measurement_source"], entity_id=entity_id, previous=goal.measurement_source,
+        )
     validate_goal_status_transition(goal.status, fields.get("status"))
     if fields.get("current_value") is not None and (goal.stat_id or fields.get("stat_id")):
         raise ValueError("A Stat-linked Goal value must be written through record_measurement or record_stat_assessment")

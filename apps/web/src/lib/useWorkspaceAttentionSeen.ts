@@ -13,10 +13,9 @@ export function useWorkspaceAttentionSeen(
     if (!root.current || !unseenKeys || !Object.keys(unseenKeys).length) return;
     return observeWorkspaceAttention(root.current, async (keys) => {
       await api.workspaces.chat.markAttentionSeen(workspaceId, keys);
-      // Refresh the badge without reprocessing the chat page or moving its
-      // scroll anchor. The observer retains successful receipts until refetch.
+      // Refresh personal read metadata without reprocessing the chat page or
+      // moving its scroll anchor. Pending counts remain unchanged.
       void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-      void queryClient.invalidateQueries({ queryKey: ["workspace-unread-attention", workspaceId] });
     });
   }, [workspaceId, unseenKeys, root, queryClient]);
 }

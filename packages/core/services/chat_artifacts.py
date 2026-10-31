@@ -75,6 +75,7 @@ _GENERATING_TOOL_NAMES = {
 }
 _EXPLICIT_ARTIFACT_TOOL_NAMES = {
     "sandbox_save_result",
+    # Retired tool; kept so persisted transcripts keep their artifact cards.
     "save_sandbox_file",
 }
 _DISPLAY_FLAG_KEYS = (

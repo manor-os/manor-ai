@@ -9,6 +9,7 @@ import json
 from packages.core.ai.runtime.capabilities import (
     AGENT_INITIATIVE_TOOL_NAMES,
     CORE_CAPABILITIES,
+    capability_tool_name,
 )
 from packages.core.ai.runtime.profiles import WORKSPACE_AGENT_TOOL_PROFILE
 from packages.core.constants.agent_capabilities import (
@@ -103,9 +104,22 @@ _AGENT_EAGER_CAPABILITY_TOOLS = {
     "human.input": ("request_input",),
 }
 
+# Server-owned grants every internal Agent holds without an explicit binding
+# (product decision 2026-10-06: every internal principal may use the Sandbox).
+# They are default-deferred: listed in the search_tools hint, loaded by
+# search_tools and called through call_tool, so an Agent that never needs them
+# pays a few prompt tokens rather than their full schemas. External surfaces
+# never receive them: their hard profile allowlist excludes these
+# capabilities, and the authorization boundary refuses them for external
+# principals and surfaces.
+_AGENT_DEFAULT_GRANTED_CAPABILITY_TOOLS = {
+    "sandbox.execute": ("sandbox",),
+}
+
 _AGENT_DEFERRED_CAPABILITY_TOOLS = {
     "response.render": ("render_response_surface",),
     "initiative.manage": AGENT_INITIATIVE_TOOL_NAMES,
+    **_AGENT_DEFAULT_GRANTED_CAPABILITY_TOOLS,
 }
 
 _MASTER_EAGER_CAPABILITY_TOOLS = {
@@ -200,6 +214,22 @@ AGENT_DEFAULT_DEFERRED_TOOLS = frozenset(
     for tool_name in tool_names
 )
 
+AGENT_DEFAULT_GRANTED_TOOLS = frozenset(
+    tool_name
+    for tool_names in _AGENT_DEFAULT_GRANTED_CAPABILITY_TOOLS.values()
+    for tool_name in tool_names
+)
+
+def runtime_tool_is_internal_default_grant(name: str) -> bool:
+    """Whether a tool, or a legacy alias of one, is a server-owned grant.
+
+    Every internal Agent holds these without a durable binding; no external
+    principal or surface ever does.
+    """
+
+    return capability_tool_name(name) in AGENT_DEFAULT_GRANTED_TOOLS
+
+
 def _flatten_capability_tool_subset(capability_tool_names: dict[str, tuple[str, ...]]) -> frozenset[str]:
     return frozenset(
         tool_name
@@ -237,6 +267,7 @@ def _validate_capability_tool_subset(capability_tool_names: dict[str, tuple[str,
 
 _validate_capability_tool_subset(_AGENT_EAGER_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_AGENT_DEFERRED_CAPABILITY_TOOLS)
+_validate_capability_tool_subset(_AGENT_DEFAULT_GRANTED_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_MASTER_EAGER_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS)
@@ -375,12 +406,18 @@ def runtime_tool_surface_spec(
             contextual_capability_ids=tuple(_WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS.keys()),
         )
     if is_master:
+        # The master loads some default grants (the Sandbox) eagerly; they
+        # are not also contextual for it.
         return RuntimeToolSurfaceSpec(
             name="master",
             eager_tool_names=MASTER_ALWAYS_LOADED,
             capability_ids=tuple(_MASTER_EAGER_CAPABILITY_TOOLS.keys()),
-            contextual_tool_names=AGENT_DEFAULT_DEFERRED_TOOLS,
-            contextual_capability_ids=tuple(_AGENT_DEFERRED_CAPABILITY_TOOLS.keys()),
+            contextual_tool_names=AGENT_DEFAULT_DEFERRED_TOOLS - MASTER_ALWAYS_LOADED,
+            contextual_capability_ids=tuple(
+                capability_id
+                for capability_id in _AGENT_DEFERRED_CAPABILITY_TOOLS
+                if capability_id not in _MASTER_EAGER_CAPABILITY_TOOLS
+            ),
         )
     return RuntimeToolSurfaceSpec(
         name="agent",
@@ -512,13 +549,22 @@ def runtime_shadowed_file_generation_tool(
     bound_tool_names: set[str] | None,
     available_tool_names: Iterable[str] | None = None,
 ) -> bool:
-    """Hide duplicate low-level generators when the composite gateway is usable."""
+    """Hide duplicate low-level generators when the composite gateway is usable.
+
+    Shadowing de-duplicates an *implicit* surface (the master's whole registry,
+    or an Agent that holds only the composite gateway). An explicit Agent
+    binding of the generator itself is an execution contract: it stays in the
+    Agent's scope, so a Skill that declares it receives it and an acquisition
+    that binds it actually reaches the runtime.
+    """
 
     if name not in LOW_LEVEL_FILE_GENERATION_TOOLS:
         return False
     if available_tool_names is not None and "generate_file" not in set(available_tool_names):
         return False
-    return bound_tool_names is None or "generate_file" in bound_tool_names
+    if bound_tool_names is None:
+        return True
+    return "generate_file" in bound_tool_names and name not in bound_tool_names
 
 
 def runtime_tool_visible_for_profile(

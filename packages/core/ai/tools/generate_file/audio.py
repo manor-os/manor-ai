@@ -30,4 +30,5 @@ async def handle_audio(
         conversation_id=conversation_id,
         task_id=None if storage_scope == "workspace" else kwargs.get("task_id"),
         agent_id=agent_id,
+        workflow_context=kwargs,
     )

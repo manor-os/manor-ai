@@ -16,7 +16,9 @@ import {
   resolvePresentationPartTarget,
 } from "./presentationOoxml";
 import {
+  PRESENTATION_DEFAULT_TEXT_INSETS,
   presentationInheritedTextStyleLevels,
+  presentationLineSpacingMultiplier,
   type PresentationTextLevelStyle,
 } from "./presentationStyleInheritance";
 import { presentationStrokeDash } from "./presentationShapeStyle";
@@ -76,7 +78,7 @@ export interface PptxShape {
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   vAlign?: "top" | "middle" | "bottom"; // text vertical alignment
   wordWrap?: boolean;
-  padding?: { l: number; t: number; r: number; b: number }; // text insets in %
+  padding?: { l: number; t: number; r: number; b: number }; // text insets in points
   tableRows?: { text: string; bold?: boolean; color?: string; fill?: string }[][];
   tableColWidths?: number[]; // column widths in EMU
   tableCols?: number;
@@ -422,14 +424,15 @@ function parseTextRuns(spXml: string, inheritedLevels?: PresentationTextLevelSty
     }
 
     // Line/paragraph spacing
-    let lineSpacing: number | undefined, spaceBefore: number | undefined, spaceAfter: number | undefined;
+    let lineSpacing: number | undefined, lineSpacingPoints: number | undefined;
+    let spaceBefore: number | undefined, spaceAfter: number | undefined;
     if (pPr) {
       const lnSpc = xmlInner(pPr, "a:lnSpc");
       if (lnSpc) {
         const spcPct = lnSpc.match(/<a:spcPct val="(\d+)"/);
         if (spcPct) lineSpacing = parseInt(spcPct[1], 10) / 100000;
         const spcPts = lnSpc.match(/<a:spcPts val="(\d+)"/);
-        if (spcPts) lineSpacing = parseInt(spcPts[1], 10) / 100 / 12; // approximate pt → line multiplier
+        if (spcPts) lineSpacingPoints = parseInt(spcPts[1], 10) / 100;
       }
       const spcBef = xmlInner(pPr, "a:spcBef");
       if (spcBef) {
@@ -471,7 +474,10 @@ function parseTextRuns(spXml: string, inheritedLevels?: PresentationTextLevelSty
     defFontFamily ??= inherited.fontFamily;
     if (!defRPr || xmlStartTagAttr(defRPr, "b") == null) defBold ||= Boolean(inherited.bold);
     if (!defRPr || xmlStartTagAttr(defRPr, "i") == null) defItalic ||= Boolean(inherited.italic);
-    lineSpacing ??= inherited.lineSpacing;
+    if (lineSpacing == null && lineSpacingPoints == null) {
+      lineSpacing = inherited.lineSpacing;
+      lineSpacingPoints = inherited.lineSpacingPoints;
+    }
     spaceBefore ??= inherited.spaceBefore;
     spaceAfter ??= inherited.spaceAfter;
 
@@ -536,6 +542,9 @@ function parseTextRuns(spXml: string, inheritedLevels?: PresentationTextLevelSty
         firstFontSize = rFontSize; firstColor = rColor; firstFontFamily = rFontFamily;
         isFirst = false;
       }
+    }
+    if (lineSpacingPoints != null) {
+      lineSpacing = presentationLineSpacingMultiplier(lineSpacingPoints, runs.map((run) => run.fontSize), defFontSize);
     }
 
     if (paraText.trim() || paraText.includes("\n")) {
@@ -765,7 +774,7 @@ function parseShape(
   }
 
   // Text body properties (vertical alignment + insets)
-  const bodyPr = xmlInner(spXml, "a:bodyPr");
+  const bodyPr = xmlElementAny(spXml, "a:bodyPr");
   if (bodyPr) {
     const anchor = xmlAttr(bodyPr, "anchor");
     const wrap = xmlAttr(bodyPr, "wrap");
@@ -773,17 +782,17 @@ function parseShape(
     if (anchor === "t") shape.vAlign = "top";
     else if (anchor === "b") shape.vAlign = "bottom";
     else if (anchor === "ctr") shape.vAlign = "middle";
-    // Text insets (EMU → % of slide)
+    // Text insets (EMU → points); unset sides keep the OOXML defaults.
     const lIns = xmlAttr(bodyPr, "lIns");
     const tIns = xmlAttr(bodyPr, "tIns");
     const rIns = xmlAttr(bodyPr, "rIns");
     const bIns = xmlAttr(bodyPr, "bIns");
     if (lIns || tIns || rIns || bIns) {
       shape.padding = {
-        l: lIns ? parseInt(lIns, 10) / 12700 : 7,
-        t: tIns ? parseInt(tIns, 10) / 12700 : 4,
-        r: rIns ? parseInt(rIns, 10) / 12700 : 7,
-        b: bIns ? parseInt(bIns, 10) / 12700 : 4,
+        l: lIns ? parseInt(lIns, 10) / 12700 : PRESENTATION_DEFAULT_TEXT_INSETS.l,
+        t: tIns ? parseInt(tIns, 10) / 12700 : PRESENTATION_DEFAULT_TEXT_INSETS.t,
+        r: rIns ? parseInt(rIns, 10) / 12700 : PRESENTATION_DEFAULT_TEXT_INSETS.r,
+        b: bIns ? parseInt(bIns, 10) / 12700 : PRESENTATION_DEFAULT_TEXT_INSETS.b,
       };
     }
   }

@@ -377,11 +377,12 @@ async def test_canonical_builtin_invocation_honors_legacy_public_agent_binding(m
     )
 
     if matching_source:
-        assert result.get("content") == "ok"
-        executor.assert_awaited_once()
+        # The legacy binding is honored; the external surface then stops at
+        # the Sandbox boundary instead of allocating a container.
+        assert result["code"] == "skill_surface_not_allowed"
     else:
         assert result["code"] == "skill_not_bound_to_agent"
-        executor.assert_not_awaited()
+    executor.assert_not_awaited()
 
 
 def test_skill_source_sha256_reuses_digest_until_a_file_changes(tmp_path: Path, monkeypatch):

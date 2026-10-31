@@ -107,7 +107,7 @@ async def test_known_chrome_effects_obey_current_policy_on_every_surface(db_sess
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["automatic", "confirm_changes", "risk_based"])
-async def test_unknown_workflow_impact_obeys_the_selected_mode(db_session, mode):
+async def test_unknown_workflow_impact_obeys_the_selected_mode(undeclared_effects_allowed, db_session, mode):
     ids, run = await _running_workflow(db_session, mode=mode)
     result = await check_step_policy(db_session, **ids, workflow_run_id=run.id,
         kind="action", action_key="unclassified.action", risk_level="medium")
@@ -140,7 +140,9 @@ async def test_risk_based_workflow_guard_blocks_unresolved_chrome_actions(
         assert classification.action is None
     else:
         _, impact = runtime_policy_action_for_classification(classification)
-        assert impact is None  # A dynamic Chrome category is not a known external effect.
+        # A dynamic Chrome category is not a known external effect: the
+        # factory declares it unknown (the effect contract never leaves None).
+        assert impact == "unknown"
     ids, run = await _running_workflow(db_session, mode="risk_based")
     envelope = replace(_runtime_envelope(ids, name=name), surface=ChatSurface.WORKFLOW_AGENT_STEP)
     result = await guard_runtime_tool_action(

@@ -1,7 +1,8 @@
-import { createBrowserRouter, Navigate, useLocation } from "react-router-dom";
+import { createBrowserRouter, Navigate, useLocation, type RouteObject } from "react-router-dom";
 import { Suspense, lazy, useEffect } from "react";
 import ProtectedRoute from "./components/ProtectedRoute";
 import RouteErrorBoundary from "./components/RouteErrorBoundary";
+import RouterRoot from "./components/RouterRoot";
 import WorkflowLegacyRedirect from "./components/workflows/WorkflowLegacyRedirect";
 import { PageLoading } from "./components/ui/Skeleton";
 import Button from "./components/ui/Button";
@@ -18,6 +19,9 @@ const AppLayout = lazy(() => import("./layouts/AppLayout"));
 const Login = lazy(() => import("./pages/Login"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Tasks = lazy(() => import("./pages/Tasks"));
+const TaskImport = lazy(() => import("./pages/TaskImport"));
+const TaskImportEmbed = lazy(() => import("./pages/TaskImportEmbed"));
+const CalendarPickerEmbed = lazy(() => import("./pages/CalendarPickerEmbed"));
 const TaskDetail = lazy(() => import("./pages/TaskDetail"));
 const TaskBoard = lazy(() => import("./pages/TaskBoard"));
 const TaskCollections = lazy(() => import("./pages/TaskCollections"));
@@ -48,6 +52,7 @@ const Users = lazy(() => import("./pages/Users"));
 const Activity = lazy(() => import("./pages/Activity"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Notifications = lazy(() => import("./pages/Notifications"));
+const ApprovalRequest = lazy(() => import("./pages/ApprovalRequest"));
 const Clients = lazy(() => import("./pages/Clients"));
 const ClientDelivery = lazy(() => import("./pages/ClientDelivery"));
 const WorkspaceCollaboration = lazy(() => import("./pages/WorkspaceCollaboration"));
@@ -104,8 +109,20 @@ function PreviewFeatureRoute({
   return <>{children}</>;
 }
 
-export const router = createBrowserRouter([
+const routes: RouteObject[] = [
+  {
+    path: "/calendar-picker/embed",
+    element: <Suspense fallback={<PageLoading />}><CalendarPickerEmbed /></Suspense>,
+  },
   // Public routes
+  {
+    path: "/task-import/embed",
+    element: <Suspense fallback={<PageLoading />}><TaskImportEmbed /></Suspense>,
+  },
+  {
+    path: "/task-import",
+    element: <Suspense fallback={<PageLoading />}><TaskImport /></Suspense>,
+  },
   {
     path: "/login",
     element: (
@@ -379,6 +396,14 @@ export const router = createBrowserRouter([
             element: (
               <S>
                 <Notifications />
+              </S>
+            ),
+          },
+          {
+            path: "/approvals/:requestId",
+            element: (
+              <S>
+                <ApprovalRequest />
               </S>
             ),
           },
@@ -703,4 +728,8 @@ export const router = createBrowserRouter([
       </S>
     ),
   },
+];
+
+export const router = createBrowserRouter([
+  { element: <RouterRoot />, errorElement: <RouteErrorBoundary />, children: routes },
 ]);

@@ -21,9 +21,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
-from packages.core.constants.execution import (
-    WorkerStatus,
-)
 from packages.core.ai.runtime.capability_bindings import (
     normalize_workspace_custom_agent_tool_bindings,
 )
@@ -57,7 +54,6 @@ from packages.core.services.workspace_access import (
 from packages.core.services.workspace_ledger_matching import (
     settings_with_business_ledgers,
 )
-from packages.core.workers.protocol import CURRENT_WORKER_PROTOCOL_VERSION
 # Task import previously used by the seeded starter task; removed
 # along with the seed in finalize_setup. Add back if any task creation
 # moves into setup again.
@@ -895,10 +891,43 @@ def _explicit_rule_capability_patterns(rule: dict[str, Any]) -> list[str]:
     return []
 
 
+def _rule_selector_dicts(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    selectors = rule.get("approval_selectors")
+    return [s for s in selectors if isinstance(s, dict)] if isinstance(selectors, list) else []
+
+
+def _rule_action_keys(rule: dict[str, Any]) -> list[str]:
+    keys = list(_explicit_rule_patterns(rule)) + [
+        str(selector.get("action_key") or "")
+        for selector in _rule_selector_dicts(rule)
+        if selector.get("kind") in {"action", "resource"}
+    ]
+    return list(dict.fromkeys(keys))
+
+
+def ungateable_rule_action_keys(rule: dict[str, Any]) -> list[str]:
+    """Action keys in ``rule`` that no runtime call carries, so they gate nothing."""
+    from packages.core.ai.runtime.approval_classifier import runtime_action_key_is_gateable
+
+    return [key for key in _rule_action_keys(rule) if not runtime_action_key_is_gateable(key)]
+
+
+def _rule_can_gate(rule: dict[str, Any]) -> bool:
+    if _explicit_rule_capability_patterns(rule) or any(
+        selector.get("kind") == "category" for selector in _rule_selector_dicts(rule)
+    ):
+        return True
+    return len(ungateable_rule_action_keys(rule)) < len(_rule_action_keys(rule))
+
+
 def _infer_rule_enforcement(rule: dict[str, Any]) -> dict[str, Any] | None:
     explicit_capability_patterns = _explicit_rule_capability_patterns(rule)
     explicit_patterns = _explicit_rule_patterns(rule)
     if not explicit_patterns and not explicit_capability_patterns and not rule.get("approval_selectors"):
+        return None
+    if not _rule_can_gate(rule):
+        # Every selector names an action no call carries: the rule is guidance,
+        # whatever its type says, and must not be reported as enforced.
         return None
 
     patterns = explicit_patterns
@@ -1002,6 +1031,8 @@ def user_requested_hard_block(text: str) -> bool:
 _APPROVAL_RULE_TYPES = frozenset({
     "approval_required", "hitl_required", "require_approval", "review_required",
 })
+# Rule types that compile into an approval rule (approval_projection effects).
+ENFORCING_RULE_TYPES = _HARD_BLOCK_RULE_TYPES | _APPROVAL_RULE_TYPES | {"auto_approve", "allow", "exception"}
 
 
 def rule_enforcement_conflicts(rules: Any) -> list[dict[str, Any]]:
@@ -1456,57 +1487,6 @@ async def finalize_setup(
         raise WorkspaceProvisioningError(
             "Workspace services could not be materialized: " + ", ".join(missing_service_keys)
         )
-
-    # Ensure entity has an InternalWorker, then bind all subscriptions to it.
-    # Without this, the Dispatcher can't assign plan steps to any executor.
-    if created_subs:
-        try:
-            from packages.core.models.worker import Worker, SubscriptionWorker
-            worker = (await db.execute(
-                select(Worker).where(
-                    Worker.entity_id == session.entity_id,
-                    Worker.kind == "internal",
-                    Worker.status == WorkerStatus.ACTIVE,
-                ).limit(1)
-            )).scalar_one_or_none()
-
-            # Auto-create internal worker if none exists for this entity
-            if not worker:
-                worker = Worker(
-                    id=generate_ulid(),
-                    entity_id=session.entity_id,
-                    kind="internal",
-                    display_name="Manor Internal Worker",
-                    status="active",
-                    capabilities={
-                        "supported_kinds": ["llm", "action", "subagent", "sleep", "human"],
-                        "max_risk_level": "high",
-                        "supported_providers": None,
-                        "max_concurrent_leases": 4,
-                        "protocol_version": int(CURRENT_WORKER_PROTOCOL_VERSION),
-                        "deployment": "local",
-                        "uses_manor_credentials": True,
-                    },
-                )
-                db.add(worker)
-                await db.flush()
-                logger.info("Auto-created internal worker %s for entity %s", worker.id, session.entity_id)
-            else:
-                capabilities = dict(worker.capabilities or {})
-                capabilities["protocol_version"] = int(CURRENT_WORKER_PROTOCOL_VERSION)
-                worker.capabilities = capabilities
-
-            for sub_data in created_subs:
-                db.add(SubscriptionWorker(
-                    worker_id=worker.id,
-                    subscription_id=sub_data["subscription_id"],
-                ))
-            await db.flush()
-        except Exception as exc:
-            logger.exception("Failed to bind subscriptions to worker for workspace %s", workspace_id)
-            raise WorkspaceProvisioningError(
-                "Could not bind workspace services to an executable worker"
-            ) from exc
 
     _report("agents_done", count=len(created_subs))
 
@@ -2167,9 +2147,9 @@ async def finalize_setup(
         logger.exception("Failed to seed workspace state/file caches for %s", workspace_id)
 
     # ── Apply the explicit autonomous-runtime choice ──────────────────
-    # A workspace can be active with or without Goals, and with or without
-    # autonomous Strategist scheduling.  Executable services remain the
-    # readiness boundary; Goals are optional direction/measurement metadata.
+    # Goals remain optional direction/measurement metadata. For new UI-mode
+    # Workspaces, ``active`` means the Strategist is enabled; Workflow/manual
+    # mode stays ``paused`` while its own enabled deployments remain runnable.
     heartbeat_cadence = (
         fields.get("heartbeat_cadence")
         or operating_model.get("heartbeat_cadence")
@@ -2182,7 +2162,17 @@ async def finalize_setup(
             operating_model.get("heartbeat_enabled", False),
         )
     )
-    workspace.status = "active" if runtime_ready else "needs_setup"
+    # A creation UI draft explicitly records whether the Strategist owns the
+    # Workspace runtime. Workflow/manual mode remains available for its own
+    # enabled deployments, but its Strategist starts paused. Keep legacy
+    # drafts without that explicit mode on their historical lifecycle.
+    explicit_runtime_mode = uses_ui_runtime_mode(fields)
+    if not runtime_ready:
+        workspace.status = "needs_setup"
+    elif explicit_runtime_mode and not autonomous_enabled:
+        workspace.status = "paused"
+    else:
+        workspace.status = "active"
     workspace.heartbeat_enabled = runtime_ready and autonomous_enabled
     workspace.heartbeat_cadence = heartbeat_cadence
     workspace_settings = dict(workspace.settings or {})

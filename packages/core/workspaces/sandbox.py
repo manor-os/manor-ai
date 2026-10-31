@@ -374,20 +374,17 @@ async def create_sandbox_workspace(
         runtime_workspace_id=workspace_id,
     )
 
-    # Starter task lands in 'pending' so the existing auto-trigger
-    # (task_service.update_task hook) fires plan_and_run_task as soon
-    # as it sees a status transition. We bypass that hook here by
-    # writing the row in 'pending' directly — the dispatch happens
-    # the moment a worker picks the task up via run_agent_task or the
-    # caller invokes plan_and_run_task explicitly.
+    # The starter task is written directly in 'pending', so no run starts
+    # here: task_service.update_task stages the agent-loop start intent
+    # only on a transition to 'in_progress'.
     db.add(Task(
         id=task_id,
         entity_id=entity_id,
         workspace_id=workspace_id,
         title=seed_task_title,
         description=(
-            "Workspace simulation task — Planner will draft a tweet, Executor will "
-            "'post' it (simulated). Approve the proposal in chat to watch "
+            "Workspace simulation task — the content agent drafts a tweet and "
+            "'posts' it (simulated). Approve the draft in chat to watch "
             "the full pipeline."
         ),
         status="pending",

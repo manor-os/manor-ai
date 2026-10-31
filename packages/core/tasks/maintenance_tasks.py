@@ -134,6 +134,26 @@ def cleanup_ai_edit_sessions() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+@celery_app.task(name="maintenance.cleanup_oauth_dynamic_clients")
+def cleanup_oauth_dynamic_clients() -> dict:
+    """Delete self-registered OAuth clients with no live sign-in after their TTL."""
+
+    async def _run() -> dict:
+        from packages.core.database import async_session
+        from packages.core.services.oauth_provider_service import cleanup_unused_dynamic_clients
+
+        async with async_session() as db:
+            deleted = await cleanup_unused_dynamic_clients(db)
+            await db.commit()
+        return {"ok": True, "deleted": deleted}
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("maintenance.cleanup_oauth_dynamic_clients failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
 @celery_app.task(name="maintenance.repair_missing_document_files")
 def repair_missing_document_files() -> dict:
     """Repair Knowledge rows whose backing filesystem file is missing."""

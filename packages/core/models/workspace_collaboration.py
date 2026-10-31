@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Index, String
+from sqlalchemy import Boolean, DateTime, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -11,7 +11,21 @@ from .base import Base, TimestampMixin, generate_ulid
 
 class WorkspaceCollaboration(Base, TimestampMixin):
     __tablename__ = "workspace_collaborations"
-    __table_args__ = (Index("ix_workspace_collaboration_scope", "entity_id", "workspace_id"),)
+    __table_args__ = (
+        Index("ix_workspace_collaboration_scope", "entity_id", "workspace_id"),
+        # One live access grant per person and delivery: each manager of the
+        # source Workspace holds their own, and a revoked one never blocks the next.
+        Index(
+            "ux_workspace_collaboration_delivery_user",
+            "delivery_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text(
+                "delivery_id IS NOT NULL AND user_id IS NOT NULL AND status = 'active'"
+                " AND role IN ('provider_trial', 'maintainer')"
+            ),
+        ),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26))
     workspace_id: Mapped[str] = mapped_column(String(26))
@@ -22,7 +36,7 @@ class WorkspaceCollaboration(Base, TimestampMixin):
     requested_by: Mapped[str | None] = mapped_column(String(26))
     authorized_by: Mapped[str | None] = mapped_column(String(26))
     user_id: Mapped[str | None] = mapped_column(String(26))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     share_configuration: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     snapshot: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")

@@ -11,10 +11,6 @@ Two audiences hit this router:
     header): self-deregister, rotate secret, heartbeat (the hot path),
     and report lease outcomes.
 
-Internal workers never touch this router — they reach the dispatcher
-through ``packages.core.workers.internal.tick_one_internal_worker``
-inside the Celery process.
-
 Endpoint groups:
   POST   /api/v1/workers/register                 admin (User JWT)
   GET    /api/v1/workers                          admin
@@ -88,6 +84,7 @@ from packages.core.workers import (
     update_worker_status,
     worker_protocol_header_value,
 )
+from packages.core.workers import wake as worker_wake
 from packages.core.services.local_worker_targeting import (
     local_worker_display_name,
     normalize_local_worker_name,
@@ -207,6 +204,9 @@ class HeartbeatRequest(BaseModel):
     completed_since_last: list[HeartbeatCompletedLease] = Field(default_factory=list)
     capacity: HeartbeatCapacity = Field(default_factory=HeartbeatCapacity)
     capabilities: Optional[dict] = None
+    # Long poll: an idle worker with nothing to report may have this beat wait
+    # up to this long for work addressed to it (packages/core/workers/wake.py).
+    wait_seconds: int = Field(default=0, ge=0, le=25)
 
 
 class LeaseDTO(BaseModel):
@@ -243,6 +243,8 @@ class HeartbeatResponse(BaseModel):
     next_heartbeat_in_seconds: int
     new_leases: list[LeaseDTO] = Field(default_factory=list)
     instructions: list[HeartbeatInstruction] = Field(default_factory=list)
+    # This server honours ``wait_seconds``.
+    long_poll: bool = True
 
 
 # ── Lease lifecycle schemas ──────────────────────────────────────────
@@ -286,6 +288,70 @@ class ActivityResponse(BaseModel):
 
 
 
+# ── Helpers ────────────────────────────────────────────────────────────
+
+def _to_worker_response(w: Worker) -> WorkerResponse:
+    return WorkerResponse(
+        id=w.id,
+        entity_id=w.entity_id,
+        kind=w.kind,
+        display_name=w.display_name,
+        description=w.description,
+        version=w.version,
+        capabilities=w.capabilities or {},
+        trust_level=w.trust_level,
+        status=w.status,
+        last_heartbeat_at=w.last_heartbeat_at,
+        last_seen_ip=w.last_seen_ip,
+        consecutive_failures=w.consecutive_failures or 0,
+        monthly_budget_usd=float(w.monthly_budget_usd) if w.monthly_budget_usd is not None else None,
+        monthly_spent_usd=float(w.monthly_spent_usd or 0),
+        expires_at=w.expires_at,
+        created_at=w.created_at,
+        updated_at=w.updated_at,
+    )
+
+
+def _user_worker_scope(stmt, user: User):
+    return stmt.where(
+        Worker.entity_id == user.entity_id,
+        (Worker.kind != "custom_http") | (Worker.created_by_user_id == user.id),
+    )
+
+
+def _clean_local_worker_name(value: str) -> str:
+    return local_worker_display_name(value).strip()
+
+
+async def _ensure_local_worker_name_available(
+    db: AsyncSession,
+    *,
+    user: User,
+    display_name: str,
+    exclude_worker_id: str | None = None,
+) -> str:
+    cleaned = _clean_local_worker_name(display_name)
+    if not cleaned:
+        raise HTTPException(422, "computer name is required")
+    if len(cleaned) > 80:
+        raise HTTPException(422, "computer name must be 80 characters or fewer")
+    normalized = normalize_local_worker_name(cleaned)
+    stmt = select(Worker).where(
+        Worker.entity_id == user.entity_id,
+        Worker.kind == "custom_http",
+        Worker.created_by_user_id == user.id,
+        Worker.status != WorkerStatus.REVOKED.value,
+    )
+    if exclude_worker_id:
+        stmt = stmt.where(Worker.id != exclude_worker_id)
+    rows = list((await db.execute(stmt)).scalars().all())
+    if any(normalize_local_worker_name(worker) == normalized for worker in rows):
+        raise HTTPException(409, "another paired computer already uses this name")
+    return cleaned
+
+
+
+
 def _merge_worker_capabilities(
     stored: dict | None,
     reported: dict | None,
@@ -298,10 +364,15 @@ def _merge_worker_capabilities(
     incoming = dict(reported or {})
     for key, value in incoming.items():
         # Heartbeat capability discovery describes runtime availability.  The
-        # registered lease ceiling is server-owned admission policy and must
-        # not be raised by the same client that requests new work.
-        if key not in {"browser", "max_concurrent_leases"}:
-            merged[key] = value
+        # registered lease ceiling, risk ceiling and the worker's placement
+        # (targeted_only, computer_id) are server-owned admission policy and
+        # must not be changed by the same client that requests new work. A
+        # worker registered without a risk ceiling keeps reporting its own.
+        if key in {"browser", "max_concurrent_leases", "targeted_only", "computer_id"}:
+            continue
+        if key == "max_risk_level" and "max_risk_level" in (stored or {}):
+            continue
+        merged[key] = value
     # A worker may add this fencing contract during a rolling SDK upgrade,
     # but it cannot later downgrade itself and receive unfenced attempts.
     if supports_lease_attempt_token(stored):
@@ -1060,6 +1131,40 @@ async def _heartbeat_inner(
         for lease, step in leased:
             new_leases.append(await _serialize_lease_for_worker(db, lease, step))
 
+    # Instructions the server queued for this worker (e.g. open a view tunnel).
+    if worker.status == WorkerStatus.ACTIVE:
+        from packages.core.workers.instructions import drain_instructions
+
+        instructions.extend(HeartbeatInstruction(**item) for item in await drain_instructions(worker.id))
+
+    # Phase 4b — long poll. An idle worker that reported nothing and got
+    # nothing may wait for work addressed to it. No transaction (and no DB
+    # admission permit) is held while it waits.
+    waited = False
+    if (
+        req.wait_seconds > 0
+        and not new_leases
+        and not instructions
+        and not req.active_leases
+        and not req.completed_since_last
+        and req.state == "idle"
+        and req.capacity.can_accept_leases > 0
+        and worker.status == WorkerStatus.ACTIVE
+    ):
+        worker_id = worker.id
+        await db.commit()
+        woken = await worker_wake.wait_for_wake(worker_id, req.wait_seconds)
+        waited = woken is not None
+        if woken:
+            leased = await dispatcher.checkout_steps_for_worker(
+                db, worker, max_n=req.capacity.can_accept_leases,
+            )
+            for lease, step in leased:
+                new_leases.append(await _serialize_lease_for_worker(db, lease, step))
+            from packages.core.workers.instructions import drain_instructions
+
+            instructions.extend(HeartbeatInstruction(**item) for item in await drain_instructions(worker_id))
+
     # Phase 5 — out-of-band instructions.
     # "pause"    → worker should stop accepting leases but may be resumed later.
     # "shutdown" → worker should terminate completely (deregistered / offline).
@@ -1074,7 +1179,10 @@ async def _heartbeat_inner(
 
     await db.commit()
 
-    next_in = _next_heartbeat_interval(worker, has_active_leases=bool(req.active_leases or new_leases))
+    # After a long poll the wait was the interval: poll again at once.
+    next_in = 1 if waited else _next_heartbeat_interval(
+        worker, has_active_leases=bool(req.active_leases or new_leases),
+    )
     return HeartbeatResponse(
         server_time=now,
         next_heartbeat_in_seconds=next_in,

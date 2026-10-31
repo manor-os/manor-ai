@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: Roles of files made on the way to a result (an edit recipe, a QA frame, a
+#: timeline, a QA report) rather than the result itself. Surfaces that list what
+#: a run delivered leave them out; an unknown role is still shown.
+WORK_ARTIFACT_ROLES = frozenset({
+    "editor_recipe", "intermediate", "qa_evidence", "qa_report", "recording_source", "review", "timeline",
+})
+
+
+def is_work_artifact(metadata: Any) -> bool:
+    """Whether a Document's recorded artifact role marks it as a work file."""
+    artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+    role = artifact.get("role") if isinstance(artifact, dict) else None
+    return isinstance(role, str) and role.strip().lower() in WORK_ARTIFACT_ROLES
 
 
 async def generated_artifact_document_folder_id(
@@ -32,20 +49,25 @@ async def generated_artifact_document_folder_id(
     from packages.core.services.knowledge_sync import ensure_folder_path
 
     if conversation_id and user_id and not task_id and is_default_chat_output_path(rel_path):
-        if db is None:
-            from packages.core.database import async_session
+        folder_id = None
+        try:
+            if db is None:
+                from packages.core.database import async_session
 
-            async with async_session() as owned_db:
+                async with async_session() as owned_db:
+                    folder_id = await ensure_conversation_generated_folder(
+                        owned_db, entity_id=entity_id, user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
+                    await owned_db.commit()
+            else:
                 folder_id = await ensure_conversation_generated_folder(
-                    owned_db, entity_id=entity_id, user_id=user_id,
+                    db, entity_id=entity_id, user_id=user_id,
                     conversation_id=conversation_id,
                 )
-                await owned_db.commit()
-        else:
-            folder_id = await ensure_conversation_generated_folder(
-                db, entity_id=entity_id, user_id=user_id,
-                conversation_id=conversation_id,
-            )
+        except RuntimeError:
+            # Chat filing is presentation only: never fail the artifact save.
+            logger.warning("Chat sessions filing unavailable for %s", rel_path, exc_info=True)
         if folder_id:
             return folder_id
 
@@ -168,3 +190,36 @@ __all__ = [
     "generated_artifact_document_folder_id",
     "register_generated_file_artifact",
 ]
+
+
+async def mark_production_results(entity_id: str, output_directory: str, final_paths: set[str]) -> None:
+    """The verified files are this production's results; everything else it wrote is how they were made.
+
+    Files never move: what the App lists as a result is answered by each
+    Document's artifact role, so the brief snapshot, raw narration and
+    other working files stay out of outputs and project packs.
+    """
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+    from packages.core.services.document_metadata import merge_document_metadata
+
+    from packages.core.services.workspace_layout import PROJECT_TAKES_SEGMENT
+
+    prefix = output_directory.rstrip("/") + "/"
+    # A production made in a project's own folder (before takes) is not the
+    # versions made again inside it: their roles stay theirs.
+    takes = prefix + PROJECT_TAKES_SEGMENT + "/"
+    async with async_session() as db:
+        docs = (await db.execute(select(Document).where(
+            Document.entity_id == entity_id, Document.is_trashed.is_(False),
+            Document.fs_path.startswith(prefix, autoescape=True),
+            ~Document.fs_path.startswith(takes, autoescape=True),
+        ))).scalars()
+        for doc in docs:
+            # ``delivered`` tells a verified result from a file a newer, still
+            # unverified version wrote with the default role.
+            artifact = {"role": "final", "delivered": True} if doc.fs_path in final_paths else {"role": "intermediate"}
+            doc.metadata_ = merge_document_metadata(doc.metadata_, artifact=artifact)
+        await db.commit()

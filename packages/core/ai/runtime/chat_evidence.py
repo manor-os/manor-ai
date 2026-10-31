@@ -194,7 +194,10 @@ correction; evidence_aliases in feedback refer only to actual current calls.
         is invoked again. Until then no reply may end the turn while execution
         is still allowed. An observed failure after the handoff lets the agent
         report that blocker honestly (blocked/partial, checked by the rules
-        below); it never lets it claim delivery.
+        below); it never lets it claim delivery. Not every skill use asks for
+        a file ("what does this PDF say"): once the skill has run in its
+        sandbox, a plain ``answered`` reply, which claims no completed
+        operation, may end the turn.
         """
         if not context.allow_execution:
             return None
@@ -204,6 +207,10 @@ correction; evidence_aliases in feedback refer only to actual current calls.
         outcome = candidate.get("outcome")
         status = outcome.get("status") if isinstance(outcome, dict) else None
         if status in {"blocked", "partial"} and any(handoff["failed_call_ids"] for handoff in pending):
+            return None
+        if status == "answered" and all(
+            handoff.get("kind") == "sandbox_ready" and handoff.get("ran") for handoff in pending
+        ):
             return None
         handoff = pending[-1]
         skill = handoff["skill"] or "skill"
@@ -813,8 +820,12 @@ class ChatStopGate(RuntimeToolEvidence):
         if not pairs:
             return "", ()
         ordered = [fact for _ref, fact in pairs]
+        from packages.core.ai.runtime.response_language import current_response_locale
+
+        # Rendered inside the run, where the user's reply language is known;
+        # the request locale is not (a worker turn has no request headers).
         return render_verified_task_status(
-            [ref for ref, _fact in pairs], ordered, locale=self.locale,
+            [ref for ref, _fact in pairs], ordered, locale=current_response_locale() or self.locale,
         ), tuple(ordered)
 
 

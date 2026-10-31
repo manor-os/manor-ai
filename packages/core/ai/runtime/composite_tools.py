@@ -34,6 +34,22 @@ class SandboxToolErrorCode(StrEnum):
     ALREADY_ACTIVE = "sandbox_already_active"
     EXEC_TIMEOUT = "sandbox_execution_timeout"
     EXEC_FAILED = "sandbox_execution_failed"
+    # The shared sandbox already runs its maximum of concurrent commands, or
+    # is loading a Skill; waiting (or running in the background) fixes it.
+    SANDBOX_BUSY = "sandbox_busy"
+    # The command never ran: no slot freed up in time, or its sandbox was
+    # lost before it started (and it could not be moved to a new one).
+    EXEC_NOT_STARTED = "sandbox_execution_not_started"
+    # The command never ran: its work area holds more than its share of a
+    # disk the user's sandbox shares (cleanup commands still run there).
+    DISK_QUOTA = "sandbox_disk_quota"
+    # The sandbox was lost while the command ran; it is never re-run.
+    SANDBOX_LOST = "sandbox_lost_while_running"
+    # The runner did not answer; the command's state is reported as unknown.
+    RUNNER_UNREACHABLE = "sandbox_runner_unreachable"
+    # The runner hosting the sandbox lacks a capability the call needs
+    # (``sandbox_sdk.capabilities``); nothing ran. Fixed only by upgrading it.
+    RUNNER_OUTDATED = "sandbox_runner_outdated"
     EXPIRED = "sandbox_expired"
     EXECUTION_NOT_FOUND = "sandbox_execution_not_found"
     EXECUTION_EVENT_NOT_FOUND = "sandbox_execution_event_not_found"
@@ -55,6 +71,8 @@ class WorkspaceToolAction(StrEnum):
     SEARCH = "search"
     CREATE_TASK = "create_task"
     UPDATE_TASK_RUNTIME = "update_task_runtime"
+    START_TASK = "start_task"
+    HOLD_FOR_APPROVAL = "hold_for_approval"
     LIST_KNOWLEDGE = "list_knowledge"
     CREATE_KNOWLEDGE_FOLDER = "create_knowledge_folder"
     ADD_KNOWLEDGE_DOCUMENTS = "add_knowledge_documents"
@@ -67,6 +85,7 @@ class WorkspaceToolAction(StrEnum):
     UPDATE_GOAL_VALUE = "update_goal_value"
     GET_STAT_STATUS = "get_stat_status"
     RECORD_STAT_ASSESSMENT = "record_stat_assessment"
+    ADD_ASSESSED_METRICS = "add_assessed_metrics"
     OPERATION = "operation"
     REQUEST_STRATEGIST_REVIEW = "request_strategist_review"
     RESOLVE_HITL = "resolve_hitl"

@@ -10,7 +10,38 @@ export type WorkflowRunInput = {
   maximum?: number;
   documents: boolean;
   options?: { value: string; label: string }[];
+  /** A JSON string array limited to these values: pick any number of them. */
+  choices?: { value: string; label: string }[];  /** Picks Workspace Ledger records (`x-ui.control: "record_select"`): one key, or a JSON array of keys. */
+  records?: { multiple: boolean };
 };
+
+function schemaOptions(schema: Record<string, any>): { value: string; label: string }[] | undefined {
+  if (!Array.isArray(schema.enum)) return undefined;
+  return schema.enum.map((value: unknown, i: number) => {
+    const label = Array.isArray(schema["x-enum-labels"]) ? schema["x-enum-labels"][i] : undefined;
+    return {
+      value: String(value),
+      label: typeof label === "string" && label.trim() ? label : String(value),
+    };
+  });
+}
+
+function recordSelect(type: WorkflowRunInput["type"], schema: Record<string, any>): WorkflowRunInput["records"] {
+  const ui = schema["x-ui"];
+  if (ui?.control !== "record_select" || typeof ui.record_source?.ledger !== "string") return undefined;
+  if (type === "json" && schema.type === "array" && schema.items?.type === "string") return { multiple: true };
+  return type === "string" && schema.type === "string" ? { multiple: false } : undefined;
+}
+
+/** Values chosen in a multi-choice draft (JSON array text). */
+export function workflowRunInputChosen(draft: string): string[] {
+  try {
+    const parsed = JSON.parse(draft || "[]");
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
 
 function runInputDefault(value: unknown, variables?: Record<string, unknown>): unknown {
   if (typeof value !== "string") return value;
@@ -68,15 +99,11 @@ export function workflowRunInputs(flow: { steps?: { type?: string; config?: Reco
         minimum: typeof schema.minimum === "number" ? schema.minimum : undefined,
         maximum: typeof schema.maximum === "number" ? schema.maximum : undefined,
         documents: type === "json" && schema.type === "array" && schema["x-ui"]?.control === "documents",
-        options: Array.isArray(schema.enum)
-          ? schema.enum.map((value: unknown, i: number) => {
-            const label = Array.isArray(schema["x-enum-labels"]) ? schema["x-enum-labels"][i] : undefined;
-            return {
-              value: String(value),
-              label: typeof label === "string" && label.trim() ? label : String(value),
-            };
-          })
+        options: schemaOptions(schema),
+        choices: type === "json" && schema.type === "array" && schema.items?.type === "string"
+          ? schemaOptions(schema.items)
           : undefined,
+        records: recordSelect(type, schema),
       });
     }
   }
@@ -98,19 +125,50 @@ export type WorkflowUpload = {
   document?: WorkflowDocumentRef;
 };
 
-/** Keep each successful receipt on the pending item before attempting the next
- * upload, including when a later upload or the eventual launch fails. */
+/** Upload at most three files at a time. A failure stops the queue, as in the
+ * serial uploader, but already-started uploads settle before retry is allowed.
+ * Keep their successful receipts so retry only sends unfinished files. */
 export async function prepareWorkflowDocuments(
   selected: WorkflowDocumentRef[],
   pending: WorkflowUpload[],
   upload: (item: WorkflowUpload) => Promise<WorkflowDocumentRef>,
 ): Promise<WorkflowDocumentRef[]> {
-  const documents = new Map(selected.map((document) => [document.document_id, document]));
-  for (const item of pending) {
-    item.document ??= await upload(item);
-    documents.set(item.document.document_id, item.document);
+  const errors = new Map<number, unknown>();
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < pending.length && errors.size === 0) {
+      const index = nextIndex++;
+      const item = pending[index];
+      if (item.document) continue;
+      try {
+        item.document = await upload(item);
+      } catch (error) {
+        errors.set(index, error);
+      }
+    }
   }
+
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, worker));
+  for (let index = 0; index < pending.length; index++) {
+    if (errors.has(index)) throw errors.get(index);
+  }
+
+  const documents = new Map(selected.map((document) => [document.document_id, document]));
+  for (const item of pending) documents.set(item.document!.document_id, item.document!);
   return [...documents.values()];
+}
+
+/** Uploads for a Workspace run land in its root folder (`Workspaces/<name>`),
+ * not the Knowledge root. Outside a Workspace the upload keeps no folder. */
+export async function workflowUploadFolderId(
+  workspaceId: string | null | undefined,
+  loadWorkspace: (id: string) => Promise<{ artifact_folder_id?: string | null }>,
+): Promise<string | null> {
+  if (!workspaceId) return null;
+  const folderId = (await loadWorkspace(workspaceId)).artifact_folder_id;
+  if (!folderId) throw new Error("The Workspace folder is unavailable. Refresh and try again.");
+  return folderId;
 }
 
 type WorkflowDocumentGroup = {

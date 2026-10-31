@@ -2,12 +2,13 @@
   "id": "mcp_facebook",
   "name": "mcp_facebook",
   "type": "runtime_guidance",
-  "description": "Operate Facebook Pages the user manages: publish posts/photos/video, manage comments, Messenger DMs, live video, Page/post insights, and linked Instagram Business accounts (publish, comments, insights).",
+  "description": "Operate Facebook Pages the user manages: publish posts/photos/video, manage comments, Messenger DMs, live video, Page/post insights, and linked Instagram professional accounts, Business or Creator (publish, comments, insights).",
   "category": "social-media",
   "output_format": "guidance",
   "tags": ["facebook", "instagram", "messenger", "social-media", "posting", "runtime-guidance", "builtin", "mcp"],
   "tools": [
     "mcp__facebook__list_pages",
+    "mcp__facebook__get_page",
     "mcp__facebook__create_post",
     "mcp__facebook__create_multi_photo_post",
     "mcp__facebook__create_video_post",
@@ -22,8 +23,11 @@
     "mcp__facebook__get_page_insights",
     "mcp__facebook__get_post_insights",
     "mcp__facebook__list_instagram_accounts",
+    "mcp__facebook__get_instagram_account",
     "mcp__facebook__create_instagram_media",
+    "mcp__facebook__get_instagram_container_status",
     "mcp__facebook__publish_instagram_media",
+    "mcp__facebook__get_instagram_media",
     "mcp__facebook__reply_instagram_comment"
   ],
   "search": {

@@ -1,24 +1,27 @@
 """Strategist — periodic / event-driven workspace reviewer.
 
-Reads the workspace's:
-  * active goals + their pace
-  * recent tasks + outcomes
-  * workspace memory (relevant entries by similarity)
-  * recent owner messages
+Reads the workspace's goals, services, recent and open tasks, execution
+snapshot, memory, integrations, governance policy, missing setup and
+outcome calibration (``context.gather_context``), and produces one
+``Proposal``: up to 8 tasks (the prompt asks for 0-5) plus human
+requests, workflow runs, experiments, retries and configuration changes.
 
-…and produces 2-5 task proposals (default mode: ``propose_only``).
+Proposed tasks are written as ``Task`` rows with ``status='proposed'``.
+``_wire_proposal_governance`` resolves the cohort's approval once: an
+approval rule that allows it approves it as the system, otherwise the chat
+shows a proposal card (approve all / approve selected / reject /
+feedback). ``approve_proposal`` flips dependency-ready tasks to
+``in_progress``, which stages the Task agent loop's start intent in
+``task_service.update_task``; tasks waiting on predecessors stay
+``pending`` until the dependency gate releases them.
 
-Proposals are written as ``Task`` rows with ``status='proposed'`` —
-the workspace chat shows them in a single proposal card with
-[Approve all] [Pick] [Skip] buttons. On approve, the chat resolve
-handler flips them to ``status='pending'``, which fires the existing
-``task_service.update_task`` hook that calls the Planner.
-
-Trigger sources:
-  * ScheduledJob row (cron / interval) — set up at workspace setup
-    time from ``operating_model.strategist.cadence``.
-  * Manual via ``POST /api/v1/workspaces/{id}/strategist/run``.
-  * Event-driven: when a goal's pace turns ``at_risk`` (M3 +).
+Trigger sources (``triggers.ReviewTriggerKind``):
+  * Scheduled: the ``sr:<workspace>`` ScheduledJob installed from
+    ``Workspace.heartbeat_cadence`` while the workspace heartbeat runs.
+  * Event: workspace created, a work batch completed, the last human
+    commitment closed, or new agents / goals / integrations detected.
+  * Human-requested: the ``workspace_request_strategist_review`` tool,
+    proposal-card feedback, or the failure card's retry.
 """
 from packages.core.strategist.proposal import Proposal, ProposedTask
 from packages.core.strategist.service import (

@@ -1888,18 +1888,20 @@ def _blocked_chrome_control_interruption(
 
 def _chrome_control_interruption_reason(value: Any) -> str:
     reason = str(value or "").strip()
-    if reason in {"user_takeover", "extension_reload", "disconnected"}:
+    if reason in {"explicit_stop", "user_takeover", "extension_reload", "disconnected"}:
         return reason
     return "user_takeover"
 
 
 def _chrome_control_interruption_message(reason: str) -> str:
     normalized = _chrome_control_interruption_reason(reason)
+    if normalized == "explicit_stop":
+        return "Browser control stopped because the user explicitly stopped Manor."
     if normalized == "extension_reload":
         return "Browser control stopped because the Manor Chrome extension reloaded."
     if normalized == "disconnected":
         return "Browser control stopped because the Manor Chrome extension disconnected."
-    return "Browser control stopped because the user took over Chrome."
+    return "Browser control stopped because of an ambiguous legacy interruption."
 
 
 def _chrome_action_signature(tool_name: str, arguments: dict[str, Any]) -> str:

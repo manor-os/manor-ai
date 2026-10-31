@@ -29,6 +29,7 @@ class ScheduledJob(Base, TimestampMixin):
     __tablename__ = "scheduled_jobs"
     __table_args__ = (
         Index("ix_scheduled_jobs_due", "enabled", "next_run_at", "id"),
+        Index("uq_scheduled_jobs_workspace_idempotency", "entity_id", "workspace_id", "idempotency_key", unique=True),
         Index(
             "ix_scheduled_jobs_skill_generation_due",
             "enabled",
@@ -47,6 +48,9 @@ class ScheduledJob(Base, TimestampMixin):
     job_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    owner_project_id: Mapped[Optional[str]] = mapped_column(String(26), index=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(200))
+    stop_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     agent_initiative_id: Mapped[Optional[str]] = mapped_column(
         String(26),
         ForeignKey(

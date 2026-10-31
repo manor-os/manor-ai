@@ -625,12 +625,14 @@ async def test_cancel_scheduled_drops_pending_row(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_origin", ["absent", "completed", "foreign_workspace"])
 async def test_sweeper_cancels_pending_delivery_when_workspace_paused(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_telegram: _Adapter,
+    workflow_origin,
 ):
-    """A pending external delivery must not escape after its Workspace is paused."""
+    """Only exact Workflow evidence keeps delivery independent of Strategist."""
     ctx = await _register(client, "sched_paused_workspace_user")
     workspace_response = await client.post(
         "/api/v1/workspaces",
@@ -647,6 +649,18 @@ async def test_sweeper_cancels_pending_delivery_when_workspace_paused(
     )
 
     future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    meta = None
+    if workflow_origin != "absent":
+        from packages.core.models.workflow import WorkflowRun
+
+        run = WorkflowRun(
+            workflow_id="invoice-report", entity_id=ctx["entity_id"],
+            workspace_id=workspace_id if workflow_origin == "completed" else generate_ulid(),
+            started_by=ctx["user_id"], status="completed", trigger_source="manual",
+        )
+        db_session.add(run)
+        await db_session.commit()
+        meta = {"workflow_origin": {"run_id": run.id, "actor_user_id": ctx["user_id"]}}
     await notify_module.notify(
         entity_id=ctx["entity_id"],
         user_id=ctx["user_id"],
@@ -654,6 +668,7 @@ async def test_sweeper_cancels_pending_delivery_when_workspace_paused(
         title="Must not escape pause",
         workspace_id=workspace_id,
         deliver_at=future,
+        meta=meta,
     )
     notification = (
         await db_session.execute(
@@ -678,13 +693,19 @@ async def test_sweeper_cancels_pending_delivery_when_workspace_paused(
         now=future + timedelta(minutes=1),
     )
 
-    assert result["canceled"] == 1
-    assert result["dispatched"] == 0
-    assert fake_telegram.sent == []
     await db_session.refresh(notification)
     await db_session.refresh(outbox)
-    assert notification.dispatch_status == "canceled"
-    assert outbox.status == "canceled"
+    if workflow_origin == "completed":
+        assert result["dispatched"] == 1
+        assert len(fake_telegram.sent) == 1
+        assert notification.dispatch_status == "dispatched"
+        assert outbox.status == "delivered"
+    else:
+        assert result["canceled"] == 1
+        assert result["dispatched"] == 0
+        assert fake_telegram.sent == []
+        assert notification.dispatch_status == "canceled"
+        assert outbox.status == "canceled"
 
 
 @pytest.mark.asyncio

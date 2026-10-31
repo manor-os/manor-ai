@@ -57,7 +57,7 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
             prompt="system prompt",
         )
 
-    async def fake_resolve_model(role, *, user_id=None, entity_id=None, db=None):
+    async def fake_resolve_model(role, *, user_id=None, entity_id=None, db=None, workspace_id=None):
         seen["model"] = {
             "role": role,
             "user_id": user_id,
@@ -66,7 +66,7 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
         }
         return "openai/gpt-5.5"
 
-    async def fake_resolve_metadata(role, *, user_id=None, entity_id=None, db=None):
+    async def fake_resolve_metadata(role, *, user_id=None, entity_id=None, db=None, workspace_id=None):
         seen["metadata"] = {
             "role": role,
             "user_id": user_id,

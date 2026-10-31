@@ -59,7 +59,6 @@ _PARSE_ALLOWLIST: dict[str, str] = {
     "packages/core/ai/mcp/_knowledge_url.py": (
         "decodes signed /api/v1/fs/public/<token> URLs (parse_file_reference rejects them by design)"
     ),
-    "packages/core/ai/mcp/tiktok.py": "redacts the capability token of a signed /api/v1/fs/public/ URL",
     "packages/core/tasks/media_tasks.py": (
         "re-mints expired signed /api/v1/fs/public/ URLs and explains malformed fs URLs to the model"
     ),

@@ -136,9 +136,13 @@ child runs linked). The run detail view streams node status live via SSE.
   explicit `from_step_id` checkpoint. It preserves completed sibling receipts
   outside the recovery frontier, invalidates the selected node and affected
   downstream work, and waits for every required branch before a merge
-  continues. Recovery uses the run's immutable execution snapshot; missing
-  or incompatible snapshots are refused. A step with an uncertain external
-  effect must be reconciled before retry.
+  continues. A retry runs the workflow as it is now, so a fix made after the
+  failure takes effect, and still resumes at the checkpoint: completed steps
+  are not re-run even if they were edited, removed steps' results are dropped,
+  and a step added before the checkpoint runs first. Pass
+  `"definition": "original"` to replay the run's immutable execution snapshot
+  instead. A step with an uncertain external effect must be reconciled before
+  retry.
 - **Lineage**: `GET /runs/{run_id}/family` returns the retry chain and its
   durable recovery evidence.
 

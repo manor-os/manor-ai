@@ -25,6 +25,8 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_GOAL_MEASUREMENT_SOURCE,
     RUNTIME_INTERNAL_WORKER_SOURCE,
     RUNTIME_KNOWLEDGE_GEN_SOURCE,
+    RUNTIME_KNOWLEDGE_MEDIA_ANALYSIS_SOURCE,
+    RUNTIME_LISTEN_TO_AUDIO_TOOL_SOURCE,
     RUNTIME_MEMORY_SOURCE,
     RUNTIME_OUTCOME_EVALUATION_SOURCE,
     RUNTIME_PLAN_EXECUTOR_SOURCE,
@@ -44,6 +46,7 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_WORKFLOW_SERVICE_SOURCE,
     RUNTIME_WORKFLOW_SOURCE,
     RUNTIME_WORKSPACE_ARCHITECT_SOURCE,
+    RUNTIME_WORKSPACE_TRANSLATION_SOURCE,
     RUNTIME_WORKSPACE_SETUP_SOURCE,
 )
 
@@ -98,6 +101,27 @@ def runtime_prompt_with_output_schema(
     )
 
 
+# A Workflow step that can act finishes its own work: a check it can pass by
+# acting again is not a blocker for the person.
+RUNTIME_FINISH_BEFORE_BLOCKING = (
+    "Finish the work before you report it:\n"
+    "- When your own check finds a defect your tools can fix (a length, size or format a little off, a "
+    "file to re-render, re-encode, trim or regenerate, a step to redo), fix it and check again. Do this "
+    "up to three times before you report the step as not done.\n"
+    "- Measured media meets its target within normal rounding: a duration within one frame or 0.05 "
+    "seconds of its target meets it, and so does a size within one pixel. Never fail a result for less.\n"
+    "- Report the step as not done, with its reason, only for what you cannot fix yourself: missing "
+    "access, keys or credits, a provider that keeps refusing, or a choice only the person can make. Say "
+    "it in one plain sentence; technical detail goes in other fields."
+)
+
+
+def runtime_prompt_with_completion_rules(prompt: Any, *, can_act: bool) -> str:
+    """A step that can act is told to repair what it can before it reports a blocker."""
+    text = str(prompt)
+    return f"{text}\n\n{RUNTIME_FINISH_BEFORE_BLOCKING}" if can_act else text
+
+
 def runtime_one_shot_messages(
     *,
     user_prompt: Any,
@@ -145,6 +169,11 @@ RUNTIME_TEXT_COMPLETION_SOURCE_MODEL_ROLES: dict[str, str] = {
     RUNTIME_GOAL_MEASUREMENT_SOURCE: "goal_measurement",
     RUNTIME_INTERNAL_WORKER_SOURCE: "worker",
     RUNTIME_KNOWLEDGE_GEN_SOURCE: "knowledge_gen",
+    # The model is fixed by the caller (MEDIA_ANALYSIS_MODEL); the role only
+    # selects whose BYOK key may pay for it.
+    RUNTIME_KNOWLEDGE_MEDIA_ANALYSIS_SOURCE: "primary",
+    # The model is fixed by the caller (LISTEN_TO_AUDIO_MODEL).
+    RUNTIME_LISTEN_TO_AUDIO_TOOL_SOURCE: "primary",
     RUNTIME_MEMORY_SOURCE: "memory",
     RUNTIME_OUTCOME_EVALUATION_SOURCE: "outcome_evaluation",
     RUNTIME_PLAN_EXECUTOR_SOURCE: "plan_executor",
@@ -164,6 +193,8 @@ RUNTIME_TEXT_COMPLETION_SOURCE_MODEL_ROLES: dict[str, str] = {
     RUNTIME_WORKFLOW_SERVICE_SOURCE: "workflow_service",
     RUNTIME_WORKFLOW_SOURCE: "workflow",
     RUNTIME_WORKSPACE_ARCHITECT_SOURCE: "workspace_architect",
+    # The model is fixed by the caller (WORKSPACE_TRANSLATION_MODEL).
+    RUNTIME_WORKSPACE_TRANSLATION_SOURCE: "primary",
     RUNTIME_WORKSPACE_SETUP_SOURCE: "workspace_setup",
 }
 
@@ -182,8 +213,13 @@ async def runtime_resolve_text_completion_route(
     source: str,
     model: str | None,
     metadata: dict[str, Any] | None,
+    workspace_id: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None, bool | None]:
-    """Resolve tenant BYOK metadata/model for Runtime text completions."""
+    """Resolve tenant BYOK metadata/model for Runtime text completions.
+
+    ``workspace_id`` is the Workspace the completion runs in: its payer's
+    keys and models apply (the provider during a client delivery trial).
+    """
 
     if not entity_id:
         # Platform-scoped call (no tenant). Honor the admin-configured
@@ -219,6 +255,7 @@ async def runtime_resolve_text_completion_route(
             user_id=user_id,
             entity_id=entity_id,
             db=None,
+            workspace_id=workspace_id,
         )
         if tenant_metadata:
             resolved_metadata = {**(metadata or {}), **tenant_metadata}
@@ -228,6 +265,7 @@ async def runtime_resolve_text_completion_route(
                 user_id=user_id,
                 entity_id=entity_id,
                 db=None,
+                workspace_id=workspace_id,
             )
         routed_metadata = resolved_metadata
         if resolved_metadata and resolved_model:
@@ -308,6 +346,7 @@ async def runtime_execute_text_completion(
         source=source,
         model=model,
         metadata=metadata,
+        workspace_id=workspace_id,
     )
     if byok is not None:
         resolved_byok = byok

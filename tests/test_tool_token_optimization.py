@@ -34,7 +34,7 @@ from packages.core.ai.runtime.manor_actions import (
 )
 from packages.core.ai.tools.manor_tool import MANOR_SCHEMA, _doc_summary
 from packages.core.ai.tools.sandbox_tools import _SANDBOX_SAVE_RESULT_SCHEMA, _sandbox_read_file
-from packages.core.ai.tools.bash_tool import _execute_local
+from packages.core.ai.tools.bash_tool import _stream_output_fields
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.ai.runtime.tool_registry import runtime_registered_tool_surface_from_schemas
 from packages.core.config import get_settings
@@ -1509,22 +1509,15 @@ def test_sandbox_save_result_schema_stays_compact():
     assert {"sandbox_id", "file_path", "url", "filename"} <= set(props)
 
 
-@pytest.mark.asyncio
-async def test_bash_local_output_marks_truncation_with_digest(tmp_path):
-    result = json.loads(
-        await _execute_local(
-            "python3 -c \"import sys; sys.stdout.write('x' * 70000)\"",
-            timeout=5,
-            cwd=str(tmp_path),
-        )
-    )
+def test_bash_output_marks_truncation_with_digest():
+    result = _stream_output_fields("stdout", "x" * 70000)
 
-    assert result["exit_code"] == 0
     assert len(result["stdout"]) == 65536
     assert result["stdout_truncated"] is True
     assert result["stdout_chars"] == 70000
     assert len(result["stdout_sha256"]) == 64
     assert "read_file with offsets" in result["stdout_hint"]
+    assert _stream_output_fields("stdout", "short") == {"stdout": "short"}
 
 
 @pytest.mark.asyncio
@@ -1541,7 +1534,11 @@ async def test_sandbox_read_file_returns_structured_metadata(monkeypatch):
         async def close(self):
             return None
 
+    async def allow_access(**_kwargs):
+        return None
+
     monkeypatch.setattr("packages.core.ai.tools.sandbox_tools._get_client", lambda: FakeClient())
+    monkeypatch.setattr("packages.core.ai.tools.sandbox_tools._sandbox_instance_access_error", allow_access)
 
     result = json.loads(await _sandbox_read_file(sandbox_id="sandbox_1", path="/skill/output.txt"))
 

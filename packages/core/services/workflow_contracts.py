@@ -109,7 +109,7 @@ def _step_output_type(step: dict[str, Any]) -> str:
     if step_type == "media":
         return str(config.get("kind") or "any").lower()
     if step_type in {
-        "rag", "extract", "code", "workflow_project", "publication_receipt", "subworkflow",
+        "rag", "extract", "code", "workflow_project", "workflow_effect_deadline", "publication_receipt", "subworkflow",
         "foreach_subworkflow", "loop", "merge", "aggregate", "split",
         "sort", "dedupe",
     }:

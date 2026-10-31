@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import importlib.util
+import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from redis.asyncio import Redis
+from sqlalchemy import event, select
+
+from packages.core import database
+from packages.core.models.user import User
+from packages.core.services import password_reset_service as password_reset
+from packages.core.services.auth_service import verify_password
 
 
 # ── Email service unit tests ──
@@ -47,14 +59,14 @@ async def test_send_email_disabled():
         assert result is True
 
 
-def test_smtp_config_accepts_kubernetes_username_alias(monkeypatch):
-    """Older DOKS runtime files used SMTP_USERNAME instead of SMTP_USER."""
+def test_smtp_config_accepts_legacy_username_alias(monkeypatch):
+    """Older runtime files used SMTP_USERNAME instead of SMTP_USER."""
     from packages.core.services.email_service import _get_smtp_config
 
     monkeypatch.delenv("SMTP_USER", raising=False)
-    monkeypatch.setenv("SMTP_USERNAME", "k8s-smtp-user")
+    monkeypatch.setenv("SMTP_USERNAME", "legacy-smtp-user")
 
-    assert _get_smtp_config()["username"] == "k8s-smtp-user"
+    assert _get_smtp_config()["username"] == "legacy-smtp-user"
 
 
 @pytest.mark.asyncio
@@ -80,6 +92,34 @@ async def test_send_email_blocks_local_fixture_domains():
             delattr(smtp_transport, "send_message_async")
         else:
             smtp_transport.send_message_async = original
+
+
+@pytest.mark.asyncio
+async def test_notification_email_escapes_plain_text_body(monkeypatch):
+    """Notification text is plain text: markup in it must render literally."""
+    import packages.core.services.email_service as email_mod
+
+    sent: dict[str, str] = {}
+
+    async def fake_send_email(to, subject, html_body, *args, **kwargs):
+        sent.update(to=to, subject=subject, html=html_body)
+        return True
+
+    monkeypatch.setattr(email_mod, "send_email", fake_send_email)
+
+    ok = await email_mod.send_notification_email(
+        "owner@manor-test.io",
+        "Review <script>alert(1)</script>",
+        "<b>Q&A</b> needs you\nSecond line",
+    )
+
+    assert ok is True
+    html = sent["html"]
+    assert "&lt;b&gt;Q&amp;A&lt;/b&gt; needs you\nSecond line" in html
+    assert "<b>Q&A</b>" not in html
+    assert "<script>" not in html
+    # A subject is a header, not HTML: it stays as written.
+    assert sent["subject"] == "Manor AI: Review <script>alert(1)</script>"
 
 
 @pytest.mark.asyncio
@@ -114,7 +154,35 @@ async def test_invite_email_template():
             smtp_transport.send_message_async = original_transport
 
 
-# ── Password reset e2e tests (use real DB via client fixture) ──
+# ── Password reset integration tests (real PostgreSQL and isolated Redis) ──
+
+_EMAIL = "emailuser@example.com"
+_OLD_PASSWORD = "Original-reset-password-123"
+_NEW_PASSWORD = "Updated-reset-password-456"
+_INVALID_TOKEN = {
+    "code": "auth.password_reset.invalid_token",
+    "message": "Invalid or expired reset token",
+}
+
+
+@pytest.fixture
+async def reset_deliveries(isolated_test_redis, monkeypatch):
+    """Capture the mail boundary; token persistence still uses real Redis."""
+    tokens = []
+    store = Redis.from_url(isolated_test_redis, decode_responses=True)
+
+    async def deliver(email, token):
+        assert email == _EMAIL
+        tokens.append(token)
+        return True
+
+    monkeypatch.setattr("packages.core.services.email_service.send_password_reset_email", deliver)
+    try:
+        yield store, tokens
+    finally:
+        if tokens:
+            await store.delete(*[password_reset._token_key(token) for token in tokens])
+        await store.aclose()
 
 
 async def _register_email_user(client):
@@ -123,8 +191,8 @@ async def _register_email_user(client):
         "/api/v1/auth/register",
         json={
             "username": "emailuser",
-            "email": "emailuser@example.com",
-            "password": "oldpass123",
+            "email": _EMAIL,
+            "password": _OLD_PASSWORD,
             "entity_name": "EmailTestOrg",
         },
     )
@@ -132,92 +200,241 @@ async def _register_email_user(client):
     return resp.json()
 
 
+async def _request_reset(client, reset_deliveries):
+    response = await client.post("/api/v1/auth/forgot-password", json={"email": _EMAIL})
+    assert response.status_code == 200, response.text
+    return reset_deliveries[1][-1]
+
+
+@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_password_reset_flow(client):
-    """Full flow: register -> forgot-password -> reset -> login with new password."""
-    await _register_email_user(client)
+async def test_password_reset_flow(client, reset_deliveries):
+    """A committed reset revokes old passwords, sessions, and all old links."""
+    registration = await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    second_token = await _request_reset(client, reset_deliveries)
+    store, _ = reset_deliveries
+    key = password_reset._token_key(token)
+    assert token not in key
+    assert key.endswith(hashlib.sha256(token.encode()).hexdigest())
+    assert 0 < await store.ttl(key) <= 3600
+    assert token not in await store.get(key)
 
-    # Request reset (should always return 200)
-    with patch("packages.core.services.email_service.send_email", new_callable=AsyncMock):
-        resp = await client.post(
-            "/api/v1/auth/forgot-password",
-            json={
-                "email": "emailuser@example.com",
-            },
-        )
-    assert resp.status_code == 200
-    assert "reset link" in resp.json()["detail"].lower()
-
-    # Grab the token from the in-memory store
-    from packages.core.services.password_reset_service import _reset_tokens
-
-    assert len(_reset_tokens) == 1
-    token = list(_reset_tokens.keys())[0]
-
-    # Reset password
     resp = await client.post(
         "/api/v1/auth/reset-password",
-        json={
-            "token": token,
-            "new_password": "newpass456",
-        },
+        json={"token": token, "new_password": _NEW_PASSWORD},
     )
     assert resp.status_code == 200
-    assert "reset" in resp.json()["detail"].lower()
+    for old_token in (token, second_token):
+        repeated = await client.post(
+            "/api/v1/auth/reset-password",
+            json={"token": old_token, "new_password": "Another-reset-password-789"},
+        )
+        assert repeated.status_code == 400
+        assert repeated.json()["detail"] == _INVALID_TOKEN
 
-    # Token should be consumed
-    assert len(_reset_tokens) == 0
-
-    # Old password should fail
+    old_session = await client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {registration['access_token']}"},
+    )
+    assert old_session.status_code == 401
     resp = await client.post(
-        "/api/v1/auth/login",
-        json={
-            "username": "emailuser",
-            "password": "oldpass123",
-        },
+        "/api/v1/auth/login", json={"email": _EMAIL, "password": _OLD_PASSWORD},
     )
     assert resp.status_code == 401
-
-    # New password should work
     resp = await client.post(
-        "/api/v1/auth/login",
-        json={
-            "username": "emailuser",
-            "password": "newpass456",
-        },
+        "/api/v1/auth/login", json={"email": _EMAIL, "password": _NEW_PASSWORD},
     )
     assert resp.status_code == 200
     assert "access_token" in resp.json()
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_password_reset_expired_token(client):
-    """Expired tokens are rejected."""
+async def test_password_reset_shared_across_service_instances(client, reset_deliveries):
+    """A fresh module with no issuer globals can redeem the shared link."""
     await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    spec = importlib.util.spec_from_file_location("password_reset_other_worker", password_reset.__file__)
+    other_worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(other_worker)
+    async with database.async_session() as db:
+        assert await other_worker.reset_password(db, token, _NEW_PASSWORD)
+        await db.commit()
+    async with database.async_session() as db:
+        assert not await password_reset.reset_password(db, token, _NEW_PASSWORD)
 
-    # Request reset
-    with patch("packages.core.services.email_service.send_email", new_callable=AsyncMock):
-        await client.post(
-            "/api/v1/auth/forgot-password",
-            json={
-                "email": "emailuser@example.com",
-            },
-        )
 
-    from packages.core.services.password_reset_service import _reset_tokens
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_password_reset_concurrent_consumption(client, reset_deliveries, monkeypatch):
+    """Both callers read the link before contending for the real User row lock."""
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    original_verify = password_reset.verify_reset_token
+    both_read = asyncio.Event()
+    reads = 0
 
-    token = list(_reset_tokens.keys())[0]
+    async def coordinated_verify(value):
+        nonlocal reads
+        data = await original_verify(value)
+        reads += 1
+        if reads == 2:
+            both_read.set()
+        await asyncio.wait_for(both_read.wait(), 5)
+        return data
 
-    # Expire the token by setting expires_at to the past
-    _reset_tokens[token]["expires_at"] = time.time() - 1
+    monkeypatch.setattr(password_reset, "verify_reset_token", coordinated_verify)
+    responses = await asyncio.wait_for(asyncio.gather(*[
+        client.post("/api/v1/auth/reset-password", json={"token": token, "new_password": value})
+        for value in (_NEW_PASSWORD, "Other-concurrent-password-789")
+    ]), 10)
+    assert sorted(response.status_code for response in responses) == [200, 400]
+    async with database.async_session() as db:
+        user = await db.scalar(select(User).where(User.email == _EMAIL))
+        assert user.token_version == 1
 
-    # Attempt reset — should fail
-    resp = await client.post(
-        "/api/v1/auth/reset-password",
-        json={
-            "token": token,
-            "new_password": "newpass456",
-        },
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_password_reset_commit_failure_keeps_link_retryable(client, reset_deliveries):
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    async with database.async_session() as db:
+        assert await password_reset.reset_password(db, token, _NEW_PASSWORD)
+
+        def fail_commit(session):
+            raise RuntimeError("simulated commit failure")
+
+        event.listen(db.sync_session, "before_commit", fail_commit, once=True)
+        with pytest.raises(RuntimeError, match="simulated commit failure"):
+            await db.commit()
+        await db.rollback()
+    async with database.async_session() as db:
+        user = await db.scalar(select(User).where(User.email == _EMAIL))
+        assert verify_password(_OLD_PASSWORD, user.password_hash)
+        assert user.token_version == 0
+    retried = await client.post(
+        "/api/v1/auth/reset-password", json={"token": token, "new_password": _NEW_PASSWORD},
     )
-    assert resp.status_code == 400
-    assert "invalid" in resp.json()["detail"].lower() or "expired" in resp.json()["detail"].lower()
+    assert retried.status_code == 200
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["expired", "missing", "malformed"])
+async def test_password_reset_invalid_token(client, reset_deliveries, record):
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    store, _ = reset_deliveries
+    key = password_reset._token_key(token)
+    if record == "expired":
+        payload = json.loads(await store.get(key))
+        payload["expires_at"] = time.time() - 1
+        await store.setex(key, 3600, json.dumps(payload))
+    elif record == "missing":
+        await store.delete(key)
+    else:
+        await store.setex(key, 3600, "not-json")
+    response = await client.post(
+        "/api/v1/auth/reset-password", json={"token": token, "new_password": _NEW_PASSWORD},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == _INVALID_TOKEN
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["email", "password", "version", "deleted"])
+async def test_password_reset_bound_to_current_identity(client, reset_deliveries, change):
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    async with database.async_session.begin() as db:
+        user = await db.scalar(select(User).where(User.email == _EMAIL))
+        if change == "email":
+            user.email = "changed@example.com"
+        elif change == "password":
+            user.password_hash = "changed-password-fingerprint"
+        elif change == "version":
+            user.token_version += 1
+        else:
+            user.deleted_at = datetime.now(timezone.utc)
+    response = await client.post(
+        "/api/v1/auth/reset-password", json={"token": token, "new_password": _NEW_PASSWORD},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == _INVALID_TOKEN
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_password_reset_policy_error_preserves_link(client, reset_deliveries, monkeypatch):
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    monkeypatch.setenv("PASSWORD_POLICY_ENFORCED", "true")
+    monkeypatch.setenv("PASSWORD_MIN_LENGTH", "12")
+    response = await client.post(
+        "/api/v1/auth/reset-password", json={"token": token, "new_password": "short"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Password must be at least 12 characters"
+    response = await client.post(
+        "/api/v1/auth/reset-password", json={"token": token, "new_password": _NEW_PASSWORD},
+    )
+    assert response.status_code == 200
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unavailable", "write", "read", "timeout"])
+async def test_password_reset_storage_failure_is_503(client, reset_deliveries, monkeypatch, failure):
+    await _register_email_user(client)
+    token = await _request_reset(client, reset_deliveries)
+    store = await password_reset._get_redis()
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("sensitive-storage-detail")
+
+    if failure == "unavailable":
+        monkeypatch.setattr(password_reset, "_get_redis", AsyncMock(return_value=None))
+    elif failure == "timeout":
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+        monkeypatch.setattr(store, "get", hanging)
+        monkeypatch.setattr(password_reset, "_STORE_TIMEOUT", 0.01)
+    else:
+        monkeypatch.setattr(store, {"write": "setex", "read": "get"}[failure], broken)
+
+    if failure in {"unavailable", "write"}:
+        response = await client.post("/api/v1/auth/forgot-password", json={"email": _EMAIL})
+        unknown = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "not-registered@example.com"},
+        )
+        assert (unknown.status_code, unknown.json()["detail"]) == (
+            response.status_code, response.json()["detail"],
+        )
+    else:
+        response = await client.post(
+            "/api/v1/auth/reset-password", json={"token": token, "new_password": _NEW_PASSWORD},
+        )
+    assert response.status_code == 503
+    assert "sensitive-storage-detail" not in response.text
+    assert "invalid_token" not in response.text
+    async with database.async_session() as db:
+        user = await db.scalar(select(User).where(User.email == _EMAIL))
+        assert user.token_version == 0
+        assert verify_password(_OLD_PASSWORD, user.password_hash)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_forgot_password_mail_failure_preserves_generic_response(client, reset_deliveries, monkeypatch):
+    await _register_email_user(client)
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_password_reset_email", AsyncMock(return_value=False),
+    )
+    known = await client.post("/api/v1/auth/forgot-password", json={"email": _EMAIL})
+    unknown = await client.post(
+        "/api/v1/auth/forgot-password", json={"email": "not-registered@example.com"},
+    )
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()

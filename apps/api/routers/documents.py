@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
@@ -159,6 +160,9 @@ class DocumentResponse(BaseModel):
     editor_recipe_document_id: str | None = None
     editor_recipe_path: str | None = None
     editor_recipe_name: str | None = None
+    # What the file is, in one line, when its name may not say: the prompt that made it or what
+    # media analysis heard or saw in it.
+    hint: str | None = None
     current_user_capabilities: list[str] = Field(default_factory=list)
 
 
@@ -173,6 +177,20 @@ class DocumentListResponse(BaseModel):
     # before the user hits a 402. ``storage_limit_mb`` is null when unlimited.
     storage_used_mb: float | None = None
     storage_limit_mb: float | None = None
+
+
+class DocumentContentMatch(BaseModel):
+    document: DocumentResponse
+    score: float
+    snippet: str
+
+
+class DocumentContentSearchResponse(BaseModel):
+    items: list[DocumentContentMatch]
+    # Documents read for this query; ``partial`` means the scan stopped at its
+    # document or time bound before covering every visible document.
+    scanned: int
+    partial: bool
 
 
 class DocumentIndexingStatusResponse(BaseModel):
@@ -288,8 +306,24 @@ def _doc_resp(
         editor_recipe_document_id=artifact_meta.get("editor_recipe_document_id") or generation_meta.get("editor_recipe_document_id"),
         editor_recipe_path=artifact_meta.get("editor_recipe_path") or generation_meta.get("editor_recipe_path"),
         editor_recipe_name=artifact_meta.get("editor_recipe_name") or generation_meta.get("editor_recipe_name"),
+        hint=_document_hint(meta),
         current_user_capabilities=_ordered_capabilities(current_user_capabilities or set()),
     )
+
+
+def _document_hint(meta: Any) -> str | None:
+    """One short line saying what a file is: its generation prompt, else what media analysis found."""
+    if not isinstance(meta, dict):
+        return None
+    generation = meta.get("generation") if isinstance(meta.get("generation"), dict) else {}
+    text = str(generation.get("prompt") or "").strip()
+    if not text:
+        analysis = meta.get("media_analysis") if isinstance(meta.get("media_analysis"), dict) else {}
+        text = str(analysis.get("summary_en") or analysis.get("summary_zh") or "").strip()
+    # A prompt often opens with "Title: …."; the words after it say what was made.
+    text = re.sub(r"^title:\s*[^.\n]*[.\n]\s*", "", text, flags=re.IGNORECASE)
+    line = re.split(r"(?<=[.!?。！？])\s|\n", text, maxsplit=1)[0].strip()
+    return (line[:117].rstrip() + "…") if len(line) > 120 else (line or None)
 
 
 async def _doc_resp_for_user(
@@ -1536,7 +1570,17 @@ def _thumbnail_cache_path(entity_id: str, doc_id: str) -> str:
     return os.path.join(cache_dir, f"{doc_id}.jpg")
 
 
+# A list of new media asks for many thumbnails at once; each decodes a whole image or runs ffmpeg
+# inside the API's memory limit. Two at a time per process keeps that bounded (the rest wait).
+_THUMBNAIL_SLOTS = asyncio.Semaphore(2)
+
+
 async def _generate_video_thumbnail(source_path: str, target_path: str) -> None:
+    async with _THUMBNAIL_SLOTS:
+        await _render_video_thumbnail(source_path, target_path)
+
+
+async def _render_video_thumbnail(source_path: str, target_path: str) -> None:
     temp_path = f"{os.path.splitext(target_path)[0]}.tmp.jpg"
     if os.path.exists(temp_path):
         try:
@@ -1675,6 +1719,11 @@ async def list_my_documents(
     folder_id: str | None = Query(None),
     workspace_id: str | None = Query(None),
     include_generated_assets: bool = Query(True),
+    kind: list[Literal["audio", "video", "image", "document"]] | None = Query(
+        None, description="Only these media kinds; repeat for several.",
+    ),
+    results_only: bool = Query(False, description="Leave out files made on the way to a result (QA frames, recipes)."),
+    include_usage: bool = Query(True, description="Compute total_files/total_size; pickers skip it."),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
@@ -1685,19 +1734,7 @@ async def list_my_documents(
     # Folder ids whose documents count toward the current location's storage:
     # the folder itself plus every descendant (None → the whole scope, e.g. the
     # root of the knowledge base or a workspace).
-    storage_folder_ids: set[str] | None = None
-    if folder_id not in (None, "", "root"):
-        from packages.core.services.knowledge_visibility import is_user_visible_folder_path
-
-        folders, folder_by_id = await _load_document_folders(db, user.entity_id)
-        folder = folder_by_id.get(folder_id)
-        if (
-            not folder
-            or not is_user_visible_folder_path(_folder_rel_path(folder, folder_by_id))
-            or not await _user_can_read_folder_path(db, folder, folder_by_id, user)
-        ):
-            raise HTTPException(404, "Folder not found")
-        storage_folder_ids = _folder_subtree_ids(folders, folder_id)
+    storage_folder_ids = await _readable_folder_subtree_ids(db, user, folder_id)
     list_folder_id = folder_id
     list_folder_ids: set[str] | None = None
     if search_query:
@@ -1713,6 +1750,8 @@ async def list_my_documents(
         user_id=user.id,
         role=user.role,
         include_generated_assets=include_generated_assets,
+        media_kinds=kind,
+        exclude_work_artifacts=results_only,
         limit=limit, offset=offset,
     )
     total_size, total_files = await visible_storage_usage(
@@ -1723,7 +1762,7 @@ async def list_my_documents(
         folder_ids=storage_folder_ids,
         workspace_id=workspace_id,
         include_generated_assets=include_generated_assets,
-    )
+    ) if include_usage else (0, 0)
     # Entity-wide storage status (plan limit) for the "add" UI guard.
     from packages.core.services.plan_gate import check as _plan_check
     gate = await _plan_check(db, user.entity_id, "storage_mb")
@@ -1736,6 +1775,65 @@ async def list_my_documents(
     return DocumentListResponse(
         items=items, total=total, total_files=total_files, total_size=total_size,
         storage_used_mb=gate.current, storage_limit_mb=gate.limit,
+    )
+
+
+async def _readable_folder_subtree_ids(
+    db: AsyncSession, user: User, folder_id: str | None,
+) -> set[str] | None:
+    """The folder and its descendants, or None for the root; 404 if unreadable."""
+    if folder_id in (None, "", "root"):
+        return None
+    from packages.core.services.knowledge_visibility import is_user_visible_folder_path
+
+    folders, folder_by_id = await _load_document_folders(db, user.entity_id)
+    folder = folder_by_id.get(folder_id)
+    if (
+        not folder
+        or not is_user_visible_folder_path(_folder_rel_path(folder, folder_by_id))
+        or not await _user_can_read_folder_path(db, folder, folder_by_id, user)
+    ):
+        raise HTTPException(404, "Folder not found")
+    return _folder_subtree_ids(folders, folder_id)
+
+
+@router.get("/content-search", response_model=DocumentContentSearchResponse)
+async def search_document_content(
+    q: str = Query(..., min_length=1, max_length=500),
+    folder_id: str | None = Query(None),
+    workspace_id: str | None = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Documents this user can read whose text matches ``q``, best first.
+
+    The same query-time text search the in-product agents use
+    (``knowledge_content_search``), run as the signed-in user under the
+    Document ACL that ``GET /documents`` applies.
+    """
+    from packages.core.services.knowledge_content_search import search_knowledge_content
+
+    folder_ids = await _readable_folder_subtree_ids(db, user, folder_id)
+    result = await search_knowledge_content(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+        actor_type="user", query=q, limit=limit,
+        filters={"workspace_id": workspace_id, "folder_ids": folder_ids},
+    )
+    matches = result["matches"]
+    access_ctx = await DocumentAccessContext.load(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
+    await access_ctx.preload_documents(db, [match["doc"] for match in matches])
+    return DocumentContentSearchResponse(
+        items=[
+            DocumentContentMatch(
+                document=await _doc_resp_for_user(db, match["doc"], user, access_ctx),
+                score=match["score"], snippet=match["snippet"],
+            )
+            for match in matches
+        ],
+        scanned=result["scanned"], partial=result["partial"],
     )
 
 
@@ -2423,6 +2521,10 @@ async def upload_document(
                         )
                     content_hasher.update(chunk)
                     await f.write(chunk)
+            from packages.core.services.image_metadata import (
+                ImageMetadataStripError,
+                strip_image_metadata_path,
+            )
             from packages.core.services.upload_security import (
                 UploadSecurityError,
                 inspect_upload_path,
@@ -2434,10 +2536,20 @@ async def upload_document(
                     filename=filename,
                     declared_content_type=file.content_type,
                 )
+                # Photos lose their location and camera metadata here, so the
+                # size and digest below describe the bytes that are stored.
+                rewritten = await asyncio.to_thread(
+                    strip_image_metadata_path, tmp_path, media_type=mime_type,
+                )
+            except ImageMetadataStripError as exc:
+                raise CodedError(exc.status_code, code=exc.code, message=str(exc)) from exc
             except UploadSecurityError as exc:
                 raise HTTPException(exc.status_code, str(exc)) from exc
+            content_sha256 = content_hasher.hexdigest()
+            if rewritten is not None:
+                file_size, content_sha256 = rewritten
             request_fingerprint = _document_upload_request_fingerprint(
-                content_sha256=content_hasher.hexdigest(),
+                content_sha256=content_sha256,
                 filename=filename,
                 file_size=file_size,
                 folder_id=resolved_folder_id,
@@ -2506,7 +2618,7 @@ async def upload_document(
                         if not await _document_upload_source_matches(
                             entity_id=entity_id,
                             fs_path=rel_target,
-                            content_sha256=content_hasher.hexdigest(),
+                            content_sha256=content_sha256,
                             file_size=file_size,
                         ):
                             fs_path = await _copy_document_file_atomic(
@@ -4954,6 +5066,8 @@ async def _generate_image_thumbnail(source_path: str, target_path: str) -> None:
 
         temp_path = f"{target_path}.tmp"
         with Image.open(source_path) as opened:
+            # A JPEG decodes straight at a fraction of its size; others decode once, then shrink.
+            opened.draft("RGB", (1280, 1280))
             image = ImageOps.exif_transpose(opened)
             image.thumbnail((640, 640))
             if image.mode not in {"RGB", "L"}:
@@ -4968,7 +5082,8 @@ async def _generate_image_thumbnail(source_path: str, target_path: str) -> None:
 
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     try:
-        await asyncio.to_thread(_render)
+        async with _THUMBNAIL_SLOTS:
+            await asyncio.to_thread(_render)
     except Exception:
         temp_path = f"{target_path}.tmp"
         if os.path.exists(temp_path):
@@ -5948,6 +6063,10 @@ class FolderResponse(BaseModel):
     id: str
     entity_id: str
     name: str
+    # Readable label when ``name`` is an identifier the UI should not show
+    # (a Workspace Task/Workflow execution archive); ``name`` stays the
+    # canonical folder name used for paths, rename and search.
+    display_name: str | None = None
     parent_id: str | None = None
     document_count: int | None = 0
     created_at: str | None = None
@@ -5957,6 +6076,9 @@ class FolderResponse(BaseModel):
     owner_id: str | None = None
     client_visible: bool | None = None
     current_user_capabilities: list[str] = Field(default_factory=list)
+    # True for a Workspace artifact root and every folder holding one. The
+    # delete endpoint refuses these, so clients must not offer deletion.
+    delete_blocked_by_workspace: bool = False
 
 
 class DocumentBrowseResponse(DocumentListResponse):
@@ -5994,6 +6116,64 @@ def _folder_resp(
         client_visible=getattr(f, "client_visible", None),
         current_user_capabilities=_ordered_capabilities(current_user_capabilities or set()),
     )
+
+
+async def _workspace_delete_blocked_folder_ids(
+    db: AsyncSession,
+    entity_id: str,
+) -> set[str]:
+    """Folders ``delete_folder`` refuses: Workspace roots and their ancestors.
+
+    Mirrors the guard in ``delete_folder``, which checks every Workspace row
+    (soft-deleted ones included) against the folder's whole subtree.
+    """
+    from packages.core.models.document import DocumentFolder
+    from packages.core.models.workspace import Workspace
+
+    root_ids = set((await db.execute(
+        select(Workspace.artifact_folder_id).where(
+            Workspace.entity_id == entity_id,
+            Workspace.artifact_folder_id.isnot(None),
+        )
+    )).scalars().all())
+    if not root_ids:
+        return set()
+    parent_by_id = dict((await db.execute(
+        select(DocumentFolder.id, DocumentFolder.parent_id).where(
+            DocumentFolder.entity_id == entity_id,
+        )
+    )).all())
+    blocked: set[str] = set()
+    for root_id in root_ids:
+        folder_id: str | None = root_id
+        while folder_id and folder_id not in blocked:
+            blocked.add(folder_id)
+            folder_id = parent_by_id.get(folder_id)
+    return blocked
+
+
+async def _with_folder_display_names(
+    db: AsyncSession,
+    entity_id: str,
+    responses: list[FolderResponse],
+) -> list[FolderResponse]:
+    """Label Workspace execution archive folders (``tasks/<id>``) readably
+    and flag folders that cannot be deleted from Knowledge."""
+    from packages.core.services.workspace_artifacts import workspace_archive_folder_labels
+
+    if not responses:
+        return responses
+    labels = await workspace_archive_folder_labels(
+        db,
+        entity_id=entity_id,
+        folders=[(item.id, item.name, item.parent_id) for item in responses],
+    )
+    blocked = await _workspace_delete_blocked_folder_ids(db, entity_id)
+    for item in responses:
+        if item.id in labels:
+            item.display_name = labels[item.id]
+        item.delete_blocked_by_workspace = item.id in blocked
+    return responses
 
 
 async def _folder_resp_for_user(
@@ -6488,14 +6668,14 @@ async def browse_documents_page(
     gate = await _plan_check(db, user.entity_id, "storage_mb") if not cursor else None
     return DocumentBrowsePageResponse(
         items=final_items,
-        folders=[
+        folders=await _with_folder_display_names(db, user.entity_id, [
             await _folder_resp_for_user(
                 db, folder, user,
                 document_count=None,
                 access_ctx=final_folder_context,
             )
             for folder in direct_folders
-        ],
+        ]),
         next_cursor=_encode_browse_cursor(position, sort_by) if has_more and position else None,
         storage_used_mb=gate.current if gate else None,
         storage_limit_mb=gate.limit if gate else None,
@@ -6713,7 +6893,7 @@ async def browse_documents(
         final_visible_folders,
         storage_documents,
     )
-    folder_responses = [
+    folder_responses = await _with_folder_display_names(db, user.entity_id, [
         await _folder_resp_for_user(
             db,
             folder,
@@ -6722,7 +6902,7 @@ async def browse_documents(
             access_ctx=final_folders.access_context,
         )
         for folder in direct_folders
-    ]
+    ])
 
     return DocumentBrowseResponse(
         items=items,
@@ -6802,7 +6982,7 @@ async def document_folder_tree(
         )
     else:
         folder_counts = {}
-    return [
+    return await _with_folder_display_names(db, user.entity_id, [
         await _folder_resp_for_user(
             db, f, user,
             document_count=folder_counts.get(f.id) if include_counts else None,
@@ -6812,7 +6992,7 @@ async def document_folder_tree(
             visible_folders,
             key=lambda f: ((f.parent_id or ""), (f.name or "").lower()),
         )
-    ]
+    ])
 
 
 async def _validate_folder_position(
@@ -6889,14 +7069,14 @@ async def list_folders(
     )
     visible_folders = sorted(visible_folders, key=lambda f: f.created_at, reverse=True)
 
-    return [
+    return await _with_folder_display_names(db, user.entity_id, [
         await _folder_resp_for_user(
             db, f, user,
             document_count=folder_counts.get(f.id, 0),
             access_ctx=access_context,
         )
         for f in visible_folders
-    ]
+    ])
 
 
 @router.post("/folders", response_model=FolderResponse, status_code=201)
@@ -6953,7 +7133,9 @@ async def create_folder(
     folder.owner_id = user.id
     db.add(folder)
     await db.flush()
-    return await _folder_resp_for_user(db, folder, user, document_count=0)
+    return (await _with_folder_display_names(db, user.entity_id, [
+        await _folder_resp_for_user(db, folder, user, document_count=0),
+    ]))[0]
 
 
 @router.put("/folders/{folder_id}", response_model=FolderResponse)
@@ -7021,7 +7203,9 @@ async def rename_folder(
             raise HTTPException(409, "Folders containing Workspaces cannot be renamed")
         folder.name = clean_name
     await db.flush()
-    return await _folder_resp_for_user(db, folder, user, document_count=0)
+    return (await _with_folder_display_names(db, user.entity_id, [
+        await _folder_resp_for_user(db, folder, user, document_count=0),
+    ]))[0]
 
 
 @router.delete("/folders/{folder_id}", status_code=204)
@@ -7188,7 +7372,9 @@ async def move_folder(
         document.classification = doc_cls
         document.client_visible = doc_cv
     await db.flush()
-    return await _folder_resp_for_user(db, folder, user, document_count=0)
+    return (await _with_folder_display_names(db, user.entity_id, [
+        await _folder_resp_for_user(db, folder, user, document_count=0),
+    ]))[0]
 
 
 # ── Move document to folder ──

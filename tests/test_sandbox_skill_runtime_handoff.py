@@ -183,9 +183,15 @@ async def test_agentic_loop_loads_sandbox_after_skill_handoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delegated_sandbox_binding_rechecks_active_skill_context(
-    monkeypatch,
-) -> None:
+async def test_delegated_sandbox_binding_needs_no_skill_handoff_on_internal_surfaces() -> None:
+    """The Sandbox is a server-owned grant for every internal Agent.
+
+    No Skill handoff or durable binding row is consulted: a session that
+    would explode on use proves the decision is made without storage. The
+    Sandbox handler still binds each sandbox_id to its owning agent/user.
+    """
+    from packages.core.ai.runtime.composite_tools import SANDBOX_LEGACY_TOOL_BY_ACTION
+    from packages.core.ai.runtime.profiles import INTERNAL_CHAT_SURFACES
     from packages.core.services.runtime_authorization.binding_verifier import (
         CurrentRuntimeToolBindingVerifier,
     )
@@ -195,132 +201,25 @@ async def test_delegated_sandbox_binding_rechecks_active_skill_context(
         RuntimeToolBindingSource,
     )
 
-    async def fake_load_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-1",
-            "skill_id": "skill-xlsx",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-            "agent_id": "agent-1",
-        }
-
-    async def fake_list_skills_for_agent(
-        _db,
-        _entity_id,
-        _agent_id,
-        **_kwargs,
-    ):
-        return [SimpleNamespace(id="skill-xlsx", slug="xlsx", name="xlsx")]
-
-    monkeypatch.setattr(
-        "packages.core.ai.runtime.sandbox.runtime_load_sandbox_context",
-        fake_load_context,
-    )
-    monkeypatch.setattr(
-        "packages.core.services.skill_service.list_skills_for_agent",
-        fake_list_skills_for_agent,
-    )
-
-    request = RuntimeAuthorizationRequest.create(
-        entity_id="entity-1",
-        user_id="user-1",
-        workspace_id=None,
-        action_key="sandbox.execute",
-        capability_id="sandbox.execute",
-        access=RuntimeAuthorizationAccess.USE,
-        principal_kind="agent",
-        principal_agent_id="agent-1",
-        principal_execution_user_id="user-1",
-        tool_name="sandbox",
-        bound_tool_names={"search_tools", "invoke_skill", "sandbox"},
-        conversation_id="conversation-1",
-        runtime_surface="agent_dm",
-    )
-
     verifier = CurrentRuntimeToolBindingVerifier()
-    decision = await verifier.verify(object(), request)
-
-    assert decision.source is RuntimeToolBindingSource.CONTEXTUAL
-
-    wrong_agent_request = RuntimeAuthorizationRequest.create(
-        entity_id="entity-1",
-        user_id="user-1",
-        workspace_id=None,
-        action_key="sandbox.execute",
-        capability_id="sandbox.execute",
-        access=RuntimeAuthorizationAccess.USE,
-        principal_kind="agent",
-        principal_agent_id="agent-2",
-        principal_execution_user_id="user-1",
-        tool_name="sandbox",
-        bound_tool_names={"sandbox"},
-        conversation_id="conversation-1",
-        runtime_surface="agent_dm",
-    )
-    assert not await verifier._has_active_sandbox_skill_binding(
-        object(),
-        wrong_agent_request,
-    )
-
-
-@pytest.mark.asyncio
-async def test_delegated_sandbox_binding_rejects_same_slug_replacement(
-    monkeypatch,
-) -> None:
-    from packages.core.services.runtime_authorization.binding_verifier import (
-        CurrentRuntimeToolBindingVerifier,
-    )
-    from packages.core.services.runtime_authorization.domain import (
-        RuntimeAuthorizationAccess,
-        RuntimeAuthorizationRequest,
-    )
-
-    async def fake_load_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-1",
-            "skill_id": "revoked-skill-id",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-            "agent_id": "agent-1",
-        }
-
-    async def fake_list_skills_for_agent(
-        _db,
-        _entity_id,
-        _agent_id,
-        **_kwargs,
-    ):
-        return [SimpleNamespace(id="replacement-skill-id", slug="xlsx", name="xlsx")]
-
-    monkeypatch.setattr(
-        "packages.core.ai.runtime.sandbox.runtime_load_sandbox_context",
-        fake_load_context,
-    )
-    monkeypatch.setattr(
-        "packages.core.services.skill_service.list_skills_for_agent",
-        fake_list_skills_for_agent,
-    )
-
-    request = RuntimeAuthorizationRequest.create(
-        entity_id="entity-1",
-        user_id="user-1",
-        workspace_id=None,
-        action_key="sandbox.execute",
-        capability_id="sandbox.execute",
-        access=RuntimeAuthorizationAccess.USE,
-        principal_kind="agent",
-        principal_agent_id="agent-1",
-        principal_execution_user_id="user-1",
-        tool_name="sandbox",
-        bound_tool_names={"sandbox"},
-        conversation_id="conversation-1",
-        runtime_surface="agent_dm",
-    )
-
-    assert not await CurrentRuntimeToolBindingVerifier._has_active_sandbox_skill_binding(
-        object(),
-        request,
-    )
+    for surface in sorted(INTERNAL_CHAT_SURFACES, key=lambda item: item.value):
+        for tool_name in ("sandbox", *SANDBOX_LEGACY_TOOL_BY_ACTION.values()):
+            request = RuntimeAuthorizationRequest.create(
+                entity_id="entity-1",
+                user_id="user-1",
+                workspace_id=None,
+                action_key="sandbox.execute",
+                capability_id="sandbox.execute",
+                access=RuntimeAuthorizationAccess.USE,
+                principal_kind="agent",
+                principal_agent_id="agent-without-skills",
+                principal_execution_user_id="user-1",
+                tool_name=tool_name,
+                bound_tool_names={"search_tools", tool_name},
+                runtime_surface=surface,
+            )
+            decision = await verifier.verify(SimpleNamespace(), request)
+            assert decision.source is RuntimeToolBindingSource.CONTEXTUAL, (surface, tool_name)
 
 
 @pytest.mark.asyncio
@@ -340,12 +239,10 @@ async def test_sandbox_context_initialization_requires_successful_cache_write(
     monkeypatch.setattr(cache_module.cache, "set", failed_cache_write)
 
     with pytest.raises(RuntimeError, match="could not be persisted"):
-        await runtime_sandbox.runtime_init_sandbox_context(
-            "conversation-1",
+        await runtime_sandbox.runtime_init_sandbox_binding(
+            runtime_sandbox.RuntimeSandboxScope("entity-1", "user-1", "conversation-1"),
             "sandbox-1",
             "skill-1",
-            entity_id="entity-1",
-            user_id="user-1",
             agent_id="agent-1",
         )
 

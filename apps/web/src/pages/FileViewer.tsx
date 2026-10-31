@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef, type ImgHTMLAttributes, type ReactNode } from "react";
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type ImgHTMLAttributes, type ReactNode } from "react";
 import { useLocation, useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
@@ -71,7 +71,11 @@ import {
 import { isCodeLikeFile } from "../lib/codeFiles";
 import { getFilePreviewKind, type FilePreviewKind } from "../lib/filePreviewKind";
 import { useHtmlPreviewDocument } from "../lib/useHtmlPreviewDocument";
-import { presentationPointsToCqh } from "../lib/presentationStyleInheritance";
+import {
+  PRESENTATION_DEFAULT_TEXT_INSETS,
+  presentationPointsToCqh,
+  presentationTextInsetPadding,
+} from "../lib/presentationStyleInheritance";
 import { presentationRoundRectRadius, presentationStrokeDash } from "../lib/presentationShapeStyle";
 import {
   presentationPresetClipPath,
@@ -114,6 +118,7 @@ import { spreadsheetAxisOffsets, spreadsheetViewportRange } from "../lib/spreads
 import { parseSpreadsheetPreview } from "../lib/spreadsheetPreviewParser";
 
 import { t } from "../lib/i18n";
+import { getPreferredTimeZone } from "../lib/format";
 
 const LazyDiagramArtifactViewer = lazy(
   () => import("../components/diagram/DiagramArtifactViewer"),
@@ -820,8 +825,8 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
   });
 }
 
-async function readDocumentTextViaDownload(docId: string): Promise<string> {
-  const blob = await api.documents.previewBlob(docId);
+async function readDocumentTextViaDownload(docId: string, signal?: AbortSignal): Promise<string> {
+  const blob = await api.documents.previewBlob(docId, { signal });
   return decodeTextFile(await blob.arrayBuffer()).text;
 }
 
@@ -1022,6 +1027,7 @@ function DocxViewer({
   const legacyPreviewRef = useRef<HTMLDivElement | null>(null);
   const serverPagesRef = useRef<HTMLDivElement | null>(null);
   const previewKey = `${docId || ""}:${url}`;
+  const originalBlobRef = useRef<{ key: string; blob: Blob } | null>(null);
   const useClientFallback = serverFallbackKey === previewKey;
   const visibleCommentAnchors = useMemo(
     () => quoteAnchoredComments(commentAnchors),
@@ -1057,8 +1063,21 @@ function DocxViewer({
           }
         }
 
-        const buf = blob
-          ? await blob.arrayBuffer()
+        // Server pages need no original file. Fetch it only for selectable
+        // comments or a failed server preview, through the same protected API.
+        let sourceBlob = blob ?? (originalBlobRef.current?.key === previewKey
+          ? originalBlobRef.current.blob
+          : null);
+        if (!sourceBlob && docId) {
+          sourceBlob = await api.documents.previewBlob(docId, { signal: abortController.signal });
+          if (cancelled) return;
+          // Keep the original only for this open preview, as the parent did
+          // before lazy loading, so toggling comments does not download again.
+          originalBlobRef.current = { key: previewKey, blob: sourceBlob };
+        }
+        if (cancelled) return;
+        const buf = sourceBlob
+          ? await sourceBlob.arrayBuffer()
           : await (await fetch(url, { signal: abortController.signal })).arrayBuffer();
         if (cancelled) return;
         const bytes = new Uint8Array(buf);
@@ -1088,7 +1107,7 @@ function DocxViewer({
       cancelled = true;
       abortController.abort();
     };
-  }, [blob, docId, preferSelectablePreview, retryGeneration, url, useClientFallback]);
+  }, [blob, docId, preferSelectablePreview, previewKey, retryGeneration, url, useClientFallback]);
 
   useEffect(() => {
     const root = serverPagesRef.current;
@@ -1366,6 +1385,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
   const [error, setError] = useState("");
   const [gridScroll, setGridScroll] = useState({ left: 0, top: 0 });
   const [gridViewport, setGridViewport] = useState({ width: 0, height: 600 });
+  const [rowLayout, setRowLayout] = useState<{ sheet: SpreadsheetSheetModel; heights: number[] } | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -1439,7 +1459,8 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
   }, [sheets.length]);
 
   const sheet = sheets[activeSheet] || EMPTY_SPREADSHEET_SHEET;
-  const rowOffsets = useMemo(() => spreadsheetAxisOffsets(sheet.rowHeights, 32), [sheet.rowHeights]);
+  const rowHeights = rowLayout?.sheet === sheet ? rowLayout.heights : sheet.rowHeights;
+  const rowOffsets = useMemo(() => spreadsheetAxisOffsets(rowHeights, 32), [rowHeights]);
   const columnOffsets = useMemo(() => spreadsheetAxisOffsets(sheet.columnWidths, 112), [sheet.columnWidths]);
   const baseRowRange = spreadsheetViewportRange(rowOffsets, Math.max(0, gridScroll.top - 34), gridViewport.height, 3);
   const baseColumnRange = spreadsheetViewportRange(columnOffsets, Math.max(0, gridScroll.left - 48), gridViewport.width, 2);
@@ -1458,6 +1479,39 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
     });
     return [...cells.values()].sort((a, b) => a.row - b.row || a.column - b.column);
   }, [baseColumnRange.end, baseColumnRange.start, baseRowRange.end, baseRowRange.start, sheet.merges]);
+
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const texts = [...grid.querySelectorAll<HTMLElement>("[data-spreadsheet-preview-text]")];
+    // Measure only mounted cells; growing their rows keeps virtual scrolling,
+    // merged cells and picture anchors aligned without changing workbook data.
+    const measureRows = () => {
+      const heights = rowHeights.slice();
+      let changed = false;
+      for (const text of texts) {
+        const cell = text.parentElement!;
+        const row = Number(cell.parentElement!.getAttribute("aria-rowindex")) - 2;
+        const rowSpan = Number(cell.getAttribute("aria-rowspan") || 1);
+        const lastRow = Math.min(heights.length - 1, row + rowSpan - 1);
+        const style = getComputedStyle(cell);
+        const requiredHeight = Math.ceil(text.getBoundingClientRect().height
+          + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+          + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth));
+        const availableHeight = rowOffsets[lastRow + 1] - rowOffsets[row];
+        if (requiredHeight > availableHeight) {
+          heights[lastRow] = Math.max(heights[lastRow], rowHeights[lastRow] + requiredHeight - availableHeight);
+          changed = true;
+        }
+      }
+      if (changed) setRowLayout({ sheet, heights });
+    };
+    measureRows();
+    const observer = new ResizeObserver(measureRows);
+    texts.forEach((text) => observer.observe(text));
+    return () => observer.disconnect();
+  }, [sheet, visibleCells, rowHeights, rowOffsets]);
+
   const gridWidth = 48 + columnOffsets[columnOffsets.length - 1];
   const gridHeight = 34 + rowOffsets[rowOffsets.length - 1];
   const visibleCellRows = new Map<number, number[]>();
@@ -1516,7 +1570,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
             ))}
           </div>
           {[...visibleCellRows].map(([row, columns]) => (
-            <div key={row} role="row" aria-rowindex={row + 2} style={{ position: "absolute", top: 34 + rowOffsets[row], left: 0, width: "100%", height: sheet.rowHeights[row] || 32 }}>
+            <div key={row} role="row" aria-rowindex={row + 2} style={{ position: "absolute", top: 34 + rowOffsets[row], left: 0, width: "100%", height: rowHeights[row] || 32 }}>
               <div role="rowheader" aria-colindex={1} style={{ ...tdStyle, padding: "6px 4px", position: "sticky", left: 0, width: 48, height: "100%", boxSizing: "border-box", color: "#a8a29e", fontWeight: 600, background: "#fafaf9", textAlign: "center", zIndex: 3 }}>{row + 1}</div>
               {columns.map((column) => {
             const merge = spreadsheetMergeAt(sheet.merges, row, column);
@@ -1549,10 +1603,12 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
                   flexDirection: "column",
                   justifyContent: cellStyle.verticalAlign === "bottom" ? "flex-end" : cellStyle.verticalAlign === "middle" ? "center" : "flex-start",
                   overflow: "hidden",
-                  textOverflow: "ellipsis",
+                  textOverflow: "clip",
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
                 }}
               >
-                {display}
+                <span data-spreadsheet-preview-text style={{ flex: "0 0 auto", minWidth: 0 }}>{display}</span>
               </div>
             );
               })}
@@ -1561,7 +1617,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
         <SpreadsheetImageLayer
           images={sheet.images}
           columnWidths={sheet.columnWidths}
-          rowHeights={sheet.rowHeights}
+          rowHeights={rowHeights}
           columnHeaderHeight={34}
         />
         </div>
@@ -4724,10 +4780,8 @@ function PptxCssSlidePreview({
           : shape.vAlign === "bottom"
             ? "flex-end"
             : shape.texts.length > 0 ? "center" : undefined;
-        const padding = shape.padding;
-        const paddingStyle = padding
-          ? `${presentationPointsToCqh(padding.t)} ${presentationPointsToCqh(padding.r)} ${presentationPointsToCqh(padding.b)} ${presentationPointsToCqh(padding.l)}`
-          : shape.texts.length > 0 ? "2% 3%" : undefined;
+        const insets = shape.padding ?? (shape.texts.length > 0 ? PRESENTATION_DEFAULT_TEXT_INSETS : undefined);
+        const paddingStyle = insets ? presentationTextInsetPadding(insets, shape) : undefined;
         const transforms: string[] = [];
         if (shape.rotation) transforms.push(`rotate(${shape.rotation}deg)`);
         if (shape.flipH) transforms.push("scaleX(-1)");
@@ -5920,6 +5974,7 @@ function AccessLogSection({ docId }: { docId: string }) {
                   {new Date(r.ts).toLocaleString(undefined, {
                     month: "short", day: "numeric",
                     hour: "2-digit", minute: "2-digit",
+                    timeZone: getPreferredTimeZone(),
                   })}
                 </span>
               </div>
@@ -6923,6 +6978,13 @@ function ImageEditor({
 // ── Main component ──
 export default function FileViewer() {
   const { docId } = useParams<{ docId: string }>();
+  // A new file owns its preview, dialogs and live-edit bridges from the first
+  // render; an effect reset would leave one render with the previous file.
+  return <FileViewerDocument key={docId} />;
+}
+
+function FileViewerDocument() {
+  const { docId } = useParams<{ docId: string }>();
   const navigate = useNavigate();
   const currentUser = useAuthStore((s) => s.user);
   const toast = useToastStore();
@@ -6931,6 +6993,7 @@ export default function FileViewer() {
   const taskOutputPreview = useMemo(() => getTaskOutputPreview(location.state), [location.state]);
   const viewerSurfaceRef = useRef<HTMLDivElement | null>(null);
   const fetchGenerationRef = useRef(0);
+  const fetchAbortControllerRef = useRef<AbortController | null>(null);
 
   const queryClient = useQueryClient();
   const [doc, setDoc] = useState<Document | null>(null);
@@ -7060,14 +7123,23 @@ export default function FileViewer() {
     if (!docId) return;
     const requestId = ++fetchGenerationRef.current;
     const isCurrentRequest = () => fetchGenerationRef.current === requestId;
+    fetchAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchAbortControllerRef.current = controller;
+    const { signal } = controller;
     setLoading(true);
+    setDoc(null);
+    setContent("");
+    setPdfLiveEditBridge(null);
+    setImageLiveEditBridge(null);
+    setAudioLiveEditBridge(null);
     setError("");
     setPreviewError("");
     replaceDownloadUrl("");
     setDownloadBlob(null);
     try {
       const resolvedDocumentId = docId;
-      const meta = await api.documents.get(resolvedDocumentId);
+      const meta = await api.documents.getForPreview(resolvedDocumentId, { signal });
       if (!isCurrentRequest()) return;
       setDoc(meta);
 
@@ -7075,7 +7147,7 @@ export default function FileViewer() {
       if (cat === "diagram") {
         try {
           assertDiagramPreviewFileSize(meta.file_size);
-          const response = await api.documents.previewResponse(resolvedDocumentId);
+          const response = await api.documents.previewResponse(resolvedDocumentId, { signal });
           const text = await readDiagramPreviewText(response);
           if (!isCurrentRequest()) return;
           setContent(text);
@@ -7092,12 +7164,13 @@ export default function FileViewer() {
 
       if (["text", "markdown", "code", "html", "csv", "json"].includes(cat)) {
         try {
-          const text = await readDocumentTextViaDownload(resolvedDocumentId);
+          const text = await readDocumentTextViaDownload(resolvedDocumentId, signal);
           if (!isCurrentRequest()) return;
           setContent(text);
         } catch (downloadTextError) {
+          if (!isCurrentRequest()) return;
           try {
-            const res = await api.documents.getContent(resolvedDocumentId);
+            const res = await api.documents.getContent(resolvedDocumentId, signal);
             if (!isCurrentRequest()) return;
             setContent(typeof res === "string" ? res : res.content);
           } catch {
@@ -7112,7 +7185,7 @@ export default function FileViewer() {
         }
       }
 
-      if (["image", "video", "audio", "pdf", "docx", "xlsx", "pptx"].includes(cat)) {
+      if (["image", "video", "audio", "pdf", "xlsx", "pptx"].includes(cat)) {
         // For video/audio, prefer streaming URL (avoids downloading entire file into memory)
         try {
           if (["video", "audio"].includes(cat)) {
@@ -7121,7 +7194,7 @@ export default function FileViewer() {
               if (!isCurrentRequest()) return;
               replaceDownloadUrl(streamUrl);
             } else {
-              const url = await api.documents.preview(resolvedDocumentId);
+              const url = await api.documents.preview(resolvedDocumentId, { signal });
               if (!isCurrentRequest()) {
                 if (url.startsWith("blob:")) URL.revokeObjectURL(url);
                 return;
@@ -7129,7 +7202,7 @@ export default function FileViewer() {
               replaceDownloadUrl(url);
             }
           } else {
-            const blob = await api.documents.previewBlob(resolvedDocumentId);
+            const blob = await api.documents.previewBlob(resolvedDocumentId, { signal });
             if (!isCurrentRequest()) return;
             const url = URL.createObjectURL(blob);
             setDownloadBlob(blob);
@@ -7208,7 +7281,13 @@ export default function FileViewer() {
     };
   }, []);
 
-  useEffect(() => { fetchDoc(); }, [fetchDoc]);
+  useEffect(() => {
+    void fetchDoc();
+    return () => {
+      fetchGenerationRef.current += 1;
+      fetchAbortControllerRef.current?.abort();
+    };
+  }, [fetchDoc]);
 
   useEffect(() => {
     setCommentAnchor(documentCommentAnchor(doc));
@@ -7400,7 +7479,7 @@ export default function FileViewer() {
     if (fileViewerAiEditDetail) openEditorLiveChat(fileViewerAiEditDetail);
   }, [fileViewerAiEditDetail]);
 
-  if (loading) {
+  if (loading && !doc) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", padding: "128px 0" }}>
         <LoadingSpinner size={32} />
@@ -7413,7 +7492,10 @@ export default function FileViewer() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", padding: "128px 0" }}>
         <div className="glass-panel" style={{ padding: 32, textAlign: "center", maxWidth: 480 }}>
           <p style={{ color: "#c14a44", marginBottom: 16 }}>{error}</p>
-          <Button variant="outline" onClick={goBack}>{t("page.file_viewer.go_back")}</Button>
+          <div className="flex justify-center gap-2">
+            <Button variant="outline" onClick={fetchDoc}>{t("component.chat_message_actions.retry")}</Button>
+            <Button variant="outline" onClick={goBack}>{t("page.file_viewer.go_back")}</Button>
+          </div>
         </div>
       </div>
     );
@@ -7593,6 +7675,7 @@ export default function FileViewer() {
         <div
           ref={viewerSurfaceRef}
           className="glass-panel manor-editor-viewer-surface"
+          aria-busy={loading}
           data-selection-context="knowledge"
           data-selection-source-label={doc?.name || "Knowledge Base"}
           data-selection-source-path={`${location.pathname}${location.search}`}
@@ -7612,6 +7695,11 @@ export default function FileViewer() {
             density={watermarkDensity}
           />
         )}
+        {loading ? (
+          <div role="status" aria-label={t("status.loading")} style={{ display: "flex", justifyContent: "center", padding: 64 }}>
+            <LoadingSpinner size={28} />
+          </div>
+        ) : <>
         {previewError && (
           <div style={{ padding: "64px 0" }}>
             <EmptyState
@@ -7711,11 +7799,11 @@ export default function FileViewer() {
           </div>
         )}
 
-        {!previewError && category === "docx" && downloadUrl && (
+        {!previewError && category === "docx" && (!isTaskOutputPreview || downloadUrl) && (
           <DocxViewer
             url={downloadUrl}
             blob={downloadBlob}
-            docId={currentDocumentId}
+            docId={isTaskOutputPreview ? undefined : currentDocumentId}
             docName={doc?.name}
             onDownload={handleDownload}
             commentAnchors={viewerAnchoredComments}
@@ -7792,6 +7880,7 @@ export default function FileViewer() {
             />
           </div>
         )}
+        </>}
         </div>
 
       {/* Comments drawer */}
@@ -7870,7 +7959,7 @@ export default function FileViewer() {
           {doc.created_at && (
             <DetailRow label={t("page.file_viewer.details.uploaded")}>
               <span style={{ fontSize: 12, color: "#57534e" }}>
-                {new Date(doc.created_at).toLocaleString()}
+                {new Date(doc.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() })}
               </span>
             </DetailRow>
           )}

@@ -13,6 +13,7 @@ import Input from "../components/ui/Input";
 import { IconDownload, IconRefresh } from "../components/icons";
 
 import { t } from "../lib/i18n";
+import { getPreferredTimeZone } from "../lib/format";
 /* -- types ---------------------------------------------------- */
 
 type ReportTab = "tasks" | "usage" | "activity";
@@ -200,7 +201,7 @@ export default function Reports() {
               {(currentReport as Report).title || `${tab.charAt(0).toUpperCase() + tab.slice(1)} Report`}
             </h3>
             <span style={{ fontSize: 11, color: "#a8a29e" }}>
-              {t("page.reports.generated")} {(currentReport as Report).generated_at ? new Date((currentReport as Report).generated_at).toLocaleString() : "N/A"}
+              {t("page.reports.generated")} {(currentReport as Report).generated_at ? new Date((currentReport as Report).generated_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : "N/A"}
             </span>
           </div>
 

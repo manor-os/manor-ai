@@ -96,7 +96,6 @@ def test_task_planning_claim_uses_shared_enum_factory():
 async def test_agent_task_execution_claim_suppresses_concurrent_runner(monkeypatch):
     from contextlib import asynccontextmanager
 
-    from packages.core.ai.task_runner import TaskRunner
     from packages.core.services import workflow_run_execution_claim as claim_service
     from packages.core.tasks import ai_tasks
 
@@ -110,10 +109,10 @@ async def test_agent_task_execution_claim_suppresses_concurrent_runner(monkeypat
         )
 
     async def unexpected_run(*_args, **_kwargs):
-        raise AssertionError("a denied delivery must not enter TaskRunner")
+        raise AssertionError("a denied delivery must not hand the Task to its run")
 
     monkeypatch.setattr(claim_service, "agent_task_execution_claim", held_claim)
-    monkeypatch.setattr(TaskRunner, "run", unexpected_run)
+    monkeypatch.setattr(ai_tasks, "_prepare_agent_task_runtime", unexpected_run)
 
     claimed, result = await ai_tasks._run_agent_task_with_execution_claim(
         object(),
@@ -126,70 +125,10 @@ async def test_agent_task_execution_claim_suppresses_concurrent_runner(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_agent_task_runner_fences_and_closes_its_terminal_commit(monkeypatch):
-    from contextlib import asynccontextmanager
-
-    from packages.core.ai.task_runner import TaskRunner
-    from packages.core.services import workflow_run_execution_claim as claim_service
-    from packages.core.tasks import ai_tasks
-
-    claim = claim_service._claim(
-        "task-1",
-        "worker-1",
-        granted=True,
-        reason=claim_service.CLAIM_GRANTED,
-        lost_error_type=claim_service.AgentTaskExecutionClaimLost,
-    )
-
-    @asynccontextmanager
-    async def granted_claim(_task_id):
-        yield claim
-
-    async def fake_run(
-        self,
-        *_args,
-        runtime_hitl_delivery_identity=None,
-    ):
-        assert self._execution_claim is claim
-        assert runtime_hitl_delivery_identity is None
-        self._before_terminal_commit()
-        self._after_terminal_commit()
-        claim.lost.set()
-        self._before_terminal_commit()
-        return {"status": "completed"}
-
-    async def legacy_runtime(*_args, **_kwargs):
-        from packages.core.constants.task import TaskRuntimeKind
-        from packages.core.services.task_execution import TaskExecutionDispatch
-
-        return (
-            TaskExecutionDispatch(
-                runtime_kind=TaskRuntimeKind.LEGACY_AGENT,
-                task_id="task-1",
-                target_id="agent-1",
-            ),
-            None,
-        )
-
-    monkeypatch.setattr(claim_service, "agent_task_execution_claim", granted_claim)
-    monkeypatch.setattr(ai_tasks, "_prepare_agent_task_runtime", legacy_runtime)
-    monkeypatch.setattr(TaskRunner, "run", fake_run)
-
-    claimed, result = await ai_tasks._run_agent_task_with_execution_claim(
-        object(),
-        "task-1",
-        "agent-1",
-    )
-
-    assert claimed is True
-    assert result == {"status": "completed"}
-    assert claim.terminal_committed.is_set() is True
-
-
-@pytest.mark.asyncio
 async def test_agent_task_claim_loss_settlement_uses_fresh_fenced_claim(monkeypatch):
     from contextlib import asynccontextmanager
 
+    from packages.core.models.task_coordinator import TaskCoordinatorRun
     from packages.core.services import event_emitter
     from packages.core.services import task_state_machine
     from packages.core.services import workflow_run_execution_claim as claim_service
@@ -215,6 +154,9 @@ async def test_agent_task_claim_loss_settlement_uses_fresh_fenced_claim(monkeypa
         yield claim
 
     class QueryResult:
+        def __init__(self, scalar_row=task):
+            self.scalar_row = scalar_row
+
         def one_or_none(self):
             return SimpleNamespace(
                 id=task.id,
@@ -223,7 +165,7 @@ async def test_agent_task_claim_loss_settlement_uses_fresh_fenced_claim(monkeypa
             )
 
         def scalar_one_or_none(self):
-            return task
+            return self.scalar_row
 
         def scalars(self):
             return self
@@ -235,7 +177,11 @@ async def test_agent_task_claim_loss_settlement_uses_fresh_fenced_claim(monkeypa
         commits = 0
         rollbacks = 0
 
-        async def execute(self, _statement):
+        async def execute(self, statement):
+            descriptions = getattr(statement, "column_descriptions", [])
+            if descriptions and descriptions[0].get("entity") is TaskCoordinatorRun:
+                # This legacy runner has no durable coordinator to clean up.
+                return QueryResult(None)
             return QueryResult()
 
         async def commit(self):
@@ -978,11 +924,6 @@ def test_run_agent_task_does_not_finalize_a_suppressed_duplicate(monkeypatch):
         "agent-1",
         scheduled_run_id="run-1",
         scheduled_job_id="job-1",
-        runtime_hitl_id="hitl-1",
-        runtime_hitl_generation=7,
-        runtime_hitl_checkpoint_digest="checkpoint-digest",
-        runtime_hitl_checkpoint_signature="checkpoint-signature",
-        runtime_hitl_resolution_signature="resolution-signature",
     )
 
     assert result == {
@@ -997,11 +938,6 @@ def test_run_agent_task_does_not_finalize_a_suppressed_duplicate(monkeypatch):
             "scheduled_run_id": "run-1",
             "scheduled_job_id": "job-1",
             "claim_recheck": True,
-            "runtime_hitl_id": "hitl-1",
-            "runtime_hitl_generation": 7,
-            "runtime_hitl_checkpoint_digest": "checkpoint-digest",
-            "runtime_hitl_checkpoint_signature": "checkpoint-signature",
-            "runtime_hitl_resolution_signature": "resolution-signature",
         },
         "countdown": AGENT_TASK_EXECUTION_RECHECK_SECONDS,
     }]
@@ -5189,7 +5125,6 @@ def test_file_deliverable_completion_requires_generation_tool_result():
 
 def test_scheduled_agent_credit_exhaustion_closes_task_and_run(monkeypatch):
     from packages.core.ai.llm_client import CreditExhaustedError
-    from packages.core.ai.task_runner import TaskRunner
     from packages.core.tasks import ai_tasks
     import packages.core.database as database
 
@@ -5202,7 +5137,6 @@ def test_scheduled_agent_credit_exhaustion_closes_task_and_run(monkeypatch):
         raise CreditExhaustedError("no credits")
 
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    monkeypatch.setattr(TaskRunner, "run", lambda self, *args, **kwargs: None)
     monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
     monkeypatch.setattr(
         ai_tasks,
@@ -5225,7 +5159,6 @@ def test_scheduled_agent_credit_exhaustion_closes_task_and_run(monkeypatch):
 
 
 def test_scheduled_agent_retry_exhaustion_closes_task_and_run(monkeypatch):
-    from packages.core.ai.task_runner import TaskRunner
     from packages.core.tasks import ai_tasks
     import packages.core.database as database
 
@@ -5238,7 +5171,6 @@ def test_scheduled_agent_retry_exhaustion_closes_task_and_run(monkeypatch):
         raise RuntimeError("provider timeout")
 
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    monkeypatch.setattr(TaskRunner, "run", lambda self, *args, **kwargs: None)
     monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
     monkeypatch.setattr(
         ai_tasks,
@@ -5264,65 +5196,8 @@ def test_scheduled_agent_retry_exhaustion_closes_task_and_run(monkeypatch):
     assert finalized[0][2] == result
 
 
-@pytest.mark.asyncio
-async def test_task_runtime_surfaces_transient_provider_usage_for_retry(monkeypatch):
-    from packages.core.ai.engine import ChatMessage
-    from packages.core.ai.runtime import task_agent
-
-    async def fake_agent_chat(**_kwargs):
-        return ChatMessage(
-            role="assistant",
-            content="",
-            usage={"error": "HTTP 503: service temporarily unavailable"},
-        )
-
-    monkeypatch.setattr(task_agent, "runtime_execute_task_agent_chat", fake_agent_chat)
-
-    with pytest.raises(task_agent.RuntimeTaskProviderError) as raised:
-        await task_agent.runtime_execute_task_agent_turn(
-            engine=object(),
-            messages=[],
-            tools=[],
-            loaded_tool_names=set(),
-            system_prompt="",
-            runtime_envelope=None,
-            entity_id="entity-provider-retry",
-            agent_id=None,
-        )
-
-    assert raised.value.retryable is True
-    assert "HTTP 503" in str(raised.value)
-    assert task_agent.runtime_task_provider_error_is_retryable("HTTP 401") is False
-
-
-@pytest.mark.asyncio
-async def test_task_supervisor_does_not_downgrade_credit_exhaustion(monkeypatch):
-    from packages.core.ai.llm_client import CreditExhaustedError
-    from packages.core.ai.runtime import task_agent
-
-    async def exhausted_supervisor(**_kwargs):
-        raise CreditExhaustedError("no credits")
-
-    monkeypatch.setattr(
-        task_agent,
-        "runtime_execute_task_supervisor_chat",
-        exhausted_supervisor,
-    )
-
-    with pytest.raises(CreditExhaustedError):
-        await task_agent.runtime_review_task_agent_output(
-            engine=object(),
-            task_title="Credit-gated review",
-            agent_response="Draft result",
-            done_when="Draft is reviewed",
-            turns_used=1,
-            max_turns=3,
-        )
-
-
 def test_scheduled_agent_rate_limit_exhaustion_closes_task_and_run(monkeypatch):
     from packages.core.ai.llm_client import LLMRateLimited
-    from packages.core.ai.task_runner import TaskRunner
     from packages.core.tasks import ai_tasks
     import packages.core.database as database
 
@@ -5335,7 +5210,6 @@ def test_scheduled_agent_rate_limit_exhaustion_closes_task_and_run(monkeypatch):
         raise LLMRateLimited(45)
 
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    monkeypatch.setattr(TaskRunner, "run", lambda self, *args, **kwargs: None)
     monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
     monkeypatch.setattr(
         ai_tasks,
@@ -5359,204 +5233,6 @@ def test_scheduled_agent_rate_limit_exhaustion_closes_task_and_run(monkeypatch):
     assert "4 attempts" in marked[0][0][1]
     assert finalized[0][0:2] == (session_factory, "task-rate-limited")
     assert finalized[0][2] == result
-
-
-@pytest.mark.parametrize("task_name", ["run_plan", "plan_and_run_task"])
-def test_plan_tasks_cooperatively_retry_provider_rate_limits(monkeypatch, task_name):
-    from celery.exceptions import Retry
-    from packages.core.ai.llm_client import LLMRateLimited
-    from packages.core.tasks import ai_tasks
-
-    task = getattr(ai_tasks, task_name)
-    retry_calls = []
-
-    def fail_run(awaitable):
-        awaitable.close()
-        raise LLMRateLimited(45)
-
-    def retry(**kwargs):
-        retry_calls.append(kwargs)
-        raise Retry()
-
-    monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
-    if task_name == "run_plan":
-        monkeypatch.setattr(
-            ai_tasks,
-            "_claim_plan_cycle_delivery",
-            lambda **_kwargs: (
-                SimpleNamespace(
-                    event_id="event-1",
-                    plan_id="task-or-plan-id",
-                    wake_generation="generation-1",
-                    claim_token="claim-1",
-                ),
-                "claimed",
-            ),
-        )
-        monkeypatch.setattr(
-            ai_tasks,
-            "_release_plan_cycle_delivery",
-            lambda *_args, **_kwargs: True,
-        )
-    monkeypatch.setattr(task, "retry", retry)
-
-    with pytest.raises(Retry):
-        if task_name == "run_plan":
-            task.run(
-                "task-or-plan-id",
-                outbox_event_id="event-1",
-                wake_generation="generation-1",
-            )
-        else:
-            task.run("task-or-plan-id")
-
-    assert retry_calls[0]["countdown"] == 45
-
-
-@pytest.mark.parametrize(
-    ("task_name", "failure_marker"),
-    [
-        ("run_plan", "_mark_plan_failed"),
-        ("plan_and_run_task", "_mark_task_failed"),
-    ],
-)
-def test_plan_rate_limit_exhaustion_closes_runtime(
-    monkeypatch, task_name, failure_marker,
-):
-    from packages.core.ai.llm_client import LLMRateLimited
-    from packages.core.tasks import ai_tasks
-
-    task = getattr(ai_tasks, task_name)
-    marked = []
-
-    def fail_run(awaitable):
-        awaitable.close()
-        raise LLMRateLimited(45)
-
-    monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
-    if task_name == "run_plan":
-        monkeypatch.setattr(
-            ai_tasks,
-            "_claim_plan_cycle_delivery",
-            lambda **_kwargs: (
-                SimpleNamespace(
-                    event_id="event-1",
-                    plan_id="task-or-plan-id",
-                    wake_generation="generation-1",
-                    claim_token="claim-1",
-                ),
-                "claimed",
-            ),
-        )
-        monkeypatch.setattr(
-            ai_tasks,
-            "_release_plan_cycle_delivery",
-            lambda *_args, **_kwargs: True,
-        )
-    monkeypatch.setattr(
-        ai_tasks,
-        failure_marker,
-        lambda *args, **kwargs: marked.append((args, kwargs)),
-    )
-
-    task.push_request(retries=task.max_retries, id=f"{task_name}-rate-limit")
-    try:
-        if task_name == "run_plan":
-            result = task.run(
-                "task-or-plan-id",
-                outbox_event_id="event-1",
-                wake_generation="generation-1",
-            )
-        else:
-            result = task.run("task-or-plan-id")
-    finally:
-        task.pop_request()
-
-    assert result["status"] == "failed"
-    assert "attempts" in result["error"]
-    assert marked[0][0][0] == "task-or-plan-id"
-    assert marked[0][1]["error_type"] == "LLMRateLimited"
-
-
-def test_plan_hint_failure_keeps_the_committed_plan_runnable(monkeypatch):
-    from packages.core.tasks import ai_tasks
-    from packages.core.plans import wakeup
-
-    awaited = []
-
-    def run_async(awaitable):
-        awaited.append(awaitable.cr_code.co_name)
-        awaitable.close()
-        return (
-            "plan-committed",
-            "draft",
-            SimpleNamespace(
-                event_id="event-1",
-                plan_id="plan-committed",
-                wake_generation="generation-1",
-            ),
-        )
-
-    hinted = []
-
-    monkeypatch.setattr(ai_tasks, "_run_async", run_async)
-    monkeypatch.setattr(
-        wakeup,
-        "dispatch_plan_cycle_wake_hint",
-        lambda *_args, **_kwargs: hinted.append(False) or False,
-    )
-
-    result = ai_tasks.plan_and_run_task.run("task-1")
-
-    assert awaited == ["_go"]
-    assert hinted == [False]
-    assert result == {"plan_id": "plan-committed", "status": "draft"}
-
-
-def test_existing_plan_hint_failure_does_not_project_business_failure(monkeypatch):
-    from packages.core.tasks import ai_tasks
-    from packages.core.plans import wakeup
-
-    awaited = []
-    marked = []
-
-    def run_async(awaitable):
-        awaited.append(awaitable.cr_code.co_name)
-        awaitable.close()
-        return (
-            "plan-committed",
-            "draft",
-            SimpleNamespace(
-                event_id="event-1",
-                plan_id="plan-committed",
-                wake_generation="generation-1",
-            ),
-        )
-
-    monkeypatch.setattr(ai_tasks, "_run_async", run_async)
-    monkeypatch.setattr(
-        wakeup,
-        "dispatch_plan_cycle_wake_hint",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        ai_tasks,
-        "_mark_initial_plan_dispatch_failed",
-        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
-    )
-
-    ai_tasks.plan_and_run_task.push_request(retries=2, id="dispatch-attempt-3")
-    try:
-        result = ai_tasks.plan_and_run_task.run(
-            "task-1",
-            existing_plan_id="plan-committed",
-        )
-    finally:
-        ai_tasks.plan_and_run_task.pop_request()
-
-    assert awaited == ["_load_existing_plan_for_dispatch"]
-    assert result == {"plan_id": "plan-committed", "status": "draft"}
-    assert marked == []
 
 
 @pytest.mark.asyncio

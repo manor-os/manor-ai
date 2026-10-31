@@ -312,6 +312,42 @@ async def test_task_runtime_context_cannot_be_set_through_public_crud(client: As
 
 
 @pytest.mark.asyncio
+async def test_required_skills_accept_only_skills_the_caller_can_see(client: AsyncClient, db_session):
+    """A caller names the Skills a Task carries out; unknown or foreign refs are a 422."""
+    from packages.core.models.skill import Skill
+
+    headers = await _auth(client, "taskskills")
+    other = await _auth(client, "taskskills_other")
+    entity_id = (await client.post("/api/v1/tasks", headers=headers, json={"title": "probe"})).json()["entity_id"]
+    other_entity_id = (await client.post("/api/v1/tasks", headers=other, json={"title": "probe"})).json()["entity_id"]
+    own = Skill(entity_id=entity_id, name="Launch notes", slug="launch-notes", system_prompt="x", status="active")
+    builtin = Skill(entity_id=None, name="Shared guide", slug=f"shared-guide-{generate_ulid().lower()}",
+                    system_prompt="x", status="active", is_public=True)
+    foreign = Skill(entity_id=other_entity_id, name="Foreign", slug="foreign-notes", system_prompt="x", status="active")
+    db_session.add_all([own, builtin, foreign])
+    await db_session.commit()
+
+    created = await client.post("/api/v1/tasks", headers=headers, json={
+        "title": "Write the launch note", "required_skills": [own.id, builtin.slug, own.slug],
+    })
+    assert created.status_code == 201, created.text
+    assert created.json()["required_skills"] == ["launch-notes", builtin.slug]
+
+    for refs in (["no-such-skill"], [foreign.id], ["foreign-notes"]):
+        refused = await client.post("/api/v1/tasks", headers=headers, json={"title": "t", "required_skills": refs})
+        assert refused.status_code == 422, (refs, refused.text)
+    too_many = await client.post("/api/v1/tasks", headers=headers, json={
+        "title": "t", "required_skills": [f"s{index}" for index in range(11)],
+    })
+    assert too_many.status_code == 422
+
+    task_url = f"/api/v1/tasks/{created.json()['id']}"
+    assert (await client.put(task_url, headers=headers, json={"required_skills": ["no-such-skill"]})).status_code == 422
+    cleared = await client.put(task_url, headers=headers, json={"required_skills": []})
+    assert cleared.status_code == 200 and cleared.json()["required_skills"] == []
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_with_filter(client: AsyncClient):
     headers = await _auth(client)
     # Create tasks with different statuses
@@ -787,15 +823,16 @@ async def test_assign_to_manor_ai(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_retry_failed_agent_task(client: AsyncClient, monkeypatch):
-    """Manual retry re-dispatches an assigned agent task and records a log."""
-    calls = []
+async def test_retry_failed_agent_task(client: AsyncClient, db_session, monkeypatch):
+    """Manual retry restarts an assigned agent task's run and records a log."""
+    from sqlalchemy import func, select
+
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services import event_emitter
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+
     events = []
 
-    from packages.core.tasks import ai_tasks
-    from packages.core.services import event_emitter
-
-    monkeypatch.setattr(ai_tasks.run_agent_task, "delay", lambda *args: calls.append(args))
     async def capture_emit_in_session(
         _db,
         entity_id,
@@ -832,32 +869,39 @@ async def test_retry_failed_agent_task(client: AsyncClient, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["task"]["status"] == "in_progress"
-    assert body["mode"] == "agent"
+    assert body["mode"] == "plan_new"
     assert body["dispatched"] is True
-    assert len(calls) >= 2  # initial assignment + manual retry
+    # The assignment and the retry each staged a durable start of the Task's run.
+    assert await db_session.scalar(select(func.count()).select_from(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+    )) == 2
 
     logs = await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)
     retry_log = next(log for log in logs.json() if log["log_type"] == "manual_retry")
-    assert retry_log["meta"]["mode"] == "agent"
+    assert retry_log["meta"]["mode"] == "plan_new"
     assert retry_log["meta"]["retry_count"] == 1
     retry_event = next(event for event in events if event[1] == "task.retried")
     assert retry_event[2] == "tasks_api"
     assert retry_event[3]["task_id"] == task_id
-    assert retry_event[3]["mode"] == "agent"
+    assert retry_event[3]["mode"] == "plan_new"
     assert retry_event[3]["retry_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_concurrent_task_retry_dispatches_once(client: AsyncClient, monkeypatch):
+async def test_concurrent_task_retry_dispatches_once(client: AsyncClient, db_session):
     """The Task row serializes retry entry surfaces before dispatch."""
-    from packages.core.tasks import ai_tasks
+    from sqlalchemy import func, select
 
-    calls: list[tuple] = []
-    monkeypatch.setattr(
-        ai_tasks.run_agent_task,
-        "delay",
-        lambda *args: calls.append(args),
-    )
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+
+    async def starts() -> int:
+        return await db_session.scalar(select(func.count()).select_from(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+            RuntimeOutboxEvent.aggregate_id == task_id,
+        ))
+
     headers = await _auth(client, "taskretry_concurrent")
     create = await client.post(
         "/api/v1/tasks",
@@ -870,7 +914,7 @@ async def test_concurrent_task_retry_dispatches_once(client: AsyncClient, monkey
         headers=headers,
         json={"status": "failed"},
     )
-    calls.clear()
+    before = await starts()
 
     responses = await asyncio.gather(
         client.post(f"/api/v1/tasks/{task_id}/retry", headers=headers, json={}),
@@ -878,7 +922,7 @@ async def test_concurrent_task_retry_dispatches_once(client: AsyncClient, monkey
     )
 
     assert sorted(response.status_code for response in responses) == [200, 409]
-    assert len(calls) == 1
+    assert await starts() == before + 1
 
 
 @pytest.mark.asyncio
@@ -971,494 +1015,10 @@ async def test_concurrent_direct_and_chat_task_retry_dispatch_once(
 
 
 @pytest.mark.asyncio
-async def test_retry_dispatch_failure_returns_task_to_a_retryable_state(
+async def test_retry_unconsumed_proposal_external_task_restores_approved_context(
     client: AsyncClient,
-    monkeypatch,
 ):
-    """A broker failure must not strand a committed retry in_progress."""
-    from packages.core.tasks import ai_tasks
-
-    monkeypatch.setattr(ai_tasks.run_agent_task, "delay", lambda *_args: None)
-    headers = await _auth(client, "taskretry_dispatch_failure")
-    create = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Retry after queue outage", "agent_type": "manor_agent"},
-    )
-    task_id = create.json()["id"]
-    await client.put(
-        f"/api/v1/tasks/{task_id}",
-        headers=headers,
-        json={"status": "failed"},
-    )
-
-    def fail_dispatch(*_args):
-        raise RuntimeError("broker unavailable")
-
-    monkeypatch.setattr(ai_tasks.run_agent_task, "delay", fail_dispatch)
-    first = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={},
-    )
-    assert first.status_code == 200, first.text
-    assert first.json()["dispatched"] is False
-    assert first.json()["task"]["status"] == "waiting_on_customer"
-
-    dispatched: list[tuple] = []
-    monkeypatch.setattr(
-        ai_tasks.run_agent_task,
-        "delay",
-        lambda *args: dispatched.append(args),
-    )
-    second = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={},
-    )
-    assert second.status_code == 200, second.text
-    assert second.json()["dispatched"] is True
-    assert second.json()["task"]["status"] == "in_progress"
-    assert dispatched
-
-
-@pytest.mark.asyncio
-async def test_retry_plan_backed_task_records_reset_step_ids(client: AsyncClient, monkeypatch):
-    """Task-level retry preserves the exact plan steps it reset."""
-    calls = []
-    events = []
-
-    from packages.core.tasks import ai_tasks
-    from packages.core.services import event_emitter
-
-    monkeypatch.setattr(ai_tasks.run_plan, "delay", lambda plan_id: calls.append(plan_id))
-    async def capture_emit_in_session(
-        _db,
-        entity_id,
-        event_type,
-        *,
-        source=None,
-        payload=None,
-        **_kwargs,
-    ):
-        events.append((entity_id, event_type, source, payload))
-
-    monkeypatch.setattr(event_emitter, "emit_in_session", capture_emit_in_session)
-
-    headers = await _auth(client, "taskretry_plan")
-    me = await client.get("/api/v1/auth/me", headers=headers)
-    entity_id = me.json()["entity_id"]
-
-    create = await client.post("/api/v1/tasks", headers=headers, json={"title": "Retry plan task"})
-    task_id = create.json()["id"]
-    await client.put(f"/api/v1/tasks/{task_id}", headers=headers, json={"status": "failed"})
-
-    import packages.core.database as dbmod
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    plan_id = generate_ulid()
-    failed_step_id = generate_ulid()
-    done_step_id = generate_ulid()
-    async with dbmod.async_session() as db:
-        db.add(
-            ExecutionPlan(
-                id=plan_id,
-                entity_id=entity_id,
-                task_id=task_id,
-                status="failed",
-                execution_mode="live",
-                approval_required=False,
-                plan_dag={"steps": []},
-            )
-        )
-        db.add(
-            ExecutionStep(
-                id=failed_step_id,
-                plan_id=plan_id,
-                entity_id=entity_id,
-                step_key="failed",
-                kind="llm",
-                params={},
-                depends_on=[],
-                step_status="failed",
-                error={"type": "ProviderError"},
-                result={"stale": True},
-                attempt_count=2,
-                max_attempts=3,
-            )
-        )
-        db.add(
-            ExecutionStep(
-                id=done_step_id,
-                plan_id=plan_id,
-                entity_id=entity_id,
-                step_key="done",
-                kind="llm",
-                params={},
-                depends_on=[],
-                step_status="done",
-                result={"ok": True},
-            )
-        )
-        await db.commit()
-
-    resp = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={
-            "note": "dependency is available now",
-        },
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["mode"] == "plan"
-    assert body["plan_id"] == plan_id
-    assert body["reset_steps"] == 1
-    assert calls == []  # Plan recovery is admitted by its durable wake.
-    from sqlalchemy import select
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.plans.wakeup import plan_cycle_outbox_dedupe_key
-
-    async with dbmod.async_session() as db:
-        wake = (await db.execute(select(RuntimeOutboxEvent).where(
-            RuntimeOutboxEvent.dedupe_key == plan_cycle_outbox_dedupe_key(plan_id),
-        ))).scalar_one()
-        assert wake.delivered_at is None
-        assert wake.payload["plan_id"] == plan_id
-
-    logs = await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)
-    retry_log = next(log for log in logs.json() if log["log_type"] == "manual_retry")
-    assert retry_log["meta"]["mode"] == "plan"
-    assert retry_log["meta"]["plan_id"] == plan_id
-    assert retry_log["meta"]["step_ids"] == [failed_step_id]
-    assert retry_log["meta"]["reset_steps"] == 1
-
-    steps = await client.get(f"/api/v1/plans/{plan_id}/steps", headers=headers)
-    by_id = {step["id"]: step for step in steps.json()}
-    assert by_id[failed_step_id]["step_status"] == "pending"
-    assert by_id[done_step_id]["step_status"] == "done"
-
-    retry_event = next(event for event in events if event[1] == "task.retried")
-    assert retry_event[2] == "tasks_api"
-    assert retry_event[3]["mode"] == "plan"
-    assert retry_event[3]["plan_id"] == plan_id
-    assert retry_event[3]["step_ids"] == [failed_step_id]
-    assert retry_event[3]["reset_steps"] == 1
-
-
-@pytest.mark.asyncio
-async def test_task_retry_does_not_grant_waiting_plan_approval(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.hitl_request import HitlRequest
-    from packages.core.models.task import Task
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.run_plan,
-        "delay",
-        lambda plan_id: dispatched.append(plan_id),
-    )
-    headers = await _auth(client, "taskretry_waiting_approval")
-    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    created = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Retry an approval-paused Plan"},
-    )
-    task_id = created.json()["id"]
-    plan_id, step_id, failed_step_id, request_id = (
-        generate_ulid(),
-        generate_ulid(),
-        generate_ulid(),
-        generate_ulid(),
-    )
-
-    task = await db_session.get(Task, task_id)
-    assert task is not None
-    task.status = "waiting_on_customer"
-    db_session.add(ExecutionPlan(
-        id=plan_id,
-        entity_id=me["entity_id"],
-        task_id=task_id,
-        status="paused",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    ))
-    db_session.add(ExecutionStep(
-        id=failed_step_id,
-        plan_id=plan_id,
-        entity_id=me["entity_id"],
-        step_key="failed_sibling",
-        kind="llm",
-        params={},
-        depends_on=[],
-        step_status="failed",
-        error={"type": "ProviderError"},
-    ))
-    db_session.add(ExecutionStep(
-        id=step_id,
-        plan_id=plan_id,
-        entity_id=me["entity_id"],
-        step_key="publish_update",
-        kind="action",
-        action_key="social.publish",
-        params={"message": "Launch update"},
-        depends_on=[],
-        step_status="waiting_human",
-        human_input_prompt="Approve publishing?",
-    ))
-    db_session.add(HitlRequest(
-        id=request_id,
-        entity_id=me["entity_id"],
-        action_key="social.publish",
-        origin_kind="step",
-        origin_step_id=step_id,
-        origin_plan_id=plan_id,
-        origin_task_id=task_id,
-        status="pending",
-        dedup_key=f"step:{step_id}",
-        hitl_type="authorize",
-        payload={},
-        context={},
-    ))
-    await db_session.commit()
-
-    response = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={},
-    )
-
-    assert response.status_code == 409, response.text
-    assert dispatched == []
-    db_session.expire_all()
-    request = await db_session.get(HitlRequest, request_id)
-    step = await db_session.get(ExecutionStep, step_id)
-    failed_step = await db_session.get(ExecutionStep, failed_step_id)
-    assert request is not None and request.status == "pending"
-    assert step is not None and step.step_status == "waiting_human"
-    assert failed_step is not None and failed_step.step_status == "failed"
-
-
-@pytest.mark.asyncio
-async def test_forged_pending_plan_dispatch_cannot_bypass_plan_approval(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from packages.core.models.execution import ExecutionPlan
-    from packages.core.models.task import Task
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.run_plan,
-        "delay",
-        lambda plan_id: dispatched.append(plan_id),
-    )
-    headers = await _auth(client, "taskretry_forged_dispatch_marker")
-    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    created = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Do not bypass Plan approval"},
-    )
-    task_id = created.json()["id"]
-    plan_id = generate_ulid()
-
-    filtered_update = await client.put(
-        f"/api/v1/tasks/{task_id}",
-        headers=headers,
-        json={
-            "details": {
-                "_pending_plan_dispatch": {
-                    "plan_id": plan_id,
-                    "reason": "forged",
-                },
-                "_replan_context": {"approval_constraints": []},
-                "user_note": "keep this",
-            },
-        },
-    )
-    assert filtered_update.status_code == 200, filtered_update.text
-    assert filtered_update.json()["details"] == {"user_note": "keep this"}
-
-    task = await db_session.get(Task, task_id)
-    assert task is not None
-    task.status = "waiting_on_customer"
-    # Simulate legacy/corrupt persisted data so Retry must remain fail-closed
-    # even when the public API validation is bypassed.
-    task.details = {
-        "_pending_plan_dispatch": {
-            "plan_id": plan_id,
-            "reason": "forged",
-        },
-    }
-    db_session.add(ExecutionPlan(
-        id=plan_id,
-        entity_id=me["entity_id"],
-        task_id=task_id,
-        status="pending_approval",
-        execution_mode="live",
-        approval_required=True,
-        plan_dag={"steps": []},
-    ))
-    await db_session.commit()
-
-    response = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={},
-    )
-
-    assert response.status_code == 409, response.text
-    assert dispatched == []
-    db_session.expire_all()
-    task = await db_session.get(Task, task_id)
-    plan = await db_session.get(ExecutionPlan, plan_id)
-    assert task is not None and task.status == "waiting_on_customer"
-    assert plan is not None and plan.status == "pending_approval"
-    assert plan.approval_required is True
-
-
-@pytest.mark.asyncio
-async def test_task_contract_replan_cannot_bypass_waiting_human_decision(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-    from packages.core.tasks import ai_tasks
-
-    replanned: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.plan_and_run_task,
-        "delay",
-        lambda task_id: replanned.append(task_id),
-    )
-    headers = await _auth(client, "taskretry_contract_waiting")
-    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    created = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Retry stale Plan pending review"},
-    )
-    task_id = created.json()["id"]
-    plan_id, failed_step_id, review_step_id = (
-        generate_ulid(),
-        generate_ulid(),
-        generate_ulid(),
-    )
-    stale_artifact_ref = "${{ steps.prepare.result.outputs.files }}"
-
-    task = await db_session.get(Task, task_id)
-    assert task is not None
-    task.status = "waiting_on_customer"
-    task.owner_service_key = "content"
-    db_session.add(ExecutionPlan(
-        id=plan_id,
-        entity_id=me["entity_id"],
-        task_id=task_id,
-        status="needs_attention",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={
-            "steps": [
-                {
-                    "key": "prepare",
-                    "kind": "subagent",
-                    "service_key": "content",
-                    "output_shape": "ArtifactResult",
-                    "params": {"prompt": "Prepare files."},
-                },
-                {
-                    "key": "review",
-                    "kind": "human",
-                    "depends_on": ["prepare"],
-                    "params": {
-                        "prompt": "Review files.",
-                        "review_artifacts": stale_artifact_ref,
-                    },
-                },
-            ],
-        },
-    ))
-    db_session.add_all([
-        ExecutionStep(
-            id=failed_step_id,
-            plan_id=plan_id,
-            entity_id=me["entity_id"],
-            step_key="prepare",
-            kind="subagent",
-            params={},
-            depends_on=[],
-            step_status="failed",
-            error={"type": "ProviderError"},
-        ),
-        ExecutionStep(
-            id=review_step_id,
-            plan_id=plan_id,
-            entity_id=me["entity_id"],
-            step_key="review",
-            kind="human",
-            params={"review_artifacts": stale_artifact_ref},
-            depends_on=["prepare"],
-            step_status="waiting_human",
-            human_input_prompt="Review files.",
-        ),
-    ])
-    await db_session.commit()
-
-    response = await client.post(
-        f"/api/v1/tasks/{task_id}/retry",
-        headers=headers,
-        json={},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "human decision" in response.json()["detail"].lower()
-    assert replanned == []
-    db_session.expire_all()
-    task = await db_session.get(Task, task_id)
-    plan = await db_session.get(ExecutionPlan, plan_id)
-    failed_step = await db_session.get(ExecutionStep, failed_step_id)
-    review_step = await db_session.get(ExecutionStep, review_step_id)
-    assert task is not None and task.status == "waiting_on_customer"
-    assert plan is not None and plan.status == "needs_attention"
-    assert failed_step is not None and failed_step.step_status == "failed"
-    assert review_step is not None and review_step.step_status == "waiting_human"
-
-
-@pytest.mark.asyncio
-async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
-    client: AsyncClient,
-    monkeypatch,
-):
-    """An unspent external action must not resume a verification-only plan."""
-    new_plan_calls = []
-    resumed_plan_calls = []
-
-    from packages.core.tasks import ai_tasks
-
-    monkeypatch.setattr(
-        ai_tasks.plan_and_run_task,
-        "delay",
-        lambda task_id: new_plan_calls.append(task_id),
-    )
-    monkeypatch.setattr(
-        ai_tasks.run_plan,
-        "delay",
-        lambda plan_id: resumed_plan_calls.append(plan_id),
-    )
-
+    """An unspent external action must not retry under a verification-only context."""
     headers = await _auth(client, "taskretry_external_proposal")
     me = await client.get("/api/v1/auth/me", headers=headers)
     entity_id = me.json()["entity_id"]
@@ -1509,11 +1069,8 @@ async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
         json={"status": "failed"},
     )
 
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.task import Task, TaskLog
 
-    plan_id = generate_ulid()
-    failed_step_id = generate_ulid()
     approved_runtime_context = {
         "instructions": "Publish the approved MP4 to YouTube exactly once.",
         "rules": [
@@ -1557,12 +1114,6 @@ async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
                 "task_id": task_id,
                 "consumed_at": None,
             },
-            "_replan_context": {
-                "instruction": (
-                    "This retry was constrained to verification only: "
-                    "no uploads, edits, publishing, or external side effects."
-                ),
-            },
             "runtime_context": verification_only_runtime_context,
         }
         db.add_all([
@@ -1581,32 +1132,6 @@ async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
                 created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
             ),
         ])
-        db.add(
-            ExecutionPlan(
-                id=plan_id,
-                entity_id=entity_id,
-                task_id=task_id,
-                status="failed",
-                execution_mode="live",
-                approval_required=False,
-                plan_dag={"steps": []},
-            )
-        )
-        db.add(
-            ExecutionStep(
-                id=failed_step_id,
-                plan_id=plan_id,
-                entity_id=entity_id,
-                step_key="verify_public_youtube_url",
-                kind="llm",
-                params={},
-                depends_on=[],
-                step_status="failed",
-                error={"type": "StepResultFailed"},
-                attempt_count=3,
-                max_attempts=3,
-            )
-        )
         await db.commit()
 
     resp = await client.post(
@@ -1618,15 +1143,9 @@ async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "plan_new"
-    assert body["plan_id"] is None
-    assert body["reset_steps"] == 0
-    assert new_plan_calls == []  # New Workspace planning is a V3 Task intent.
-    assert resumed_plan_calls == []
 
     async with dbmod.async_session() as db:
         task = await db.get(Task, task_id)
-        plan = await db.get(ExecutionPlan, plan_id)
-        failed_step = await db.get(ExecutionStep, failed_step_id)
         from sqlalchemy import select
         from packages.core.models.runtime_run import RuntimeOutboxEvent
         from packages.core.services.task_execution import (
@@ -1641,10 +1160,7 @@ async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
         ))).scalar_one()
         assert wake.delivered_at is None
         assert wake.payload["task_id"] == task_id
-        assert "_replan_context" not in (task.details or {})
         assert task.details["runtime_context"] == approved_runtime_context
-        assert plan.status == "failed"
-        assert failed_step.step_status == "failed"
 
 
 @pytest.mark.asyncio
@@ -1817,193 +1333,7 @@ async def test_non_approval_task_rejects_approval_decision(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_plan_hitl_broker_hint_failure_keeps_durable_resume_runnable(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from sqlalchemy import select as sa_select
-
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.models.task import Task
-    from packages.core.plans.wakeup import (
-        PLAN_CYCLE_OUTBOX_EVENT,
-        plan_cycle_outbox_dedupe_key,
-    )
-    from packages.core.tasks import runtime_tasks
-
-    headers = await _auth(client, "task_hitl_dispatch_failure")
-    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    created = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Resume a paused Plan"},
-    )
-    assert created.status_code == 201
-    task_id = created.json()["id"]
-    plan_id, step_id, approval_step_id = (
-        generate_ulid(), generate_ulid(), generate_ulid()
-    )
-
-    task = await db_session.get(Task, task_id)
-    assert task is not None
-    task.status = "waiting_on_customer"
-    plan = ExecutionPlan(
-        id=plan_id,
-        entity_id=me["entity_id"],
-        task_id=task_id,
-        status="paused",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    )
-    step = ExecutionStep(
-        id=step_id,
-        plan_id=plan_id,
-        entity_id=me["entity_id"],
-        step_key="await_operator_input",
-        kind="subagent",
-        params={},
-        depends_on=[],
-        step_status="waiting_human",
-        human_input_prompt="Which option should be used?",
-    )
-    approval_step = ExecutionStep(
-        id=approval_step_id,
-        plan_id=plan_id,
-        entity_id=me["entity_id"],
-        step_key="approve_publish",
-        kind="subagent",
-        params={},
-        depends_on=[],
-        step_status="waiting_human",
-        requires_approval=True,
-        human_input_prompt="Approve publishing?",
-    )
-    db_session.add_all([plan, step, approval_step])
-    await db_session.commit()
-
-    hints: list[dict] = []
-
-    def fail_dispatch(*_args, **options) -> None:
-        hints.append(dict(options.get("kwargs") or {}))
-        raise RuntimeError("broker unavailable")
-
-    monkeypatch.setattr(
-        runtime_tasks.dispatch_plan_cycle_intent_task,
-        "apply_async",
-        fail_dispatch,
-    )
-    agent_dispatches: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "packages.core.tasks.ai_tasks.run_agent_task.delay",
-        lambda task_id, agent_id: agent_dispatches.append((task_id, agent_id)),
-    )
-    missing_origin = await client.post(
-        f"/api/v1/tasks/{task_id}/hitl-response",
-        headers=headers,
-        json={"response": "Use option A"},
-    )
-    assert missing_origin.status_code == 409, missing_origin.text
-    assert agent_dispatches == []
-
-    response = await client.post(
-        f"/api/v1/tasks/{task_id}/hitl-response",
-        headers=headers,
-        json={"step_id": step_id, "response": "Use option A"},
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["resumed"] is True
-    # ``dispatched`` describes the committed durable intent.  The exact
-    # CONTROL publication below is only a latency hint, so broker failure
-    # must not roll back the resumed business state.
-    assert body["dispatched"] is True
-    assert body["task"]["status"] == "in_progress"
-    db_session.expire_all()
-    plan = await db_session.get(ExecutionPlan, plan_id)
-    task = await db_session.get(Task, task_id)
-    step = await db_session.get(ExecutionStep, step_id)
-    approval_step = await db_session.get(ExecutionStep, approval_step_id)
-    wake = (await db_session.execute(
-        sa_select(RuntimeOutboxEvent).where(
-            RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
-            RuntimeOutboxEvent.aggregate_id == plan_id,
-            RuntimeOutboxEvent.dedupe_key == plan_cycle_outbox_dedupe_key(plan_id),
-            RuntimeOutboxEvent.delivered_at.is_(None),
-        )
-    )).scalar_one()
-    wake_payload = dict(wake.payload or {})
-    assert hints == [{
-        "event_id": wake.id,
-        "plan_id": plan_id,
-        "wake_generation": wake_payload["wake_generation"],
-        "reason": "task_hitl_post_commit_hint",
-    }]
-    assert wake_payload["reason"] == "task_hitl_resumed"
-    assert plan is not None and plan.status == "running"
-    assert plan.last_error is None
-    assert task is not None and task.status == "in_progress"
-    assert "_pending_plan_dispatch" not in (task.details or {})
-    assert step is not None and step.step_status == "pending"
-    assert approval_step is not None and approval_step.step_status == "waiting_human"
-
-
-@pytest.mark.asyncio
-async def test_pending_approval_plan_never_falls_through_to_legacy_agent_hitl(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from packages.core.models.execution import ExecutionPlan
-    from packages.core.models.task import Task
-
-    headers = await _auth(client, "task_hitl_pending_plan")
-    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    created = await client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "Approve this Plan before execution"},
-    )
-    task_id = created.json()["id"]
-    task = await db_session.get(Task, task_id)
-    assert task is not None
-    task.status = "waiting_on_customer"
-    task.agent_type = "manor_agent"
-    db_session.add(ExecutionPlan(
-        id=generate_ulid(),
-        entity_id=me["entity_id"],
-        task_id=task_id,
-        status="pending_approval",
-        execution_mode="live",
-        approval_required=True,
-        plan_dag={"steps": []},
-    ))
-    await db_session.commit()
-
-    agent_dispatches: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "packages.core.tasks.ai_tasks.run_agent_task.delay",
-        lambda task_id, agent_id: agent_dispatches.append((task_id, agent_id)),
-    )
-    response = await client.post(
-        f"/api/v1/tasks/{task_id}/hitl-response",
-        headers=headers,
-        json={"response": "Continue"},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "planner execution" in response.json()["detail"].lower()
-    assert agent_dispatches == []
-    db_session.expire_all()
-    task = await db_session.get(Task, task_id)
-    assert task is not None and task.status == "waiting_on_customer"
-
-
-@pytest.mark.asyncio
-async def test_ownerless_workspace_task_without_plan_never_uses_legacy_hitl(
+async def test_ownerless_workspace_task_never_uses_legacy_hitl(
     client: AsyncClient,
     db_session,
     monkeypatch,
@@ -2067,7 +1397,7 @@ async def test_ownerless_workspace_task_without_plan_never_uses_legacy_hitl(
     )
 
     assert response.status_code == 409, response.text
-    assert "planner execution" in response.json()["detail"].lower()
+    assert "not waiting for an answer" in response.json()["detail"].lower()
     assert agent_dispatches == []
     db_session.expire_all()
     stored = await db_session.get(Task, task_id)
@@ -2341,7 +1671,7 @@ async def test_task_recovery_hitl_is_visible_and_cancel_closes_task(
     card = await ensure_task_recovery_hitl(
         db_session,
         task,
-        plan_id="plan-recovery-test",
+        plan_id=None,
         prompt="The render completed without a saved MP4.",
         issue="No saved file path was recorded.",
     )
@@ -2361,7 +1691,7 @@ async def test_task_recovery_hitl_is_visible_and_cancel_closes_task(
     assert task_response.json()["status"] == "cancelled"
     assert runtime_updates[-1][1] == {
         "task_id": task_id,
-        "plan_id": "plan-recovery-test",
+        "plan_id": None,
         "workspace_id": workspace_id,
         "event": "workspace_chat_action_resolved",
     }
@@ -2374,24 +1704,14 @@ async def test_task_recovery_hitl_is_visible_and_cancel_closes_task(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("task_status", "plan_status"),
-    [
-        ("pending", None),
-        ("in_progress", None),
-        ("waiting_on_customer", "paused"),
-        ("waiting_on_customer", "pending_approval"),
-    ],
-)
+@pytest.mark.parametrize("task_status", ["pending", "in_progress", "waiting_on_customer"])
 async def test_workspace_task_comment_schedules_agent_without_blocking(
     client: AsyncClient,
     monkeypatch,
     db_session,
     task_status,
-    plan_status,
 ):
     from sqlalchemy import select as sa_select
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.workspace import WorkspaceActivity, Agent
     from packages.core.models.task import Task
@@ -2448,21 +1768,6 @@ async def test_workspace_task_comment_schedules_agent_without_blocking(
         )).scalar_one()
         task_obj.agent_id = agent.id
         task_obj.status = task_status
-        if plan_status:
-            plan_id, step_id = generate_ulid(), generate_ulid()
-            db.add(ExecutionPlan(
-                id=plan_id, entity_id=entity_id, task_id=task_id,
-                status=plan_status, execution_mode="live",
-                approval_required=plan_status == "pending_approval",
-                plan_dag={"steps": []},
-            ))
-            db.add(ExecutionStep(
-                id=step_id, plan_id=plan_id, entity_id=entity_id,
-                step_key="await_human", kind="subagent", params={},
-                depends_on=[], step_status="waiting_human",
-                requires_approval=plan_status == "pending_approval",
-                human_input_prompt="Review this action or provide input.",
-            ))
         await db.commit()
 
     resp = await asyncio.wait_for(
@@ -2486,13 +1791,6 @@ async def test_workspace_task_comment_schedules_agent_without_blocking(
     assert "_hitl_response" not in (task_obj.details or {})
     logs = (await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)).json()
     assert len([log for log in logs if log["id"] == resp.json()["id"]]) == 1
-    if plan_status:
-        plan = await db_session.get(ExecutionPlan, plan_id)
-        step = await db_session.get(ExecutionStep, step_id)
-        assert plan.status == plan_status
-        assert step.step_status == "waiting_human"
-        assert not step.result
-        assert step.human_input_response is None
     evidence = (
         await db_session.execute(
             sa_select(RuntimeEvidence).where(
@@ -2517,19 +1815,19 @@ async def test_workspace_task_comment_schedules_agent_without_blocking(
 
 
 @pytest.mark.asyncio
-async def test_legacy_waiting_task_comment_still_resumes_agent(
+async def test_comment_on_a_waiting_task_without_a_parked_run_stays_a_comment(
     client: AsyncClient, db_session, monkeypatch,
 ):
-    from packages.core.constants.agents import MANOR_AGENT_ID
+    """No run is parked on a question: the comment is recorded and nothing resumes."""
     from packages.core.models.task import Task
 
-    headers = await _auth(client, "taskcomment_legacy_resume")
+    headers = await _auth(client, "taskcomment_no_parked_run")
     created = await client.post(
-        "/api/v1/tasks", headers=headers, json={"title": "Legacy agent input"},
+        "/api/v1/tasks", headers=headers, json={"title": "Agent input"},
     )
     task_id = created.json()["id"]
     task = await db_session.get(Task, task_id)
-    task.agent_type = "manor_agent"  # An actual standalone legacy Agent Task.
+    task.agent_type = "manor_agent"
     task.status = "waiting_on_customer"
     await db_session.commit()
     dispatches = []
@@ -2545,13 +1843,12 @@ async def test_legacy_waiting_task_comment_still_resumes_agent(
 
     assert response.status_code == 201, response.text
     await db_session.refresh(task)
-    assert task.status == "pending"
-    assert task.details["_hitl_response"] == "Use option A."
-    assert task.details["_hitl_payload"]["source"] == "comment"
-    assert dispatches == [(task_id, MANOR_AGENT_ID)]
+    assert task.status == "waiting_on_customer"
+    assert "_hitl_response" not in (task.details or {})
+    assert dispatches == []
     logs = (await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)).json()
     assert len([log for log in logs if log["id"] == response.json()["id"]]) == 1
-    assert len([log for log in logs if log["log_type"] == "ai_hitl_resumed"]) == 1
+    assert [log for log in logs if log["log_type"] == "ai_hitl_resumed"] == []
 
 
 @pytest.mark.asyncio

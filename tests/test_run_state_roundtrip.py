@@ -296,6 +296,7 @@ def _task_loop_samples() -> dict:
         "unconfirmed_refusal": ["call-1"],
         "posted_work_digest": "digest-1",
         "non_submit_retries": 2,
+        "delegation_mode": "durable",
         # Cloud-only slot; absent from the OSS build's registry.
         "capability_acquisitions": {"req-1": {"state": "applied"}},
     }
@@ -358,6 +359,7 @@ def test_every_state_key_the_loop_writes_is_a_slot_or_ephemeral():
     allowed = slots.live_keys | module.TASK_LOOP_EPHEMERAL_STATE_KEYS
     sources = [
         _ROOT / "packages/core/workers/task_agent_loop.py",
+        _ROOT / "packages/core/workers/task_loop_host.py",
         _ROOT / "packages/core/workers/task_loop_capabilities.py",
     ]
     written = set().union(*(_state_writes(path) for path in sources if path.exists()))
@@ -478,3 +480,82 @@ def test_a_retry_of_a_newer_runtimes_run_says_so(caplog):
         agent_loop_retry_checkpoint(newer)
     assert str(raised.value) == RUN_STATE_NEWER_RUNTIME_DETAIL and "newer version of Manor" in str(raised.value)
     assert "saved by a newer runtime" in caplog.text
+
+
+# ── the delegated child run's registry (services.task_agent_child_state) ──
+
+
+def _child_state():
+    from packages.core.services import task_agent_child_state
+
+    return task_agent_child_state
+
+
+def _child_samples() -> dict:
+    return {
+        "answer_revised": True,
+        "tool_outcomes": [{"name": "web_search", "result": {"status": "succeeded"}}],
+    }
+
+
+def test_child_live_state_holds_only_registered_slots_and_declared_ephemera():
+    module = _child_state()
+    state = module.task_agent_child_initial_state(1)
+    slots = module.task_agent_child_run_state_slots(state)
+
+    unregistered = set(state) - slots.live_keys - module.TASK_AGENT_CHILD_EPHEMERAL_STATE_KEYS
+    assert not unregistered, f"child state that would be lost at park/resume: {unregistered}"
+    assert slots.live_keys <= set(state)
+    assert not slots.live_keys & module.TASK_AGENT_CHILD_EPHEMERAL_STATE_KEYS
+
+
+def test_every_state_key_the_child_host_writes_is_a_slot_or_ephemeral():
+    module = _child_state()
+    slots = module.task_agent_child_run_state_slots(module.task_agent_child_initial_state(1))
+    allowed = slots.live_keys | module.TASK_AGENT_CHILD_EPHEMERAL_STATE_KEYS
+    sources = [
+        _ROOT / "packages/core/workers/task_agent_child_loop.py",
+        _ROOT / "packages/core/workers/task_loop_host.py",
+        _ROOT / "packages/core/services/task_agent_child_state.py",
+    ]
+    written = set().union(*(_state_writes(path) for path in sources))
+    assert {"answer_revised", "tool_outcomes"} <= written, "the scan sees the child's writes"
+    assert written <= allowed, f"state keys neither a slot nor ephemeral: {written - allowed}"
+
+
+def test_each_child_slot_round_trips_through_json():
+    module = _child_state()
+    samples = _child_samples()
+    state = module.task_agent_child_initial_state(1)
+    slots = module.task_agent_child_run_state_slots(state)
+    assert set(slots.names) == set(samples), "a new child slot needs a round-trip sample"
+    for slot in slots:
+        state[slot.live_key] = samples[slot.name]
+
+    payload = _through_json(RuntimeRunState(messages=[{"role": "user", "content": "task"}]).snapshot(slots))
+
+    fresh = module.task_agent_child_initial_state(9)
+    fresh_slots = module.task_agent_child_run_state_slots(fresh)
+    fresh_slots.load(RuntimeRunState.restore(payload, fresh_slots).host_slots)
+    for slot in slots:
+        assert slot.encode(fresh[slot.live_key]) == slot.encode(samples[slot.name]), slot.name
+    assert fresh["version"] == 9, "ephemeral state is never restored"
+
+
+def test_child_retry_dispositions_cover_exactly_its_persisted_state():
+    module = _child_state()
+    slots = module.task_agent_child_run_state_slots(module.task_agent_child_initial_state(1))
+    dispositions = runtime_run_state_retry_dispositions()
+    carried = {name for name, value in dispositions.items() if value == RETRY_CARRY} | slots.names_on_retry(RETRY_CARRY)
+    reset = {name for name, value in dispositions.items() if value == RETRY_RESET} | slots.names_on_retry(RETRY_RESET)
+    persisted = {name for name, value in dispositions.items() if value != RETRY_PER_SLOT} | set(slots.names)
+    assert carried | reset == persisted and not carried & reset
+
+
+def test_child_tool_outcomes_are_bounded_newest_kept():
+    module = _child_state()
+    state = module.task_agent_child_initial_state(1)
+    for index in range(module.TOOL_OUTCOMES_MAX + 5):
+        module.record_tool_outcome(state, {"name": f"t{index}", "result": {"status": "succeeded"}})
+    assert len(state["tool_outcomes"]) == module.TOOL_OUTCOMES_MAX
+    assert state["tool_outcomes"][-1]["name"] == f"t{module.TOOL_OUTCOMES_MAX + 4}"

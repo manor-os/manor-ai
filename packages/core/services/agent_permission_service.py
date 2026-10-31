@@ -133,6 +133,8 @@ class ToolAccessDecision:
     reason: str
     scope: str = ""  # user/entity/platform/internal/cli_worker/env/none
     account_id: str | None = None
+    account_kind: str | None = None
+    account_owner_user_id: str | None = None
 
 
 async def can_use_integration(
@@ -237,6 +239,8 @@ async def can_use_integration(
             reason=reason,
             scope=selected.scope.value,
             account_id=selected.id,
+            account_kind=selected.kind.value,
+            account_owner_user_id=selected.owner_user_id,
         )
 
     if not accounts:

@@ -23,7 +23,6 @@ from packages.core.services.runtime_authorization import (
 from packages.core.governance.service import resolve_stale_hitl_cards
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import Workspace
 from packages.core.models.user import Entity
@@ -181,56 +180,6 @@ async def test_task_terminal_cleanup_closes_stale_cards_and_requests(db_session)
     assert target.resolved_at is not None
     assert target.resolution == {"choice": "expired", "reason": "task_terminal"}
     assert bystander.resolved_at is None
-
-
-@pytest.mark.asyncio
-async def test_finalize_expires_requests_and_closes_cards(db_session):
-    """Terminal cleanup runs after the Task/Plan transaction commits.
-
-    Approval decisions lock the request before the execution graph; keeping
-    this cleanup post-commit avoids taking those locks in the reverse order.
-    """
-    from packages.core.plans.executor import PlanExecutor
-
-    plan_id, step_id = generate_ulid(), generate_ulid()
-    entity_id, workspace_id, card = await _ws_with_card(
-        db_session, plan_id=plan_id, step_id=step_id,
-    )
-    plan = ExecutionPlan(
-        id=plan_id, entity_id=entity_id, workspace_id=workspace_id,
-        status="running", execution_mode="live", plan_dag={"steps": []},
-    )
-    db_session.add(plan)
-    decision = await resolve_approval(
-        db_session,
-        subject=ApprovalSubject(
-            entity_id=entity_id, workspace_id=workspace_id,
-            action_key="social_post.publish", capability_id="external.social",
-            risk_level="high", kind="action",
-        ),
-        origin=ApprovalOrigin(kind="step", step_id=step_id, plan_id=plan_id),
-    )
-    assert decision.outcome == "needs_human"
-    await db_session.flush()
-    request_id = decision.request.id
-    card_id = card.id
-    card_model = type(card)
-
-    await PlanExecutor._finalize(db_session, plan, "failed")
-    await db_session.commit()
-    await PlanExecutor._cleanup_terminal_approvals_after_commit(
-        db_session,
-        plan_id=plan.id,
-        task_id=plan.task_id,
-        reason="plan_terminal",
-    )
-
-    db_session.expire_all()
-    request = await db_session.get(HitlRequest, request_id)
-    card = await db_session.get(card_model, card_id)
-    assert request.status == "expired"
-    assert card.resolved_at is not None
-    assert card.resolution == {"choice": "expired", "reason": "plan_terminal"}
 
 
 @pytest.mark.asyncio

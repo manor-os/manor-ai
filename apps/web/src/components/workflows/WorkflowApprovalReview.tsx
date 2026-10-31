@@ -3,7 +3,10 @@ import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
 import InlineFileReferenceCard from "../InlineFileReferenceCard";
 import MediaPreview from "./MediaPreview";
+import ReviewDeliverables from "./ReviewDeliverables";
 import { workflowFinalMediaRefs } from "../../lib/workflowMedia";
+import { workflowPatchSummary, type WorkflowPatchSummary } from "./workflowRunDisplay";
+import { parseFileReference } from "../../lib/fileReferences";
 import Input from "../ui/Input";
 import Textarea from "../ui/Textarea";
 
@@ -32,6 +35,17 @@ function reviewHref(value: unknown): string | null {
   return null;
 }
 
+/**
+ * A Knowledge file named in a review value: a bare address, `[name](address)`,
+ * or `address (name)`. The person sees the file's name and opens it in place.
+ */
+function reviewFileReference(text: string): { reference: string; label?: string } | null {
+  const linked = text.match(/^\[([^\]]+)\]\((\S+)\)$/);
+  const named = text.match(/^(\S+)\s+\(([^()]+)\)$/);
+  const [reference, label] = linked ? [linked[2], linked[1]] : named ? [named[1], named[2]] : [text, undefined];
+  return parseFileReference(reference) ? { reference, label: label?.trim() || undefined } : null;
+}
+
 function asRecord(value: unknown): Record<string, any> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, any>
@@ -53,8 +67,17 @@ function hasReviewValue(value: unknown): boolean {
   return true;
 }
 
-function StructuredReviewValue({ value }: { value: unknown }) {
+/** Labelled fields, lists, links and Knowledge files, as a person reads them. */
+export function StructuredReviewValue({ value }: { value: unknown }) {
   if (Array.isArray(value)) {
+    const files = value.map((item) => typeof item === "string" ? reviewFileReference(item.trim()) : null);
+    if (files.length && files.every(Boolean)) {
+      return <div className="chat-workflow-review-artifacts">
+        {files.map((file, index) => (
+          <InlineFileReferenceCard key={index} reference={file!.reference} label={file!.label} compact />
+        ))}
+      </div>;
+    }
     const compact = value.length >= 6 && value.every((item) => typeof item === "string" && item.length < 70);
     return <ul className={`chat-workflow-review-items${compact ? " is-compact" : ""}`}>
       {value.filter(hasReviewValue).map((item, index) => (
@@ -77,6 +100,8 @@ function StructuredReviewValue({ value }: { value: unknown }) {
     return <span>{t(value ? "component.workflow_review.yes" : "component.workflow_review.no")}</span>;
   }
   const text = String(value ?? "").trim();
+  const file = reviewFileReference(text);
+  if (file) return <InlineFileReferenceCard reference={file.reference} label={file.label} compact />;
   const href = reviewHref(text);
   return href ? (
     <a className="chat-workflow-review-link" href={href} target={href.startsWith("http") ? "_blank" : undefined} rel={href.startsWith("http") ? "noreferrer" : undefined}>{text}</a>
@@ -263,16 +288,54 @@ function ReviewChecklist({ items }: { items: string[] }) {
   );
 }
 
+export type ReviewArtifactKind = "image" | "video" | "audio" | "presentation" | "document" | "text" | null;
+
 export interface ReviewArtifactReference {
   key: string;
   label?: string;
   reference: string;
+  documentId?: string;
+  kind: ReviewArtifactKind;
+  /** A picture addressed directly (e.g. a signed screenshot link), shown as is. */
+  imageSrc?: string;
+  /** What this file shows, written by the step that asks for review (e.g. "Shot 03 · 7.7–11.5 s"). */
+  caption?: string;
+  /** What happens in it, read beside the picture (e.g. a storyboard shot's scene and action). */
+  description?: string;
+}
+
+const KIND_BY_EXTENSION: Array<[RegExp, ReviewArtifactKind]> = [
+  [/\.(png|jpe?g|webp|gif|avif)$/i, "image"],
+  [/\.(mp4|mov|webm|m4v)$/i, "video"],
+  [/\.(mp3|wav|m4a|aac|ogg|flac)$/i, "audio"],
+  [/\.(pptx?|key)$/i, "presentation"],
+  [/\.(pdf|docx?)$/i, "document"],
+  [/\.(md|markdown|txt)$/i, "text"],
+];
+
+export function artifactKind(declared: unknown, name: string): ReviewArtifactKind {
+  const fromName = KIND_BY_EXTENSION.find(([pattern]) => pattern.test(name))?.[1] ?? null;
+  // A deck's verify step reports it as a document; its pages still preview as slides.
+  if (fromName) return fromName;
+  return ["image", "video", "audio"].includes(String(declared)) ? declared as ReviewArtifactKind : null;
+}
+
+/**
+ * The address an image artifact is displayed from when it is a plain link
+ * (a signed snapshot, a hosted picture) rather than a Manor file, which keeps
+ * opening through its file card.
+ */
+function directImageSrc(kind: ReviewArtifactKind, reference: string, documentId?: string): string | undefined {
+  if (kind !== "image" || documentId) return undefined;
+  if (!/^https?:\/\/\S+$/i.test(reference) && !/^\/api\/\S+$/.test(reference)) return undefined;
+  return parseFileReference(reference) ? undefined : reference;
 }
 
 function reviewArtifact(value: unknown, index: number): ReviewArtifactReference | null {
   if (typeof value === "string" && value.trim()) {
     const reference = value.trim();
-    return { key: `${reference}:${index}`, reference };
+    const kind = artifactKind(null, reference);
+    return { key: `${reference}:${index}`, reference, kind, imageSrc: directImageSrc(kind, reference) };
   }
   const item = asRecord(value);
   if (!item) return null;
@@ -300,7 +363,16 @@ function reviewArtifact(value: unknown, index: number): ReviewArtifactReference 
       || document?.name
       || "",
   ).trim() || undefined;
-  return { key: `${reference}:${index}`, reference, label };
+  const documentId = String(item.document_id || document?.id || "").trim() || undefined;
+  const kind = artifactKind(item.kind, String(label || item.fs_path || item.path || reference));
+  const caption = typeof item.caption === "string" && item.caption.trim() ? item.caption.trim() : undefined;
+  const description = typeof item.description === "string" && item.description.trim() ? item.description.trim() : undefined;
+  return {
+    key: `${reference}:${index}`, reference, label, documentId, kind,
+    imageSrc: directImageSrc(kind, reference, documentId),
+    ...(caption ? { caption } : {}),
+    ...(description ? { description } : {}),
+  };
 }
 
 export function workflowReviewArtifacts(value: unknown): ReviewArtifactReference[] {
@@ -323,6 +395,110 @@ export function workflowReviewArtifacts(value: unknown): ReviewArtifactReference
     seen.add(artifact.reference);
     return [artifact];
   });
+}
+
+/** A review of described pictures (storyboard frames, slides with notes) needs room to show them side by side. */
+export function workflowReviewHasFrames(review: unknown): boolean {
+  return workflowReviewArtifacts(review).some((artifact) => (
+    Boolean(artifact.description) && Boolean(artifact.imageSrc || (artifact.documentId && artifact.kind === "image"))
+  ));
+}
+
+/** A dialog showing such a review widens to fit; any other review keeps its usual size. */
+export const WORKFLOW_REVIEW_FRAMES_DIALOG_WIDTH = "min(1080px, calc(100vw - 32px))";
+
+interface PermissionRequest {
+  action: string;
+  paths: string[];
+  edits: Array<{ before: string; after: string }>;
+  written: string;
+  /** Structured edits (a JSON key, a cell, a row, a slide…): what, where, with which value. */
+  patches: WorkflowPatchSummary[];
+}
+
+function parsedPreview(value: unknown): Record<string, any> | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  if (typeof record.preview !== "string") return record;
+  try {
+    return asRecord(JSON.parse(record.preview)) ?? record;
+  } catch {
+    return record;
+  }
+}
+
+/** A step asking to act on files: what it will do, to which file, and the change itself. */
+function permissionRequest(review: Record<string, any> | null): PermissionRequest | null {
+  if (!review || typeof review.tool !== "string" || !(Array.isArray(review.paths) || review.args_preview)) return null;
+  const preview = parsedPreview(review.args_preview);
+  const paths = stringList(review.paths).length ? stringList(review.paths) : stringList(preview?.path || preview?.name);
+  const operations = Array.isArray(preview?.operations) ? preview.operations.map(asRecord) : [];
+  const edits = operations.flatMap((operation) => (
+    operation && (typeof operation.old_text === "string" || typeof operation.new_text === "string")
+      ? [{ before: String(operation.old_text || ""), after: String(operation.new_text || "") }]
+      : []
+  ));
+  const written = typeof preview?.content === "string" ? preview.content : "";
+  const patches = operations.flatMap((operation) => {
+    const summary = operation ? workflowPatchSummary(operation) : null;
+    return summary ? [summary] : [];
+  });
+  return { action: String(review.action || review.tool), paths, edits, written, patches };
+}
+
+/** "Modify CANVAS.md" from the action key workspace.file.modify and its file. */
+function permissionTitle(request: PermissionRequest): string {
+  const names = request.paths.slice(0, 2).map((path) => path.split("/").pop() || path).join(", ");
+  const verb = /^[a-z_]+(\.[a-z_]+)+$/.test(request.action)
+    ? request.action.split(".").pop()!.replace(/_/g, " ")
+    : request.action;
+  const label = `${verb.charAt(0).toUpperCase()}${verb.slice(1)}`;
+  return formatUserFacingText(names ? `${label} ${names}` : label);
+}
+
+function PermissionChanges({ edits, written, patches }: Pick<PermissionRequest, "edits" | "written" | "patches">) {
+  if (edits.length > 0 || patches.length > 0) {
+    return <ol className="workflow-review-edits" aria-label={t("component.workflow_review.changes")}>
+      {edits.map((edit, index) => <li key={`edit-${index}`}>
+        {edit.before && <del>{edit.before}</del>}
+        {edit.after && <ins>{edit.after}</ins>}
+      </li>)}
+      {patches.map((patch, index) => <li key={`patch-${index}`} className="workflow-review-patch">
+        <span className="workflow-review-patch-head">
+          <strong>{patch.verbKey ? t(patch.verbKey) : formatUserFacingLabel(patch.verb || "")}</strong>
+          {patch.target && <code>{patch.target}</code>}
+        </span>
+        {patch.value !== undefined && <StructuredReviewValue value={patch.value} />}
+      </li>)}
+    </ol>;
+  }
+  return written
+    ? <pre className="workflow-review-write" aria-label={t("component.workflow_review.content_to_write")}>{written}</pre>
+    : null;
+}
+
+/** The change a tool approval would make, read from its arguments preview. */
+export function ApprovalChangePreview({ argsPreview }: { argsPreview: unknown }) {
+  const request = permissionRequest({ tool: "tool", args_preview: argsPreview });
+  return request ? <PermissionChanges edits={request.edits} written={request.written} patches={request.patches} /> : null;
+}
+
+function PermissionRequestReview({ request, review }: { request: PermissionRequest; review: unknown }) {
+  return (
+    <div className="chat-hitl-summary chat-workflow-review">
+      <div className="chat-hitl-title">{permissionTitle(request)}</div>
+      {request.paths.length > 0 && <div className="chat-workflow-review-artifacts">
+        {request.paths.map((path) => (
+          <InlineFileReferenceCard key={path} reference={path} label={path.split("/").pop() || path} compact />
+        ))}
+      </div>}
+      <PermissionChanges edits={request.edits} written={request.written} patches={request.patches} />
+      <details className="chat-workflow-review-raw">
+        <summary>{t("component.workflow_review.original_data")}</summary>
+        <pre>{previewText(review, true)}</pre>
+      </details>
+    </div>
+  );
 }
 
 export interface WorkflowApprovalReviewProps {
@@ -351,48 +527,46 @@ export default function WorkflowApprovalReview({
   const estimate = Number(plan?.estimated_duration_seconds || 0);
   const hasProductVideoPlan = Boolean(productPromise || narration || scenes.length || outputProfile);
 
+  const permission = permissionRequest(plan);
+  if (permission) return <PermissionRequestReview request={permission} review={review} />;
+
   if (!hasProductVideoPlan) {
+    const pages = workflowReviewArtifacts({ artifacts: plan?.previews ?? plan?.pages });
+    const summary = typeof plan?.summary === "string" ? plan.summary.trim() : "";
     const entries = plan
       ? Object.entries(plan).filter(([key, value]) => (
-        !["review_artifacts", "artifacts", "files", "checklist"].includes(key)
+        !["review_artifacts", "artifacts", "files", "checklist", "summary", "previews", "pages"].includes(key)
         && hasReviewValue(value)
       ))
       : [];
     const facts = entries.filter(([, value]) => !Array.isArray(value) && !asRecord(value));
     const sections = entries.filter(([, value]) => Array.isArray(value) || Boolean(asRecord(value)));
-    // "Review the actual generated video" needs a player, not its link.
-    const media = workflowFinalMediaRefs(review);
+    // A deliverable with its own player needs no second player from its link.
+    const playable = artifacts.some((item) => item.documentId && (item.kind === "video" || item.kind === "audio"));
+    const media = playable ? [] : workflowFinalMediaRefs(review);
+    const guidance = prompt && prompt.trim() !== summary ? prompt : "";
+    const frames = workflowReviewHasFrames(plan);
     return (
-      <div className="chat-hitl-summary chat-workflow-review">
+      <div className={`chat-hitl-summary chat-workflow-review chat-workflow-review--compact${frames ? " chat-workflow-review--frames" : ""}`}>
         <div className="chat-hitl-title">
-          {reviewTitle ? formatUserFacingLabel(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
+          {reviewTitle ? formatUserFacingText(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
         </div>
-        {prompt && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
-        {(media.length > 0 || artifacts.length > 0 || checklist.length > 0 || entries.length > 0 || hasReviewValue(review)) && (
-          <div className="chat-workflow-review-scroll chat-workflow-review-scroll--structured">
-            {media.length > 0 && (
-              <section className="chat-workflow-review-section chat-workflow-review-media">
-                {media.map((item, index) => <MediaPreview key={`${item.url}-${index}`} refItem={item} maxHeight={320} />)}
-              </section>
-            )}
-            {artifacts.length > 0 && (
-              <section className="chat-workflow-review-section">
-                <span className="chat-workflow-review-label">
-                  {t("component.chat_action_card.files_requiring_approval")}
-                </span>
-                <div className="chat-workflow-review-artifacts">
-                  {artifacts.map((artifact) => (
-                    <InlineFileReferenceCard
-                      key={artifact.key}
-                      reference={artifact.reference}
-                      label={artifact.label}
-                      compact
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
+        {summary && <div className="workflow-review-summary">{formatUserFacingText(summary)}</div>}
+        {media.length > 0 && (
+          <section className="chat-workflow-review-section chat-workflow-review-media">
+            {media.map((item, index) => <MediaPreview key={`${item.url}-${index}`} refItem={item} maxHeight={320} />)}
+          </section>
+        )}
+        <ReviewDeliverables artifacts={artifacts} pages={pages} compact />
+        {(guidance || checklist.length > 0) && (
+          <details className="workflow-review-guidance">
+            <summary>{t("component.workflow_review.what_to_check")}</summary>
+            {guidance && <p>{formatUserFacingText(guidance)}</p>}
             <ReviewChecklist items={checklist} />
+          </details>
+        )}
+        {(facts.length > 0 || sections.length > 0 || !plan) && (
+          <div className="chat-workflow-review-scroll chat-workflow-review-scroll--structured">
             {facts.length > 0 && <div className="chat-workflow-review-facts">
               {facts.map(([key, value]) => <div key={key} className={String(value).length > 100 ? "is-wide" : undefined}>
                 <span className="chat-workflow-review-label">{formatUserFacingLabel(key)}</span>
@@ -404,12 +578,12 @@ export default function WorkflowApprovalReview({
               <StructuredReviewValue value={value} />
             </section>)}
             {!plan && <StructuredReviewValue value={review} />}
-            {plan && <details className="chat-workflow-review-raw">
-              <summary>{t("component.workflow_review.original_data")}</summary>
-              <pre>{previewText(review, true)}</pre>
-            </details>}
           </div>
         )}
+        {plan && <details className="chat-workflow-review-raw">
+          <summary>{t("component.workflow_review.original_data")}</summary>
+          <pre>{previewText(review, true)}</pre>
+        </details>}
       </div>
     );
   }

@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import (
     get_current_user,
-    require_plan,
+    require_workspace_ai_plan,
     require_workspace_authority,
     require_workspace_writable,
 )
@@ -202,62 +202,6 @@ class ResolveActionRequest(BaseModel):
     payload: Optional[dict] = None
     # ``payload`` covers free-form input (e.g. HITL prompt response);
     # ``choice`` covers button-style proposals ("approve" / "reject").
-
-
-def _effect_reconciliation_decisions(
-    pending_action: dict,
-    request: ResolveActionRequest,
-) -> tuple[dict[str, str], dict[str, Any]]:
-    from packages.core.constants.tool_effects import (
-        EffectReconciliationDecision,
-    )
-    payload = (
-        pending_action.get("payload")
-        if isinstance(pending_action.get("payload"), dict)
-        else {}
-    )
-    snapshot = (
-        payload.get("reconciliation")
-        if isinstance(payload.get("reconciliation"), dict)
-        else {}
-    )
-    digests = EffectReconciliationDecisionFactory.effect_digests(snapshot)
-    supplied = request.payload if isinstance(request.payload, dict) else {}
-    raw_decisions = supplied.get("decisions")
-    if isinstance(raw_decisions, dict):
-        normalized_decisions = EffectReconciliationDecisionFactory.normalize_map(
-            raw_decisions
-        )
-        if normalized_decisions is None:
-            raise HTTPException(
-                400,
-                "Every effect digest must have a recognized reconciliation decision",
-            )
-        decisions = normalized_decisions
-    else:
-        normalized = EffectReconciliationDecisionFactory.normalize_choice(
-            request.choice
-        )
-        # Older single-effect clients posted the decision vocabulary directly
-        # (``applied`` / ``not_applied``) instead of the newer button choice.
-        # Keep that bounded compatibility without allowing one scalar to decide
-        # a multi-effect reconciliation.
-        if normalized is None and len(digests) == 1:
-            normalized = EffectReconciliationDecisionFactory.normalize(
-                request.choice
-            )
-        if len(digests) > 1 and normalized in {
-            EffectReconciliationDecision.APPLIED,
-            EffectReconciliationDecision.NOT_APPLIED,
-        }:
-            raise HTTPException(
-                400,
-                "Choose an outcome for each recorded external effect",
-            )
-        decision = normalized.value if normalized is not None else ""
-        decisions = {digest: decision for digest in digests} if decision else {}
-    results = supplied.get("results")
-    return decisions, (dict(results) if isinstance(results, dict) else {})
 
 
 class SimulationRunResponse(BaseModel):
@@ -945,7 +889,9 @@ def _message_refs_with_hydrated_task_ref(
         if details:
             merged = dict(ref)
             for key, value in details.items():
-                if value is not None and not merged.get(key):
+                # A stored status is a snapshot from when the message was
+                # written; the label always shows the Task's live status.
+                if value is not None and (key == "status" or not merged.get(key)):
                     merged[key] = value
             hydrated_refs.append(merged)
             hydrated = hydrated or merged != ref
@@ -1128,17 +1074,23 @@ async def _hydrate_messages(
         run_id for message in rows if (run_id := _message_workflow_run_id(message))
     ))
     workflow_run_updated_at: dict[str, datetime | None] = {}
+    run_names: dict[str, dict] = {}
     if workflow_run_ids:
+        from packages.core.i18n import get_locale
+        from packages.core.services.viewer_language import RUN_DISPLAY_I18N_KEY, run_names_for
+
         run_rows = (await db.execute(
-            select(WorkflowRun.id, WorkflowRun.updated_at).where(
+            select(WorkflowRun.id, WorkflowRun.updated_at, WorkflowRun.trigger_data[RUN_DISPLAY_I18N_KEY]).where(
                 WorkflowRun.id.in_(workflow_run_ids),
                 WorkflowRun.entity_id == entity_id,
                 WorkflowRun.workspace_id == workspace_id,
             )
         )).all()
         workflow_run_updated_at = {
-            str(run_id): updated_at for run_id, updated_at in run_rows
+            str(run_id): updated_at for run_id, updated_at, _ in run_rows
         }
+        locale = get_locale()
+        run_names = {str(run_id): run_names_for(translations, locale) for run_id, _, translations in run_rows if translations}
     plan_task_ids = await _plan_task_ids_for_messages(
         db,
         rows,
@@ -1164,7 +1116,7 @@ async def _hydrate_messages(
         db, rows, entity_id=entity_id, workspace_id=workspace_id,
     )
     return [
-        _to_message(
+        _in_viewer_language(_to_message(
             m,
             refs=_message_refs_with_hydrated_task_ref(
                 m,
@@ -1176,9 +1128,21 @@ async def _hydrate_messages(
             resolved_by_user=authors_by_id.get(m.resolved_by_user_id or ""),
             updated_at=workflow_run_updated_at.get(_message_workflow_run_id(m) or ""),
             recovery_reason=recovery_reasons.get(m.id),
-        )
+        ), run_names.get(_message_workflow_run_id(m) or ""))
         for m in rows
     ]
+
+
+def _in_viewer_language(message: MessageResponse, names: dict | None) -> MessageResponse:
+    """A Flow card names its Flow and steps in the viewer's language (see viewer_language)."""
+    if not names:
+        return message
+    from packages.core.services.viewer_language import localize_run_names
+
+    return message.model_copy(update={
+        field: localize_run_names(getattr(message, field), names)
+        for field in ("refs", "meta", "pending_action", "hitl_requests")
+    })
 
 
 async def _enqueue_learning_candidate_applies(
@@ -1456,12 +1420,15 @@ async def list_chat_entrypoints(
         list_workspace_chat_entrypoints,
     )
 
+    from packages.core.i18n import get_locale
+
     entrypoints = await list_workspace_chat_entrypoints(
         db,
         entity_id=user.entity_id,
         workspace_id=workspace_id,
         user=user,
         require_control=True,
+        locale=get_locale(),
     )
     return [entrypoint.public_dict() for entrypoint in entrypoints]
 
@@ -1509,7 +1476,7 @@ async def stream_chat_entrypoint(
     thread_ref_id: str | None = Form(None),
     document_ids: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
-    _gate=Depends(require_plan("ai_budget_usd")),
+    _gate=Depends(require_workspace_ai_plan()),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1700,8 +1667,9 @@ async def list_chat_messages_page(
 ):
     await _verify_workspace(db, workspace_id, user)
     from packages.core.workspace_chat.attention import workspace_attention
+    from packages.core.workspace_chat.pending_actions import pending_action_total
     attention = (await workspace_attention(db, user=user, workspace_ids=[workspace_id]))[workspace_id]
-    open_action_count = sum(attention[key] for key in ("chat_pending_actions", "proposal_actions", "failed_actions"))
+    open_action_count = pending_action_total(attention)
     before_created_at, before_id = _decode_message_cursor(before)
     is_main_view = not (thread_ref_kind and thread_ref_id)
     conversation_filters = [
@@ -1848,19 +1816,22 @@ class AttentionReminderResponse(BaseModel):
     created_at: datetime
 
 
-class UnreadAttentionResponse(BaseModel):
+class AttentionResponse(BaseModel):
     items: list[AttentionReminderResponse]
 
 
-@router.get('/attention', response_model=UnreadAttentionResponse)
-async def list_unread_chat_attention(
+@router.get('/attention', response_model=AttentionResponse)
+async def list_chat_attention(
     workspace_id: str,
+    scope: Literal["unread", "open"] = "unread",
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     await _verify_workspace(db, workspace_id, user)
-    from packages.core.workspace_chat.attention import unread_workspace_attention
-    return await unread_workspace_attention(db, user=user, workspace_id=workspace_id)
+    from packages.core.workspace_chat.attention import list_workspace_attention
+    return await list_workspace_attention(
+        db, user=user, workspace_id=workspace_id, unread_only=scope == "unread",
+    )
 
 
 class SeenAttentionRequest(BaseModel):
@@ -2079,16 +2050,20 @@ async def resolve_chat_action(
         and isinstance(pa_reconciliation.get("effects"), list)
         and pa_reconciliation["effects"]
     )
-    effect_reconciliation_decision = (
-        kind == PendingActionKind.EFFECT_RECONCILIATION
-        or (
-            task_recovery_has_effects
-            and EffectReconciliationDecisionFactory.is_reconciliation_choice(
-                normalized_choice,
-                allow_cancel=False,
-            )
+    if kind == PendingActionKind.EFFECT_RECONCILIATION or (
+        task_recovery_has_effects
+        and EffectReconciliationDecisionFactory.is_reconciliation_choice(
+            normalized_choice,
+            allow_cancel=False,
         )
-    )
+    ):
+        # Recorded-effect reconciliation belonged to Plan Steps of the retired
+        # Plan engine; its open cards were expired when the engine was retired.
+        raise HTTPException(
+            409,
+            "This decision belonged to the retired Plan engine and is no longer "
+            "actionable. Retry the Task to continue it.",
+        )
     external_decision_intent = (
         external_reply_decision_intent(normalized_choice)
         if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL
@@ -2125,7 +2100,6 @@ async def resolve_chat_action(
     lease_request = None
     task_approval_task = None
     task_recovery_task = None
-    reconciliation_resolution_won: bool | None = None
     governance_hitl_type = str(
         pa.get("hitl_type") or HitlType.AUTHORIZE.value
     ).strip().lower()
@@ -2321,8 +2295,7 @@ async def resolve_chat_action(
             # Lease -> Step -> Request lock order.  A read-only preview here
             # is enough for rendering checks; the service locks and revalidates
             # the exact row before any mutation.
-            if not effect_reconciliation_decision:
-                lease_request_statement = lease_request_statement.with_for_update()
+            lease_request_statement = lease_request_statement.with_for_update()
             lease_request = (await db.execute(
                 lease_request_statement
             )).scalar_one_or_none()
@@ -2371,7 +2344,6 @@ async def resolve_chat_action(
     )
     if (
         not external_approval_requested
-        and not effect_reconciliation_decision
         and kind != PendingActionKind.WORKSPACE_OPERATION_REVIEW
     ):
         decision_message_statement = decision_message_statement.with_for_update()
@@ -2430,7 +2402,6 @@ async def resolve_chat_action(
     if (
         lease_request is not None
         and lease_request.status != ApprovalStatus.PENDING.value
-        and not effect_reconciliation_decision
     ):
         raise HTTPException(409, "human-input request has already been resolved")
 
@@ -2552,7 +2523,6 @@ async def resolve_chat_action(
     # canonical locks; other actions retain the original atomic resolve path.
     deferred_resolution = (
         external_approval_requested
-        or effect_reconciliation_decision
         or kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW
         or kind == PendingActionKind.APPROVE_PROPOSALS
     )
@@ -2618,38 +2588,6 @@ async def resolve_chat_action(
     human_queue_dispatch: dict[str, str] | None = None
 
     if (
-        kind == PendingActionKind.EFFECT_RECONCILIATION
-        and pa.get("step_id")
-        and pa.get("plan_id")
-        and pa.get("approval_request_id")
-    ):
-        from packages.core.services.effect_reconciliation import (
-            EffectReconciliationError,
-            reconcile_external_effects,
-        )
-
-        decisions, supplied_results = _effect_reconciliation_decisions(pa, req)
-        try:
-            reconciled = await reconcile_external_effects(
-                db,
-                approval_request_id=str(pa["approval_request_id"]),
-                plan_id=str(pa["plan_id"]),
-                decisions=decisions,
-                user_id=user.id,
-                note=req.note,
-                supplied_results=supplied_results,
-            )
-        except EffectReconciliationError as exc:
-            if exc.commit_refreshed_card:
-                await db.commit()
-            raise HTTPException(exc.status_code, exc.detail) from exc
-        plan_to_run_after_commit = (
-            reconciled.plan_id if reconciled.should_dispatch else None
-        )
-        task_runtime_update_id = reconciled.task_id
-        task_runtime_update_plan_id = reconciled.plan_id
-
-    elif (
         kind == PendingActionKind.HUMAN_INPUT
         and pa.get("task_id")
         and not pa.get("step_id")
@@ -2681,6 +2619,9 @@ async def resolve_chat_action(
                 "fields": (req.payload or {}).get("fields") or {},
                 "source": "workspace_chat",
             },
+            # The card's own request: a delegated agent's question resumes
+            # exactly that agent's run.
+            request_id=str(pa.get("approval_request_id") or "") or None,
         )
         if not applied["resumed"]:
             raise HTTPException(409, "this task is no longer waiting for an answer")
@@ -2913,7 +2854,7 @@ async def resolve_chat_action(
                     changed_by=user.id,
                 )
             if _intent is HumanDecisionIntent.RETRY and governance_step is not None:
-                from packages.core.plans.step_reset import renew_step_approval_intent
+                from packages.core.dispatcher.step_state import renew_step_approval_intent
                 from packages.core.governance.approvals import consume_approval
 
                 # This explicit retry is a new execution. The failure review
@@ -2926,9 +2867,6 @@ async def resolve_chat_action(
             # retried step's prompt. Without it, "Retry with guidance" would
             # re-run the exact attempt the user just watched fail.
             _retry_note = (req.note or "").strip()
-            _human_review_response = (
-                governance_step is not None and governance_step.kind == "human"
-            )
             plan_to_run_after_commit = await _resume_step_for_retry(
                 db, user,
                 step_id=pa["step_id"],
@@ -2940,7 +2878,7 @@ async def resolve_chat_action(
                         "user": _user_display_name(user),
                         "via": "chat_card",
                     }
-                    if _retry_note or _human_review_response
+                    if _retry_note
                     else None
                 ),
                 workspace_id=workspace_id,
@@ -3041,7 +2979,6 @@ async def resolve_chat_action(
             raise HTTPException(409, "task recovery card is stale")
         if (
             normalized_choice not in {member.value for member in TaskRecoveryChoice}
-            and not effect_reconciliation_decision
         ):
             raise HTTPException(400, "invalid task recovery choice")
         if normalized_choice == TaskRecoveryChoice.RETRY.value:
@@ -3056,36 +2993,6 @@ async def resolve_chat_action(
             except TaskRetryError as exc:
                 raise HTTPException(exc.status_code, exc.detail) from exc
             task = task_retry_result.task
-        elif effect_reconciliation_decision:
-            from packages.core.services.effect_reconciliation import (
-                EffectReconciliationError,
-                reconcile_external_effects,
-            )
-
-            approval_request_id = str(pa.get("approval_request_id") or "")
-            plan_id = str(pa.get("plan_id") or "")
-            if not approval_request_id or not plan_id:
-                raise HTTPException(409, "task recovery card has no effect binding")
-            decisions, supplied_results = _effect_reconciliation_decisions(pa, req)
-            try:
-                reconciled = await reconcile_external_effects(
-                    db,
-                    approval_request_id=approval_request_id,
-                    plan_id=plan_id,
-                    decisions=decisions,
-                    user_id=user.id,
-                    note=req.note,
-                    supplied_results=supplied_results,
-                )
-            except EffectReconciliationError as exc:
-                if exc.commit_refreshed_card:
-                    await db.commit()
-                raise HTTPException(exc.status_code, exc.detail) from exc
-            plan_to_run_after_commit = (
-                reconciled.plan_id if reconciled.should_dispatch else None
-            )
-            task_runtime_update_id = reconciled.task_id
-            task_runtime_update_plan_id = reconciled.plan_id
         else:
             cancelled = await update_task(
                 db,
@@ -3096,21 +3003,15 @@ async def resolve_chat_action(
             )
             if cancelled is None:
                 raise HTTPException(404, "task not found")
-        if not effect_reconciliation_decision:
-            await resolve_task_hitl(
-                db,
-                task=task,
-                kind=PendingActionKind.TASK_RECOVERY,
-                choice=normalized_choice,
-                user_id=user.id,
-                note=req.note,
-            )
-        task_runtime_update_id = task_runtime_update_id or task.id
-        task_runtime_update_plan_id = task_runtime_update_plan_id or (
-            task_retry_result.plan_id
-            if task_retry_result is not None
-            else pa.get("plan_id")
+        await resolve_task_hitl(
+            db,
+            task=task,
+            kind=PendingActionKind.TASK_RECOVERY,
+            choice=normalized_choice,
+            user_id=user.id,
+            note=req.note,
         )
+        task_runtime_update_id = task_runtime_update_id or task.id
 
     elif kind == PendingActionKind.APPROVE_PROPOSALS and pa.get("review_id"):
         # Strategist proposal card: approve, approve_selected, reject, or feedback.
@@ -3359,18 +3260,6 @@ async def resolve_chat_action(
             hitl_id=review_hitl_id,
             choice=str(result.get("action") or req.choice or ""),
         )
-        db.add(Message(
-            conversation_id=msg.conversation_id,
-            role="system",
-            content=str(result.get("message") or "Workspace operation review resolved."),
-            author_kind="system",
-            message_kind="system",
-            refs=[
-                {"type": "message", "id": msg.id},
-                {"type": "workspace_operation_draft", "id": result.get("draft_id")},
-            ],
-        ))
-        await db.flush()
 
     elif kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
         if external_approval_requested:
@@ -3380,7 +3269,7 @@ async def resolve_chat_action(
                 ApprovedExternalReplyOutcomeUnknownError,
                 ApprovedExternalReplySameKeyRetryRequired,
                 approved_external_reply_delivery_disposition,
-                approved_external_reply_outcome_message,
+                approved_external_reply_resolution_fields,
                 claim_external_reply_approval,
                 deliver_approved_external_reply,
                 external_reply_approval_claim_owner_conflict_reason,
@@ -3516,15 +3405,8 @@ async def resolve_chat_action(
                     "The external reply was not sent. The approval is still open; "
                     "please retry.",
                 )
-            if (
-                delivery_disposition
-                is ApprovedExternalReplyDeliveryDisposition.OUTCOME_UNKNOWN
-            ):
-                resolution.update({
-                    "delivery_outcome": "unknown",
-                    "message_log_id": result.get("message_log_id"),
-                    "delivery_error": result.get("error"),
-                })
+            # The answered card shows the delivery result on its own line.
+            resolution.update(approved_external_reply_resolution_fields(result))
             # Provider acceptance (or a durable at-least-once quarantine) is
             # now established. Re-lock the exact scoped Message before the
             # decision and any standing grant become visible.
@@ -3573,39 +3455,6 @@ async def resolve_chat_action(
             if resolved is None:
                 await db.rollback()
                 raise HTTPException(404, "message not found")
-            body = approved_external_reply_outcome_message(result)
-            db.add(Message(
-                conversation_id=msg.conversation_id,
-                role="system",
-                content=body,
-                author_kind="system",
-                message_kind="system",
-                refs=[
-                    {"type": "message", "id": msg.id},
-                    {"type": "channel_conversation", "id": pa.get("channel_conversation_id")},
-                    {"type": "message_log", "id": result.get("message_log_id")},
-                ],
-            ))
-            await db.flush()
-        elif external_decision_intent in {
-            HumanDecisionIntent.DENY,
-            HumanDecisionIntent.CANCEL,
-        }:
-            channel_conversation_id = str(pa.get("channel_conversation_id") or "")
-            if channel_conversation_id:
-                db.add(Message(
-                    conversation_id=channel_conversation_id,
-                    role="system",
-                    content="External reply rejected by workspace operator.",
-                    author_kind="system",
-                    message_kind="system",
-                    meta={
-                        "channel_type": pa.get("channel_type"),
-                        "chat_id": pa.get("chat_id"),
-                        "rejected_external_message": True,
-                    },
-                ))
-                await db.flush()
 
     # Apply the verdict the path-C branch above recorded. Same transaction as
     # the step mutation it accompanies (this handler commits once, below), so
@@ -3627,7 +3476,6 @@ async def resolve_chat_action(
     if (
         step_decision_expected
         and plan_to_run_after_commit is None
-        and not effect_reconciliation_decision
     ):
         raise HTTPException(409, "execution step is no longer waiting for this decision")
 
@@ -3657,66 +3505,24 @@ async def resolve_chat_action(
                 db, lease_request, by_user_id=user.id, via="chat_card",
             )
 
-    if effect_reconciliation_decision:
-        (
-            resolved,
-            reconciliation_resolution_won,
-        ) = await chat_service.resolve_effect_reconciliation_pending_action(
-            db,
-            message_id=message_id,
-            approval_request_id=str(pa.get("approval_request_id") or ""),
-            pending_action_kind=str(kind),
-            user_id=user.id,
-            resolution=resolution,
-        )
-        if resolved is None:
-            raise HTTPException(404, "message not found")
-        if not reconciliation_resolution_won:
-            current_action = (
-                resolved.pending_action
-                if isinstance(resolved.pending_action, dict)
-                else {}
-            )
-            if (
-                str(current_action.get("approval_request_id") or "")
-                != str(pa.get("approval_request_id") or "")
-                or str(current_action.get("kind") or "") != str(kind)
-            ):
-                await db.rollback()
-                raise HTTPException(
-                    409,
-                    "effect reconciliation card binding changed before resolution",
-                )
-            # The reconciliation itself is idempotent under its canonical
-            # locks. The Message CAS owns every projection/wakeup, so a replay
-            # cannot duplicate follow-ups, learning/activity evidence, or the
-            # Plan dispatch.
-            plan_to_run_after_commit = None
-            task_runtime_update_id = None
-            task_runtime_update_plan_id = None
-
-    if not effect_reconciliation_decision or reconciliation_resolution_won:
-        queued_learning_ids = await _record_pending_action_resolution_evidence(
-            db,
-            workspace_id=workspace_id,
-            user=user,
-            conversation_id=conv.id,
-            message_id=msg.id,
-            pending_action=pa,
-            resolution=resolution,
-        )
-        await _record_pending_action_activity(
-            db,
-            workspace_id=workspace_id,
-            user=user,
-            conversation_id=conv.id,
-            message_id=msg.id,
-            pending_action=pa,
-            resolution=resolution,
-        )
-    else:
-        queued_learning_ids = []
-
+    queued_learning_ids = await _record_pending_action_resolution_evidence(
+        db,
+        workspace_id=workspace_id,
+        user=user,
+        conversation_id=conv.id,
+        message_id=msg.id,
+        pending_action=pa,
+        resolution=resolution,
+    )
+    await _record_pending_action_activity(
+        db,
+        workspace_id=workspace_id,
+        user=user,
+        conversation_id=conv.id,
+        message_id=msg.id,
+        pending_action=pa,
+        resolution=resolution,
+    )
     await db.commit()
     if human_queue_dispatch is not None:
         from apps.api.routers.humans import _dispatch_strategist_for_cleared_human_queue
@@ -3726,17 +3532,6 @@ async def resolve_chat_action(
         from packages.core.services.task_input_resume import dispatch_task_input_resume
 
         dispatch_task_input_resume(*task_input_dispatch)
-    if plan_to_run_after_commit:
-        from packages.core.plans.wakeup import hint_pending_plan_cycle
-
-        # Every Plan mutation above staged its generation in the transaction
-        # just committed. Publication is only a low-latency hint; failure stays
-        # in logs while the durable outbox sweep recovers it.
-        await hint_pending_plan_cycle(
-            db,
-            plan_to_run_after_commit,
-            reason="workspace_chat_post_commit_hint",
-        )
     if task_retry_result is not None:
         try:
             from packages.core.services.task_retry_service import (
@@ -3980,35 +3775,6 @@ def _allow_side_effect_after_resolved(pending_action: dict, choice: str | None) 
         return True
     if kind == PendingActionKind.WORKFLOW_RETRY and normalized in {"retry", "retry_now"}:
         return True
-    if (
-        kind == PendingActionKind.EFFECT_RECONCILIATION
-        and EffectReconciliationDecisionFactory.is_reconciliation_choice(
-            normalized,
-            allow_cancel=True,
-        )
-    ):
-        # The reconciliation service fingerprints the complete decision under
-        # the request row lock. Replaying an identical callback is what closes
-        # the commit -> queue-wakeup crash window; a conflicting retry is 409.
-        return True
-    if (
-        kind == PendingActionKind.TASK_RECOVERY
-        and EffectReconciliationDecisionFactory.is_reconciliation_choice(
-            normalized,
-            allow_cancel=False,
-        )
-    ):
-        payload = (
-            pending_action.get("payload")
-            if isinstance(pending_action.get("payload"), dict)
-            else {}
-        )
-        reconciliation = (
-            payload.get("reconciliation")
-            if isinstance(payload.get("reconciliation"), dict)
-            else {}
-        )
-        return bool(reconciliation.get("effects"))
     # Releases proposal cards affected by the historical approve_all/approve
     # mismatch.  approve_proposal() only selects tickets still in `proposed`,
     # so already-started tickets cannot be dispatched twice.
@@ -4076,26 +3842,6 @@ async def _resume_step_for_retry(
         params_update=params_update,
         human_input_response=human_input_response,
         enqueue=enqueue,
-    )
-
-
-async def _mark_plan_continuation_dispatch_failed(
-    db: AsyncSession,
-    *,
-    plan_id: str,
-    user_id: str,
-) -> bool:
-    """Compatibility shim that re-arms the durable Plan wake."""
-
-    from packages.core.services.task_retry_service import (
-        mark_plan_continuation_dispatch_failed,
-    )
-
-    return await mark_plan_continuation_dispatch_failed(
-        db,
-        plan_id=plan_id,
-        user_id=user_id,
-        reason="chat_resolution_dispatch_failed",
     )
 
 

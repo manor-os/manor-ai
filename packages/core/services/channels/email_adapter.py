@@ -6,6 +6,16 @@ posts parsed messages to ``/api/v1/channels/email/callback`` or (b) wire
 an external mail-forward-to-webhook service (Mailgun, Postmark, SendGrid
 inbound parse). Both funnel through ``parse_inbound`` below.
 
+Every inbound POST must be signed with the ChannelConfig's inbound secret:
+
+    X-Manor-Timestamp: <unix seconds>
+    X-Manor-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>." + raw body)>
+
+Requests older or newer than ``INBOUND_TOLERANCE_SECONDS`` are rejected, so
+a captured request cannot be replayed later. A config without a secret
+accepts nothing; its owner reveals (and thereby creates) the secret through
+the Integration's email-inbound endpoint.
+
 Credentials are leased from the ChannelConfig's source Integration (mirrors
 the email MCP bundle):
     {
@@ -17,11 +27,16 @@ the email MCP bundle):
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
+import secrets
+import time
 from email.message import EmailMessage
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
+from packages.core.credentials import Requester, get_credential_service
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.base import (
     ChannelAdapter, ChannelTextSendError, NormalizedInbound, register_adapter,
@@ -29,6 +44,50 @@ from packages.core.services.channels.base import (
 from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
+
+INBOUND_SIGNATURE_HEADER = "X-Manor-Signature"
+INBOUND_TIMESTAMP_HEADER = "X-Manor-Timestamp"
+INBOUND_TOLERANCE_SECONDS = 300
+_SIGNATURE_PREFIX = "sha256="
+
+
+def sign_inbound_body(secret: str, timestamp: str, body: bytes) -> str:
+    """Return the ``X-Manor-Signature`` value a sender puts on ``body``."""
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"{timestamp}.".encode("ascii") + body,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{_SIGNATURE_PREFIX}{digest}"
+
+
+def load_inbound_secret(cc: ChannelConfig, *, reason: str) -> Optional[str]:
+    return get_credential_service().lease_channel_inbound_secret(
+        cc, requester=Requester(kind="channel", id=cc.id), reason=reason,
+    )
+
+
+def ensure_inbound_secret(cc: ChannelConfig, *, reason: str) -> tuple[str, bool]:
+    """Return ``(secret, created)``; the caller commits a new secret."""
+    existing = load_inbound_secret(cc, reason=reason)
+    if existing:
+        return existing, False
+    return rotate_inbound_secret(cc), True
+
+
+def rotate_inbound_secret(cc: ChannelConfig) -> str:
+    """Replace the secret; senders using the old one are rejected."""
+    secret = secrets.token_urlsafe(32)
+    get_credential_service().store_channel_inbound_secret(cc, secret)
+    return secret
+
+
+def _header(headers: Mapping[str, str], name: str) -> str:
+    wanted = name.lower()
+    for key, value in headers.items():
+        if key.lower() == wanted:
+            return str(value or "").strip()
+    return ""
 
 
 def _normalize_inbound_attachments(payload: Dict[str, Any]) -> list[dict[str, Any]]:
@@ -186,6 +245,32 @@ class EmailChannelAdapter(ChannelAdapter):
             timeout=30,
         )
         return {"to": to, "filename": fname, "status": "sent"}
+
+    async def verify_inbound(
+        self, cc: ChannelConfig, *, headers, query, body,
+    ) -> bool:
+        signature = _header(headers, INBOUND_SIGNATURE_HEADER)
+        timestamp = _header(headers, INBOUND_TIMESTAMP_HEADER)
+        if not signature or not (timestamp.isascii() and timestamp.isdigit()):
+            return False
+        if abs(time.time() - int(timestamp)) > INBOUND_TOLERANCE_SECONDS:
+            return False
+        secret = load_inbound_secret(cc, reason="channel.email.verify_inbound")
+        if not secret:
+            return False
+        return hmac.compare_digest(
+            sign_inbound_body(secret, timestamp, body).encode("ascii"),
+            signature.encode("utf-8"),
+        )
+
+    async def register_webhook(self, cc: ChannelConfig) -> Dict[str, Any]:
+        """Create the inbound secret when the email connection is saved."""
+        _secret, created = ensure_inbound_secret(
+            cc, reason="channel.email.register_webhook",
+        )
+        if created:
+            return {"registered": True, "detail": "inbound signing secret created"}
+        return {"registered": False, "reason": "inbound signing secret already exists"}
 
     async def parse_inbound(
         self, cc: ChannelConfig, *, headers, query, body,

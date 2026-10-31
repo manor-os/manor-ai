@@ -18,6 +18,7 @@ from packages.core.services.model_context_window import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     effective_context_window_tokens,
     model_context_window_tokens,
+    normalize_model_limits,
 )
 from tests.test_runtime_capability_refresh import mock_runtime, _envelope, _loop_kwargs  # noqa: F401
 
@@ -81,6 +82,25 @@ def test_effective_window_is_the_model_window_within_cost_caps(gateway_caches, m
     assert effective_context_window_tokens(model) == expected
 
 
+@pytest.mark.parametrize("cap", [None, "500000"])
+@pytest.mark.parametrize("bare", ["gpt-5.6-terra", "claude-sonnet-4.6", "gemini-2.5-pro"])
+def test_native_byok_bare_ids_are_sized_like_their_catalog_ids(gateway_caches, monkeypatch, bare, cap):
+    """A native BYOK route calls the provider's bare id; it is the same model."""
+    if cap:
+        monkeypatch.setenv("MANOR_CONTEXT_WINDOW_CAP_TOKENS", cap)
+    qualified = next(key for key in MODEL_CONTEXT_WINDOWS if key.split("/", 1)[-1] == bare)
+    assert effective_context_window_tokens(bare) == effective_context_window_tokens(qualified) != DEFAULT_CONTEXT_WINDOW_TOKENS
+
+
+def test_native_byok_bare_ids_are_learnt_from_the_synced_caches(gateway_caches):
+    # Staging 2026-10-21: BYOK gpt-6.1-sol was budgeted at the 128K default and
+    # compacted every few rounds although the gateways list a 1.05M window.
+    gateway_caches("openrouter", {"openai/gpt-6.1-sol": {"context_window": 1_050_000}})
+    assert model_context_window_tokens("gpt-6.1-sol") == 1_050_000
+    assert effective_context_window_tokens("gpt-6.1-sol") == 200_000
+    assert model_context_window_tokens("never-seen-model") is None
+
+
 def test_models_outside_the_catalog_are_sized_from_the_synced_caches(gateway_caches):
     # A stored legacy preference keeps working against its real 8K window.
     gateway_caches("openrouter", {"openai/gpt-4": {"context_window": 8_191}})
@@ -138,23 +158,66 @@ async def test_compacted_context_has_headroom_before_the_next_trigger():
     assert await _compact(grown, target_ratio=.5, complete=forbidden) is grown
 
 
+def _byok_limits(model, window=None, output=None):
+    limits = {"model": model, "context_window_tokens": window, "max_output_tokens": output}
+    return {"llm_api_key": "sk-tenant-key-1234567890", "llm_model_limits": {k: v for k, v in limits.items() if v}}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model,window", [("anthropic/claude-sonnet-4.6", 200_000), ("test-model", 128_000)])
-async def test_loop_budgets_against_the_called_models_window(mock_runtime, monkeypatch, gateway_caches, model, window):  # noqa: F811
+@pytest.mark.parametrize("model,route_metadata,window,max_tokens", [
+    ("anthropic/claude-sonnet-4.6", {}, 200_000, 16_384),
+    ("test-model", {}, 128_000, 16_384),
+    # A BYOK model the catalog cannot size runs at its declared limits,
+    # including a window above the platform resend cap.
+    ("acme/unknown-chat", _byok_limits("acme/unknown-chat", 1_000_000, 100_000), 1_000_000, 100_000),
+    # A declared ceiling too large to compact against is clamped to 1/4 window.
+    ("acme/unknown-chat", _byok_limits("acme/unknown-chat", 200_000, 120_000), 200_000, 50_000),
+    # Only the window declared: output keeps the default.
+    ("acme/unknown-chat", _byok_limits("acme/unknown-chat", 400_000), 400_000, 16_384),
+    # Limits bound to another model never resize the called catalog model.
+    ("anthropic/claude-sonnet-4.6", _byok_limits("acme/unknown-chat", 1_000_000, 100_000), 200_000, 16_384),
+])
+async def test_loop_budgets_and_requests_with_the_called_models_limits(
+    mock_runtime, monkeypatch, gateway_caches, model, route_metadata, window, max_tokens,  # noqa: F811
+):
+    from packages.core.ai.runtime import agentic_llm
     from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
 
-    async def complete(messages, tools, **kwargs):
+    sent = []
+
+    async def provider(messages, tools, **kwargs):
+        sent.append(kwargs["max_tokens"])
         return "Done.", [], {"total": 1}
 
     async def route(*, model=None, metadata=None, **kwargs):
-        return model, {}, True
+        return model, dict(route_metadata), True
 
-    monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", complete)
+    # Patch the provider boundary so the real round wrapper picks max_tokens.
+    monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion",
+                        agentic_llm.runtime_execute_agentic_round_tool_completion)
+    monkeypatch.setattr(agentic_llm, "chat_completion_with_tools", provider)
     monkeypatch.setattr("packages.core.ai.runtime.completions.runtime_resolve_text_completion_route", route)
     kwargs = _loop_kwargs(_envelope("read_file"), None)
     kwargs.update(model=model, dynamic_tool_handlers={}, capability_refresh_tool_names=set(), max_rounds=2)
     result = await runtime_execute_agentic_loop(**kwargs)
-    assert result.usage["context_window_last"]["context_window_tokens"] == window
+    usage = result.usage["context_window_last"]
+    assert usage["context_window_tokens"] == window
+    assert usage["output_reserve_tokens"] == max_tokens
+    assert sent == [max_tokens]
+
+
+@pytest.mark.parametrize("window,output,error", [
+    (8_000, None, "context_window_tokens must be between"),
+    (None, 100, "max_output_tokens must be between"),
+    (50_000_000, None, "context_window_tokens must be between"),
+    (64_000, 64_000, "smaller than context_window_tokens"),
+    ("lots", None, "must be an integer"),
+    (True, None, "must be an integer"),
+])
+def test_declared_limits_are_bounded(window, output, error):
+    with pytest.raises(ValueError, match=error):
+        normalize_model_limits(window, output)
+    assert normalize_model_limits(None, None) == {}
 
 
 def test_no_hard_coded_window_outside_the_model_window_fallback():

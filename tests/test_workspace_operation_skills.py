@@ -45,6 +45,18 @@ def test_preload_selects_relevant_guides_without_executing_tools(message, expect
     assert len(rendered) < (18_000 if "workspace-configuration" in expected else 12_000)
 
 
+def test_app_preload_is_bounded_but_the_full_guide_remains_available_on_demand():
+    preloaded, preload_digest = guides.load_workspace_operation_preload_guide("workspace-app")
+    full, full_digest = guides.load_workspace_operation_guide("workspace-app")
+    config = guides.workspace_operation_guide_configs()["workspace-app"]
+
+    assert preload_digest == full_digest
+    assert len(preloaded) < len(full)
+    assert config["preload_summary"] in preloaded
+    assert "Supported tool catalog" in preloaded
+    assert full.startswith("### Guide `workspace-app`")
+
+
 @pytest.mark.parametrize("kwargs", [
     {"surface": ChatSurface.GLOBAL_OWNER_CHAT},
     {"surface": ChatSurface.PUBLIC_CUSTOMER_CHAT},

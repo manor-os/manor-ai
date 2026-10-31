@@ -213,8 +213,8 @@ for (const choice of ["approve", "reject"] as const) {
       review: { tool: "file_engine", action: "write_file", paths: ["notes/review.md"], args_preview: { content: "Reviewed output" } },
     } });
     const host = page.locator(".workspace-workflow-run-host");
-    await host.getByRole("button", { name: "Details", exact: true }).click();
-    await expect(host.getByText("notes/review.md", { exact: true })).toBeVisible();
+    await host.getByRole("button", { name: "Review", exact: true }).click();
+    await expect(host.getByRole("button", { name: /^review\.md\b/ })).toBeVisible();
     await expect(host.getByRole("textbox")).toHaveCount(0);
     const button = host.getByRole("button", { name: choice === "approve" ? "Approve" : "Reject", exact: true });
     await button.focus();
@@ -313,6 +313,71 @@ test("invalid input stays local and retains the server state", async ({ page }) 
   await expect(host.locator('[aria-invalid="true"]')).toBeFocused();
   await expect(host.locator(".workflow-run-status")).toHaveText("Paused");
   expect(fixture.submissions).toEqual([]);
+});
+
+test("collection workflow input submits answers through the message contract", async ({ page }) => {
+  const fixture = await installWorkflowFixture(page, { action: {
+    kind: "workflow_input", workflow_run_id: RUN, message_id: MESSAGE,
+    step_id: "step-0", response_variable: "answers",
+    inputs: [{ key: "campaign", label: "Campaign", type: "string", required: true }],
+    options: ["respond", "cancel"],
+  } });
+  const host = page.locator(".workspace-workflow-run-host");
+  await host.getByRole("textbox", { name: "Campaign *", exact: true }).fill("Release");
+  await host.getByRole("button", { name: "Respond", exact: true }).click();
+  await expect.poll(() => fixture.submissions.length).toBe(1);
+  expect(fixture.submissionPaths).toEqual([`/workspaces/${WORKSPACE}/chat/messages/${MESSAGE}/resolve`]);
+  expect(fixture.submissions).toEqual([{ choice: "respond", payload: { inputs: { campaign: "Release" } } }]);
+  await fixture.finish(true);
+  await expect(host.locator(".workflow-run-status")).toHaveText("Running");
+  expect(fixture.pageErrors).toEqual([]);
+  expect(fixture.unexpectedWrites).toEqual([]);
+});
+
+test("workflow input renders and submits a prefilled document intake schema", async ({ page }) => {
+  const sourceDocument = {
+    document_id: "customer-brief", id: "customer-brief", name: "Customer brief.pdf",
+    type: "knowledge", viewer_url: "/viewer/customer-brief",
+  };
+  const fixture = await installWorkflowFixture(page, { action: {
+    kind: "workflow_input", workflow_run_id: RUN, message_id: MESSAGE,
+    step_id: "step-0", response_variable: "intake",
+    input_schema: {
+      type: "object", required: ["source_documents", "editor_note"], properties: {
+        source_documents: {
+          type: "array", items: { type: "object", required: ["document_id"] },
+          "x-ui": { control: "documents" }, title: "Source documents",
+        },
+        editor_note: { type: "string", minLength: 1, title: "Editorial note" },
+        existing_source_project_id: {
+          type: "string", minLength: 1, title: "Existing source project",
+          "x-ui": {
+            control: "workflow_project_select", project_type: "release",
+            allowed_stages: ["verified"],
+          },
+        },
+      },
+    },
+    values: { source_documents: [sourceDocument] },
+    options: ["respond", "cancel"],
+  } });
+  const host = page.locator(".workspace-workflow-run-host");
+  await expect(host.getByText("Source documents *", { exact: true })).toBeVisible();
+  await expect(host.getByText("Customer brief.pdf", { exact: true })).toBeVisible();
+  await expect(host.getByRole("combobox", { name: "Existing source project", exact: true })).toBeVisible();
+  await host.getByRole("textbox", { name: "Editorial note *", exact: true }).fill("Approved for publishing.");
+  await host.getByRole("button", { name: "Respond", exact: true }).click();
+  await expect.poll(() => fixture.submissions.length).toBe(1);
+  expect(fixture.submissionPaths).toEqual([`/workspaces/${WORKSPACE}/chat/messages/${MESSAGE}/resolve`]);
+  expect(fixture.submissions).toEqual([{
+    choice: "respond", payload: { intake: {
+      source_documents: [sourceDocument], editor_note: "Approved for publishing.",
+    } },
+  }]);
+  await fixture.finish(true);
+  await expect(host.locator(".workflow-run-status")).toHaveText("Running");
+  expect(fixture.pageErrors).toEqual([]);
+  expect(fixture.unexpectedWrites).toEqual([]);
 });
 
 for (const scenario of [
@@ -505,13 +570,12 @@ for (const width of [1440, 390]) {
     } });
     const host = page.locator(".workspace-workflow-run-host");
     await expect(host.locator(".workflow-run-status")).toHaveText("Input needed");
-    await expect(page.locator(".workspace-workflow-activity-status")).toHaveText("Input needed");
-    await expect(page.locator(".workspace-workflow-activity")).toHaveAttribute("data-status", "paused");
+    await expect(page.getByText("Review workflow · Input needed", { exact: true })).toBeVisible();
     await expect(host.getByRole("textbox", { name: "Source caption" })).toBeHidden();
     await host.getByRole("button", { name: "Provide input", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Provide input", exact: true });
     await expect(dialog).toBeVisible();
-    await dialog.getByRole("button", { name: "Continue", exact: true }).click();
+    await expect(dialog.getByRole("button", { name: "Continue", exact: true })).toBeDisabled();
     expect(fixture.submissions).toHaveLength(0);
     await dialog.getByRole("textbox", { name: "Source caption" }).fill("A complete synthetic caption.");
     await dialog.getByRole("button", { name: "Continue", exact: true }).click();

@@ -9,8 +9,10 @@ referenced through ``evidence_refs`` rather than copied into the ledger.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from enum import StrEnum
+from functools import lru_cache
 import hashlib
 import ipaddress
 import json
@@ -36,6 +38,7 @@ from packages.core.services.workspace_artifacts import (
     resolve_workspace_artifact_directory,
 )
 from packages.core.services.workspace_ledger import (
+    LEDGER_PROVENANCE_FIELDS,
     LedgerStorage,
     WorkspaceLedgerError,
     ensure_ledger_location,
@@ -1306,6 +1309,37 @@ def _identity_conflicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return conflicts
 
 
+def _events_revision(ledger_root: str) -> tuple[int, int, int]:
+    """Change token of the immutable events folder; adding a record changes it."""
+    try:
+        stat = os.stat(os.path.join(ledger_root, "events"))
+    except FileNotFoundError:
+        return (0, 0, 0)
+    except OSError as exc:
+        raise RelationshipLedgerError(
+            "filesystem_unavailable",
+            "Relationship ledger events could not be inspected",
+        ) from exc
+    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=128)
+def _load_events_at_revision(
+    ledger_root: str,
+    workspace_id: str,
+    entity_id: str,
+    _revision: tuple[int, int, int],
+) -> tuple[RelationshipLedgerEvent, ...]:
+    """Parse every event once per folder revision; records never change in place."""
+    events = [
+        _parse_event(path, workspace_id=workspace_id, entity_id=entity_id)
+        for path in ledger_record_files(ledger_root)
+        if os.path.basename(os.path.dirname(path)) == "events"
+    ]
+    events.sort(key=lambda item: item.recorded_at)
+    return tuple(events)
+
+
 async def read_relationship_ledger(
     *,
     entity_id: str,
@@ -1322,12 +1356,10 @@ async def read_relationship_ledger(
         directory=directory,
         create=create_location,
     )
-    events = [
-        _parse_event(path, workspace_id=workspace_id, entity_id=entity_id)
-        for path in ledger_record_files(ledger_root)
-        if os.path.basename(os.path.dirname(path)) == "events"
-    ]
-    events.sort(key=lambda item: item.recorded_at)
+    revision = await asyncio.to_thread(_events_revision, ledger_root)
+    events = list(await asyncio.to_thread(
+        _load_events_at_revision, ledger_root, workspace_id, entity_id, revision,
+    ))
     if recent_limit is None or int(recent_limit) <= 0:
         visible_events = events
     else:
@@ -1352,7 +1384,7 @@ async def read_relationship_ledger(
 def _idempotency_payload(event: RelationshipLedgerEvent) -> dict[str, Any]:
     payload = event.model_dump(
         mode="json",
-        exclude={"event_id", "identity_fingerprint", "recorded_at"},
+        exclude={"event_id", "identity_fingerprint", "recorded_at", *LEDGER_PROVENANCE_FIELDS},
     )
     for ref in payload.get("evidence_refs") or []:
         ref.pop("verified_at", None)

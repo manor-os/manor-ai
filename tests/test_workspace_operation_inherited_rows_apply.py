@@ -7,6 +7,8 @@ subscription, so apply acts only on what the draft actually changed.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import select
 
@@ -31,9 +33,14 @@ async def _workspace_with_inherited_duplicate(db):
     agents = [Agent(id=generate_ulid(), entity_id=entity_id, name=f"Agent {n}", status="active") for n in range(3)]
     db.add_all([workspace, *agents])
     await db.flush()
+    # Mappings are listed by (created_at, id). Rows inserted in one
+    # transaction share the server now(), and ULIDs follow the wall clock,
+    # which a runner may step back; pin the order the paths below assume.
+    created_at = datetime.now(timezone.utc)
     subs = [
         AgentSubscription(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id,
-                          service_key=key, agent_id=agent.id, status="active", custom_prompt=f"prompt {n}")
+                          service_key=key, agent_id=agent.id, status="active", custom_prompt=f"prompt {n}",
+                          created_at=created_at + timedelta(milliseconds=n))
         for n, (key, agent) in enumerate(zip(("a", "a", "b"), agents))
     ]
     db.add_all(subs)

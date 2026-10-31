@@ -165,6 +165,10 @@ async def publish_target(db, value: dict, *, user, cc, binding) -> dict:
     if not value["enabled"]:
         return {"enabled": False}
     if cc.owner_user_id is None and cc.channel_type == "webchat":
+        # An external collaborator never takes over a customer webchat; the ones
+        # they create pass to the customer when the collaboration ends.
+        if getattr(user, "_collaborator_workspace_ids", None) is not None:
+            raise ResidentAccessError(403, "resident_invalid_target", "The channel owner must publish the resident connection.")
         cc.owner_user_id = user.id
     if cc.owner_user_id != user.id:
         raise ResidentAccessError(403, "resident_invalid_target", "The channel owner must publish the resident connection.")

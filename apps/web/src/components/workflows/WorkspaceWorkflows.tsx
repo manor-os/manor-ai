@@ -28,6 +28,7 @@ import {
   sortWorkflowRunsNewestFirst,
   workflowRunHasImmutableListMetadata,
   workflowRunDurationMs,
+  workflowRunProgressPercent,
   workflowRunStatusPresentation,
   type WorkflowHistoryNode,
   type WorkflowHistoryRun,
@@ -383,6 +384,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
             const workflow = workflowById.get(family.latestRun.workflow_id || "");
             const currentNode = workflow?.steps?.find((step) => step.id === run.current_step_id);
             const immutableListMetadata = workflowRunHasImmutableListMetadata(run);
+            const progressPercent = workflowRunProgressPercent(family.processedCount, family.totalCount, family.status);
             const workflowName = run.workflow_name || workflow?.name || t("component.workflow_run_history.unknown_workflow");
             const currentNodeName = run.current_step_name || currentNode?.name || run.current_step_id;
             const blocker = formatWorkflowError(
@@ -422,18 +424,15 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
                         )}
                       </span>
                       <span className="workflow-run-history-row-progress">
-                        {family.totalCount > 0
-                          ? t("component.workflow_run_history.steps_progress", {
-                              count: family.processedCount,
-                              total: family.totalCount,
-                            })
+                        {progressPercent !== null
+                          ? `${Math.floor(progressPercent)}%`
                           : t("component.workflow_run_history.progress_in_details")}
                       </span>
                     </span>
                   </span>
                   <span className="workflow-run-history-status" data-status={statusPresentation.iconStatus}>
                     <span aria-hidden="true" />
-                    {t(`component.workflow_run.status.${statusPresentation.labelKey}`)}
+                    {t(statusPresentation.stateKey)}
                   </span>
                   <span className="workflow-run-history-row-meta">
                     <span>{t("component.workflow_run_history.attempts", { count: family.attemptCount })}</span>

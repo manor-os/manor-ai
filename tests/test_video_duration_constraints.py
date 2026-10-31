@@ -276,6 +276,40 @@ async def test_video_handler_rejects_prompt_only_atlas_wan_before_creating_job(m
     assert "text-to-video model" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_video_handler_fails_instead_of_dropping_unselected_first_frame(monkeypatch):
+    # Regression: an unselected first frame used to be stripped with only a
+    # route warning, so an image-to-video request silently became a billed
+    # text-to-video clip that ignored the image.
+    from packages.core.ai.tools import extended_tools
+
+    async def fake_resolve_video_model(_user_id, _entity_id):
+        return "bytedance/seedance-v1.0-pro-fast"
+
+    async def fail_if_credentials_resolved(*_args, **_kwargs):
+        raise AssertionError("must fail before resolving credentials or creating a job")
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", fake_resolve_video_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fail_if_credentials_resolved)
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="The camera slowly pushes forward.",
+            first_frame_url="/api/v1/fs/entity/shot01.png",
+            duration=4,
+            generate_audio=False,
+            _active_user_message_from_context="用 shot01.png 作为首帧做图生视频",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "reference_media_not_selected"
+    assert "first_frame_url" in result["error"]
+    assert "job_id" not in result
+
+
 def test_video_reference_url_alias_is_normalized():
     from packages.core.ai.tools.extended_tools import _coerce_video_reference_urls
 
@@ -358,6 +392,25 @@ def test_unmentioned_visual_reference_is_filtered_from_tool_args():
     assert last == ""
     assert refs == []
     assert omitted == ["last_frame_url", "reference_urls"]
+
+
+def test_hash_mention_ends_at_the_file_name_in_chinese_text():
+    """A Workflow prompt wrote `#presenter-master.png（主持人定妆照）` and every
+    first frame was rejected as unselected."""
+    from packages.core.ai.tools.extended_tools import _reference_selected_by_user
+
+    url = "/api/v1/fs/entity/uploads/品牌/presenter-master.png"
+    for text in (
+        "参考图：#presenter-master.png（固定主持人定妆照）",
+        "用 #presenter-master.png、#owner.png",
+        "#presenter-master.png：首帧",
+        "用#presenter-master.png做首帧",
+        "use #presenter-master.png.",
+        "#presenter-master.png",
+    ):
+        assert _reference_selected_by_user(text, url), text
+    for text in ("#presenter-master.png.bak", "#presenter-master.pngx", "#presenter-master-v2.png"):
+        assert not _reference_selected_by_user(text, url), text
 
 
 def test_runtime_generated_visual_references_are_kept_without_user_hash_selection():
@@ -1045,7 +1098,9 @@ async def test_generate_video_accepts_matching_planned_model(monkeypatch):
     )
 
     assert result["status"] == "failed"
-    assert result["error"] == "No video generation API key configured"
+    # Past the planned-model gate it stops at credentials: a model outside the
+    # catalog runs only on the Account's own key.
+    assert "runs only on your own API key" in result["error"]
     assert result["model"] == "current/video-model"
     assert "error_code" not in result
 
@@ -1202,6 +1257,32 @@ def test_video_capability_validation_allows_narration_for_post_warning():
     assert 'generate_file(kind="audio")' in _video_post_production_warning("narration")
 
 
+def test_native_dialogue_model_keeps_spoken_lines_in_the_clip():
+    """Grok speaks the prompt's lines in lip sync; a "leave dialogue for post"
+    note made it mouth gibberish instead."""
+    from packages.core.ai.tools.extended_tools import (
+        _prompt_requests_video_post_asset,
+        _video_native_audio_assets,
+    )
+
+    prompt = (
+        "The host says in Mandarin: 「你看到一盘没吃完的肉」. "
+        "Her lips move in sync with her speech. No text, no subtitles."
+    )
+
+    grok_native = _video_native_audio_assets("xai/grok-imagine-video-1.5", True)
+    assert _prompt_requests_video_post_asset(prompt, native=grok_native) == ""
+    # Native audio off, or a model without native dialogue: dialogue stays post work.
+    assert _video_native_audio_assets("xai/grok-imagine-video-1.5", False) == frozenset()
+    seedance_native = _video_native_audio_assets("bytedance/seedance-2.0", True)
+    assert _prompt_requests_video_post_asset(prompt, native=seedance_native) == "dialogue"
+    # Subtitles are never native.
+    assert (
+        _prompt_requests_video_post_asset("Generate burned-in subtitles.", native=grok_native)
+        == "subtitles"
+    )
+
+
 def test_video_capability_validation_allows_silent_negative_audio_prompt():
     from packages.core.ai.tools.extended_tools import _video_capability_error
 
@@ -1233,17 +1314,24 @@ def test_video_capability_validation_allows_positive_audio_for_post_warning():
     )
 
 
-def test_video_capability_validation_rejects_kling_native_audio():
+def test_video_capability_validation_kling_native_audio_needs_pro_mode():
+    # Kling v3.0 generates sound only in pro mode (@ai-sdk/klingai `sound`).
     from packages.core.ai.tools.extended_tools import _video_capability_error
 
-    error = _video_capability_error(
+    std_error = _video_capability_error(
+        model="kwaivgi/kling-v3.0-std",
+        prompt="Create a cinematic beach landing shot.",
+        generate_audio=True,
+    )
+    pro_error = _video_capability_error(
         model="kwaivgi/kling-v3.0-pro",
         prompt="Create a cinematic beach landing shot.",
         generate_audio=True,
     )
 
-    assert error is not None
-    assert "native video audio" in error
+    assert std_error is not None
+    assert "native video audio" in std_error
+    assert pro_error is None
 
 
 def test_video_capability_validation_allows_seedance_native_audio_without_reference():

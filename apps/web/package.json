@@ -19,13 +19,12 @@
     "@xyflow/react": "^12.11.2",
     "chart.js": "^4.5.1",
     "clsx": "^2.1.0",
-    "dompurify": "^3.4.13",
+    "dompurify": "^3.4.17",
     "emoji-picker-react": "^4.22.2",
     "heic-to": "1.6.5",
     "image-size": "file:vendor/image-size",
     "jszip": "^3.10.1",
     "lucide-react": "^1.44.0",
-    "mammoth": "^1.12.0",
     "mdast-util-from-markdown": "^2.0.3",
     "mdast-util-gfm": "^3.1.0",
     "mermaid": "^11.16.1",
@@ -62,6 +61,9 @@
   },
   "overrides": {
     "@xmldom/xmldom": "0.8.15",
+    "mermaid": {
+      "katex": "0.18.2"
+    },
     "pptxgenjs": {
       "image-size": "$image-size"
     }

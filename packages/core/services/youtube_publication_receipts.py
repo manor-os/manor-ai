@@ -149,6 +149,7 @@ def build_publication_receipt(
     expected_title: str,
     expected_video_id: str = "",
     expected_channel_name: str = "",
+    expected_channel_id: str = "",
     source_kind: PublicationSourceKind,
     source_task_id: str | None,
     source_workflow_run_id: str | None = None,
@@ -159,6 +160,7 @@ def build_publication_receipt(
     title = str(expected_title or "").strip()
     video_id = str(expected_video_id or "").strip()
     channel_name = str(expected_channel_name or "").strip()
+    channel_id = str(expected_channel_id or "").strip()
     if video_id and metrics.video_id != video_id:
         raise YouTubePublicationReceiptError(
             "video_mismatch",
@@ -173,6 +175,11 @@ def build_publication_receipt(
         raise YouTubePublicationReceiptError(
             "channel_mismatch",
             "Public channel does not match the verified Studio channel",
+        )
+    if channel_id and metrics.channel_id != channel_id:
+        raise YouTubePublicationReceiptError(
+            "channel_mismatch",
+            "Public channel ID does not match the selected Studio channel",
         )
     return validate_publication_receipt(
         {

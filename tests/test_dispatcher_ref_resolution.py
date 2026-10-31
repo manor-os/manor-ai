@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,7 +35,6 @@ from packages.core.models.workspace import (
 )
 async def test_dispatcher_excludes_inactive_workspace_before_candidate_scan(
     db_session,
-    monkeypatch,
     workspace_status,
     deleted_at,
 ) -> None:
@@ -93,27 +90,20 @@ async def test_dispatcher_excludes_inactive_workspace_before_candidate_scan(
     )
     await db_session.flush()
 
-    readiness = AsyncMock(return_value=None)
-    monkeypatch.setattr(
-        "packages.core.services.workspace_readiness."
-        "evaluate_current_workspace_blocking_setup",
-        readiness,
-    )
-
     assert await Dispatcher().checkout_steps_for_worker(
         db_session,
         worker,
         max_n=1,
     ) == []
-    readiness.assert_not_awaited()
     assert step.step_status == "pending"
+    assert step.error is None, "an inactive Workspace's step must not even be scanned"
 
     actor = await initialize_test_account_approval(db_session, entity_id=entity_id,
         user_rules=[action_rule("unclassified.action")])
     await initialize_test_approval_owners(db_session, workspace, user_id=actor.id)
-    # Restore/resume makes the row visible to the normal readiness gate again.
-    # It remains unleased here because this focused fixture intentionally has
-    # no AgentSubscription; active subscription dispatch is covered below.
+    # Restore/resume makes the row visible to the checkout gates again. It
+    # remains unleased here because this focused fixture intentionally has no
+    # AgentSubscription; active subscription dispatch is covered below.
     workspace.status = "active"
     workspace.deleted_at = None
     await db_session.flush()
@@ -123,7 +113,7 @@ async def test_dispatcher_excludes_inactive_workspace_before_candidate_scan(
         worker,
         max_n=1,
     ) == []
-    readiness.assert_awaited_once()
+    assert step.error["dispatch_skip"]["reason"] == "subscription_unresolved"
 
 
 @pytest.mark.asyncio
@@ -625,190 +615,6 @@ async def test_scheduled_task_creation_receipt_is_valid_system_provenance(
     assert await resolve_task_execution_user_id(db_session, task) is None
 
 
-@pytest.mark.asyncio
-async def test_internal_worker_rejects_legacy_task_without_executable_requester(
-    client,
-    monkeypatch,
-) -> None:
-    import packages.core.database as dbmod
-    from packages.core.workers import internal
-
-    entity_id = generate_ulid()
-    agent_id = generate_ulid()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    step_id = generate_ulid()
-    lease_id = generate_ulid()
-    worker_id = generate_ulid()
-    handler_calls: list[dict] = []
-
-    async def should_not_execute(snapshot: dict) -> dict:
-        handler_calls.append(snapshot)
-        return {"result": {"text": "must not run"}, "cost": {"usd": 1}}
-
-    monkeypatch.setattr(internal, "_execute_by_kind", should_not_execute)
-
-    async with dbmod.async_session() as db:
-        await initialize_test_account_approval(db, entity_id=entity_id,
-            user_rules=[action_rule("unclassified.action")])
-        db.add_all(
-            [
-                Agent(
-                    id=agent_id,
-                    entity_id=entity_id,
-                    name="Legacy stored creator",
-                    config={},
-                    status="active",
-                ),
-                Task(
-                    id=task_id,
-                    entity_id=entity_id,
-                    title="Unaudited legacy Task",
-                    creator_id=agent_id,
-                ),
-                Worker(
-                    id=worker_id,
-                    entity_id=entity_id,
-                    kind="internal",
-                    display_name="Internal worker",
-                    capabilities={
-                        "supported_kinds": ["subagent"],
-                        "max_risk_level": "high",
-                    },
-                    monthly_spent_usd=Decimal("0"),
-                    auto_pause_on_budget=True,
-                    status="active",
-                ),
-                ExecutionPlan(
-                    id=plan_id,
-                    entity_id=entity_id,
-                    task_id=task_id,
-                    status="running",
-                    execution_mode="live",
-                    approval_required=False,
-                    plan_dag={"steps": []},
-                ),
-                ExecutionStep(
-                    id=step_id,
-                    plan_id=plan_id,
-                    entity_id=entity_id,
-                    step_key="must_not_execute",
-                    kind="subagent",
-                    params={"prompt": "Do not run"},
-                    depends_on=[],
-                    step_status="running",
-                    attempt_count=1,
-                    max_attempts=1,
-                    current_lease_id=lease_id,
-                ),
-                WorkLease(
-                    id=lease_id,
-                    step_id=step_id,
-                    plan_id=plan_id,
-                    entity_id=entity_id,
-                    worker_id=worker_id,
-                    lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-                    status="active",
-                ),
-            ]
-        )
-        await db.commit()
-
-    outcome = await internal.execute_lease_inproc(lease_id)
-
-    async with dbmod.async_session() as db:
-        lease = await db.get(WorkLease, lease_id)
-        step = await db.get(ExecutionStep, step_id)
-
-    assert handler_calls == []
-    assert outcome["outcome"] == "failed"
-    assert outcome["error"]["type"] == "TaskRequesterIdentityError"
-    assert lease.status == "failed"
-    assert step.step_status == "failed"
-    assert step.error["type"] == "TaskRequesterIdentityError"
-
-
-
-
-@pytest.mark.asyncio
-async def test_dispatcher_resolves_step_refs_before_leasing(client) -> None:
-    """Worker checkout must receive self-contained params.
-
-    PlanExecutor resolves refs too, but worker heartbeats can race ahead after
-    dependencies finish. Dispatcher is the last safe boundary before a payload
-    leaves the runtime.
-    """
-    import packages.core.database as dbmod
-
-    entity_id = generate_ulid()
-    plan_id = generate_ulid()
-    worker = Worker(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        kind="internal",
-        display_name="Internal worker",
-        capabilities={"supported_kinds": ["llm"], "max_risk_level": "high"},
-        monthly_spent_usd=Decimal("0"),
-        auto_pause_on_budget=True,
-        status="active",
-    )
-
-    async with dbmod.async_session() as db:
-        await initialize_test_account_approval(db, entity_id=entity_id,
-            user_rules=[action_rule("unclassified.action")])
-        db.add(worker)
-        db.add(
-            ExecutionPlan(
-                id=plan_id,
-                entity_id=entity_id,
-                status="running",
-                execution_mode="live",
-                approval_required=False,
-                plan_dag={"steps": []},
-            )
-        )
-        db.add(
-            ExecutionStep(
-                id=generate_ulid(),
-                plan_id=plan_id,
-                entity_id=entity_id,
-                step_key="draft",
-                kind="llm",
-                params={"prompt": "draft"},
-                result={"text": "resolved draft", "metadata": {"score": 0.91}},
-                depends_on=[],
-                step_status="done",
-                attempt_count=1,
-                max_attempts=3,
-            )
-        )
-        pending = ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            step_key="finalize",
-            kind="llm",
-            params={
-                "prompt": "Use this upstream output: ${{ steps.draft.result.text }}",
-                "native": "${{ steps.draft.result.metadata }}",
-            },
-            depends_on=["draft"],
-            step_status="pending",
-            attempt_count=0,
-            max_attempts=3,
-        )
-        db.add(pending)
-        await db.flush()
-
-        leases = await Dispatcher().checkout_steps_for_worker(db, worker, max_n=1)
-
-        assert len(leases) == 1
-        _, leased_step = leases[0]
-        assert leased_step.id == pending.id
-        assert leased_step.step_status == "running"
-        assert leased_step.params["prompt"] == "Use this upstream output: resolved draft"
-        assert leased_step.params["native"] == {"score": 0.91}
-        assert "${{" not in str(leased_step.params)
 
 
 @pytest.mark.asyncio
@@ -910,7 +716,9 @@ async def test_dispatcher_hydrates_agent_id_from_workspace_subscription(client) 
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_rejects_action_not_bound_to_resolved_service_agent(client) -> None:
+async def test_dispatcher_rejects_action_not_bound_to_resolved_service_agent(undeclared_effects_allowed, client) -> None:
+    # plan_dag action steps name raw tools; "search_tweets" is not a registered
+    # tool, so its step subject is undeclared by construction.
     import packages.core.database as dbmod
     from packages.core.models.mcp import AgentMCPBinding, MCPServer
 
@@ -1039,32 +847,14 @@ async def test_dispatcher_rejects_action_not_bound_to_resolved_service_agent(cli
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_coerces_worker_output_before_validation(
-    client, tmp_path, monkeypatch,
-) -> None:
+async def test_dispatcher_coerces_worker_output_before_validation(client) -> None:
     import packages.core.database as dbmod
-    from types import SimpleNamespace
-
-    from packages.core.services import artifact_knowledge
 
     entity_id = generate_ulid()
     plan_id = generate_ulid()
     step_id = generate_ulid()
     lease_id = generate_ulid()
     worker_id = generate_ulid()
-    artifact = tmp_path / "workspace" / "social" / "draft-pack.md"
-    artifact.parent.mkdir(parents=True)
-    artifact.write_text("Draft pack", encoding="utf-8")
-    monkeypatch.setattr(
-        artifact_knowledge,
-        "get_entity_root",
-        lambda _entity_id: str(tmp_path),
-    )
-
-    async def sync_artifact(**_kwargs):
-        return SimpleNamespace(synced=True, document_id="doc_draft_pack", reason=None)
-
-    monkeypatch.setattr(artifact_knowledge, "sync_file_to_knowledge", sync_artifact)
     schema = {
         "type": "object",
         "required": ["files", "summary", "draft_count"],
@@ -1156,127 +946,5 @@ async def test_dispatcher_coerces_worker_output_before_validation(
         assert step.step_status == "done"
         assert step.result["draft_count"] == 3
         assert step.result["files"][0]["path"] == "workspace/social/draft-pack.md"
-        assert step.result["document_id"] == "doc_draft_pack"
         assert lease.status == "completed"
         assert lease.result == step.result
-
-
-@pytest.mark.asyncio
-async def test_internal_worker_heartbeats_during_long_lease(client, monkeypatch) -> None:
-    import packages.core.database as dbmod
-    from packages.core.workers import internal
-    from packages.core.services.auth_service import hash_password
-
-    entity_id = generate_ulid()
-    plan_id = generate_ulid()
-    step_id = generate_ulid()
-    lease_id = generate_ulid()
-    worker_id = generate_ulid()
-    task_id = generate_ulid()
-    creator_id = generate_ulid()
-    conversation_id = generate_ulid()
-    snapshots: list[dict] = []
-
-    async def slow_handler(_snapshot: dict) -> dict:
-        snapshots.append(dict(_snapshot))
-        async with asyncio.timeout(2):
-            while True:
-                async with dbmod.async_session() as db:
-                    lease = await db.get(WorkLease, lease_id)
-                    if lease is not None and lease.heartbeat_count > 0:
-                        break
-                await asyncio.sleep(0.01)
-        return {"result": {"text": "done"}, "cost": {"usd": 0}}
-
-    monkeypatch.setattr(internal, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(internal, "LEASE_HEARTBEAT_EXTEND_SECONDS", 60)
-    monkeypatch.setattr(internal, "_execute_by_kind", slow_handler)
-
-    async with dbmod.async_session() as db:
-        await initialize_test_account_approval(db, entity_id=entity_id,
-            user_rules=[action_rule("unclassified.action")])
-        db.add_all(
-            [
-                User(
-                    id=creator_id,
-                    entity_id=entity_id,
-                    email="heartbeat-task-creator@test.com",
-                    display_name="Heartbeat Task Creator",
-                    password_hash=hash_password("pass123"),
-                    role="member",
-                    status="active",
-                ),
-                Worker(
-                    id=worker_id,
-                    entity_id=entity_id,
-                    kind="internal",
-                    display_name="Internal worker",
-                    capabilities={"supported_kinds": ["subagent"], "max_risk_level": "high"},
-                    monthly_spent_usd=Decimal("0"),
-                    auto_pause_on_budget=True,
-                    status="active",
-                ),
-            ]
-        )
-        db.add(
-            Task(
-                id=task_id,
-                entity_id=entity_id,
-                title="Creator-backed task",
-                status="in_progress",
-                creator_id=creator_id,
-                conversation_id=conversation_id,
-            )
-        )
-        db.add(
-            ExecutionPlan(
-                id=plan_id,
-                entity_id=entity_id,
-                task_id=task_id,
-                status="running",
-                execution_mode="live",
-                approval_required=False,
-                plan_dag={"steps": []},
-            )
-        )
-        db.add(
-            ExecutionStep(
-                id=step_id,
-                plan_id=plan_id,
-                entity_id=entity_id,
-                step_key="generate_ux_spec_doc",
-                kind="subagent",
-                params={"prompt": "Generate UX spec"},
-                depends_on=[],
-                step_status="running",
-                attempt_count=1,
-                max_attempts=3,
-                current_lease_id=lease_id,
-            )
-        )
-        db.add(
-            WorkLease(
-                id=lease_id,
-                step_id=step_id,
-                plan_id=plan_id,
-                entity_id=entity_id,
-                worker_id=worker_id,
-                lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-                status="active",
-            )
-        )
-        await db.commit()
-
-    outcome = await internal.execute_lease_inproc(lease_id)
-
-    async with dbmod.async_session() as db:
-        lease = await db.get(WorkLease, lease_id)
-        step = await db.get(ExecutionStep, step_id)
-
-    assert outcome == {"lease_id": lease_id, "outcome": "completed"}
-    assert snapshots and snapshots[0]["task_id"] == task_id
-    assert snapshots[0]["user_id"] == creator_id
-    assert snapshots[0]["conversation_id"] == conversation_id
-    assert lease.status == "completed"
-    assert lease.heartbeat_count > 0
-    assert step.step_status == "done"

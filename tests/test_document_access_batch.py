@@ -12,11 +12,12 @@ single-item helper returns.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import event
 
 import packages.core.database as db_module
 from packages.core.models.base import generate_ulid
@@ -346,6 +347,82 @@ async def test_folder_counts_bound_each_folder_id_query(monkeypatch):
 
     assert counts == {}
     assert sorted(folder_batch_sizes) == [201, 500, 500]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["owner", "member"])
+async def test_folder_batch_workspace_authorization_queries_stay_bounded(db_session, role):
+    from packages.core.services.actor_authorization import AuthenticatedUserCredential
+    from packages.core.services.permission_gate import ResourcePermissionGate
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    user = User(
+        id=user_id, entity_id=entity_id, email=f"{user_id}@test.invalid",
+        password_hash="unused", role=role, status="active",
+    )
+    db_session.add_all([
+        Entity(id=entity_id, name="Folder batch query budget"),
+        user,
+        UserMembership(user_id=user_id, entity_id=entity_id, role=role, status="active"),
+    ])
+    folders = []
+    expected_ids = set()
+    now = datetime.now(timezone.utc)
+    states = ["member", "entity", "private", "expired", "inactive", "deleted"]
+    for index, state in enumerate(states * 84):
+        folder = _folder(entity_id, f"Workspace {index}", visibility="workspace")
+        workspace = Workspace(
+            id=generate_ulid(), entity_id=entity_id, name=folder.name,
+            artifact_folder_id=folder.id,
+            settings={"access_mode": "entity_visible" if state == "entity" else "members_only"},
+            deleted_at=now if state == "deleted" else None,
+        )
+        db_session.add_all([folder, workspace])
+        if state in {"member", "expired", "inactive", "deleted"}:
+            db_session.add(WorkspaceStaff(
+                workspace_id=workspace.id, user_id=user_id, role="member",
+                status="inactive" if state == "inactive" else "active",
+                expires_at=now - timedelta(days=1) if state == "expired" else None,
+            ))
+        folders.append(folder)
+        if state != "deleted" and (role == "owner" or state in {"member", "entity"}):
+            expected_ids.add(folder.id)
+    await db_session.flush()
+    credential = AuthenticatedUserCredential.from_user(user)
+    query_count = 0
+
+    def count_query(*_args):
+        nonlocal query_count
+        query_count += 1
+
+    bind = db_session.sync_session.get_bind()
+    event.listen(bind, "before_cursor_execute", count_query)
+    try:
+        small = await ResourcePermissionGate.authorize_folder_batch_read(
+            db_session, credential=credential, folders=folders[:6],
+        )
+        small_query_count = query_count
+        query_count = 0
+        large = await ResourcePermissionGate.authorize_folder_batch_read(
+            db_session, credential=credential, folders=folders[:24],
+        )
+        large_query_count = query_count
+        query_count = 0
+        multiple_batches = await ResourcePermissionGate.authorize_folder_batch_read(
+            db_session, credential=credential, folders=folders,
+        )
+        multiple_batch_query_count = query_count
+    finally:
+        event.remove(bind, "before_cursor_execute", count_query)
+
+    assert small is not None and large is not None and multiple_batches is not None
+    assert small.folder_ids == expected_ids.intersection(folder.id for folder in folders[:6])
+    assert large.folder_ids == expected_ids.intersection(folder.id for folder in folders[:24])
+    assert multiple_batches.folder_ids == expected_ids
+    # Growing within one bounded SQL batch must not add a query per Workspace.
+    assert large_query_count <= small_query_count + 2
+    # Crossing the 500-ID limit adds bounded queries and keeps every decision.
+    assert multiple_batch_query_count <= large_query_count + 6
 
 
 @pytest.mark.asyncio
@@ -760,6 +837,26 @@ async def _cross_workspace_source(db):
         entity_id=entity_id, user=user, root=root, source=source, target=target,
         membership=membership, document=document, group=group, link=link,
     )
+
+
+@pytest.mark.asyncio
+async def test_non_listing_context_checks_workspace_access_at_first_use(db_session):
+    case = await _cross_workspace_source(db_session)
+    db_session.add(DocumentFolder(
+        id=case.target.artifact_folder_id, entity_id=case.entity_id,
+        name="Target inputs", visibility="workspace",
+    ))
+    await db_session.flush()
+    ctx = await DocumentAccessContext.load(
+        db_session, entity_id=case.entity_id, user_id=case.user.id,
+        folder_ids={case.target.artifact_folder_id},
+    )
+
+    # An unrelated caller may await more work before its first Workspace read.
+    # Loading a context must not pre-authorize that later read.
+    case.membership.status = "inactive"
+    await db_session.flush()
+    assert not await ctx.workspace_readable(db_session, case.target.id)
 
 
 @pytest.mark.asyncio

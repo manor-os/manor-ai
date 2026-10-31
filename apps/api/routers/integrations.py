@@ -1,11 +1,13 @@
 """Integration & Channel endpoints — CRUD for external integrations and channels."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import secrets
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
@@ -69,6 +71,9 @@ from packages.core.services.whatsapp_business_provisioning import (
     provision_whatsapp_business_number,
 )
 from packages.core.constants.execution import WorkerStatus
+
+if TYPE_CHECKING:
+    from packages.core.services.integration_access import ConnectionShareState
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +177,18 @@ class HealthStatus(BaseModel):
     checks: dict[str, dict[str, Any]] | None = None
 
 
+class ConnectionSharePersonResponse(BaseModel):
+    user_id: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+
+
+class ConnectionShareSummaryResponse(BaseModel):
+    entity: bool = False
+    user_count: int = 0
+    people: list[ConnectionSharePersonResponse] = []
+
+
 class UserOAuthConnection(BaseModel):
     """A single OAuth account a user has connected for this provider."""
     id: str                          # oauth_accounts.id
@@ -187,6 +204,7 @@ class UserOAuthConnection(BaseModel):
     owner_display_name: str | None = None
     can_manage: bool = True
     can_share: bool = False
+    share_summary: ConnectionShareSummaryResponse | None = None
     runtime_callable: bool = True
     availability: str = IntegrationAccountAvailability.CALLABLE.value
 
@@ -212,6 +230,7 @@ class EntityAccountConnection(BaseModel):
     owner_display_name: str | None = None
     can_manage: bool = True
     can_share: bool = False
+    share_summary: ConnectionShareSummaryResponse | None = None
     runtime_callable: bool = True
     availability: str = IntegrationAccountAvailability.CALLABLE.value
 
@@ -358,13 +377,74 @@ class MCPToolCatalogResponse(BaseModel):
 
 
 class ConnectionGrantRequest(BaseModel):
-    user_id: str
+    user_ids: list[str] = Field(default_factory=list, max_length=200)
 
 
-class ConnectionGrantResponse(BaseModel):
-    id: str
+class ConnectionEntityShareRequest(BaseModel):
+    enabled: bool
+
+
+class ConnectionShareMemberResponse(BaseModel):
     user_id: str
-    capabilities: list[str]
+    display_name: str | None = None
+    email: str | None = None
+    avatar_url: str | None = None
+
+
+class ConnectionUserShareResponse(ConnectionShareMemberResponse):
+    grant_id: str
+
+
+class ConnectionShareStateResponse(BaseModel):
+    entity_grant_id: str | None = None
+    users: list[ConnectionUserShareResponse]
+    candidates: list[ConnectionShareMemberResponse]
+
+
+def _share_state_response(state: ConnectionShareState) -> ConnectionShareStateResponse:
+    return ConnectionShareStateResponse(
+        entity_grant_id=state.entity_grant_id,
+        users=[
+            ConnectionUserShareResponse(
+                grant_id=share.grant_id,
+                user_id=share.member.user_id,
+                display_name=share.member.display_name,
+                email=share.member.email,
+                avatar_url=share.member.avatar_url,
+            )
+            for share in state.users
+        ],
+        candidates=[
+            ConnectionShareMemberResponse(
+                user_id=member.user_id,
+                display_name=member.display_name,
+                email=member.email,
+                avatar_url=member.avatar_url,
+            )
+            for member in state.candidates
+        ],
+    )
+
+
+async def _notify_connection_shared(
+    *, entity_id: str, owner: User, recipient_ids: list[str], kind: str, connection_id: str,
+) -> None:
+    from packages.core.services.notify import notify
+
+    owner_name = owner.display_name or owner.email
+    for recipient_id in recipient_ids:
+        try:
+            await notify(
+                entity_id,
+                recipient_id,
+                "integration_shared",
+                f"{owner_name} shared a connected account with you",
+                body="Your agents can use it now. Find it under Integrations.",
+                link="/integrations",
+                meta={"connection_kind": kind, "connection_id": connection_id},
+            )
+        except Exception:
+            logger.warning("Connection share notification failed", exc_info=True)
 
 
 def _connection_resource_type(kind: str) -> str | None:
@@ -411,6 +491,23 @@ def _whatsapp_integration_is_ready(row: Any) -> bool:
     )
 
 
+def _share_summary_response(summary: Any) -> ConnectionShareSummaryResponse | None:
+    if not summary:
+        return None
+    return ConnectionShareSummaryResponse(
+        entity=summary.entity,
+        user_count=summary.user_count,
+        people=[
+            ConnectionSharePersonResponse(
+                user_id=person.user_id,
+                display_name=person.display_name or person.email,
+                avatar_url=person.avatar_url,
+            )
+            for person in summary.people
+        ],
+    )
+
+
 class _CatalogConnectionFactory:
     """Build API-safe account projections from an authorized catalog account.
 
@@ -426,6 +523,7 @@ class _CatalogConnectionFactory:
         *,
         owner_display_names: dict[str, str],
         can_share_owned_connections: bool,
+        share_summaries: Mapping[tuple[str, str], Any],
     ) -> UserOAuthConnection:
         profile = row.profile if isinstance(row.profile, dict) else {}
         health_raw = profile.get("last_health_check")
@@ -448,7 +546,13 @@ class _CatalogConnectionFactory:
             owner_display_name=owner_display_names.get(account.owner_user_id or ""),
             can_manage=account.ownership == "mine",
             can_share=(
-                account.ownership == "mine" and can_share_owned_connections
+                account.ownership == "mine"
+                and can_share_owned_connections
+                and canonical_provider_key(row.provider) != "chrome"
+            ),
+            share_summary=_share_summary_response(
+                share_summaries.get(("oauth_account", row.id))
+                if account.ownership == "mine" else None
             ),
             runtime_callable=account.runtime_callable,
             availability=account.availability.value,
@@ -461,6 +565,7 @@ class _CatalogConnectionFactory:
         *,
         owner_display_names: dict[str, str],
         can_share_owned_connections: bool,
+        share_summaries: Mapping[tuple[str, str], Any],
         include_health: bool = True,
     ) -> EntityAccountConnection:
         cfg = row.config if isinstance(row.config, dict) else {}
@@ -491,7 +596,13 @@ class _CatalogConnectionFactory:
             owner_display_name=owner_display_names.get(account.owner_user_id or ""),
             can_manage=account.ownership == "mine",
             can_share=(
-                account.ownership == "mine" and can_share_owned_connections
+                account.ownership == "mine"
+                and can_share_owned_connections
+                and canonical_provider_key(row.provider) != "chrome"
+            ),
+            share_summary=_share_summary_response(
+                share_summaries.get(("integration", row.id))
+                if account.ownership == "mine" else None
             ),
             runtime_callable=(
                 account.runtime_callable and _whatsapp_integration_is_ready(row)
@@ -744,20 +855,6 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Get an API key at elevenlabs.io → Settings → API Keys.",
                        "color_hex": "#000000",
                        "supports_multi_account": True},
-    "suno":           {"category": "AI Tools", "tagline": "Original songs, covers, and mashups through Suno's official API.",
-                       "docs_url": "https://platform.suno.com/",
-                       "setup_hint": "Create an API key at platform.suno.com, then paste it here. Music creation uses your Suno account credits.",
-                       "color_hex": "#000000",
-                       "supports_multi_account": True,
-                       "capabilities": [
-                           "Generate songs from a description or custom lyrics and style",
-                           "Create covers and mashups from existing Suno audio",
-                           "Check generation status and account usage without starting new work",
-                       ],
-                       "example_prompts": [
-                           "Create an upbeat instrumental launch theme in a warm indie-pop style.",
-                           "Turn these approved lyrics into a cinematic electronic track.",
-                       ]},
     "tavily":         {"category": "AI Tools", "tagline": "Agent-tuned web search + extraction. 1000 calls/month free.",
                        "docs_url": "https://app.tavily.com/home",
                        "setup_hint": "Sign up at tavily.com to get an API key (starts with tvly-).",
@@ -816,19 +913,19 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                            "Find the top comments on my latest video and draft replies in my voice.",
                            "Pull view + like stats for my last 10 uploads and tell me what's trending.",
                        ]},
-    "tiktok":         {"category": "Social", "tagline": "Read your TikTok profile and videos, publish video/photo posts from a URL.",
-                       "docs_url": "https://developers.tiktok.com/doc/overview",
+    "tiktok":         {"category": "Social", "tagline": "Read your TikTok profile and videos, review and publish video or photo posts.",
+                       "docs_url": "https://developers.tiktok.com/doc/content-posting-api-get-started",
                        "setup_hint": "Create an app at developers.tiktok.com (Login Kit + Content Posting API).",
                        "color_hex": "#000000",
                        "supports_multi_account": True,
                        "capabilities": [
                            "Read your profile and video list (Display API)",
                            "Query video stats by id",
-                           "Publish video or photo posts from a hosted URL (Content Posting API)",
+                           "Review and approve video or photo attachments and Workspace Knowledge media before publishing",
                            "Track publish status of a post",
                        ],
                        "example_prompts": [
-                           "Post this video URL to TikTok with a caption about our launch.",
+                           "Prepare this attached video for TikTok. I will review the caption and publishing settings before posting.",
                            "Pull stats for my last 10 TikToks and tell me which performed best.",
                        ]},
     "shopify":        {"category": "E-commerce", "tagline": "Manage your Shopify store — products, orders, customers, and inventory.",
@@ -1043,8 +1140,6 @@ async def list_mcp_server_status(
     from datetime import datetime, timedelta, timezone
     from sqlalchemy import select
     from packages.core.models.mcp import MCPServer
-    from packages.core.permissions import user_has_permission
-
     servers = (await db.execute(
         select(MCPServer).where(MCPServer.status == "active").order_by(MCPServer.name)
     )).scalars().all()
@@ -1224,13 +1319,19 @@ async def list_mcp_server_status(
             for row in owner_rows
         }
 
-    from packages.core.permissions import Permission
+    from packages.core.permissions import Permission, effective_user_has_permission
+    from packages.core.services.integration_access import connection_share_summaries
 
-    can_share_owned_connections = await user_has_permission(
+    can_share_owned_connections = await effective_user_has_permission(
+        db, user, Permission.INTEGRATIONS_SHARE,
+    )
+    share_summaries = await connection_share_summaries(
         db,
-        user.id,
-        user.entity_id,
-        Permission.INTEGRATIONS_SHARE,
+        entity_id=user.entity_id,
+        oauth_account_ids=[row_id for row_id, row in oauth_rows_by_id.items() if row.user_id == user.id],
+        integration_ids=[
+            row_id for row_id, row in integration_rows_by_id.items() if row.owner_user_id == user.id
+        ],
     )
 
     out: list[MCPServerStatus] = []
@@ -1269,6 +1370,7 @@ async def list_mcp_server_status(
                 row,
                 owner_display_names=owner_display_names,
                 can_share_owned_connections=can_share_owned_connections,
+                share_summaries=share_summaries,
             )
             for account, row in oauth_accounts
         ]
@@ -1295,6 +1397,7 @@ async def list_mcp_server_status(
                 row,
                 owner_display_names=owner_display_names,
                 can_share_owned_connections=can_share_owned_connections,
+                share_summaries=share_summaries,
             )
             for account, row in integration_accounts
         ]
@@ -1663,6 +1766,7 @@ async def list_mcp_server_status(
                     row,
                     owner_display_names=owner_display_names,
                     can_share_owned_connections=can_share_owned_connections,
+                    share_summaries=share_summaries,
                     include_health=False,
                 )
                 for account, row in integration_accounts
@@ -1758,7 +1862,7 @@ async def update_builtin_plugin_preference(
 
 @router.get(
     "/connections/{kind}/{connection_id}/grants",
-    response_model=list[ConnectionGrantResponse],
+    response_model=ConnectionShareStateResponse,
 )
 async def list_connection_grants(
     kind: str,
@@ -1766,41 +1870,26 @@ async def list_connection_grants(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List recipients for a connection the current user owns."""
-    from packages.core.models.permission import GrantStatus, ResourceGrant, SubjectType
-    from packages.core.permissions import Permission, check_effective_user_permission
+    """Who can use a connection the current user owns, and who could be added."""
+    from packages.core.permissions import Permission, effective_user_has_permission
+    from packages.core.services.integration_access import connection_share_state
 
-    await _require_owned_connection(
-        db,
-        kind=kind,
-        connection_id=connection_id,
-        user=user,
+    await _require_owned_connection(db, kind=kind, connection_id=connection_id, user=user)
+    state = await connection_share_state(
+        db, kind=kind, connection_id=connection_id,
+        entity_id=user.entity_id, owner_user_id=user.id,
     )
-    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
-    resource_type = _connection_resource_type(kind)
-    assert resource_type is not None
-    rows = (await db.execute(
-        select(ResourceGrant).where(
-            ResourceGrant.entity_id == user.entity_id,
-            ResourceGrant.resource_type == resource_type,
-            ResourceGrant.resource_id == connection_id,
-            ResourceGrant.subject_type == SubjectType.USER,
-            ResourceGrant.status == GrantStatus.ACTIVE,
-        ).order_by(ResourceGrant.granted_at.asc())
-    )).scalars().all()
-    return [
-        ConnectionGrantResponse(
-            id=row.id,
-            user_id=row.subject_id,
-            capabilities=list(row.capabilities or []),
-        )
-        for row in rows
-    ]
+    response = _share_state_response(state)
+    # Revoking is always the owner's right and needs the grant ids above; only
+    # the list of people who could be added depends on the share permission.
+    if not await effective_user_has_permission(db, user, Permission.INTEGRATIONS_SHARE):
+        response.candidates = []
+    return response
 
 
 @router.post(
     "/connections/{kind}/{connection_id}/grants",
-    response_model=ConnectionGrantResponse,
+    response_model=ConnectionShareStateResponse,
     status_code=201,
 )
 async def create_connection_grant(
@@ -1810,34 +1899,77 @@ async def create_connection_grant(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Grant one named Entity member permission to use an owned connection."""
+    """Grant named Entity members use of an owned connection."""
     from packages.core.permissions import Permission, check_effective_user_permission
-    from packages.core.services.integration_access import grant_connection_use
+    from packages.core.services.integration_access import connection_share_state, grant_connection_use
 
-    await _require_owned_connection(
-        db,
-        kind=kind,
-        connection_id=connection_id,
-        user=user,
-    )
+    await _require_owned_connection(db, kind=kind, connection_id=connection_id, user=user)
     await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    recipient_ids = list(dict.fromkeys(
+        user_id.strip() for user_id in req.user_ids if user_id and user_id.strip()
+    ))
+    if not recipient_ids:
+        raise HTTPException(400, "Choose at least one member")
+    before = await connection_share_state(
+        db, kind=kind, connection_id=connection_id,
+        entity_id=user.entity_id, owner_user_id=user.id,
+    )
+    already_shared = {share.member.user_id for share in before.users}
     try:
-        grant = await grant_connection_use(
-            db,
-            kind=kind,
-            connection_id=connection_id,
-            entity_id=user.entity_id,
-            owner_user_id=user.id,
-            grantee_user_id=req.user_id,
-        )
+        for recipient_id in recipient_ids:
+            await grant_connection_use(
+                db, kind=kind, connection_id=connection_id, entity_id=user.entity_id,
+                owner_user_id=user.id, grantee_user_id=recipient_id,
+            )
     except ValueError as exc:
+        await db.rollback()
         raise HTTPException(400, str(exc)) from exc
     await db.commit()
-    return ConnectionGrantResponse(
-        id=grant.id,
-        user_id=grant.subject_id,
-        capabilities=list(grant.capabilities or []),
+    await _notify_connection_shared(
+        entity_id=user.entity_id, owner=user,
+        recipient_ids=[rid for rid in recipient_ids if rid not in already_shared],
+        kind=kind, connection_id=connection_id,
     )
+    return _share_state_response(await connection_share_state(
+        db, kind=kind, connection_id=connection_id,
+        entity_id=user.entity_id, owner_user_id=user.id,
+    ))
+
+
+@router.put(
+    "/connections/{kind}/{connection_id}/entity-share",
+    response_model=ConnectionShareStateResponse,
+)
+async def set_connection_entity_share_endpoint(
+    kind: str,
+    connection_id: str,
+    req: ConnectionEntityShareRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Let every member of the Entity (clients excluded) use an owned connection."""
+    from packages.core.permissions import Permission, check_effective_user_permission
+    from packages.core.services.integration_access import (
+        connection_share_state,
+        set_connection_entity_share,
+    )
+
+    await _require_owned_connection(db, kind=kind, connection_id=connection_id, user=user)
+    if req.enabled:
+        await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    try:
+        await set_connection_entity_share(
+            db, kind=kind, connection_id=connection_id, entity_id=user.entity_id,
+            owner_user_id=user.id, enabled=req.enabled,
+        )
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    return _share_state_response(await connection_share_state(
+        db, kind=kind, connection_id=connection_id,
+        entity_id=user.entity_id, owner_user_id=user.id,
+    ))
 
 
 @router.delete("/connections/{kind}/{connection_id}/grants/{grant_id}", status_code=204)
@@ -1848,27 +1980,107 @@ async def revoke_connection_grant(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Revoke one recipient's use grant from an owned connection."""
-    from packages.core.permissions import Permission, check_effective_user_permission
+    """Revoke one share of an owned connection; taking access back needs no share right."""
     from packages.core.services.integration_access import revoke_connection_use
 
-    await _require_owned_connection(
-        db,
-        kind=kind,
-        connection_id=connection_id,
-        user=user,
-    )
-    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    await _require_owned_connection(db, kind=kind, connection_id=connection_id, user=user)
     revoked = await revoke_connection_use(
-        db,
-        kind=kind,
-        connection_id=connection_id,
-        grant_id=grant_id,
-        entity_id=user.entity_id,
-        owner_user_id=user.id,
+        db, kind=kind, connection_id=connection_id, grant_id=grant_id,
+        entity_id=user.entity_id, owner_user_id=user.id,
     )
     if not revoked:
         raise HTTPException(404, "Grant not found")
+    await db.commit()
+
+
+class ConnectionUseResponse(BaseModel):
+    actor_user_id: str
+    actor_display_name: str | None = None
+    server_key: str
+    tool_name: str
+    created_at: str
+
+
+@router.get(
+    "/connections/{kind}/{connection_id}/usage",
+    response_model=list[ConnectionUseResponse],
+)
+async def list_connection_usage(
+    kind: str,
+    connection_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Recent use of an owned connection by other members."""
+    from packages.core.services.connection_usage import list_connection_uses
+
+    await _require_owned_connection(db, kind=kind, connection_id=connection_id, user=user)
+    uses = await list_connection_uses(
+        db, entity_id=user.entity_id, connection_kind=kind,
+        connection_id=connection_id, limit=limit,
+    )
+    return [
+        ConnectionUseResponse(
+            actor_user_id=use.actor_user_id,
+            actor_display_name=use.actor_display_name,
+            server_key=use.server_key,
+            tool_name=use.tool_name,
+            created_at=use.created_at.isoformat(),
+        )
+        for use in uses
+    ]
+
+
+class EntityConnectionShareResponse(BaseModel):
+    grant_id: str
+    connection_kind: str
+    connection_id: str
+    provider: str
+    connection_label: str
+    owner_user_id: str
+    owner_display_name: str | None = None
+    owner_active: bool
+    subject_type: str
+    recipient_user_id: str | None = None
+    recipient_display_name: str | None = None
+    granted_at: str
+
+
+@router.get("/shares", response_model=list[EntityConnectionShareResponse])
+async def list_entity_connection_shares_endpoint(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin view of every shared connection in the current Entity."""
+    from packages.core.permissions import Permission, check_effective_user_permission
+    from packages.core.services.integration_access import list_entity_connection_shares
+
+    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_MANAGE)
+    shares = await list_entity_connection_shares(db, entity_id=user.entity_id)
+    return [
+        EntityConnectionShareResponse(
+            **{**dataclasses.asdict(share), "granted_at": share.granted_at.isoformat()},
+        )
+        for share in shares
+    ]
+
+
+@router.delete("/shares/{grant_id}", status_code=204)
+async def admin_revoke_connection_share_endpoint(
+    grant_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin revokes one connection share; this grants the admin no use."""
+    from packages.core.permissions import Permission, check_effective_user_permission
+    from packages.core.services.integration_access import admin_revoke_connection_share
+
+    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_MANAGE)
+    if not await admin_revoke_connection_share(
+        db, entity_id=user.entity_id, grant_id=grant_id, revoked_by=user.id,
+    ):
+        raise HTTPException(404, "Share not found")
     await db.commit()
 
 
@@ -2120,6 +2332,11 @@ async def disconnect_account(
         entity_id=user.entity_id,
         owner_user_id=user.id,
         oauth_account_id=connection_id,
+    )
+    from packages.core.services.integration_access import revoke_all_connection_grants
+
+    await revoke_all_connection_grants(
+        db, kind="oauth_account", connection_id=row.id, revoked_by=user.id,
     )
     await db.delete(row)
     await db.flush()
@@ -3730,7 +3947,9 @@ def _integration_resp(
         owner_display_name=(owner_names or {}).get(owner_id) if owner_id else None,
         ownership="mine" if is_owner else "shared",
         can_manage=is_owner,
-        can_share=is_owner and can_share,
+        can_share=(
+            is_owner and can_share and canonical_provider_key(i.provider) != "chrome"
+        ),
         created_at=i.created_at.isoformat() if i.created_at else None,
         updated_at=i.updated_at.isoformat() if i.updated_at else None,
     )
@@ -5587,3 +5806,105 @@ async def list_integration_channels(
         workspace_id=workspace_id,
     )
     return [_channel_resp(c) for c in channels]
+
+
+class EmailInboundSigningResponse(BaseModel):
+    """What an inbound mail forwarder needs to post signed messages."""
+
+    channel_config_id: str
+    callback_path: str
+    callback_url: str | None
+    signing_secret: str
+    signature_header: str
+    timestamp_header: str
+    tolerance_seconds: int
+
+
+async def _email_inbound_signing(
+    db: AsyncSession,
+    *,
+    user: User,
+    integration_id: str,
+    rotate: bool,
+    response: Response,
+) -> EmailInboundSigningResponse:
+    from packages.core.config import get_settings
+    from packages.core.services.channels import email_adapter
+
+    integration = await get_integration(
+        db, integration_id, user.entity_id, user.id, action="manage",
+    )
+    if not integration:
+        raise HTTPException(404, "Integration not found")
+    # The secret lets its holder start turns on this channel, so only the
+    # channel's owner may read or rotate it.
+    channel_config = next(
+        (
+            row
+            for row in await _channel_configs_for_integration(
+                db, entity_id=user.entity_id, integration_id=integration_id,
+            )
+            if row.channel_type == "email" and row.owner_user_id == user.id
+        ),
+        None,
+    )
+    if channel_config is None:
+        raise HTTPException(404, "Email channel not found for this integration")
+    try:
+        if rotate:
+            secret = email_adapter.rotate_inbound_secret(channel_config)
+            changed = True
+        else:
+            secret, changed = email_adapter.ensure_inbound_secret(
+                channel_config, reason="integration.email_inbound.reveal",
+            )
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(
+            db, exc, action="email_inbound_signing",
+        )
+    if changed:
+        await db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    callback_path = email_adapter.EmailChannelAdapter().webhook_path(channel_config)
+    base = (get_settings().PUBLIC_BASE_URL or "").rstrip("/")
+    return EmailInboundSigningResponse(
+        channel_config_id=channel_config.id,
+        callback_path=callback_path,
+        callback_url=f"{base}{callback_path}" if base else None,
+        signing_secret=secret,
+        signature_header=email_adapter.INBOUND_SIGNATURE_HEADER,
+        timestamp_header=email_adapter.INBOUND_TIMESTAMP_HEADER,
+        tolerance_seconds=email_adapter.INBOUND_TOLERANCE_SECONDS,
+    )
+
+
+@router.get(
+    "/{integration_id}/email-inbound",
+    response_model=EmailInboundSigningResponse,
+)
+async def get_email_inbound_signing(
+    integration_id: str,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return (creating on first use) the email channel's inbound secret."""
+    return await _email_inbound_signing(
+        db, user=user, integration_id=integration_id, rotate=False, response=response,
+    )
+
+
+@router.post(
+    "/{integration_id}/email-inbound/rotate",
+    response_model=EmailInboundSigningResponse,
+)
+async def rotate_email_inbound_signing(
+    integration_id: str,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace the inbound secret; forwarders using the old one stop working."""
+    return await _email_inbound_signing(
+        db, user=user, integration_id=integration_id, rotate=True, response=response,
+    )

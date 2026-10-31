@@ -23,108 +23,40 @@ function runApiContainerPython(script: string, payload: Record<string, string>):
   ).trim();
 }
 
-const SEED_COMPLETED_PLAN = String.raw`
+// Seed the Task's delivered output the way the agent loop records it.
+const SEED_TASK_OUTPUT = String.raw`
 import asyncio
 import json
 import sys
 
 from packages.core.database import async_session
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.task import Task
 
 payload = json.load(sys.stdin)
 
 async def main():
     async with async_session() as db:
-        plan = ExecutionPlan(
-            entity_id=payload["entity_id"],
-            workspace_id=payload["workspace_id"],
-            task_id=payload["task_id"],
-            status="completed",
-            approval_required=False,
-            execution_mode="live",
-            plan_dag={"steps": [{"key": "create_csv", "kind": "code"}]},
-        )
-        db.add(plan)
-        await db.flush()
-        db.add(ExecutionStep(
-            plan_id=plan.id,
-            entity_id=payload["entity_id"],
-            workspace_id=payload["workspace_id"],
-            step_key="create_csv",
-            kind="code",
-            params={},
-            depends_on=[],
-            result={
-                "artifact_materialized": True,
-                "files": [{
-                    "name": payload["filename"],
-                    "url": f"/viewer/{payload['document_id']}",
-                }],
-            },
-            step_status="done",
-            attempt_count=1,
-            max_attempts=3,
-        ))
+        task = await db.get(Task, payload["task_id"])
+        task.actual_output = {
+            "files": [{
+                "name": payload["filename"],
+                "document_id": payload["document_id"],
+                "url": f"/viewer/{payload['document_id']}",
+            }],
+        }
         await db.commit()
-
-asyncio.run(main())
-`;
-
-const ASSERT_PROVENANCE = String.raw`
-import asyncio
-import json
-import sys
-
-from packages.core.database import async_session
-from packages.core.models.document import Document
-
-payload = json.load(sys.stdin)
-
-async def main():
-    async with async_session() as db:
-        document = await db.get(Document, payload["document_id"])
-        origin = (document.metadata_ or {}).get("origin", {}) if document else {}
-        if origin.get("task_id") != payload["task_id"]:
-            raise RuntimeError("Document task provenance was not backfilled")
-        print("ok")
-
-asyncio.run(main())
-`;
-
-const CLEAN_PLAN = String.raw`
-import asyncio
-import json
-import sys
-
-from sqlalchemy import delete, select
-
-from packages.core.database import async_session
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-payload = json.load(sys.stdin)
-
-async def main():
-    async with async_session() as db:
-        plan_ids = list((await db.execute(
-            select(ExecutionPlan.id).where(ExecutionPlan.task_id == payload["task_id"])
-        )).scalars())
-        if plan_ids:
-            await db.execute(delete(ExecutionStep).where(ExecutionStep.plan_id.in_(plan_ids)))
-            await db.execute(delete(ExecutionPlan).where(ExecutionPlan.id.in_(plan_ids)))
-            await db.commit()
 
 asyncio.run(main())
 `;
 
 test.skip(!RUN_DOCKER_E2E, "Set E2E_DOCKER_TASK_ARTIFACT=1 for the Docker live-stack test");
 
-test("Task artifact records provenance and opens through its Document viewer", async ({ page }) => {
+test("Task output file opens through its Document viewer", async ({ page }) => {
   const api = await pwRequest.newContext({ baseURL: API });
   const suffix = Date.now();
   const filename = `task-artifact-${suffix}.csv`;
   const taskTitle = `Generate task artifact ${suffix}`;
   let token = "";
-  let entityId = "";
   let workspaceId = "";
   let taskId = "";
   let documentId = "";
@@ -139,7 +71,6 @@ test("Task artifact records provenance and opens through its Document viewer", a
     expect(login.ok(), `login failed: ${login.status()}`).toBeTruthy();
     const auth = await login.json();
     token = auth.access_token;
-    entityId = auth.entity_id;
     const headers = { Authorization: `Bearer ${token}` };
 
     const workspaceResponse = await api.post("/api/v1/workspaces", {
@@ -172,29 +103,20 @@ test("Task artifact records provenance and opens through its Document viewer", a
     expect(uploadResponse.ok(), `upload failed: ${uploadResponse.status()}`).toBeTruthy();
     documentId = (await uploadResponse.json()).id;
 
-    runApiContainerPython(SEED_COMPLETED_PLAN, {
-      entity_id: entityId,
-      workspace_id: workspaceId,
+    runApiContainerPython(SEED_TASK_OUTPUT, {
       task_id: taskId,
       document_id: documentId,
       filename,
     });
 
-    const reconciledResponse = await api.get(`/api/v1/tasks/${taskId}`, { headers });
-    expect(reconciledResponse.ok(), `reconcile failed: ${reconciledResponse.status()}`).toBeTruthy();
-    const reconciledTask = await reconciledResponse.json();
-    const taskFile = reconciledTask.actual_output?.files?.find(
+    const seededResponse = await api.get(`/api/v1/tasks/${taskId}`, { headers });
+    expect(seededResponse.ok(), `task read failed: ${seededResponse.status()}`).toBeTruthy();
+    const seededTask = await seededResponse.json();
+    const taskFile = seededTask.actual_output?.files?.find(
       (file: { name?: string }) => file.name === filename,
     );
-    expect(taskFile, JSON.stringify(reconciledTask.actual_output)).toBeTruthy();
+    expect(taskFile, JSON.stringify(seededTask.actual_output)).toBeTruthy();
     expect(taskFile?.document_id).toBe(documentId);
-    expect(taskFile?.viewer_url).toBe(`/viewer/${documentId}`);
-    expect(taskFile?.open_url).toBe(`/viewer/${documentId}`);
-
-    expect(runApiContainerPython(ASSERT_PROVENANCE, {
-      task_id: taskId,
-      document_id: documentId,
-    })).toBe("ok");
 
     await page.addInitScript((accessToken) => {
       window.localStorage.setItem("manor_token", accessToken as string);
@@ -237,7 +159,6 @@ test("Task artifact records provenance and opens through its Document viewer", a
     await expect(page.getByText(filename, { exact: true }).first()).toBeVisible();
     await expect(page.getByRole("heading", { name: new RegExp(taskTitle) })).toBeVisible();
   } finally {
-    if (taskId) runApiContainerPython(CLEAN_PLAN, { task_id: taskId });
     if (token) {
       const headers = { Authorization: `Bearer ${token}` };
       if (taskId) await api.delete(`/api/v1/tasks/${taskId}`, { headers });

@@ -1,70 +1,11 @@
-"""A failed file-producing Task must expose its cause and retry only unfinished work."""
+"""A stopped Task's recovery card projects its current cause without rewriting the stored card."""
 from __future__ import annotations
 
 import pytest
 
-from packages.core.constants.execution import ExecutionPlanStatus
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace
-from packages.core.plans.executor import PlanExecutor
-from packages.core.services.task_retry_service import prepare_task_retry
-from tests.test_workspace_write_authz import _add_workspace_plan_runtime
-
-
-@pytest.mark.asyncio
-async def test_file_task_failure_projects_real_error_and_retry_preserves_completed_step(db_session):
-    entity_id = generate_ulid()
-    workspace = Workspace(id=generate_ulid(), entity_id=entity_id, name="AI SDE preparation")
-    db_session.add(workspace)
-    await db_session.flush()
-    subscription = await _add_workspace_plan_runtime(
-        db_session, entity_id=entity_id, workspace_id=workspace.id,
-    )
-    task = Task(
-        id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id,
-        title="Create baseline diagnostic packet", status="in_progress",
-        expected_output={"deliverables": [{"kind": "file", "name": "baseline_diagnostic_packet"}]},
-        owner_service_key=subscription.service_key,
-        owner_subscription_id=subscription.id,
-    )
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id,
-        task_id=task.id, status="running", plan_dag={},
-    )
-    completed = ExecutionStep(
-        id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id,
-        plan_id=plan.id, step_key="extract_curriculum_scope", kind="subagent",
-        step_status="done", result={"scope_summary": "Seven modules, 90–120 minutes."},
-    )
-    reason = "search_tools was blocked by permission.agent_tool_binding"
-    failure = {"reason": reason, "requires_human": True, "retryable": False, "blockers": ["search_tools"]}
-    failed = ExecutionStep(
-        id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id,
-        plan_id=plan.id, step_key="create_diagnostic_packet", kind="subagent",
-        step_status="failed", attempt_count=1,
-        result={"status": "failed", "summary": reason, "failure": failure},
-        error={"type": "StepResultFailed", "message": reason, "failure": failure},
-    )
-    db_session.add_all([workspace, task, plan, completed, failed])
-    await db_session.commit()
-
-    await PlanExecutor._finalize(db_session, plan, ExecutionPlanStatus.FAILED)
-    await db_session.flush()
-    assert task.status == "failed"
-    assert task.actual_output["steps"][1]["error"]["message"] == reason
-    assert not task.actual_output.get("files")
-    await db_session.commit()
-
-    retried = await prepare_task_retry(
-        db_session, task=task, user_id=generate_ulid(), user_label="Reviewer",
-    )
-    assert retried.plan_id == plan.id
-    assert completed.step_status == "done"
-    assert completed.result["scope_summary"] == "Seven modules, 90–120 minutes."
-    assert failed.step_status == "pending"
-    assert failed.attempt_count == 0
 
 
 @pytest.mark.asyncio

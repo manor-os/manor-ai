@@ -11,6 +11,7 @@ import { t } from "../../lib/i18n";
 import Select from "../ui/Select";
 import UserAvatar from "../ui/UserAvatar";
 import type { ShareRole } from "../../lib/shareRoles";
+import { getPreferredTimeZone } from "../../lib/format";
 
 export type { ShareRole } from "../../lib/shareRoles";
 
@@ -97,7 +98,7 @@ export default function PersonRow({
         >
           {email}
           {source === "workspace" && ` · ${t("permissions.row.workspace_inherited")}`}
-          {expiresAt && !expired && ` · ${t("permissions.row.expires_on", { date: new Date(expiresAt).toLocaleDateString() })}`}
+          {expiresAt && !expired && ` · ${t("permissions.row.expires_on", { date: new Date(expiresAt).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) })}`}
         </div>
       </div>
 

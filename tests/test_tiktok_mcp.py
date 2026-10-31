@@ -81,6 +81,37 @@ def approved_call_context(args, *, context=None, media=None, evidence_changes=No
         runtime_end_tool_authorization_scope(scope)
 
 
+@contextmanager
+def approved_photo_call_context(args, *, sources, context=None):
+    """Exercise a distinct photo receipt; video receipts cannot authorize it."""
+    context = {"entity_id": "entity", "user_id": "actor", "conversation_id": "conversation", **(context or {})}
+    context.setdefault("integration_account_id", "account")
+    evidence = {
+        "version": 2, "review_id": "photo-review", "tool_name": "mcp__tiktok__post_photo",
+        "workspace_id": None, "media_type": "photo", "media_sources": sources,
+        **context, "creator_username": CREATOR["creator_username"],
+    }
+    consent = TikTokPublishConsent("photo-approval", json.dumps(evidence), json.dumps(args))
+    receipt = RuntimeToolAuthorizationReceipt(
+        tool_name="mcp__tiktok__post_photo",
+        **{key: context[key] for key in ("entity_id", "user_id", "conversation_id")},
+        workspace_id=context.get("workspace_id"), task_id=None,
+        action_key="social_post.publish", capability_id="external.social",
+        access=RuntimeAuthorizationAccess.ACTION,
+        arguments_hash=runtime_authorization_arguments_hash(args, public_argument_keys=frozenset(args)),
+        resource_kind="integration", file_resources=(), public_argument_keys=frozenset(args),
+        tiktok_publish_consent=consent,
+    )
+    scope = runtime_begin_tool_authorization_scope(RuntimeToolAuthorizationLease(receipt), arguments=args)
+    assert scope.valid
+    token = tiktok._call_ctx_var.set({**context, "tiktok_publish_consent": consent})
+    try:
+        yield consent
+    finally:
+        tiktok._call_ctx_var.reset(token)
+        runtime_end_tool_authorization_scope(scope)
+
+
 @pytest.fixture
 def publish_mocks(monkeypatch):
     calls = []
@@ -281,9 +312,47 @@ async def test_photo_cannot_bypass_video_review(publish_mocks):
     with approved_call_context(ARGS):
         result = await tiktok.call_tool("post_photo", {"photo_urls": ["https://example.com/photo.jpg"]}, "test-token")
     assert result["isError"]
-    assert "matching human photo" in result["content"][0]["text"]
+    assert "fresh review" in result["content"][0]["text"]
     assert not calls
     signer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reviewed_photo_post_uses_ordered_signed_sources_and_exact_one_time_consent(monkeypatch):
+    photos = [
+        {"source_kind": "chat_attachment", "rel_path": "uploads/chat/1111111111111111.jpg", "source_sha256": "1" * 64, "size_bytes": 101},
+        {"source_kind": "workspace_document", "document_id": "doc-2", "rel_path": "Knowledge/second.webp", "source_sha256": "2" * 64, "size_bytes": 102},
+    ]
+    args = {
+        "photo_urls": [photos[0]["rel_path"], {"source_kind": "workspace_document", "document_id": "doc-2"}],
+        "title": "Reviewed photos", "privacy_level": "PUBLIC_TO_EVERYONE", "photo_cover_index": 1,
+    }
+    calls = []
+
+    async def api(_token, _method, endpoint, _params=None, body=None):
+        calls.append((endpoint, body))
+        if "creator_info" in endpoint:
+            return json.dumps({"data": CREATOR})
+        return json.dumps({"data": {"publish_id": "photos-pending"}})
+
+    signed = AsyncMock(return_value=["https://app.example/one.jpg", "https://app.example/two.webp"])
+    monkeypatch.setattr(tiktok, "_api", api)
+    monkeypatch.setattr(tiktok, "_signed_tiktok_photo_urls", signed)
+    with approved_photo_call_context(args, sources=photos):
+        result = await tiktok.call_tool("post_photo", args, "test-token")
+        replay = await tiktok.call_tool("post_photo", args, "test-token")
+    assert not result["isError"] and replay["isError"]
+    assert [endpoint for endpoint, _body in calls] == ["post/publish/creator_info/query/", "post/publish/content/init/", "post/publish/creator_info/query/"]
+    assert calls[1][1]["source_info"] == {
+        "source": "PULL_FROM_URL", "photo_images": ["https://app.example/one.jpg", "https://app.example/two.webp"],
+        "photo_cover_index": 1,
+    }
+    assert calls[1][1]["post_info"]["description"] == "Reviewed photos"
+    assert calls[1][1]["post_mode"] == "DIRECT_POST"
+    assert calls[1][1]["media_type"] == "PHOTO"
+    assert "disable_duet" not in calls[1][1]["post_info"]
+    assert "disable_stitch" not in calls[1][1]["post_info"]
+    signed.assert_awaited_once_with(args["photo_urls"], expected_sources=photos)
 
 
 @pytest.mark.asyncio
@@ -303,3 +372,38 @@ async def test_unaudited_error_explains_app_audit_not_oauth_or_private_retry(mon
     assert "audit required" in message
     assert "Content Posting API audit" in message
     assert "Reconnect" not in message and "retry" not in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_status_rate_limit_does_not_claim_the_publication_stopped(monkeypatch):
+    from test_youtube_tiktok_mcp import _FakeClient, _FakeResp
+
+    monkeypatch.setattr(_FakeClient, "response", _FakeResp(429, {"error": {"code": "rate_limit_exceeded"}}))
+    monkeypatch.setattr(_FakeClient, "route", None)
+    monkeypatch.setattr(tiktok.httpx, "AsyncClient", _FakeClient)
+    result = await tiktok.call_tool("get_publish_status", {"publish_id": "existing-post"}, "test-token")
+    assert result["isError"] is True
+    assert "rate_limit_exceeded" in result["content"][0]["text"]
+    assert "publishing attempt has stopped" not in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 429])
+@pytest.mark.parametrize("code", ["spam_risk_too_many_posts", "reached_active_user_cap", "rate_limit_exceeded"])
+async def test_creator_limit_stops_publish_before_signing_and_explains_retry(monkeypatch, status, code):
+    from test_youtube_tiktok_mcp import _FakeClient, _FakeResp
+
+    monkeypatch.setattr(_FakeClient, "response", _FakeResp(status, {"error": {"code": code, "message": "Limit reached"}}))
+    monkeypatch.setattr(_FakeClient, "route", None)
+    monkeypatch.setattr(_FakeClient, "calls", [])
+    monkeypatch.setattr(tiktok.httpx, "AsyncClient", _FakeClient)
+    signer = AsyncMock()
+    monkeypatch.setattr(tiktok, "_signed_chat_video_url", signer)
+    with approved_call_context(ARGS):
+        result = await tiktok.call_tool("post_video", ARGS, "test-token")
+    assert result["isError"] is True
+    assert "try again later" in result["content"][0]["text"]
+    assert "Reconnect" not in result["content"][0]["text"]
+    assert len(_FakeClient.calls) == 1
+    assert _FakeClient.calls[0]["url"].endswith("/post/publish/creator_info/query/")
+    signer.assert_not_awaited()

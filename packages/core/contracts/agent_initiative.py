@@ -157,7 +157,55 @@ class InitiativeDecision(_StrictContract):
         return self
 
 
+#: The JSON Schema an Initiative Task declares for its run's structured result
+#: (``details["result_schema"]``). It states every rule ``InitiativeDecision``
+#: enforces, so a result the run's host accepts also settles.
+INITIATIVE_DECISION_RESULT_SCHEMA: dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["version", "decision", "reason_code"],
+    "properties": {
+        "version": {"type": "string", "enum": ["1"]},
+        "decision": {"type": "string", "enum": ["notify", "silent"]},
+        "message": {
+            "type": "string", "maxLength": 20_000,
+            "description": "What the person is told. Required to notify; omitted when silent.",
+        },
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_]+$"},
+        "reason": {"type": "string", "maxLength": 2_000},
+        "severity": {"type": "string", "enum": ["info", "warn"]},
+        "dedupe_key": {"type": "string", "maxLength": 255},
+        "evidence_refs": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "id": {"type": "string", "maxLength": 500},
+                    "url": {"type": "string", "maxLength": 2_000},
+                    "label": {"type": "string", "maxLength": 500},
+                },
+            },
+        },
+    },
+    "allOf": [
+        {
+            "if": {"properties": {"decision": {"const": "notify"}}},
+            "then": {"required": ["message"], "properties": {"message": {"pattern": "\\S"}}},
+        },
+        {
+            "if": {"properties": {"decision": {"const": "silent"}}},
+            "then": {"properties": {"message": {"maxLength": 0}}},
+        },
+    ],
+}
+
+
 __all__ = [
+    "INITIATIVE_DECISION_RESULT_SCHEMA",
     "ConditionSpec",
     "DecisionPolicy",
     "DeliveryPolicy",

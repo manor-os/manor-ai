@@ -1,14 +1,12 @@
-"""Durable host mechanics shared by every Task run engine.
+"""Durable host mechanics of a Task run.
 
-A ``TaskCoordinatorRun`` is driven either by the Plan/Step DAG coordinator
-(``workers.task_coordinator``) or by the Task agent loop
-(``workers.task_agent_loop``). Both own the run the same way: admit the
-Workspace and Task, claim the exact wake, renew the claim while provider I/O
-runs, and re-check the claim before every model call. The engines differ only
-in what one round does.
+The Task agent loop (``workers.task_agent_loop``) owns its
+``TaskCoordinatorRun`` through these helpers: admit the Workspace and Task,
+claim the exact wake, renew the claim while provider I/O runs, and re-check
+the claim before every model call.
 
-Callers pass their session factory and lease settings explicitly so each
-engine keeps its own patch points and constants.
+Callers pass their session factory and lease settings explicitly so they keep
+their own patch points and constants.
 """
 from __future__ import annotations
 
@@ -37,8 +35,13 @@ from packages.core.services.task_execution import (
     resolve_task_execution,
     task_execution_intent_generation,
 )
+from packages.core.services.task_execution_origin import task_has_manual_execution
 from packages.core.services.workspace_access import lock_workspace_access_boundary
 from packages.core.services.workspace_autonomy import workspace_allows_manual_work
+from packages.core.services.workspace_readiness import (
+    evaluate_workspace_blocking_setup,
+    task_is_authorized_workspace_setup,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -60,28 +63,43 @@ def run_engine(run: Any) -> str:
 async def admit_task_scope(db: Any, task_id: str) -> tuple[Task | None, str]:
     """Admit Workspace -> Task for one wake and lock the Task.
 
-    Locks the Workspace access boundary, then the Task, in the canonical
-    order. Returns the locked in-progress Task, or None and the reason the
-    wake is deferred. Each run kind's claim follows inside the same
-    transaction.
+    Locks the Workspace access boundary (a Task assigned directly to an
+    Agent has none), then the Task, in the canonical order. Returns the
+    locked in-progress Task, or None and the reason the wake is deferred.
+    Each run kind's claim follows inside the same transaction.
     """
 
     scope = (await db.execute(
         select(Task.entity_id, Task.workspace_id).where(Task.id == task_id)
     )).one_or_none()
-    if scope is None or not scope.workspace_id:
-        return None, "missing_workspace_task"
-    workspace = await lock_workspace_access_boundary(
-        db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
-    )
-    if workspace is None or not workspace_allows_manual_work(workspace):
-        return None, "workspace_unavailable"
+    if scope is None:
+        return None, "missing_task"
+    workspace = None
+    if scope.workspace_id:
+        workspace = await lock_workspace_access_boundary(
+            db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
+        )
+        if workspace is None or not workspace_allows_manual_work(workspace):
+            return None, "workspace_unavailable"
     task = (await db.execute(
         select(Task).where(Task.id == task_id).with_for_update()
         .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if task is None or task.status != TaskStatus.IN_PROGRESS.value:
         return None, "task_inactive"
+    if workspace is None:
+        # A Task assigned directly to an Agent has no Workspace autonomy or
+        # setup gate.
+        return task, "admitted"
+    if workspace.status == "paused" and not task_has_manual_execution(task):
+        # Pausing autonomy holds automatic Tasks (Strategist, schedules);
+        # recovery redelivers the wake once the Workspace runs again.
+        return None, "workspace_autonomy_paused"
+    setup = await evaluate_workspace_blocking_setup(db, workspace)
+    if setup is not None and setup.blocks_work and not await task_is_authorized_workspace_setup(db, task):
+        # Blueprint setup must finish (through its authorized setup job)
+        # before ordinary Tasks run; recovery redelivers the wake.
+        return None, "workspace_setup_incomplete"
     return task, "admitted"
 
 
@@ -148,14 +166,15 @@ async def claim_is_current(
         )).scalar_one_or_none()
         if task is None or task.status != TaskStatus.IN_PROGRESS.value or run is None:
             return False
-        workspace = (await db.execute(
-            select(Workspace).where(
-                Workspace.id == task.workspace_id,
-                Workspace.entity_id == task.entity_id,
-            )
-        )).scalar_one_or_none()
-        if not workspace_allows_manual_work(workspace):
-            return False
+        if task.workspace_id:
+            workspace = (await db.execute(
+                select(Workspace).where(
+                    Workspace.id == task.workspace_id,
+                    Workspace.entity_id == task.entity_id,
+                )
+            )).scalar_one_or_none()
+            if not workspace_allows_manual_work(workspace):
+                return False
         execution = await resolve_task_execution(db, task)
         if (
             execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN

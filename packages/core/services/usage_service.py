@@ -14,6 +14,7 @@ from typing import Any, Optional
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.plans import is_cloud
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.base import generate_ulid
 from packages.core.services.timezone_utils import user_range_start_utc
@@ -39,6 +40,66 @@ def _usage_is_byok(usage: dict) -> bool:
     return False
 
 
+async def _ledger_payer(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    payer_entity_id: str | None,
+) -> str:
+    """Return who a ledger write for ``entity_id``'s data charges.
+
+    A pinned ``payer_entity_id`` must be the data owner or the provider of a
+    delivery targeting the Workspace; without one the Workspace's current
+    payer is resolved (``TrialSponsorUnavailable`` propagates).
+    """
+    from packages.core.services.billing_payer import (
+        payer_entity_id as resolve_payer,
+        validate_payer,
+    )
+
+    if payer_entity_id is None:
+        return await resolve_payer(db, entity_id, workspace_id)
+    if payer_entity_id != entity_id:
+        await validate_payer(
+            db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=payer_entity_id,
+        )
+    return payer_entity_id
+
+
+async def _ledger_payer_or_uncharged(
+    db: AsyncSession,
+    *,
+    writer: str,
+    entity_id: str,
+    workspace_id: str | None,
+    payer_entity_id: str | None,
+    strict: bool,
+    operation_id: str | None = None,
+) -> str | None:
+    """``_ledger_payer`` for best-effort writers: None when nobody may be charged.
+
+    A trial whose provider is gone, or a pin that no delivery backs, leaves
+    the spend uncharged. Strict writers raise instead; best-effort ones log
+    it distinctly so an uncharged call is never mistaken for a transient
+    billing failure.
+    """
+    from packages.core.services.billing_payer import TrialSponsorUnavailable
+
+    try:
+        return await _ledger_payer(
+            db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=payer_entity_id,
+        )
+    except (TrialSponsorUnavailable, ValueError) as exc:
+        if strict:
+            raise
+        logger.warning(
+            "%s: trial payer unavailable; usage not charged entity=%s workspace=%s payer=%s operation=%s err=%s",
+            writer, entity_id, workspace_id, payer_entity_id, operation_id, exc,
+        )
+        return None
+
+
 def chat_llm_usage_is_byok(usage: dict | None = None) -> bool:
     """Return whether the active chat call or its normalized usage is BYOK."""
     from packages.core.ai.runtime import runtime_is_byok_call_active
@@ -48,7 +109,7 @@ def chat_llm_usage_is_byok(usage: dict | None = None) -> bool:
 
 def chat_llm_usage_to_credits(usage: dict) -> int:
     """Convert normalized chat usage with the same pricing path as the ledger."""
-    if not usage:
+    if not usage or not is_cloud():
         return 0
 
     try:
@@ -116,8 +177,13 @@ def build_durable_llm_billing_callbacks(
     conversation_id: str | None,
     fallback_model: str | None,
     byok: bool = False,
+    payer_entity_id: str | None = None,
 ):
     """Build per-provider-call reserve/settle callbacks for an agentic loop.
+
+    ``payer_entity_id`` pins who pays. Without it the first reservation
+    resolves the Workspace's payer and every later round reuses it, so a
+    delivery phase change mid-loop cannot split one loop across two payers.
 
     Reservations are committed before provider I/O. Settlement, ledger and
     reservation consumption share a later transaction. The reservation row is
@@ -133,6 +199,7 @@ def build_durable_llm_billing_callbacks(
     # Validate eagerly, while still deriving the final bounded id per round.
     durable_llm_call_source_id(source_prefix, 0)
     source_ids: dict[int, str] = {}
+    pinned_payer: dict[str, str | None] = {"entity_id": payer_entity_id}
 
     def source_id(round_num: int) -> str:
         return durable_llm_call_source_id(source_prefix, round_num)
@@ -145,15 +212,18 @@ def build_durable_llm_billing_callbacks(
     ) -> None:
         call_source_id = source_id(round_num)
         source_ids[round_num] = call_source_id
-        if not entity_id or byok or chat_llm_usage_is_byok():
+        if not entity_id or not is_cloud() or byok or chat_llm_usage_is_byok():
             return
 
         from packages.core.ai.agentic_loop import _estimate_tokens
         from packages.core.ai.llm_client import CreditExhaustedError
         from packages.core.database import async_session
+        from packages.core.services.billing_payer import TrialSponsorUnavailable
+        from packages.core.services.billing_payer import payer_entity_id as resolve_payer
         from packages.core.services.billing_service import tokens_to_credits
         from packages.core.services.credit_reservations import (
             CreditReservationError,
+            TrialCreditReservationError,
             reserve_credits,
         )
 
@@ -166,9 +236,30 @@ def build_durable_llm_billing_callbacks(
                 int(tokens_to_credits(_estimate_tokens(messages), output_tokens, model)),
             )
             async with async_session() as db:
+                if pinned_payer["entity_id"] is None:
+                    # Share one payer with the bound billing context, whose
+                    # credit preflight gates these same calls.
+                    from packages.core.ai.runtime.billing import runtime_current_billing_context
+
+                    bound = runtime_current_billing_context()
+                    shared = bound if (
+                        bound is not None
+                        and bound.entity_id == entity_id
+                        and bound.workspace_id == workspace_id
+                    ) else None
+                    if shared is not None and shared.payer_entity_id:
+                        pinned_payer["entity_id"] = shared.payer_entity_id
+                    else:
+                        try:
+                            pinned_payer["entity_id"] = await resolve_payer(db, entity_id, workspace_id)
+                        except TrialSponsorUnavailable as exc:
+                            raise TrialCreditReservationError() from exc
+                        if shared is not None:
+                            shared.payer_entity_id = pinned_payer["entity_id"]
                 await reserve_credits(
                     db,
                     entity_id=entity_id,
+                    payer_entity_id=pinned_payer["entity_id"],
                     amount_credits=estimate,
                     source_kind="chat_llm_call",
                     source_id=call_source_id,
@@ -181,7 +272,7 @@ def build_durable_llm_billing_callbacks(
                 )
                 await db.commit()
         except CreditReservationError as exc:
-            raise CreditExhaustedError(str(exc)) from exc
+            raise CreditExhaustedError(str(exc), kind=exc.kind) from exc
         except Exception as exc:
             raise CreditExhaustedError(
                 "Unable to reserve credits for this request. Please try again shortly."
@@ -236,6 +327,7 @@ def build_durable_llm_billing_callbacks(
                     usage=billed_usage,
                     duration_ms=int(duration_ms),
                     consumed_credits=actual_credits,
+                    payer_entity_id=pinned_payer["entity_id"],
                 )
                 await db.commit()
             except Exception:
@@ -552,8 +644,13 @@ async def record_llm_usage(
     source: str = "chat",
     operation_id: str | None = None,
     strict: bool = False,
+    payer_entity_id: str | None = None,
 ) -> None:
     """Record LLM usage in one call: token log + billing + AI budget.
+
+    ``entity_id`` owns the data and keeps the token log. The credit charge,
+    usage counters and AI budget go to the payer (``payer_entity_id``, or the
+    Workspace's current payer when omitted).
 
     ``usage`` dict should contain: prompt_tokens (or prompt),
     completion_tokens (or completion), total_tokens (or total), model,
@@ -664,9 +761,13 @@ async def record_llm_usage(
             record_token_usage as record_billing,
             estimate_provider_cost,
         )
-        if not is_byok:
+        payer = None if is_byok else await _ledger_payer_or_uncharged(
+            db, writer="record_llm_usage", entity_id=entity_id, workspace_id=workspace_id,
+            payer_entity_id=payer_entity_id, strict=strict, operation_id=operation_id,
+        )
+        if payer is not None:
             billing_log = await record_billing(
-                db, entity_id,
+                db, payer,
                 input_tokens=prompt_tokens, output_tokens=completion_tokens,
                 model=model_name, provider=provider,
                 pricing_source=str(pricing_source or ""),
@@ -730,7 +831,7 @@ async def record_llm_usage(
                     if strict:
                         raise
             from packages.core.services.plan_enforcement import record_ai_cost
-            await record_ai_cost(db, entity_id, provider_cost, model_name)
+            await record_ai_cost(db, payer, provider_cost, model_name)
     except Exception:
         logger.warning("record_llm_usage: billing failed", exc_info=True)
         if strict:
@@ -751,6 +852,7 @@ async def record_chat_llm_usage(
     rounds: int | None = None,
     operation_id: str | None = None,
     strict: bool = False,
+    payer_entity_id: str | None = None,
 ) -> None:
     """Best-effort chat LLM usage persistence with chat-specific metadata."""
 
@@ -791,6 +893,7 @@ async def record_chat_llm_usage(
             source=RUNTIME_CHAT_SOURCE,
             operation_id=operation_id,
             strict=strict,
+            payer_entity_id=payer_entity_id,
         )
     except Exception:
         logger.warning("record_chat_llm_usage: failed", exc_info=True)
@@ -810,8 +913,13 @@ async def settle_chat_llm_call_usage(
     usage: dict,
     duration_ms: int,
     consumed_credits: int | None = None,
+    payer_entity_id: str | None = None,
 ) -> bool:
     """Write one completed chat LLM call and consume its durable reservation.
+
+    The charge goes to the reservation's entity, the payer pinned when the
+    call was reserved, even if the Workspace's payer changed since.
+    ``payer_entity_id`` only matters for a BYOK call without a reservation.
 
     The caller must commit this transaction. If it fails, the separately
     committed active reservation continues to block further billable work.
@@ -825,6 +933,25 @@ async def settle_chat_llm_call_usage(
     they do not consume credits or workspace budget, but their token analytics
     are not deduplicated here.
     """
+    if not is_cloud():
+        # The public migration graph has no Cloud reservation ledger. OSS
+        # records native-provider usage even when no billing metadata was
+        # attached, without reading or charging a platform credit balance.
+        await record_chat_llm_usage(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            usage={**usage, "byok": True, "billing_mode": "byok", "api_key_source": "byok"},
+            duration_ms=duration_ms,
+            operation_id=source_id,
+            strict=True,
+            payer_entity_id=entity_id,
+        )
+        return False
+
     from packages.core.models.billing import CreditReservation
     from packages.core.services.credit_reservations import (
         RESERVATION_STATUS_ACTIVE,
@@ -835,28 +962,55 @@ async def settle_chat_llm_call_usage(
     )
 
     byok = chat_llm_usage_is_byok(usage)
+    reservation_query = (
+        select(CreditReservation)
+        .where(
+            CreditReservation.source_kind == "chat_llm_call",
+            CreditReservation.source_id == source_id,
+        )
+        .order_by(
+            (CreditReservation.status == RESERVATION_STATUS_ACTIVE).desc(),
+            CreditReservation.created_at.desc(),
+            CreditReservation.id.desc(),
+        )
+    )
     # Keep the same Entity -> reservation order as reserve/resize. Two
     # callbacks for one provider response can otherwise deadlock when one is
     # resizing the active reservation while the other starts settlement.
-    await _lock_entity(db, entity_id)
-    reservation = (
-        await db.execute(
-            select(CreditReservation)
-            .where(
-                CreditReservation.source_kind == "chat_llm_call",
-                CreditReservation.source_id == source_id,
-            )
-            .order_by(
-                (CreditReservation.status == RESERVATION_STATUS_ACTIVE).desc(),
-                CreditReservation.created_at.desc(),
-                CreditReservation.id.desc(),
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalars().first()
+    # The locked Entity is the payer the reservation is held against, so read
+    # the reservation without a lock first.
+    reservation = (await db.execute(reservation_query)).scalars().first()
     if reservation is not None:
-        if reservation.entity_id != entity_id:
+        locked_payer = reservation.entity_id
+        await _lock_entity(db, locked_payer)
+        reservation = (
+            await db.execute(
+                reservation_query.with_for_update().execution_options(populate_existing=True)
+            )
+        ).scalars().first()
+        # The charge must land on the Entity locked above: a row that changed
+        # (or vanished) between the two reads would settle unserialized.
+        if reservation is None or reservation.entity_id != locked_payer:
+            raise CreditReservationError(
+                f"chat settlement {source_id!r} reservation changed while settling"
+            )
+    elif byok:
+        if payer_entity_id is None:
+            from packages.core.services.billing_payer import TrialSponsorUnavailable
+
+            try:
+                payer_entity_id = await _ledger_payer(
+                    db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=None,
+                )
+            except TrialSponsorUnavailable:
+                # BYOK charges no credits; only the lock order needs an Entity.
+                payer_entity_id = entity_id
+        await _lock_entity(db, payer_entity_id)
+    if reservation is not None:
+        data_owner = (reservation.meta or {}).get("data_owner_entity_id")
+        if reservation.workspace_id != workspace_id or entity_id not in (
+            reservation.entity_id, data_owner,
+        ):
             raise CreditReservationError(
                 f"chat settlement {source_id!r} crosses entity scope"
             )
@@ -882,6 +1036,7 @@ async def settle_chat_llm_call_usage(
         duration_ms=duration_ms,
         operation_id=source_id,
         strict=True,
+        payer_entity_id=reservation.entity_id if reservation is not None else payer_entity_id,
     )
     if reservation is not None:
         await consume_reservation(
@@ -964,6 +1119,7 @@ async def record_media_usage(
     source: str = "tool",
     byok: bool = False,
     strict: bool = False,
+    payer_entity_id: Optional[str] = None,
 ) -> bool:
     """Record a non-token-based LLM-style call (image / video / TTS /
     Whisper / embedding).
@@ -983,6 +1139,9 @@ async def record_media_usage(
     Caller MUST commit. Failure is logged but not raised by default. Durable
     reservation settlement can pass ``strict=True`` so a caller-owned rollback
     keeps the ledger, workspace budget state, and threshold alert atomic.
+
+    The charge, counters and AI budget go to the payer (``payer_entity_id``,
+    or the Workspace's current payer when omitted).
     """
     if cost_usd is None or cost_usd <= 0:
         return False
@@ -1006,9 +1165,15 @@ async def record_media_usage(
     # 1. credit_usage_logs row (analytics + audit)
     try:
         from packages.core.models.billing import CreditUsageLog
+        payer = await _ledger_payer_or_uncharged(
+            db, writer="record_media_usage", entity_id=entity_id, workspace_id=workspace_id,
+            payer_entity_id=payer_entity_id, strict=strict,
+        )
+        if payer is None:
+            return False
         row = CreditUsageLog(
             id=generate_ulid(),
-            entity_id=entity_id,
+            entity_id=payer,
             workspace_id=workspace_id,
             agent_id=agent_id,
             conversation_id=conversation_id,
@@ -1033,15 +1198,12 @@ async def record_media_usage(
 
     # 2. Mirror credit total onto Entity.settings.used_credits
     try:
-        from sqlalchemy import select as sa_select
-        from packages.core.models.user import Entity
-        result = await db.execute(sa_select(Entity).where(Entity.id == entity_id))
-        entity = result.scalar_one_or_none()
-        if entity:
-            settings = dict(entity.settings or {})
-            settings["used_credits"] = int(settings.get("used_credits", 0)) + credits
-            entity.settings = settings
-            await db.flush()
+        from packages.core.services.entity_settings import (
+            increment_entity_settings_counters,
+        )
+        await increment_entity_settings_counters(
+            db, payer, {"used_credits": int(credits)},
+        )
     except Exception:
         logger.warning("record_media_usage: used_credits update failed", exc_info=True)
         if strict:
@@ -1070,7 +1232,7 @@ async def record_media_usage(
     # 4. Entity AI budget (ai_usage_usd)
     try:
         from packages.core.services.plan_enforcement import record_ai_cost
-        await record_ai_cost(db, entity_id, float(cost_usd), model)
+        await record_ai_cost(db, payer, float(cost_usd), model)
     except Exception:
         logger.warning("record_media_usage: budget update failed", exc_info=True)
         if strict:

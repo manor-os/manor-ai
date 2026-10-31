@@ -5,7 +5,7 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 import bcrypt
 import jwt
@@ -17,6 +17,7 @@ from packages.core.constants.plans import DEFAULT_PLAN_ID
 from packages.core.i18n import SUPPORTED_LOCALES, get_locale
 from packages.core.models.base import generate_ulid
 from packages.core.models.user import Entity, User, UserMembership
+from packages.core.services.user_avatars import real_avatar_url
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -93,8 +94,20 @@ def create_access_token(
     token_version: int = 0,
     expires_minutes: int | None = None,
     mfa_authenticated: bool = False,
+    audience: str | None = None,
+    scopes: Sequence[str] | None = None,
+    actor: str | None = None,
+    authorized_party: str | None = None,
 ) -> str:
     """Create a server-revocable API access token, valid for at most 24 hours.
+
+    ``scopes`` (``scp``) are what an OAuth client was granted; ``actor``
+    (``act: {"sub": ...}``) names an agent acting for the user (an MCP client),
+    so a route that tells people from agents can; ``authorized_party`` (``azp``)
+    is the OAuth client the token was issued to.
+
+    ``audience`` binds the token to one resource (e.g. the MCP endpoint). Such a
+    token fails ``decode_token`` and therefore every REST route.
 
     ``remember`` is retained for client compatibility, but no longer creates a
     seven-day bearer token. Persistent browser login uses a separate rotating refresh
@@ -111,24 +124,82 @@ def create_access_token(
         "jti": secrets.token_urlsafe(24),
         "iat": now,
         "iss": _JWT_ISSUER,
+        "aud": audience or _JWT_AUDIENCE,
+        "token_version": int(token_version or 0),
+        "amr": ["mfa"] if mfa_authenticated else [],
+        "exp": expire,
+    }
+    if scopes is not None:
+        payload["scp"] = [str(scope) for scope in scopes]
+    if actor:
+        payload["act"] = {"sub": str(actor)}
+    if authorized_party:
+        payload["azp"] = str(authorized_party)
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+COLLABORATOR_SESSION_TYPE = "collaborator_session"
+COLLABORATOR_SESSION_KINDS = frozenset({"client_trial", "grant"})
+
+
+def collaborator_session_minutes() -> int:
+    """Lifetime of a scoped collaborator token: MANOR_COLLABORATOR_SESSION_MINUTES, 2..60, default 15."""
+    try:
+        minutes = int(os.getenv("MANOR_COLLABORATOR_SESSION_MINUTES", "15"))
+    except ValueError:
+        minutes = 15
+    return min(max(2, minutes), 60)
+
+
+def create_collaborator_session_token(
+    *,
+    user_id: str,
+    entity_id: str,
+    workspace_id: str,
+    kind: str,
+    ref: str,
+    token_version: int = 0,
+    mfa_authenticated: bool = False,
+) -> tuple[str, datetime]:
+    """A short-lived token for one customer Workspace, minted from the caller's home sign-in.
+
+    ``cs`` pins the Workspace and names what authorized it (a client trial
+    delivery or a collaboration grant). The person's persisted company is
+    never changed; the token is held in memory by the embedded frame and
+    re-minted before it expires. Returns the token and its expiry.
+    """
+    if kind not in COLLABORATOR_SESSION_KINDS:
+        raise ValueError(f"unknown collaborator session kind: {kind!r}")
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=collaborator_session_minutes())
+    payload = {
+        "sub": user_id,
+        "entity_id": entity_id,
+        "role": "collaborator",
+        "typ": COLLABORATOR_SESSION_TYPE,
+        "cs": {"workspace_id": workspace_id, "kind": kind, "ref": ref},
+        "jti": secrets.token_urlsafe(24),
+        "iat": now,
+        "iss": _JWT_ISSUER,
         "aud": _JWT_AUDIENCE,
         "token_version": int(token_version or 0),
         "amr": ["mfa"] if mfa_authenticated else [],
         "exp": expire,
     }
-    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM), expire
 
 
 
 
-def decode_token(token: str) -> Optional[dict]:
+def decode_token(token: str, *, audience: str | None = None) -> Optional[dict]:
+    """Decode a Manor access token for the REST API or, with ``audience``, one resource."""
     try:
         return jwt.decode(
             token,
             settings.JWT_SECRET_KEY,
             algorithms=[settings.JWT_ALGORITHM],
             issuer=_JWT_ISSUER,
-            audience=_JWT_AUDIENCE,
+            audience=audience or _JWT_AUDIENCE,
         )
     except jwt.PyJWTError:
         return None
@@ -152,14 +223,6 @@ def mark_user_login(user: User, *, source: str = "auth_service") -> None:
 
 # ── Avatar ──
 
-def _generate_avatar_url(name: str) -> str:
-    """Generate a deterministic avatar URL from a display name using DiceBear API."""
-    import hashlib
-    seed = hashlib.md5(name.encode(), usedforsecurity=False).hexdigest()[:8]
-    # DiceBear initials style — generates SVG avatars server-side
-    return f"https://api.dicebear.com/9.x/initials/svg?seed={seed}&backgroundColor=0f766e,14b8a6,0d9488,0ea5e9,6366f1,8b5cf6&backgroundType=gradientLinear&fontSize=40"
-
-
 # ── Registration ──
 
 def _default_entity_settings() -> dict:
@@ -167,10 +230,28 @@ def _default_entity_settings() -> dict:
     return {"plan": DEFAULT_PLAN_ID, "approval_defaults": account_defaults()}
 
 
-_MEMBERSHIP_ROLES = {"owner", "admin", "member", "viewer", "external", "client"}
+# "collaborator" is derived from a Workspace collaboration grant and carries no company permissions.
+COLLABORATOR_ROLE = "collaborator"
+COLLABORATOR_NOT_SWITCHABLE = {
+    "code": "collaborator_membership_not_switchable",
+    "message": "Open the customer Workspace from your own company",
+}
+_MEMBERSHIP_ROLES = {"owner", "admin", "member", "viewer", "external", "client", "collaborator"}
 
 
-def _normalize_membership_role(role: str | None, default: str = "member") -> str:
+def require_assignable_role(role: str | None) -> str | None:
+    """Refuse the derived collaborator role at a role input (a ValueError is a 422 in request models).
+
+    Collaborator memberships are created and ended only by the Workspace
+    collaboration sync (external_collaboration_access.sync_external_access);
+    nobody assigns the role.
+    """
+    if (role or "").strip().lower() == "collaborator":
+        raise ValueError("The collaborator role comes only from a Workspace collaboration and cannot be assigned.")
+    return role
+
+
+def normalize_membership_role(role: str | None, default: str = "member") -> str:
     value = (role or "").strip().lower()
     return value if value in _MEMBERSHIP_ROLES else default
 
@@ -210,9 +291,9 @@ async def ensure_user_membership(
     status: str = "active",
     staff_id: str | None = None,
     is_primary: bool = False,
-) -> UserMembership:
+) -> UserMembership | None:
     """Create or update the user's membership in an entity."""
-    role_value = _normalize_membership_role(role or user.role)
+    role_value = normalize_membership_role(role or user.role)
     status_value = (status or "active").strip().lower()
     if status_value not in {"active", "invited", "inactive"}:
         status_value = "active"
@@ -225,6 +306,11 @@ async def ensure_user_membership(
             )
         )
     ).scalar_one_or_none()
+    if role_value == "collaborator":
+        # Derived from a collaboration grant only (external_collaboration_access);
+        # a login replaying a switched-in User.role must not create, reactivate
+        # or make it primary.
+        return membership
     membership_created = membership is None
     if membership_created:
         membership = UserMembership(
@@ -238,11 +324,18 @@ async def ensure_user_membership(
         )
         db.add(membership)
     else:
+        from packages.core.services.workspace_access import set_link_columns
+
         membership.role = role_value
         membership.status = status_value
-        if staff_id:
-            membership.staff_id = staff_id
-        membership.is_primary = bool(membership.is_primary or is_primary)
+        # Linking Staff or marking primary (workspace creation, login) is not an
+        # authority change; it must not void grants this person issued.
+        await set_link_columns(
+            db,
+            membership,
+            staff_id=staff_id or membership.staff_id,
+            is_primary=bool(membership.is_primary or is_primary),
+        )
     await db.flush()
     if membership_created:
         from packages.core.governance.approval_policy_service import initialize_personal_approval
@@ -309,21 +402,28 @@ async def get_user_membership(
 async def list_user_memberships(
     db: AsyncSession,
     user: User,
+    *,
+    include_collaborator: bool = True,
 ) -> list[tuple[UserMembership, Entity | None]]:
-    """List persisted memberships without creating or reactivating rows."""
-    rows = (
-        await db.execute(
-            select(UserMembership, Entity)
-            .join(Entity, Entity.id == UserMembership.entity_id, isouter=True)
-            .where(
-                UserMembership.user_id == user.id,
-                UserMembership.status.in_(("active", "invited")),
-                UserMembership.deleted_at.is_(None),
-            )
-            .order_by(UserMembership.is_primary.desc(), Entity.name.asc().nulls_last())
+    """List persisted memberships without creating or reactivating rows.
+
+    ``include_collaborator=False`` leaves out memberships derived from a
+    Workspace collaboration: they are not companies the person works in or
+    can switch to.
+    """
+    query = (
+        select(UserMembership, Entity)
+        .join(Entity, Entity.id == UserMembership.entity_id, isouter=True)
+        .where(
+            UserMembership.user_id == user.id,
+            UserMembership.status.in_(("active", "invited")),
+            UserMembership.deleted_at.is_(None),
         )
-    ).all()
-    return list(rows)
+        .order_by(UserMembership.is_primary.desc(), Entity.name.asc().nulls_last())
+    )
+    if not include_collaborator:
+        query = query.where(UserMembership.role != COLLABORATOR_ROLE)
+    return list((await db.execute(query)).all())
 
 
 async def activate_user_membership(
@@ -332,9 +432,15 @@ async def activate_user_membership(
     user: User,
     membership: UserMembership,
 ) -> User:
-    """Move the compatibility current-entity pointer to a membership."""
+    """Move the compatibility current-entity pointer to a membership.
+
+    Never to a collaborator membership: a provider works in a customer
+    Workspace through a scoped session from their own company.
+    """
+    if membership.role == COLLABORATOR_ROLE:
+        raise ValueError("A collaborator membership is not a company to switch into")
     user.entity_id = membership.entity_id
-    user.role = _normalize_membership_role(membership.role)
+    user.role = normalize_membership_role(membership.role)
     await db.flush()
     return user
 
@@ -372,7 +478,6 @@ async def register_user(
         email=email,
         display_name=name_display,
         password_hash=hash_password(password),
-        avatar_url=_generate_avatar_url(name_display),
         role="owner",
     )
     db.add(user)
@@ -517,6 +622,7 @@ async def get_user(db: AsyncSession, user_id: str, entity_id: str) -> Optional[U
 
 
 async def update_user_role(db: AsyncSession, user_id: str, entity_id: str, role: str) -> Optional[User]:
+    require_assignable_role(role)
     user = await get_user(db, user_id, entity_id)
     if not user:
         return None
@@ -527,32 +633,30 @@ async def update_user_role(db: AsyncSession, user_id: str, entity_id: str, role:
         include_inactive=True,
     )
     if membership:
-        membership.role = _normalize_membership_role(role)
+        membership.role = normalize_membership_role(role)
         if user.entity_id == entity_id:
             user.role = membership.role
     else:
-        user.role = _normalize_membership_role(role)
+        user.role = normalize_membership_role(role)
+
+    # A linked Staff row is the authority; moving only the membership would
+    # leave the person's permissions unchanged.
+    from packages.core.models.staff import Staff
+    from packages.core.services.people_service import assign_staff_role
+
+    staff_rows = (
+        await db.execute(
+            select(Staff).where(
+                Staff.user_id == user_id,
+                Staff.entity_id == entity_id,
+                Staff.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    for staff in staff_rows:
+        await assign_staff_role(db, staff, role_name=normalize_membership_role(role))
     await db.flush()
     return user
-
-
-async def deactivate_user(db: AsyncSession, user_id: str, entity_id: str) -> bool:
-    user = await get_user(db, user_id, entity_id)
-    if not user:
-        return False
-    membership = await get_user_membership(
-        db,
-        user=user,
-        entity_id=entity_id,
-        include_inactive=True,
-    )
-    if membership:
-        membership.status = "inactive"
-    if user.entity_id == entity_id:
-        user.status = "inactive"
-        user.token_version = int(user.token_version or 0) + 1
-    await db.flush()
-    return True
 
 
 async def change_password(db: AsyncSession, user_id: str, old_password: str, new_password: str) -> bool:
@@ -572,6 +676,7 @@ async def invite_user(
 ) -> User:
     """Invite a new user to an existing entity."""
     import secrets
+    require_assignable_role(role)
     temp_password = secrets.token_urlsafe(16)
 
     # Check if email already exists
@@ -585,7 +690,6 @@ async def invite_user(
         email=email,
         display_name=email.split("@")[0],
         password_hash=hash_password(temp_password),
-        avatar_url=_generate_avatar_url(email.split("@")[0]),
         role=role,
         status="invited",
     )
@@ -675,7 +779,8 @@ async def get_or_create_oauth_user(
             user.status = "active"
         if email_verified is True:
             mark_email_verified(user, email)
-        if avatar_url and not user.avatar_url:
+        # A real photo replaces nothing-or-the-old-generated-placeholder only.
+        if avatar_url and not real_avatar_url(user.avatar_url):
             user.avatar_url = avatar_url
         if first_name and not user.first_name:
             user.first_name = first_name
@@ -722,7 +827,7 @@ async def get_or_create_oauth_user(
         first_name=first_name, last_name=last_name,
         password_hash="oauth_no_password",
         locale=initial_locale if initial_locale in SUPPORTED_LOCALES else "en",
-        avatar_url=avatar_url or _generate_avatar_url(display_name or email.split("@")[0]),
+        avatar_url=avatar_url or None,
         role="owner",
         status="active",
     )

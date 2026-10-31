@@ -111,8 +111,8 @@ def estimate_image_cost_usd(model: str, size: str = "1024x1024") -> float:
     return model_pricing.estimate_image_cost_usd(model, size=size)
 
 
-def estimate_audio_cost_usd(model: str, *, purpose: str = "") -> float:
-    return model_pricing.estimate_audio_cost_usd(model, purpose=purpose)
+def estimate_audio_cost_usd(model: str, *, purpose: str = "", characters: int | None = None) -> float:
+    return model_pricing.estimate_audio_cost_usd(model, purpose=purpose, characters=characters)
 
 
 def embedding_cost_usd(model: str, total_tokens: int) -> float:

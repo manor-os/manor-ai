@@ -101,6 +101,10 @@ def test_unproven_legacy_selector_cannot_be_opted_into_as_exact_authority(legacy
     with pytest.raises(LegacyApprovalConversionError, match="no proven equivalent"):
         import_blueprint_governance(legacy, [], preserve_hard_blocks=True)
     review, _ = import_blueprint_governance(legacy, [])
+    if "auto_approve_capabilities" in legacy:
+        # A template grant is dropped; the installer's mode decides.
+        assert not policy_override(review).rules
+        return
     assert policy_override(review).rules
     assert all(rule.effect == "ask" for rule in policy_override(review).rules)
 

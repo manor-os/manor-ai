@@ -25,6 +25,19 @@ class RuntimeProfile(str, Enum):
     BACKGROUND_WORKER = "background_worker"
 
 
+# The only profiles that serve principals outside the account: public customer
+# chat visitors and external channel senders. Every other profile (present or
+# future) is internal, so internal-only capabilities derive from this set
+# instead of enumerating internal profiles by hand.
+EXTERNAL_RUNTIME_PROFILES: frozenset[RuntimeProfile] = frozenset({
+    RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
+    RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
+})
+INTERNAL_RUNTIME_PROFILES: tuple[RuntimeProfile, ...] = tuple(
+    profile for profile in RuntimeProfile if profile not in EXTERNAL_RUNTIME_PROFILES
+)
+
+
 @dataclass(frozen=True)
 class RuntimeProfileSpec:
     profile: RuntimeProfile
@@ -64,6 +77,47 @@ _PROFILE_BY_SURFACE: dict[ChatSurface, RuntimeProfileSpec] = {
         stream_allowed=False,
     ),
 }
+
+
+# Surfaces derive their internal/external side from their profile.
+EXTERNAL_CHAT_SURFACES: frozenset[ChatSurface] = frozenset(
+    surface
+    for surface, spec in _PROFILE_BY_SURFACE.items()
+    if spec.profile in EXTERNAL_RUNTIME_PROFILES
+)
+INTERNAL_CHAT_SURFACES: frozenset[ChatSurface] = frozenset(
+    surface for surface in _PROFILE_BY_SURFACE if surface not in EXTERNAL_CHAT_SURFACES
+)
+
+
+def runtime_profile_is_external(value: RuntimeProfile | str | None) -> bool:
+    return normalize_runtime_profile(value) in EXTERNAL_RUNTIME_PROFILES
+
+
+def runtime_surface_is_external(value: ChatSurface | str | None) -> bool:
+    raw = getattr(value, "value", value)
+    try:
+        surface = ChatSurface(str(raw or "").strip())
+    except ValueError:
+        return False
+    return surface in EXTERNAL_CHAT_SURFACES
+
+
+def runtime_surface_is_internal(value: ChatSurface | str | None) -> bool:
+    """Whether a runtime surface serves account-internal principals.
+
+    ``None`` is a legacy unscoped internal caller. An unrecognized surface
+    name fails closed: it is neither internal nor external.
+    """
+
+    raw = getattr(value, "value", value)
+    text = str(raw or "").strip()
+    if not text:
+        return True
+    try:
+        return ChatSurface(text) in INTERNAL_CHAT_SURFACES
+    except ValueError:
+        return False
 
 
 def profile_spec_for_surface(surface: ChatSurface) -> RuntimeProfileSpec:

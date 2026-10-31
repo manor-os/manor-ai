@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Optional
 
 from sqlalchemy import func, or_, select
@@ -55,6 +55,8 @@ class GateResult:
     plan: str = ""
     overage: bool = False
     resets_at: str | None = None
+    kind: str = ""
+    """``"trial_credit"`` when a sponsoring trial provider is the one refused."""
 
 
 class WorkspacePlanLimitError(ValueError):
@@ -207,16 +209,34 @@ async def check(
     resource: str,
     *,
     use_cache: bool = True,
+    workspace_id: str | None = None,
 ) -> GateResult:
     """Check if entity can use/create a resource under their plan.
 
     Works anywhere: FastAPI deps, service layer, Celery tasks.
     OSS mode always returns allowed=True.
+
+    For ``ai_budget_usd`` with a ``workspace_id`` the Workspace's payer is
+    checked: the provider during a client delivery trial. A refusal of the
+    provider comes back with ``kind="trial_credit"``.
     """
     if not is_cloud():
         return GateResult(allowed=True)
     if resource == "ai_budget_usd" and not ai_credit_limits_enabled():
         return GateResult(allowed=True)
+    if resource == "ai_budget_usd" and workspace_id:
+        from packages.core.services.billing_payer import TrialSponsorUnavailable, payer_entity_id
+        from packages.core.services.credit_reservations import TRIAL_CREDIT_MESSAGE
+
+        try:
+            payer = await payer_entity_id(db, entity_id, workspace_id)
+        except TrialSponsorUnavailable:
+            return GateResult(allowed=False, message=TRIAL_CREDIT_MESSAGE, kind="trial_credit")
+        if payer != entity_id:
+            result = await check(db, payer, resource, use_cache=use_cache)
+            if not result.allowed:
+                result = replace(result, message=TRIAL_CREDIT_MESSAGE, kind="trial_credit")
+            return result
 
     cacheable = use_cache and resource != "ai_budget_usd"
 

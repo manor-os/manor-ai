@@ -7,6 +7,7 @@ from sqlalchemy import and_, func, not_, or_
 
 from packages.core.credentials import Requester, get_credential_service
 from packages.core.models.user import OAuthAccount
+from packages.core.services.account_incidents import close_incident, open_incident
 
 
 def oauth_account_has_credentials_clause():
@@ -89,7 +90,9 @@ def mark_oauth_account_credential_reconnect_required(
         "checked_at": checked_at,
     }
     profile["last_health_check"] = health
-    account.profile = profile
+    account.profile = open_incident(
+        profile, reason="credential_decrypt_failed", now=datetime.fromisoformat(checked_at),
+    )
     account.token_expires_at = None
     return health
 
@@ -137,7 +140,8 @@ def store_oauth_account_tokens(
         profile = dict(account.profile or {})
         profile.pop("oauth_refresh", None)
         profile.pop("last_health_check", None)
-        account.profile = profile
+        # Fresh tokens mean the account works again: close its incident.
+        account.profile = close_incident(profile)
 
 
 def clear_oauth_account_tokens(account: OAuthAccount) -> None:

@@ -9,7 +9,10 @@ Schema that the model-provider enforces:
 
   * ``ws_commit_basics``           name + kind + context + primary_work
   * ``ws_propose_service``         service decomposition (1-5x)
-  * ``ws_configure_app_view``      primary service and display order for the app panel
+  * ``ws_design_app_view``         command the App design sub-agent (candidate page)
+  * ``ws_accept_app_view``         accept its candidate as the Draft's App page
+  * ``ws_propose_workflow``        portable native Workflow definition
+  * ``ws_propose_stat``            portable native Stat definition
   * ``ws_propose_goal``            target/cadence required, no defaults
   * ``ws_confirm_creation_preferences`` confirmed Goal choice
   * ``ws_propose_agent_mapping``   ULID-checked + entity-scoped
@@ -57,6 +60,9 @@ logger = logging.getLogger(__name__)
 
 
 _USAGE_SOURCE = "workspace_architect"
+# A full Workspace (agents, skills, workflows, knowledge, automations, app view)
+# takes many tool round-trips in one turn.
+ARCHITECT_MAX_ROUNDS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -163,16 +169,43 @@ ALL of the following in this turn before replying to the user:
   STEP B. Decompose into 1-5 services with ``ws_propose_service``,
           one call per service. Always set both ``service_key`` and
           ``name`` (Title Case).
-  STEP B1. Call ``ws_configure_app_view`` using only the service keys just
-           saved. Set a concise page title and description from the user's
-           actual goal. Choose the most useful first action for the user's stated
-           goal and give the remaining services a sensible order. Display
-           labels may be shorter than role names, but must describe the real
-           service. When the user describes a repeatable sequence of inputs,
-           configure that service's app form with short questions; use a file
-           field when the user should upload a source file. The page will add
-           runnable Flow entries only after real
-           Workflow bindings exist; this tool does not create them.
+  STEP B1. Declare the work the Workspace runs. When the user describes a
+           repeatable piece of work, save it as a Workflow with
+           ``ws_propose_workflow``, and fixed numbers they track as Stats with
+           ``ws_propose_stat``. A WorkflowProject producer is a native
+           ``workflow_project`` step: use ``type='workflow_project'`` with
+           config containing operation, project_type, project_key,
+           schema_version, state_schema.properties, state and current_stage.
+           Never wrap project creation in a generic ``tool``/``manor`` node.
+           Declare in ``state_schema.properties`` every state field the App
+           should show. When the work is made part by part (episodes of a
+           series, lessons of a course, slots of a campaign) and a matching
+           Blueprint exists, suggest it first. Otherwise build this structure,
+           in one Flow or several:
+             - Plan: ``workflow_project`` create of the parent type with
+               ``folder:{name:...}``, ``state_schema`` declaring
+               ``episodes`` (array) and ``project_root``, and the planned list
+               written into it: ``state.episodes`` set from the planning
+               step's output, or a later patch with
+               ``list_appends:[{path:'episodes',key:'code',items:...}]``. Each
+               planned item has a ``code`` (E01) and a ``title``.
+             - Make one part: run inputs ``<parent>_id`` (hidden, schema
+               ``x-ui:{control:'workflow_project_select',project_type:<parent>}``)
+               and ``<part>_code`` (hidden string); ``workflow_project`` get of
+               the parent, then claim of the child type with
+               ``state:{parent_project_id:'{{<get step>.project_id}}',
+               code:'{{<part>_code}}',...}`` (run inputs are read by key, never ``inputs.``),
+               ``folder:{name:...,under:'{{<get step>.state.project_root}}'}``
+               and ``current_stage`` such as in_production; finish with a
+               patch to a done stage (made) and ``list_upserts`` marking the
+               plan item made.
+             - Remake: run input ``<part>_id`` selecting the child type, a
+               ``workflow_project`` get with ``production:'take'``, then the
+               same production steps.
+           ``ws_lint_draft`` reports a part that does not record its parent,
+           a plan list nothing writes, or a missing folder; fix those before
+           STEP I2.
+           You do not lay out the App page yourself (see STEP I2).
   STEP C. Before matching capabilities, persist every policy, guardrail,
           allowed/denied action, and approval constraint the user described
           with ``ws_propose_rule``. Wait for those calls to finish. Then call
@@ -327,6 +360,21 @@ ALL of the following in this turn before replying to the user:
           rule_type="notice", enforcement_scope="conditional", and preserve
           the condition in description. Clarify if the user instead wants all
           matching actions banned; do not infer that from a conditional rule.
+  STEP I2. APP PAGE -- command the App design sub-agent, then accept or
+           send back its design. Call ``ws_design_app_view`` with a brief in
+           the user's words: the main job, the kinds of work they start from
+           the App, and what they want to see (progress, results, numbers).
+           It designs the whole page from the saved services, Workflows,
+           Stats and Automations and returns a checked candidate, its recipes
+           and design notes. Review it against the brief: the main job is the
+           hero, every visible entry is something the user starts, entries
+           only cards open are hidden, and data views show what the Workflows
+           keep. Accept with ``ws_accept_app_view``; otherwise call
+           ``ws_design_app_view`` again with ``feedback`` saying what to
+           change (at most twice). Do not describe the layout to the user in
+           detail; one sentence on what the App offers is enough. On a later
+           turn where the user asks to change the App page, do the same with
+           their request as the brief.
   STEP J. If at least one goal exists → ``ws_set_evaluation`` with a
           scorecard mapping each goal to its metric.
   STEP K. If the user gave a monthly credit budget or asked to control
@@ -418,12 +466,15 @@ async def architect_run_turn(
     on_tool_start: Optional[Callable[[str, dict], Any]] = None,
     on_tool_end: Optional[Callable[[str, str], Any]] = None,
     repair_service_keys: tuple[str, ...] | None = None,
+    turn: Any | None = None,
 ) -> str:
     """Run one architect turn for the given draft.
 
     Mutations land directly on the draft row via the typed tools, so
     the caller just needs to commit the session afterwards. Returns the
-    visible (non-tool) text the LLM produced for the user.
+    visible (non-tool) text the LLM produced for the user. With a
+    ``DraftTurn`` (``process_draft_message``), each tool write is committed
+    on its own and no transaction stays open during model rounds.
 
     ``history`` -- prior visible turns ([{role,content}, ...]) so the
     architect remembers the conversation. Hidden tool round-trips are
@@ -443,7 +494,7 @@ async def architect_run_turn(
     draft_snapshot = ""
     from packages.core.services.workspace_draft_service import get_draft
 
-    _draft = await get_draft(
+    _draft = await turn.lock() if turn is not None else await get_draft(
         db, draft_id, entity_id, user_id, for_update=True,
     )
     if _draft is None:
@@ -503,6 +554,10 @@ async def architect_run_turn(
         sources_block = _draft_sources_block(_draft)
     except Exception:
         logger.debug("draft sources block unavailable", exc_info=True)
+    if turn is not None:
+        # The prompt snapshot is taken; model rounds run without the draft
+        # lock, and each tool call re-locks the draft for its own write.
+        await turn.release()
 
     framed_user_message = (
         f"<draft_id>{draft_id}</draft_id>\n"
@@ -553,6 +608,7 @@ async def architect_run_turn(
             entity_id=entity_id,
             user_id=user_id,
             **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
+            **({"turn": turn} if turn is not None else {}),
         ),
     )
     schemas_by_name = {
@@ -574,7 +630,7 @@ async def architect_run_turn(
         allowed_tool_names=runtime_surface_result.allowed_tool_names,
         tool_executor=runtime_executor,
         tool_schema_resolver=lambda name: schemas_by_name.get(str(name or "")),
-        max_rounds=8 if repair_service_keys is not None else 40,
+        max_rounds=8 if repair_service_keys is not None else ARCHITECT_MAX_ROUNDS,
         initial_messages=initial_messages,
         stream_handler=stream_handler,
         on_tool_start=on_tool_start,

@@ -15,6 +15,9 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp
 
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +84,13 @@ def test_public_oauth_pkce_and_email_proof_migrations_preserve_legacy_rows_and_c
             command.upgrade(config, pkce.revision)
             command.upgrade(config, proof.revision)
             command.upgrade(config, proof.revision)
+            # Current ORM writes also need the public-client columns. Apply only
+            # that revision's body: the revisions between carry their own gates.
+            public_clients = importlib.import_module(
+                "packages.core.migrations.versions.20261020_10_oauth_public_clients")
+            with engine.begin() as conn, Operations.context(MigrationContext.configure(conn)):
+                public_clients.upgrade()
+                public_clients.upgrade()
 
             with engine.begin() as conn:
                 assert conn.execute(sa.text("SELECT require_pkce FROM oauth_client_apps WHERE id='legacy'")).scalar_one() is None

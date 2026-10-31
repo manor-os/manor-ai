@@ -32,6 +32,9 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Classic and first: in the customer-trial frame it swaps Web Storage
+         for memory before any module chunk evaluates. -->
+    <script src="/embed-isolate.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

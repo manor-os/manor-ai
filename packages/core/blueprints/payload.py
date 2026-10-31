@@ -55,9 +55,11 @@ from __future__ import annotations
 
 import copy
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import PurePosixPath
 from typing import Any
+
+from packages.core.blueprints.knowledge_templates import normalize_knowledge_template
 
 from packages.core.blueprints.simulation import (
     SIMULATION_ACTION_KINDS,
@@ -73,6 +75,7 @@ from packages.core.constants.blueprints import (
     BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
     BLUEPRINT_KNOWLEDGE_MAX_TOTAL_BYTES,
     is_runtime_derived_scheduled_job,
+    is_runtime_derived_stat,
 )
 from packages.core.goals.numbers import validate_goal_number
 from packages.core.goals.scheduling import validate_measurement_cadence
@@ -84,6 +87,9 @@ BLUEPRINT_VERSION = "1.1"
 # Versions this module knows how to read. Older versions are migrated
 # up to BLUEPRINT_VERSION on load.
 SUPPORTED_VERSIONS = frozenset({"1.0", "1.1"})
+
+#: ``manifest.release_notes``: what installers are told when a version moves.
+RELEASE_NOTES_MAX_CHARS = 1000
 
 _LOCAL_ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$", re.IGNORECASE)
 _KNOWLEDGE_DOCUMENT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -556,6 +562,15 @@ def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
         if job_id in seen:
             raise PayloadError(f"{path}.job_id duplicates {job_id!r}")
         seen.add(job_id)
+        if job.get("owner_project_id") or job.get("idempotency_key"):
+            raise PayloadError(f"{path} contains runtime project ownership or idempotency state")
+        if job.get("stop_after") is not None:
+            try:
+                stop_after = datetime.fromisoformat(job["stop_after"])
+                if stop_after.tzinfo is None:
+                    raise ValueError("timezone required")
+            except (TypeError, ValueError):
+                raise PayloadError(f"{path}.stop_after must be a timezone-aware timestamp") from None
         if is_runtime_derived_scheduled_job(
             job_id=job_id,
             execution_type=job.get("execution_type"),
@@ -748,11 +763,15 @@ def _validate_record_sections(p: dict[str, Any]) -> None:
             )
 
 
-def _validate_stat_assessment_producers(recipe: dict[str, Any]) -> None:
+def _validate_stat_assessment_producers(recipe: dict[str, Any], agents: list[dict[str, Any]] | None = None) -> None:
     from packages.core.stats.assessment import validate_review_definition
 
     workflows = {item.get("slug"): item for item in recipe.get("workflows", [])}
     subscriptions = {item.get("service_key") for item in recipe.get("subscriptions", [])}
+    agent_by_service = {
+        item.get("service_key"): item.get("agent_slug") for item in recipe.get("subscriptions", [])
+    }
+    embedded_agents = {item.get("slug"): item for item in agents or [] if isinstance(item, dict)}
     for index, stat in enumerate(recipe.get("stats", [])):
         if stat.get("collector_type") != "agent_review":
             continue
@@ -770,6 +789,13 @@ def _validate_stat_assessment_producers(recipe: dict[str, Any]) -> None:
             raise PayloadError(f"recipe.stats[{index}] requires exactly one Agent assessment producer")
         if producers[0].get("config", {}).get("service_key") not in subscriptions:
             raise PayloadError(f"recipe.stats[{index}] assessment producer requires a declared service subscription")
+        # The assessor reads get_stat_status and writes record_stat_assessment, both manor actions.
+        assessor = embedded_agents.get(agent_by_service.get(producers[0].get("config", {}).get("service_key")))
+        if assessor is not None and "manor" not in (assessor.get("tool_bindings") or []):
+            raise PayloadError(
+                f"recipe.stats[{index}] assessment producer's agent {assessor.get('slug')!r} needs the manor "
+                "tool to read stat status and record assessments"
+            )
         producer_config = producers[0].get("config", {})
         keys = producer_config.get("stat_assessment_keys")
         defined_keys = {item.get("key") for item in recipe.get("stats", []) if
@@ -1062,6 +1088,16 @@ def _validate_v11(p: dict[str, Any]) -> None:
         not isinstance(usage_guide, str) or len(usage_guide) > 10000
     ):
         raise PayloadError("manifest.usage_guide must be a string of at most 10000 characters")
+    # Shown to installers when this version is published. Listing copy, not
+    # installable content: outside the content fingerprint, so editing the
+    # notes alone moves no version.
+    release_notes = manifest.get("release_notes")
+    if release_notes is not None and (
+        not isinstance(release_notes, str) or len(release_notes) > RELEASE_NOTES_MAX_CHARS
+    ):
+        raise PayloadError(
+            f"manifest.release_notes must be a string of at most {RELEASE_NOTES_MAX_CHARS} characters"
+        )
 
     # 3) List-shaped sections must be arrays where present.
     for path in _LIST_PATHS:
@@ -1091,7 +1127,13 @@ def _validate_v11(p: dict[str, Any]) -> None:
         validate_portable_app_view(p)
     except ValueError as exc:
         raise PayloadError(str(exc)) from exc
-    _validate_stat_assessment_producers(recipe)
+    _validate_stat_assessment_producers(recipe, (p.get("embedded") or {}).get("agents"))
+    for stat in recipe.get("stats") or []:
+        try:
+            if is_runtime_derived_stat(stat.get("collector_config") or {}):
+                raise ValueError("instance-owned Stat definitions are runtime data, not portable configuration")
+        except ValueError as exc:
+            raise PayloadError(f"recipe.stats[{stat.get('key')!r}]: {exc}") from exc
 
     # 4) embedded.agents[].tool_bindings ⊆ contract.requires.tools
     declared_tools = set((contract.get("requires") or {}).get("tools") or [])
@@ -1240,24 +1282,10 @@ def _validate_v11(p: dict[str, Any]) -> None:
 
             template = d.get("template")
             if template is not None:
-                if not isinstance(template, dict):
-                    raise PayloadError(
-                        f"knowledge_pack {pack_slug!r}: starter document "
-                        f"template must be an object (got {type(template).__name__})"
-                    )
-                template_id = str(template.get("id") or "").strip()
-                mode = str(template.get("mode") or "").strip()
-                renderer = str(template.get("renderer") or "").strip()
-                version = template.get("version")
-                if not template_id or mode != "live_projection" or not renderer:
-                    raise PayloadError(
-                        f"knowledge_pack {pack_slug!r}: live Knowledge "
-                        "template requires id, mode='live_projection', and renderer"
-                    )
-                if not isinstance(version, int) or isinstance(version, bool) or version < 1:
-                    raise PayloadError(
-                        f"knowledge_pack {pack_slug!r}: live Knowledge template version must be a positive integer"
-                    )
+                try:
+                    normalize_knowledge_template(template)
+                except ValueError as exc:
+                    raise PayloadError(f"knowledge_pack {pack_slug!r}: {exc}") from exc
 
             document_key = d.get("key")
             if document_key is None:
@@ -1519,6 +1547,7 @@ def _scan_local_reference_values(node: Any) -> set[str]:
 #     "use_when": "you want consistent X presence with HITL on risky actions",
 #     "description": "Long-form markdown — story, design choices, gotchas.",
 #     "usage_guide": "Open Workspace Chat, then review the first result.",
+#     "release_notes": "Faster first draft; new review step.",  # ≤1000 chars, sent once per new version
 #     "tags": ["social", "growth"],
 #     "kind": "social_media",
 #     "category": "marketing.social",

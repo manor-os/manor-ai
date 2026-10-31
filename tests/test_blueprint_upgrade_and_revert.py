@@ -1004,6 +1004,14 @@ def opc_payload():
     return load_upgrade_blueprint(SLUG)
 
 
+def _steps_preview(spec):
+    """The new version's steps as the upgrade plan previews them, however long the Flow."""
+    from packages.core.blueprints.installer import _blueprint_workflow_definition_values
+    from packages.core.blueprints.upgrade import _preview
+
+    return _preview({"steps": _blueprint_workflow_definition_values(spec)["steps"]})["steps"]
+
+
 @pytest.fixture
 async def workflow_scenario(db_session, opc_payload):
     """An installed public Flow with a stale graph."""
@@ -1301,7 +1309,9 @@ async def test_unbound_upgrade_endpoints_reject_before_planning_or_mutation(
             db_session,
         ),
         lambda: routes.apply_blueprint_upgrade(workspace.id, legacy_request, user, db_session),
-        lambda: routes.preview_blueprint_reconfiguration(workspace.id, user, db_session),
+        lambda: routes.preview_blueprint_reconfiguration(
+            workspace.id, target_version=None, user=user, db=db_session,
+        ),
         lambda: routes.preview_blueprint_reconfiguration_with_variables(
             workspace.id,
             routes.BlueprintUpgradePreviewRequest(),
@@ -1831,7 +1841,7 @@ async def test_the_plan_includes_stale_blueprint_workflows(
     )
     assert item["action"] == UpgradeAction.UPDATE.value
     assert any("workflow graph" in change for change in item["changes"])
-    assert workflow_scenario["spec"]["steps"][0]["id"] in item["new_content"]["steps"]
+    assert item["new_content"]["steps"] == _steps_preview(workflow_scenario["spec"])
 
 
 @pytest.mark.asyncio
@@ -1950,7 +1960,7 @@ async def test_a_new_blueprint_workflow_is_installed_and_bound_on_upgrade(
     )
     assert item["action"] == UpgradeAction.MISSING.value
     assert item["changes"] == ["installs Blueprint Flow and Workspace binding"]
-    assert workflow_spec["steps"][0]["id"] in item["new_content"]["steps"]
+    assert item["new_content"]["steps"] == _steps_preview(workflow_spec)
 
     result = await apply(
         db_session,
@@ -2043,6 +2053,7 @@ async def test_applying_uses_locked_workspace_settings_instead_of_stale_preview(
     )
     db = SimpleNamespace(
         get=AsyncMock(return_value=locked_workspace),
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
         flush=AsyncMock(),
     )
 
@@ -3548,6 +3559,8 @@ async def test_upgrade_http_collision_returns_conflict_and_rolls_back_prior_skil
     source = copy.deepcopy(payload)
     source["embedded"]["agents"] = []
     source["recipe"]["workflows"] = []
+    # An App may only name workflows the Blueprint includes.
+    source["recipe"]["operating_model"].pop("app_view", None)
     pack = source["embedded"]["knowledge_packs"][0]
     pack["starter_documents"] = [copy.deepcopy(pack["starter_documents"][0])]
     pack["starter_documents"][0]["path"] = "notes.md"

@@ -53,6 +53,22 @@ def task_event_message(event_type: str, payload: dict[str, Any], task: Task | No
     if event_type == "task.failed":
         return f"{title} failed and may need review."
     if event_type == "task.succeeded":
+        exceptions = payload.get("acceptance_exceptions")
+        uncertain = payload.get("unconfirmed_effects")
+        parts = []
+        if isinstance(exceptions, int) and not isinstance(exceptions, bool) and exceptions > 0:
+            # A delivery whose acceptance report left criteria unmet or unverified.
+            parts.append(
+                f"{exceptions} acceptance criteri{'on was' if exceptions == 1 else 'a were'} "
+                "not met or not verified"
+            )
+        if isinstance(uncertain, int) and not isinstance(uncertain, bool) and uncertain > 0:
+            # A delivery with tool calls whose effect the host could not confirm.
+            parts.append(
+                f"{uncertain} change{'' if uncertain == 1 else 's'} could not be confirmed"
+            )
+        if parts:
+            return f"{title} was delivered, but " + " and ".join(parts) + "."
         return f"{title} completed successfully."
     if event_type == "task.hitl_requested":
         return f"{title} is waiting for your input."
@@ -72,8 +88,16 @@ async def task_event_recipient_users(
     entity_id: str,
     event_type: str,
     payload: dict[str, Any] | None = None,
+    *,
+    admin_fallback: bool = True,
 ) -> tuple[Task | None, list[User]]:
-    """Resolve active users who should receive a user-facing task event."""
+    """Resolve active users who should receive a user-facing task event.
+
+    For HITL events nobody on the Task falls back to the entity owners/admins
+    unless ``admin_fallback`` is False; a caller that applies its own
+    Workspace policy passes False so that policy (including an explicit
+    opt-out) decides instead.
+    """
     event_payload = dict(payload or {})
 
     task: Task | None = None
@@ -97,7 +121,7 @@ async def task_event_recipient_users(
         task.assignee_id if task else None,
     }
     recipient_ids = {rid for rid in recipient_ids if rid}
-    admin_fallback_events = {"task.hitl_requested", "task.hitl_reminder"}
+    admin_fallback_events = {"task.hitl_requested", "task.hitl_reminder"} if admin_fallback else set()
     if not recipient_ids and event_type not in admin_fallback_events:
         return task, []
 
@@ -119,25 +143,34 @@ async def task_event_recipient_users(
         or ""
     )
     if workspace_id:
-        readable_users: list[User] = []
-        for user in users:
-            role = await resolve_effective_user_role_name(
-                db,
-                user_id=user.id,
-                entity_id=entity_id,
-                legacy_role=user.role if user.entity_id == entity_id else None,
-            )
-            if await user_can_read_workspace_id(
-                db,
-                workspace_id=workspace_id,
-                entity_id=entity_id,
-                user_id=user.id,
-                role=role,
-            ):
-                readable_users.append(user)
-        users = readable_users
+        users = await _readable_workspace_users(db, entity_id, workspace_id, users)
 
     return task, users
+
+
+async def _readable_workspace_users(
+    db: AsyncSession,
+    entity_id: str,
+    workspace_id: str,
+    users: list[User],
+) -> list[User]:
+    readable_users: list[User] = []
+    for user in users:
+        role = await resolve_effective_user_role_name(
+            db,
+            user_id=user.id,
+            entity_id=entity_id,
+            legacy_role=user.role if user.entity_id == entity_id else None,
+        )
+        if await user_can_read_workspace_id(
+            db,
+            workspace_id=workspace_id,
+            entity_id=entity_id,
+            user_id=user.id,
+            role=role,
+        ):
+            readable_users.append(user)
+    return readable_users
 
 
 async def _resolve_recipient_users(
@@ -265,3 +298,5 @@ async def notify_task_event(
                 exc_info=True,
             )
     return delivered
+
+

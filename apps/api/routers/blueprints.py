@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import tempfile
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -38,6 +39,7 @@ from apps.api.deps import get_current_user, require_workspace_readable, require_
 from packages.core.constants.blueprints import (
     BLUEPRINT_EDITABLE_STATUSES,
     BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
+    BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES,
     BLUEPRINT_KNOWLEDGE_LIST_PAGE_SIZE,
     BLUEPRINT_KNOWLEDGE_LIST_MAX_PAGE_SIZE,
     BlueprintStatus,
@@ -67,6 +69,7 @@ from packages.core.blueprints.setup_preflight import (
     BlueprintSetupPreflightError,
     BlueprintSetupPreflightFactory,
 )
+from packages.core.services.integration_resolution import is_user_facing_integration_provider
 from packages.core.blueprints.seed import (
     platform_blueprint_id,
     resolve_blueprint_row,
@@ -78,9 +81,11 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
+from packages.core.blueprints.registry import set_draft_payload, set_listing_manifest
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.permissions import Permission, check_effective_user_permission
+from packages.core.models.client_delivery import DELIVERY_BLUEPRINT_ID_PREFIX
 from packages.core.services.blueprint_cover_service import (
     build_blueprint_cover_template,
 )
@@ -240,8 +245,10 @@ class ExportBlueprintRequest(ExportBlueprintPayloadRequest):
     slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]$")
     title: str = Field(..., min_length=1, max_length=200)
     cover_image_url: Optional[str] = None
-    # Re-freeze the editable Blueprint with this slug when it came from the
-    # same Workspace. Reviewed/published payloads remain immutable.
+    # Re-freeze the Blueprint with this slug when it came from the same
+    # Workspace. A draft/archived row is replaced in place; a published row
+    # keeps serving its reviewed payload and holds the re-export as its next
+    # version until that is reviewed (see pending_release.py).
     replace_existing: bool = False
 
 
@@ -257,6 +264,21 @@ class BlueprintExportKnowledgeDocument(BaseModel):
     file_size: int
     groups: list[BlueprintExportKnowledgeGroup] = Field(default_factory=list)
     groups_truncated: bool = False
+    content_source: Literal["initial_template", "current_content"] = "current_content"
+    required_by_workflows: list[str] = Field(default_factory=list)
+
+
+class BlueprintInitialTemplateRequest(BaseModel):
+    body_md: str | None = Field(..., max_length=BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES)
+
+    @field_validator("body_md")
+    @classmethod
+    def validate_initial_body(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.strip() or len(value.encode("utf-8")) > BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES
+        ):
+            raise ValueError("Initial template must be nonempty text within the starter file size limit")
+        return value
 
 
 class BlueprintSetupItem(BaseModel):
@@ -320,6 +342,8 @@ class BlueprintCoverTemplateSpec(BaseModel):
     seed: int = Field(ge=0)
 
 
+
+
 class BlueprintSummary(BaseModel):
     id: str
     slug: str
@@ -364,6 +388,8 @@ class BlueprintDetail(BlueprintSummary):
     description: Optional[str] = None
     payload: dict[str, Any]
     purchased: bool = False
+    # Set only by the detail route, in cloud deployments; always False in OSS.
+    can_notify_installers: bool = False
 
 
 class UpdateBlueprintRequest(BaseModel):
@@ -513,6 +539,87 @@ class CostResponse(BaseModel):
     simulation_days: float
     daily_avg_credits: float
     projected_monthly_credits: int
+    billed_credits: int
+    credits_per_outcome: Optional[float]
+
+
+class ErrorCountResponse(BaseModel):
+    message: str
+    count: int
+
+
+class RunBreakdownResponse(BaseModel):
+    key: str
+    label: str
+    total: int
+    succeeded: int
+    failed: int
+    success_rate: Optional[float]
+    judged: int
+
+
+class DailyOutcomeResponse(BaseModel):
+    day: str
+    succeeded: int
+    failed: int
+
+
+class RunOutcomesResponse(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    cancelled: int
+    in_flight: int
+    retried: int
+    success_rate: Optional[float]
+    avg_duration_seconds: Optional[float]
+    top_errors: list[ErrorCountResponse]
+    breakdown: list[RunBreakdownResponse]
+    below_target: list[RunBreakdownResponse]
+    daily: list[DailyOutcomeResponse]
+
+
+class HumanLoadResponse(BaseModel):
+    requested: int
+    approved: int
+    denied: int
+    expired: int
+    pending: int
+    per_day: float
+    median_wait_minutes: Optional[float]
+    oldest_pending_hours: Optional[float]
+    accepted: int
+    rejected: int
+
+
+class OperationsResponse(BaseModel):
+    tasks: RunOutcomesResponse
+    agents: RunOutcomesResponse
+    workflows: RunOutcomesResponse
+    automations: RunOutcomesResponse
+    human: HumanLoadResponse
+    stalled_tasks: int
+    stalled_workflow_runs: int
+    auto_paused_automations: list[str]
+    failing_automations: list[str]
+
+
+class LaunchCheckResponse(BaseModel):
+    key: str
+    status: Literal["pass", "warn", "fail", "na"]
+    reason: str
+    values: dict[str, Any]
+    details: list[str]
+
+
+class LaunchReadinessResponse(BaseModel):
+    verdict: Literal["ready", "at_risk", "blocked", "insufficient_data"]
+    checks: list[LaunchCheckResponse]
+
+
+class ValueEvidenceResponse(BaseModel):
+    verdict: Literal["on_track", "concerns", "below_expectations", "unproven"]
+    checks: list[LaunchCheckResponse]
 
 
 class CounterfactualResponse(BaseModel):
@@ -543,10 +650,15 @@ class SimulationReportResponse(BaseModel):
     governance_preset: Optional[str]
     window_start: Optional[datetime]
     window_end: datetime
+    simulation_started_at: Optional[datetime]
+    promoted_at: Optional[datetime]
     activity: ActivityResponse
     cost: CostResponse
     counterfactuals: list[CounterfactualResponse]
     goals: list[GoalPaceResponse]
+    operations: OperationsResponse
+    readiness: LaunchReadinessResponse
+    value: ValueEvidenceResponse
     notes: list[str]
 
 
@@ -702,7 +814,7 @@ def _payload_setup_preview(payload: dict[str, Any] | None) -> BlueprintSetupPrev
     integrations = [
         item
         for item in (_setup_item_from_integration(raw) for raw in _as_list(requirements.get("mcp_servers")))
-        if item is not None
+        if item is not None and is_user_facing_integration_provider(item.kind)
     ]
     services = [
         item
@@ -776,6 +888,23 @@ def _cover_template(
     )
 
 
+def _listing_text(b: WorkspaceBlueprint, field: str, is_owner: bool) -> str | None:
+    """A listing's text in the viewer's language, from its manifest translations.
+
+    Only text the listing still takes from its manifest is translated; an
+    edited listing keeps its own words, and its owner sees what they wrote.
+    """
+    value = getattr(b, field)
+    manifest = _manifest(b.payload)
+    if is_owner or not isinstance(manifest.get("i18n"), dict) or value != manifest.get(field):
+        return value
+    from packages.core.i18n import get_locale
+    from packages.core.services.viewer_language import localized
+
+    translated = localized(manifest, get_locale()).get(field)
+    return translated if isinstance(translated, str) and translated.strip() else value
+
+
 def _summary(
     b: WorkspaceBlueprint,
     viewer_entity_id: str,
@@ -787,11 +916,12 @@ def _summary(
 ) -> BlueprintSummary:
     is_owner = b.entity_id == viewer_entity_id
     author = _payload_author(b.payload)
+    owner_fields: dict[str, Any] = {}
     return BlueprintSummary(
         id=b.id,
         slug=b.slug,
-        title=b.title,
-        summary=b.summary,
+        title=_listing_text(b, "title", is_owner),
+        summary=_listing_text(b, "summary", is_owner),
         tags=list(b.tags or []),
         status=b.status,
         install_count=b.install_count,
@@ -832,7 +962,16 @@ def _summary(
         has_share_token=bool(b.share_token) if is_owner else False,
         share_allowed_emails=list(b.share_allowed_emails or []) if is_owner else [],
         is_owner=is_owner,
+        **owner_fields,
     )
+
+
+def _owner_detail_fields(
+    row: WorkspaceBlueprint,
+    viewer_entity_id: str,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    return fields
 
 
 def _manifest(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1359,6 +1498,7 @@ async def _commit_and_start_installed_workspace(
     *,
     result: InstallResult,
     entity_id: str,
+    requested_by: str | None = None,
 ) -> None:
     """Commit a blueprint install, then start its appropriate runtime.
 
@@ -1428,6 +1568,7 @@ async def _commit_and_start_installed_workspace(
             db,
             workspace_id=result.workspace_id,
             trigger="install",
+            requested_by=requested_by,
         )
         if startup is not None and startup.dispatched_job_ids:
             result.notes.append(
@@ -1546,6 +1687,7 @@ async def _export_workspace_payload(
     req: ExportBlueprintPayloadRequest,
     user: User,
     install_variables: tuple[dict[str, Any], ...] | None = None,
+    file_embedder: Any = None,
 ) -> dict[str, Any]:
     context = ExportContext(
         include_subscriptions=req.include_subscriptions,
@@ -1570,6 +1712,7 @@ async def _export_workspace_payload(
         include_starter_memory=req.include_starter_memory,
         include_memory_files=req.include_memory_files,
         install_variables=install_variables,
+        file_embedder=file_embedder,
     )
     author_display_name = req.author_display_name or _user_display_name(user)
     try:
@@ -1613,11 +1756,100 @@ async def list_blueprint_export_knowledge_documents(
     )
 
 
+@workspace_router.put("/{workspace_id}/blueprint-export/knowledge-documents/{document_id}/initial-template")
+async def configure_blueprint_initial_template(
+    workspace_id: str,
+    document_id: str,
+    req: BlueprintInitialTemplateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Declare portable initial content without changing the working file."""
+    from packages.core.blueprints.exporter import (
+        _document_is_inline_text, _document_portable_key, portable_document_classifications,
+    )
+    from packages.core.blueprints.knowledge_templates import INITIAL_BODY_KEY, normalize_knowledge_template
+    from packages.core.blueprints.upgrade import (
+        BlueprintUpgradeAccessDeniedError, _require_document_access,
+    )
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from packages.core.models.permission import Capability
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+    await lock_reusable_resource_lifecycle(db, entity_id=user.entity_id)
+    ws = await lock_workspace_access_boundary(db, workspace_id=workspace_id, entity_id=user.entity_id)
+    if ws is None or ws.deleted_at is not None:
+        raise HTTPException(404, "Workspace not found")
+    await lock_workspace_recipient_authorization(
+        db, workspace_id=workspace_id, entity_id=user.entity_id, user_id=user.id,
+    )
+    await require_workspace_writable(db, user, workspace_id)
+    if not await user_can_manage_workspace(
+        db, workspace_id=workspace_id, user_id=user.id, entity_role=user.role,
+    ):
+        raise HTTPException(403, "Only Workspace managers can configure initial templates")
+    doc = (await db.execute(select(Document).where(
+        Document.id == document_id, Document.entity_id == user.entity_id,
+        Document.is_trashed.is_(False),
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(404, "Knowledge document not found")
+    owners = set((await db.scalars(select(DocumentGroup.workspace_id).join(
+        DocumentGroupMember, DocumentGroupMember.group_id == DocumentGroup.id,
+    ).where(
+        DocumentGroupMember.document_id == document_id, DocumentGroup.entity_id == user.entity_id,
+    ))).all())
+    if owners != {workspace_id}:
+        raise HTTPException(409, "Initial templates require a Knowledge document exclusive to this Workspace")
+    try:
+        await _require_document_access(db, row=doc, actor=user, capability=Capability.EDIT)
+    except BlueprintUpgradeAccessDeniedError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    metadata = dict(doc.metadata_ or {})
+    template = metadata.get("blueprint_template")
+    if template is not None and (not isinstance(template, dict) or template.get("mode") != "initial_file"):
+        raise HTTPException(409, "This document already has a different template contract")
+    try:
+        template = normalize_knowledge_template(template)
+    except ValueError as exc:
+        raise HTTPException(409, "This document has an invalid template contract") from exc
+    if req.body_md is None:
+        metadata.pop("blueprint_template", None)
+        metadata.pop(INITIAL_BODY_KEY, None)
+    else:
+        if (
+            doc.visibility == "private"
+            or doc.classification not in portable_document_classifications(initial_template=True)
+            or doc.pii_detected or doc.quarantine_status != "clean" or not _document_is_inline_text(doc)
+        ):
+            raise HTTPException(
+                422,
+                "Only clean Markdown or CSV Knowledge that is public or internal, not private, "
+                "and has no detected personal data can declare an initial template",
+            )
+        if not template or metadata.get(INITIAL_BODY_KEY) != req.body_md:
+            template = {
+                "id": template["id"] if template else _document_portable_key(doc), "mode": "initial_file",
+                "version": int((template or {}).get("version") or 0) + 1,
+            }
+        metadata.update({"blueprint_template": template, INITIAL_BODY_KEY: req.body_md})
+    if metadata != doc.metadata_:
+        doc.metadata_ = metadata
+        await db.flush()
+    return {
+        "document_id": doc.id,
+        "template": metadata.get("blueprint_template"),
+        "content_source": "initial_template" if req.body_md is not None else "current_content",
+    }
+
+
 async def _export_authorized_workspace_payload(
     workspace_id: str,
     req: ExportBlueprintPayloadRequest,
     user: User,
     db: AsyncSession,
+    *,
+    file_embedder: Any = None,
 ) -> dict[str, Any]:
     # Lock the Workspace lifecycle boundary without ``get_workspace()``, whose
     # artifact-folder repair is a write. The lock also prevents a concurrent
@@ -1648,6 +1880,36 @@ async def _export_authorized_workspace_payload(
         req=req,
         user=user,
         install_variables=install_variables,
+        file_embedder=file_embedder,
+    )
+
+
+@workspace_router.post(
+    "/{workspace_id}/export-blueprint-package",
+    responses={200: {"content": {"application/gzip": {}}}},
+)
+async def export_workspace_blueprint_package(
+    workspace_id: str,
+    req: ExportBlueprintPayloadRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The portable configuration plus the files its App and Skills point at
+    (``blueprints.package``), as one ``.manor`` file."""
+    from fastapi.responses import Response
+
+    from packages.core.blueprints.package import FileEmbedder, PackageError, pack
+
+    embedder = FileEmbedder(db, entity_id=user.entity_id, user=user, workspace_id=workspace_id)
+    try:
+        payload = await _export_authorized_workspace_payload(workspace_id, req, user, db, file_embedder=embedder)
+        data = pack(payload, sorted(embedder.assets.values(), key=lambda asset: asset.sha256))
+    except PackageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    slug = re.sub(r"[^a-z0-9]+", "-", str(_manifest(payload).get("title") or "blueprint").lower()).strip("-")
+    return Response(
+        content=data, media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{slug or "blueprint"}.manor"'},
     )
 
 
@@ -1677,7 +1939,10 @@ async def export_workspace_as_blueprint(
     db: AsyncSession = Depends(get_db),
 ):
     """Snapshot the workspace's configuration as a draft blueprint row.
-    Operator can then edit metadata + publish via PUT/POST publish."""
+    Operator can then edit metadata + publish via PUT/POST publish.
+
+    Re-exporting a published Blueprint saves the snapshot as its next
+    version; the live release keeps serving until that is approved."""
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
@@ -1777,8 +2042,10 @@ async def export_workspace_as_blueprint(
             409,
             f"Workspace is already published as Blueprint {existing.id!r}",
         )
+    stage_next_version = False
     if existing is not None:
-        _require_blueprint_content_editable(existing)
+        if not stage_next_version:
+            _require_blueprint_content_editable(existing)
         if existing.source_workspace_id != workspace_id:
             raise HTTPException(
                 409,
@@ -1792,9 +2059,10 @@ async def export_workspace_as_blueprint(
             for item in req.install_variables
         )
     elif existing is not None:
+        base_payload = existing.payload or {}
         install_variables = tuple(
             dict(item)
-            for item in ((existing.payload or {}).get("contract") or {}).get(
+            for item in (base_payload.get("contract") or {}).get(
                 "variables",
                 [],
             )
@@ -1817,7 +2085,10 @@ async def export_workspace_as_blueprint(
         else {}
     )
     remixed_from_id = _string_or_none(source_blueprint.get("blueprint_id"))
-    if not remixed_from_id:
+    if remixed_from_id and remixed_from_id.startswith(DELIVERY_BLUEPRINT_ID_PREFIX):
+        # A private client delivery is not public Marketplace lineage.
+        remixed_from_id = None
+    elif not remixed_from_id:
         source_slug = _string_or_none(source_blueprint.get("blueprint_slug"))
         if source_slug:
             remixed_from_id = _builtin_id(source_slug)
@@ -1860,20 +2131,24 @@ async def export_workspace_as_blueprint(
         db.add(row)
     else:
         row = existing
-        row.slug = req.slug
-        row.source_workspace_id = workspace_id
-        row.title = req.title
-        row.summary = req.summary
-        row.description = req.description
-        row.cover_image_url = cover_image_url
-        row.tags = list(req.tags)
-        row.author_handle = req.author_handle
-        row.author_display_name = author_display_name
-        row.remixed_from_id = remixed_from_id
-        row.payload = payload
-        row.payload_version = payload_version
-        row.status = BlueprintStatus.DRAFT.value
-        row.published_at = None
+        listing = {
+            "title": req.title,
+            "summary": req.summary,
+            "description": req.description,
+            "cover_image_url": cover_image_url,
+            "tags": list(req.tags),
+            "author_handle": req.author_handle,
+            "author_display_name": author_display_name,
+            "remixed_from_id": remixed_from_id,
+        }
+        if not stage_next_version:
+            row.slug = req.slug
+            row.source_workspace_id = workspace_id
+            for field, value in listing.items():
+                setattr(row, field, value)
+            row.status = BlueprintStatus.DRAFT.value
+            row.published_at = None
+            set_draft_payload(row, payload, payload_version=payload_version)
     await db.flush()
     await record_marketplace_resource_link(
         db,
@@ -1894,6 +2169,7 @@ async def export_workspace_as_blueprint(
         **_summary(row, user.entity_id).model_dump(),
         description=row.description,
         payload=row.payload,
+        **_owner_detail_fields(row, user.entity_id),
     )
     await db.commit()
     return detail
@@ -1994,7 +2270,7 @@ async def resolve_shared_blueprint(
         summary["setup_preview"] = _payload_setup_preview(source_payload)
     return BlueprintDetail(
         **summary,
-        description=row.description,
+        description=_listing_text(row, "description", row.entity_id == user.entity_id),
         payload=source_payload,
         purchased=purchased,
     )
@@ -2020,11 +2296,14 @@ async def get_blueprint(
     ).model_dump()
     if purchase is not None:
         summary["setup_preview"] = _payload_setup_preview(source_payload)
+    can_notify_installers = False
     detail = BlueprintDetail(
         **summary,
-        description=row.description,
+        description=_listing_text(row, "description", row.entity_id == user.entity_id),
         payload=source_payload,
         purchased=purchased,
+        can_notify_installers=can_notify_installers,
+        **_owner_detail_fields(row, user.entity_id),
     )
     return detail
 
@@ -2064,7 +2343,7 @@ async def update_blueprint(
         "tags": list(row.tags or []),
         "cover_image_url": row.cover_image_url,
     })
-    row.payload = {**dict(row.payload or {}), "manifest": manifest}
+    set_listing_manifest(row, manifest)
     await db.flush()
     await db.refresh(row)
     summary = await _summary_with_signals(db, row, user.entity_id, user.id)
@@ -2114,7 +2393,7 @@ async def upload_blueprint_showcase_asset(
     manifest = dict(_manifest(row.payload))
     manifest["cover_image_url"] = row.cover_image_url
     manifest["showcase_assets"] = assets
-    row.payload = {**dict(row.payload or {}), "manifest": manifest}
+    set_listing_manifest(row, manifest)
     await db.flush()
     await db.refresh(row)
     summary = await _summary_with_signals(db, row, user.entity_id, user.id)
@@ -2164,7 +2443,7 @@ async def delete_blueprint_showcase_asset(
     manifest = dict(_manifest(row.payload))
     manifest["cover_image_url"] = row.cover_image_url
     manifest["showcase_assets"] = remaining
-    row.payload = {**dict(row.payload or {}), "manifest": manifest}
+    set_listing_manifest(row, manifest)
     await db.flush()
     await db.refresh(row)
     summary = await _summary_with_signals(db, row, user.entity_id, user.id)
@@ -2269,6 +2548,8 @@ async def revoke_share_token(
     row.share_token = None
     row.share_allowed_emails = []
     await db.commit()
+
+
 
 
 
@@ -2566,6 +2847,7 @@ async def install(
         db,
         result=result,
         entity_id=user.entity_id,
+        requested_by=user.id,
     )
     response = _install_response(result)
     return response
@@ -2690,8 +2972,67 @@ async def install_from_payload(
         db,
         result=result,
         entity_id=user.entity_id,
+        requested_by=user.id,
     )
     return _install_response(result)
+
+
+class InstallPackageOptions(BaseModel):
+    mode: InstallMode = InstallMode.SIMULATE
+    workspace_name: Optional[str] = None
+    create_missing_agents: bool = False
+    agent_ids_by_service_key: dict[str, str] = Field(default_factory=dict)
+    governance_preset: str = Field("automatic", pattern="^(automatic|follow_default|confirm_changes|risk_based)$")
+    install_author_hard_blocks: bool = False
+    variable_values: dict[str, Any] = Field(default_factory=dict)
+    channel_config_ids: dict[str, str] = Field(default_factory=dict)
+
+
+async def read_blueprint_package(file: UploadFile, entity_id: str) -> dict[str, Any]:
+    """The package's payload with each carried file written into this entity
+    and its new address in place of the placeholder."""
+    from packages.core.blueprints.package import MAX_PACKAGE_BYTES, PackageError, restore_assets, store_assets, unpack
+
+    data = await file.read(MAX_PACKAGE_BYTES + 1)
+    try:
+        payload, assets = unpack(data)
+    except PackageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if assets:
+        try:
+            assert_entity_filesystem_ready()
+        except EntityFilesystemError as exc:
+            raise HTTPException(503, f"File storage is unavailable: {exc}") from exc
+    return restore_assets(payload, await store_assets(entity_id, assets))
+
+
+@blueprint_router.post(
+    "/install-package",
+    response_model=InstallResponse,
+    status_code=201,
+)
+async def install_from_package(
+    file: UploadFile = File(...),
+    options: str = Form("{}"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Install a ``.manor`` package: its files first, then its payload as
+    ``/install-payload`` does (same entitlement, preflight and setup)."""
+    try:
+        opts = InstallPackageOptions.model_validate_json(options or "{}")
+    except ValueError as exc:
+        raise HTTPException(422, f"Invalid install options: {exc}") from exc
+    payload = await read_blueprint_package(file, user.entity_id)
+    return await install_from_payload(
+        payload=payload, mode=opts.mode, workspace_name=opts.workspace_name,
+        create_missing_agents=opts.create_missing_agents,
+        agent_ids_by_service_key=opts.agent_ids_by_service_key,
+        governance_preset=opts.governance_preset,
+        install_author_hard_blocks=opts.install_author_hard_blocks,
+        variable_values=opts.variable_values, channel_config_ids=opts.channel_config_ids,
+        workspace_source=None, user=user, db=db,
+    )
 
 
 # ── Blueprint startup repair ──────────────────────────────────────────
@@ -2736,19 +3077,22 @@ async def reconcile_workspace_blueprint_startup(
             payload=builtin[1],
             source_blueprint_id=_builtin_id(builtin[0]),
         )
-        if contract.state == "materialized":
-            await db.commit()
-        elif contract.state == "jobs_missing":
+        if contract.state == "jobs_missing":
             return BlueprintStartupReconcileResponse(
                 state="contract_jobs_missing",
                 dispatched_job_ids=[],
                 blocking_check_keys=list(contract.missing_job_ids),
             )
+        # The contract check locks the Workspace row. Dispatch claims its job in
+        # a separate session, so release the lock first, changed or not;
+        # otherwise the request waits on itself.
+        await db.commit()
 
     result = await reconcile_blueprint_startup(
         db,
         workspace_id=workspace_id,
         trigger="api_repair",
+        requested_by=user.id,
     )
     return BlueprintStartupReconcileResponse(
         state=result.state,
@@ -2765,18 +3109,24 @@ async def reconcile_workspace_blueprint_startup(
 )
 async def get_simulation_report(
     workspace_id: str,
+    recent_days: Optional[int] = Query(
+        None, ge=1, le=90,
+        description="Evaluate only the most recent N days of the simulation.",
+    ),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Activity + cost + counterfactual + goal-pace digest of what the
-    workspace did during simulation. Read-only — safe to call repeatedly
-    while the operator is deciding whether to promote."""
+    """Launch review + activity + cost + counterfactual + goal-pace digest
+    of what the workspace did during simulation. Read-only — safe to call
+    repeatedly while the operator is deciding whether to promote."""
     await require_workspace_readable(db, user, workspace_id)
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
     try:
-        report = await simulate_report(db, workspace_id)
+        report = await simulate_report(
+            db, workspace_id, viewer_user_id=user.id, recent_days=recent_days,
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     return _serialise_report(report)
@@ -2790,6 +3140,8 @@ def _serialise_report(r: SimulationReport) -> SimulationReportResponse:
         governance_preset=r.governance_preset,
         window_start=r.window_start,
         window_end=r.window_end,
+        simulation_started_at=r.simulation_started_at,
+        promoted_at=r.promoted_at,
         activity=ActivityResponse(
             total_steps=r.activity.total_steps,
             by_status=dict(r.activity.by_status),
@@ -2805,6 +3157,8 @@ def _serialise_report(r: SimulationReport) -> SimulationReportResponse:
             simulation_days=r.cost.simulation_days,
             daily_avg_credits=r.cost.daily_avg_credits,
             projected_monthly_credits=r.cost.projected_monthly_credits,
+            billed_credits=r.cost.billed_credits,
+            credits_per_outcome=r.cost.credits_per_outcome,
         ),
         counterfactuals=[
             CounterfactualResponse(
@@ -2831,6 +3185,9 @@ def _serialise_report(r: SimulationReport) -> SimulationReportResponse:
             )
             for g in r.goals
         ],
+        operations=OperationsResponse.model_validate(asdict(r.operations)),
+        readiness=LaunchReadinessResponse.model_validate(asdict(r.readiness)),
+        value=ValueEvidenceResponse.model_validate(asdict(r.value)),
         notes=list(r.notes),
     )
 

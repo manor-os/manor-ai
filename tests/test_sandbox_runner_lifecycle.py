@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import threading
 from pathlib import Path
 
@@ -19,11 +20,25 @@ from sandbox.models import (  # noqa: E402
     SandboxStatus,
 )
 from sandbox.skill_runner import SkillRunner  # noqa: E402
+from sandbox_config import config as sandbox_app_config  # noqa: E402
 from sandbox.docker_backend import DockerSandbox, _SANDBOX_BRIDGE_SOURCE  # noqa: E402
 from sandbox.credential_refs import validate_sandbox_credential_ref  # noqa: E402
 from packages.core.services.sandbox_credential_refs import (  # noqa: E402
     issue_sandbox_credential_ref,
 )
+
+
+class _ClaimableFake:
+    """Minimal claim protocol: the runner claims a sandbox before a command runs."""
+
+    active_execution_id: str | None = None
+
+    def claim_command(self, execution_id, command, timeout):
+        self.active_execution_id = execution_id
+
+    def release_command(self, execution_id):
+        if self.active_execution_id == execution_id:
+            self.active_execution_id = None
 
 
 def test_touch_sandbox_refreshes_idle_lease_and_rejects_missing_or_destroyed() -> None:
@@ -97,14 +112,14 @@ async def test_idempotent_create_deduplicates_and_reopens_after_destroy(monkeypa
     setup_calls = 0
 
     class FakeDockerSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
             self.status = SandboxStatus.CREATING
             self.skill = None
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             nonlocal setup_calls
             setup_calls += 1
             if setup_calls == 1:
@@ -120,6 +135,18 @@ async def test_idempotent_create_deduplicates_and_reopens_after_destroy(monkeypa
     monkeypatch.setattr(skill_runner_module, "DockerSandbox", FakeDockerSandbox)
 
     runner = SkillRunner()
+    # The skill scan runs in a worker thread, so wait for the follower to
+    # actually join the in-flight create instead of yielding once.
+    original_prepare = runner._prepare_idempotent_create
+    follower_joined = asyncio.Event()
+
+    async def prepare_spy(key, **kwargs):
+        prepared = await original_prepare(key, **kwargs)
+        if not prepared[2]:
+            follower_joined.set()
+        return prepared
+
+    monkeypatch.setattr(runner, "_prepare_idempotent_create", prepare_spy)
     first_task = asyncio.create_task(
         runner.create_sandbox(
             str(skill_dir),
@@ -137,7 +164,7 @@ async def test_idempotent_create_deduplicates_and_reopens_after_destroy(monkeypa
             idempotency_key="reservation-1",
         )
     )
-    await asyncio.sleep(0)
+    await asyncio.wait_for(follower_joined.wait(), timeout=5)
     allow_first_setup.set()
 
     first, follower = await asyncio.gather(first_task, follower_task)
@@ -178,6 +205,10 @@ async def test_execution_cancel_terminates_active_process_group_only_when_needed
     def fake_run_docker(args, **kwargs):
         nonlocal stubborn
         command = args[-1]
+        if args[1] == "inspect":
+            # A killed command exits 137; the backend confirms the container
+            # itself is still running before reporting that exit code.
+            return subprocess.CompletedProcess(args, 0, stdout=b"true\n", stderr=b"")
         if "start_new_session=True" in " ".join(args):
             execution_started.set()
             assert allow_execution_finish.wait(timeout=1)
@@ -224,7 +255,7 @@ async def test_execution_cancel_terminates_active_process_group_only_when_needed
 
     signals.clear()
     stubborn = False
-    sandbox._active_execution_id = "execution-2"
+    sandbox._executions["execution-2"] = ("sleep 60", time.time(), time.time() + 60)
     assert await sandbox.cancel_execution("execution-2") is True
     assert signals == ["TERM"]
 
@@ -234,7 +265,7 @@ async def test_background_execution_exposes_running_terminal_and_cancelled_statu
     started = asyncio.Event()
     release = asyncio.Event()
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -299,7 +330,7 @@ async def test_start_execution_deduplicates_while_mailbox_cleanup_is_blocked() -
     cleanup_calls = 0
     execution_calls = 0
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -360,7 +391,7 @@ async def test_start_execution_deduplicates_while_mailbox_cleanup_is_blocked() -
 async def test_start_execution_rejects_reused_id_for_different_request() -> None:
     allow_execution = asyncio.Event()
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -396,7 +427,7 @@ async def test_start_execution_rejects_reused_id_for_different_request() -> None
 
 @pytest.mark.asyncio
 async def test_background_execution_cancel_before_process_start_cleans_state() -> None:
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -432,7 +463,7 @@ async def test_background_execution_cancel_before_process_start_cleans_state() -
 
 @pytest.mark.asyncio
 async def test_background_nonzero_exit_is_a_failed_terminal_state() -> None:
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -473,7 +504,7 @@ async def test_background_execution_event_response_resumes_same_process() -> Non
     allow_complete = asyncio.Event()
     response_payloads: list[dict] = []
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -613,7 +644,7 @@ async def test_execution_response_rejects_terminal_transition_during_refresh() -
     allow_refresh_complete = asyncio.Event()
     response_writes = 0
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -629,8 +660,11 @@ async def test_execution_response_rejects_terminal_transition_during_refresh() -
             )
 
         async def read_execution_event_lines(self, _execution_id):
-            refresh_started.set()
-            await allow_refresh_complete.wait()
+            # Only the response's refresh blocks; the execution's own final
+            # event read (before it turns terminal) must not.
+            if not refresh_started.is_set():
+                refresh_started.set()
+                await allow_refresh_complete.wait()
             return [
                 json.dumps(
                     {
@@ -679,7 +713,7 @@ async def test_execution_response_rejects_secret_values(monkeypatch) -> None:
 
     responses: list[dict] = []
 
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -812,7 +846,7 @@ async def test_execution_response_rejects_secret_values(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_execution_status_filters_secret_events_that_bypass_the_bridge() -> None:
-    class FakeSandbox:
+    class FakeSandbox(_ClaimableFake):
         status = SandboxStatus.READY
 
         def ensure_available(self):
@@ -930,6 +964,7 @@ async def test_startup_reconciles_unaddressable_managed_containers(monkeypatch):
         removed.append,
         raising=False,
     )
+    monkeypatch.setattr(skill_runner_module, "_image_exists_locally", lambda _image, **_kw: True)
 
     runner = SkillRunner()
     await runner.startup()
@@ -937,6 +972,7 @@ async def test_startup_reconciles_unaddressable_managed_containers(monkeypatch):
         assert listed_scopes == ["test-deployment"]
         assert removed == ["container-a", "container-b"]
         assert runner.runtime_status()["orphan_cleanup_failures"] == []
+        assert runner.readiness() == (True, "ok")
     finally:
         await runner.shutdown()
 
@@ -969,9 +1005,15 @@ async def test_capacity_status_reports_stable_local_counters(monkeypatch):
 
     monkeypatch.setattr(skill_runner_module.app_config, "MAX_SANDBOXES", 5)
     monkeypatch.setattr(skill_runner_module.app_config, "INSTANCE_MAX_EXECUTING", 2)
-    monkeypatch.setattr(skill_runner_module, "_image_exists_locally", lambda _image: True)
+    monkeypatch.setattr(skill_runner_module, "_image_exists_locally", lambda _image, **_kw: True)
+    monkeypatch.setattr(
+        skill_runner_module, "_host_capacity", lambda: {"host_cpus": 1, "host_memory_mb": 1987}
+    )
+    monkeypatch.setattr(skill_runner_module, "_load_baked_skill_index", lambda *_a, **_kw: None)
 
     runner = SkillRunner()
+    # runtime_status() never calls Docker; startup and a background loop fill this cache.
+    await runner.refresh_image_status()
     execute_lease = await runner._gate.acquire_execute()
 
     assert runner.runtime_status() == {
@@ -983,10 +1025,43 @@ async def test_capacity_status_reports_stable_local_counters(monkeypatch):
         "executing": 1,
         "max_executing": 2,
         "orphan_cleanup_failures": [],
+        "draining": False,
+        "host_cpus": 1,
+        "host_memory_mb": 1987,
+        # Memory admission numbers (see test_sandbox_runner_memory_admission.py);
+        # they report the measured Docker host and win over the local estimate.
+        **runner.memory_status(),
+        # Capabilities the control plane adapts to.
+        "skill_layout": "slots",
+        "exec_queue": True,
+        "max_lifetime_seconds": sandbox_app_config.MAX_LIFETIME_SECONDS,
+        "baked_skills": {},
     }
+    assert runner.runtime_status()["memory_reserved_mb"] == 0
 
     await execute_lease.release()
     assert runner.runtime_status()["executing"] == 0
+
+
+@pytest.mark.parametrize("requested,host_cpus,expected", [(4.0, 1, 1.0), (4.0, 2, 2.0), (0.5, 2, 0.5)])
+def test_cpu_request_is_clamped_to_the_host(monkeypatch, requested, host_cpus, expected):
+    """Docker refuses --cpus above the host's CPU count, failing the create.
+
+    The host is the configured/measured Docker host, not the machine the
+    runner process happens to run on.
+    """
+    import sandbox.skill_runner as skill_runner_module
+
+    monkeypatch.setattr(skill_runner_module.app_config, "HOST_CPUS", float(host_cpus))
+    monkeypatch.setattr(skill_runner_module.app_config, "HOST_MEMORY", "4g")
+    monkeypatch.setattr(skill_runner_module.os, "cpu_count", lambda: 64)
+
+    runner = SkillRunner()
+    cfg = runner._resolve_config(ContainerConfig(cpus=requested))
+    warnings = runner._fit_to_host(cfg)
+
+    assert cfg.cpus == expected
+    assert any("cpus" in warning for warning in warnings) == (requested > host_cpus)
 
 
 def test_capacity_status_uses_active_limit_when_execute_limit_is_disabled(monkeypatch):
@@ -994,7 +1069,7 @@ def test_capacity_status_uses_active_limit_when_execute_limit_is_disabled(monkey
 
     monkeypatch.setattr(skill_runner_module.app_config, "MAX_SANDBOXES", 5)
     monkeypatch.setattr(skill_runner_module.app_config, "INSTANCE_MAX_EXECUTING", 0)
-    monkeypatch.setattr(skill_runner_module, "_image_exists_locally", lambda _image: True)
+    monkeypatch.setattr(skill_runner_module, "_image_exists_locally", lambda _image, **_kw: True)
 
     runner = SkillRunner()
 

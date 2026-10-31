@@ -178,10 +178,6 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "High-quality TTS + voice cloning. Multilingual; emits MP3 to "
      "Manor's filesystem so subsequent steps can attach or stream it.",
      "builtin", "packages.core.ai.mcp.elevenlabs", "api_key", None),
-    ("suno", "Suno",
-     "Generate original songs, covers, and mashups through Suno's official "
-     "asynchronous API. Paid create calls return a job for explicit status checks.",
-     "builtin", "packages.core.ai.mcp.suno", "api_key", None),
     ("tavily", "Tavily",
      "AI-tuned web search + content extraction. Returns synthesized "
      "snippets, optional inline article body, and a 1-sentence answer. "
@@ -246,11 +242,11 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "https://www.googleapis.com/auth/youtube.force-ssl"),
     ("tiktok", "TikTok",
      "TikTok API v2 — read your profile and videos (Display API) and "
-     "publish video / photo posts from a hosted URL with status tracking "
+     "publish reviewed video or photo attachments and Workspace Knowledge media, then check status "
      "(Content Posting API).",
      "builtin", "packages.core.ai.mcp.tiktok", "oauth2",
      "user.info.basic,user.info.profile,user.info.stats,"
-     "video.list,video.publish,video.upload"),
+     "video.list,video.publish"),
 
     # ── E-commerce platforms (credentials: store domain + API token /
     # consumer key+secret, stored per-entity). Read + write: products,
@@ -381,6 +377,17 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "DELETE FROM mcp_servers WHERE server_key = 'local_browser'"
         ))
 
+        # Suno was removed: its API never accepted a connection. Drop the
+        # catalog row with its bindings and saved keys.
+        for statement in (
+            "DELETE FROM agent_mcp_bindings WHERE mcp_server_id IN ("
+            "SELECT id FROM mcp_servers WHERE server_key = 'suno')",
+            "DELETE FROM mcp_account_tool_catalogs WHERE provider = 'suno'",
+            "DELETE FROM integrations WHERE provider = 'suno'",
+            "DELETE FROM mcp_servers WHERE server_key = 'suno'",
+        ):
+            await conn.execute(text(statement))
+
         # One-time migration: the SMTP-only provider was merged into a
         # combined IMAP+SMTP provider keyed ``email``. Drop any stale row
         # and re-point existing Integration rows to the new provider key.
@@ -454,10 +461,10 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "google_calendar",
             "google_drive",
             "youtube",
+            "tiktok",
             "whatsapp",
             "facebook",
             "apify",
-            "suno",
             # Refresh authentication metadata without touching saved accounts.
             "manor_pms",
             "manor_mcp_minutes",

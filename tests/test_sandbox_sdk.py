@@ -337,3 +337,67 @@ async def test_skill_provisioning_waits_for_cold_install_without_extending_healt
         assert timeout["connect"] == client_timeout
         assert timeout["write"] == client_timeout
         assert timeout["pool"] == client_timeout
+
+
+@pytest.mark.parametrize(
+    "status,body,exception_name,base_name",
+    [
+        (404, {"detail": "Sandbox not found: s", "code": "sandbox_lost"}, "SandboxNotFoundError", "SandboxError"),
+        (409, {"detail": "Sandbox is busy", "code": "sandbox_busy"}, "SandboxError", "SandboxError"),
+        (429, {"detail": "Max active", "code": "capacity_exceeded"}, "SandboxCapacityError", "SandboxError"),
+        (400, {"detail": "Invalid skill_name", "code": "invalid_request"}, "SandboxRequestError", "SandboxError"),
+        (413, {"detail": "File too large", "code": "file_too_large"}, "SandboxRequestError", "SandboxError"),
+        (422, {"detail": [{"loc": ["body"]}], "code": "invalid_request"}, "SandboxRequestError", "SandboxError"),
+        (500, {"detail": "boom", "code": "internal_error"}, "SandboxRuntimeError", "SandboxRuntimeError"),
+        (503, {"detail": "Docker down", "code": "docker_unavailable"}, "SandboxRuntimeError", "SandboxRuntimeError"),
+        (
+            504,
+            {
+                "detail": "Command timed out after 5s",
+                "code": "command_timeout",
+                "stdout": "part",
+                "stderr": "err",
+                "execution_id": "e-1",
+            },
+            "SandboxTimeoutError",
+            "SandboxRuntimeError",
+        ),
+    ],
+)
+def test_sandbox_sdk_maps_runner_statuses_and_keeps_the_runner_code(
+    status, body, exception_name, base_name
+) -> None:
+    from packages.core.services.sandbox_sdk import exceptions
+
+    response = httpx.Response(
+        status,
+        json=body,
+        request=httpx.Request("POST", "http://sandbox-service/api/v1/sandbox/s/exec"),
+    )
+
+    with pytest.raises(SandboxError) as exc_info:
+        _raise_for_status(response)
+
+    error = exc_info.value
+    assert type(error).__name__ == exception_name
+    # 504 stays a runtime error, so callers that catch SandboxRuntimeError
+    # around a command keep catching its timeout.
+    assert isinstance(error, getattr(exceptions, base_name))
+    assert error.status_code == status
+    assert error.code == body["code"]
+    assert str(error)
+    if status == 504:
+        assert (error.stdout, error.stderr, error.execution_id) == ("part", "err", "e-1")
+
+
+def test_sandbox_sdk_tolerates_bodies_without_a_code() -> None:
+    response = httpx.Response(
+        404,
+        text="not json",
+        request=httpx.Request("GET", "http://sandbox-service/api/v1/sandbox/s"),
+    )
+    with pytest.raises(SandboxError) as exc_info:
+        _raise_for_status(response)
+    assert type(exc_info.value).__name__ == "SandboxNotFoundError"
+    assert exc_info.value.code is None
+    assert str(exc_info.value) == "not json"

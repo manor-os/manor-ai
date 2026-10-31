@@ -162,10 +162,16 @@ for (const surface of ["workspace", "embedded", "floating"]) {
         await page.setViewportSize({ width: 1280, height: 800 });
         if (surface === "workspace") await page.getByRole("button", { name: "Hide workspace app", exact: true }).click();
         await page.getByRole("navigation", { name: "Conversation map" }).getByRole("button").first().click();
-        await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(2);
+        await expect(page.getByText("Earlier user question", { exact: true }).first()).toBeVisible();
+        // The first message can follow a date divider; navigation targets the message.
+        await expect.poll(() => viewport.evaluate((el) => {
+          const first = el.querySelector("[data-chat-scroll-marker-id], [data-chat-message-index]")!;
+          return Math.abs(first.getBoundingClientRect().top - el.getBoundingClientRect().top);
+        })).toBeLessThanOrEqual(16);
+        const navigationTop = await viewport.evaluate((el) => el.scrollTop);
         await append("\n\nNavigation keeps its position.");
         await expect(page.getByText("Navigation keeps its position.", { exact: true }).first()).toBeAttached();
-        await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(2);
+        await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBeCloseTo(navigationTop, 0);
       }
       await viewport.dispose();
     } finally { releaseImage(); }
@@ -261,6 +267,60 @@ test("sending preserves loaded history while the stream binds its conversation a
     })).toEqual([]);
   } finally { admitStream(); refreshHistory(); }
 });
+
+for (const hasMainConversation of [true, false]) {
+  test(`sending with a pinned Plan card preserves replies after reload (${hasMainConversation ? "existing" : "new"} main conversation)`, async ({ page }) => {
+    const pinned = {
+      ...message("pinned-plan-card", "An older Plan needs approval", "agent", 0),
+      conversation_id: "plan-conversation",
+      message_kind: "hitl_request",
+      pending_action: { kind: "approve_plan", plan_id: "older-plan", options: ["approve", "reject"] },
+    };
+    const requestText = "Create a task: Prepare the release";
+    const replyText = "Created Prepare the release. Status: Pending.";
+    let submittedConversationId: string | undefined;
+    let savedMessages: ReturnType<typeof message>[] = [];
+    let clientMessageId = "";
+    await page.route("**/api/v1/**", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path.endsWith("/chat/messages/page")) return route.fulfill({ json: {
+        items: [pinned, ...(hasMainConversation ? recentMessages : []), ...savedMessages],
+        conversation_id: hasMainConversation || savedMessages.length ? conversationId : null,
+        has_more: false, next_cursor: null,
+      } });
+      if (path === "/api/v1/chat/stream") {
+        const body = route.request().postData() || "";
+        submittedConversationId = body.match(/name="conversation_id"\r\n\r\n([^\r\n]+)/)?.[1] || "";
+        clientMessageId = body.match(/name="client_message_id"\r\n\r\n([^\r\n]+)/)?.[1] || "";
+        const target = submittedConversationId || conversationId;
+        if (target === conversationId) savedMessages = [
+          { ...message("saved-user", requestText, "user", 20), meta: { client_message_id: clientMessageId } },
+          message("saved-reply", replyText, "agent", 21),
+        ];
+        return route.fulfill({
+          contentType: "text/event-stream",
+          headers: { "X-Conversation-ID": target, "X-User-Message-ID": "saved-user", "X-Client-Message-ID": clientMessageId },
+          body: frame("stream_start", {
+            conversation_id: target, message_id: "saved-reply",
+            user_message_id: "saved-user", client_message_id: clientMessageId,
+          }) + frame("text_delta", { content: replyText })
+            + frame("stream_end", { conversation_id: target, message_id: "saved-reply", persisted: true }),
+        });
+      }
+      return route.fulfill({ json: supportingResponse(path) });
+    });
+    await page.goto("/e2e/fixtures/workspace-app-pane.html");
+    await expect(page.locator("#workspace-chat-message-pinned-plan-card")).toBeVisible();
+    await page.locator('[role="textbox"][contenteditable="true"]').fill(requestText);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(() => submittedConversationId).toBe(hasMainConversation ? conversationId : "");
+    await expect(page.locator("#workspace-chat-message-saved-reply")).toContainText(replyText);
+    await page.reload();
+    await expect(page.locator("#workspace-chat-message-saved-user")).toContainText(requestText);
+    await expect(page.locator("#workspace-chat-message-saved-reply")).toContainText(replyText);
+    await expect(page.locator("#workspace-chat-message-pinned-plan-card")).toBeVisible();
+  });
+}
 
 for (const surface of ["workspace", "embedded"]) {
   test(`${surface} switches scope without accepting a late history page`, async ({ page }) => {

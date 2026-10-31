@@ -30,6 +30,8 @@ from packages.core.services.durable_run import (
     DURABLE_RUN_MAX_WAKE_DELAY,
     DurableRunSpec,
 )
+from packages.core.models.task_agent_child import TaskAgentChildRun
+from packages.core.services.task_agent_child_wakeup import TASK_AGENT_CHILD_RUN_SPEC
 from packages.core.services.task_coordinator_wakeup import TASK_COORDINATOR_RUN_SPEC
 
 
@@ -65,6 +67,32 @@ async def _task_coordinator_run(db) -> str:
     return run.task_id
 
 
+async def _task_agent_child_run(db) -> str:
+    root_run_id = generate_ulid()
+    child = TaskAgentChildRun(
+        id=generate_ulid(),
+        task_id=generate_ulid(),
+        entity_id=generate_ulid(),
+        workspace_id=generate_ulid(),
+        root_run_id=root_run_id,
+        parent_ref=root_run_id,
+        parent_tool_call_id="call-1",
+        item_index=0,
+        batch_size=1,
+        depth=1,
+        agent_subscription_id=generate_ulid(),
+        agent_id=generate_ulid(),
+        prompt="Draft the note.",
+        answer_max_chars=4000,
+        lifecycle_generation="lifecycle-1",
+        phase=TaskCoordinatorPhase.READY.value,
+        state_version=0,
+    )
+    db.add(child)
+    await db.flush()
+    return child.id
+
+
 _CASES = [
     pytest.param(
         RunCase(
@@ -74,6 +102,15 @@ _CASES = [
             parked_phase=TaskCoordinatorPhase.WAITING_HUMAN.value,
         ),
         id="task_coordinator",
+    ),
+    pytest.param(
+        RunCase(
+            spec=TASK_AGENT_CHILD_RUN_SPEC,
+            make_run=_task_agent_child_run,
+            ready_phase=TaskCoordinatorPhase.READY.value,
+            parked_phase=TaskCoordinatorPhase.WAITING_HUMAN.value,
+        ),
+        id="task_agent_child",
     ),
 ]
 
@@ -661,7 +698,7 @@ _SHARED_FIELDS = frozenset({"claim_token", "claim_expires_at"})
 _PROTOCOL_FIELDS = _RUN_ONLY_FIELDS | _SHARED_FIELDS
 _PROTOCOL_MODULE = "packages/core/services/durable_run.py"
 # Importing from these modules reaches run rows and their specs.
-_RUN_MODULES = frozenset({"durable_run", "task_coordinator_wakeup"})
+_RUN_MODULES = frozenset({"durable_run", "task_coordinator_wakeup", "task_agent_child_wakeup"})
 _SCANNED_ROOTS = ("packages", "apps")
 _SQL_SET = re.compile(
     r"\bSET\b[^;]*?\b(claim_token|claim_generation|claim_expires_at|wake_generation)\b\s*=",
@@ -840,8 +877,8 @@ def _parsed_sources() -> dict[str, ast.AST]:
 def test_only_the_protocol_module_writes_run_claim_and_wake_fields():
     sources = _parsed_sources()
     models, spec_names = _durable_run_specs(sources)
-    assert "TaskCoordinatorRun" in models
-    assert "TASK_COORDINATOR_RUN_SPEC" in spec_names
+    assert {"TaskCoordinatorRun", "TaskAgentChildRun"} <= models
+    assert {"TASK_COORDINATOR_RUN_SPEC", "TASK_AGENT_CHILD_RUN_SPEC"} <= spec_names
     violations = {
         path: hits
         for path, tree in sources.items()

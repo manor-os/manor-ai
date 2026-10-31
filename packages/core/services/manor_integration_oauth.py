@@ -202,19 +202,85 @@ async def revoke_manor_oauth_token(db, account, token: str, *, issuer: str | Non
         return False
 
 
+async def _provider_confirms_previous_grants_retired(account, access_token: str) -> bool:
+    """Require a fresh, authenticated receipt covering the original identity.
+
+    Optional companion-provider contract: grant_status v1 confirms that the
+    presented token's grant is the only live grant for this subject across all
+    clients. Absence, changed deployments, and pending cleanup fail closed.
+    The receipt is fetched here, never trusted from saved profile metadata.
+    """
+    binding = manor_oauth_binding(account)
+    try:
+        endpoints = manor_oauth_endpoints(account.provider)
+        if (
+            binding.get("version") != 1
+            or binding.get("issuer") != endpoints["issuer"]
+            or binding.get("user_id") != account.user_id
+            or binding.get("subject") != account.provider_user_id
+            or not binding.get("entity_id")
+            or (account.profile or {}).get("oauth_disconnect")
+        ):
+            return False
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False, trust_env=False) as client:
+            response = await client.get(
+                endpoints["userinfo_url"],
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            )
+        if response.status_code != 200:
+            return False
+        data = response.json()
+        receipt = data.get("grant_status") if isinstance(data, dict) else None
+        return bool(
+            isinstance(receipt, dict)
+            and type(receipt.get("version")) is int and receipt["version"] == 1
+            and receipt.get("sole_active_grant") is True
+            and isinstance(receipt.get("grant_id"), str) and receipt["grant_id"].strip()
+            and data.get("sub") == binding["subject"]
+            and data.get("manor_user_id") == account.user_id
+            and data.get("manor_entity_id") == binding["entity_id"]
+        )
+    except (httpx.HTTPError, ValueError, KeyError):
+        return False
+
+
 async def prepare_manor_oauth_replacement(db, account, *, access_token: str, refresh_token: str) -> None:
     """Retain both grants durably until retirement of the old grant succeeds.
 
     The encrypted payload holds pending grant tokens. Profile contains only a
     disabled status; a failed replacement can be cleaned up by Disconnect.
     """
-    from packages.core.credentials import get_credential_service
+    from packages.core.credentials import CredentialDecryptError, get_credential_service
     from packages.core.services.integration_account_service import lock_runtime_integration_account_scope
     from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
     from packages.core.services.oauth_flow import OAuthFlowError
 
     await db.refresh(account, with_for_update=True)
-    old = lease_oauth_account_tokens(account, requester_id=account.user_id, reason="oauth.reconnect.stage")
+    try:
+        old = lease_oauth_account_tokens(account, requester_id=account.user_id, reason="oauth.reconnect.stage")
+    except CredentialDecryptError as exc:
+        if await _provider_confirms_previous_grants_retired(account, access_token):
+            old = {"revocation_confirmed": True}
+        else:
+            # A failed recovery must not orphan the newly exchanged grant. If
+            # revocation fails too, retain both its tokens and the old encrypted
+            # envelope durably for cleanup, without making either usable.
+            if not await revoke_manor_oauth_token(
+                db, account, refresh_token or access_token,
+                issuer=manor_oauth_endpoints(account.provider)["issuer"],
+            ):
+                get_credential_service().store_oauth_account(account, {
+                    "unreadable_credential": {
+                        "ref": account.credential_ref, "scheme": account.credential_scheme,
+                    },
+                    "pending_revocations": [{
+                        "access_token": access_token, "refresh_token": refresh_token,
+                        "issuer": manor_oauth_endpoints(account.provider)["issuer"],
+                    }],
+                })
+                account.profile = {**(account.profile or {}), "oauth_disconnect": {"status": "pending_replacement"}}
+                await db.commit()
+            raise OAuthFlowError(502, "Previous credentials are unreadable and provider revocation is not confirmed. Connection remains disabled; contact the administrator for recovery.") from exc
     already_pending = bool((account.profile or {}).get("oauth_disconnect"))
     pending = list(old.get("pending_revocations") or [])
     pending.append({
@@ -238,7 +304,7 @@ async def prepare_manor_oauth_replacement(db, account, *, access_token: str, ref
     if account.credential_ref != staged_ref:
         raise OAuthFlowError(409, "Connection changed during replacement. Retry Disconnect before connecting again.")
     old_token = old.get("refresh_token") or old.get("access_token") or ""
-    if not await revoke_manor_oauth_token(db, account, old_token):
+    if old.get("revocation_confirmed") is not True and not await revoke_manor_oauth_token(db, account, old_token):
         raise OAuthFlowError(502, "Connection is disabled in Manor. Previous grant revocation is not confirmed; retry Disconnect to clean up both grants.")
 
 

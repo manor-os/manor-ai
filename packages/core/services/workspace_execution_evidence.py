@@ -13,7 +13,7 @@ import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import load_only
 
 from packages.core.contracts.artifact_delivery import accepted_task_artifact_manifest
@@ -61,9 +61,38 @@ _PARKED_PHASES = frozenset({"waiting_timer", "waiting_job"})
 _MAX_WAIT_JOB_IDS = 50
 
 
-def task_execution_wait(phase: str | None, wait: Any) -> dict[str, Any] | None:
-    """What a parked Task agent loop is waiting for, from its task_loop_wait."""
+_WAITING_CHILD = "waiting_child"
+_MAX_WAIT_CHILDREN = 20
 
+
+def _child_claim_live(child: Any, now: datetime) -> bool:
+    return bool(
+        getattr(child, "claim_token", None) and getattr(child, "claim_generation", None)
+        and child.claim_generation == getattr(child, "wake_generation", None)
+        and _future(getattr(child, "claim_expires_at", None), now)
+    )
+
+
+def task_execution_wait(phase: str | None, wait: Any, children: Any = ()) -> dict[str, Any] | None:
+    """What a parked Task agent loop is waiting for, from its task_loop_wait.
+
+    A loop waiting on delegated agents names each child run's agent and phase.
+    """
+
+    if phase == _WAITING_CHILD:
+        if not isinstance(wait, dict) or wait.get("kind") != _WAITING_CHILD:
+            return None
+        listed = [
+            {"agent": str(getattr(child, "agent_label", None) or getattr(child, "service_key", None) or "")[:255],
+             "phase": str(getattr(child, "phase", "") or "")}
+            for child in children
+        ]
+        count = len(wait.get("child_ids") or []) or len(listed)
+        return {
+            "kind": _WAITING_CHILD,
+            "children": listed[:_MAX_WAIT_CHILDREN],
+            "label": f"Waiting for {count} delegated agent(s)",
+        }
     if phase not in _PARKED_PHASES or not isinstance(wait, dict) or wait.get("kind") != phase:
         return None
     if phase == "waiting_timer":
@@ -86,7 +115,7 @@ def task_execution_wait(phase: str | None, wait: Any) -> dict[str, Any] | None:
 def task_execution_state(
     task: Any, *, plan: Any = None, coordinator: Any = None,
     steps: tuple[Any, ...] = (), leases: tuple[Any, ...] = (), pending_input: bool = False,
-    admitted: bool = False, now: datetime | None = None,
+    admitted: bool = False, now: datetime | None = None, children: tuple[Any, ...] = (),
 ) -> ExecutionObservationState:
     """Derive a conservative observation from existing authoritative rows."""
     now = now or datetime.now(timezone.utc)
@@ -146,6 +175,15 @@ def task_execution_state(
         # A parked loop holding a live claim was woken and is working.
         return ExecutionObservationState.RUNNING if parked else ExecutionObservationState.PLANNING
     if status == "in_progress" and parked and current_lifecycle:
+        return ExecutionObservationState.WAITING
+    if (
+        status == "in_progress" and current_lifecycle
+        and coordinator.phase == _WAITING_CHILD and getattr(coordinator, "engine", None) == "agent_loop"
+    ):
+        # The loop waits on its delegated agents: working while one of them
+        # holds a live claim, otherwise waiting.
+        if any(_child_claim_live(child, now) for child in children):
+            return ExecutionObservationState.RUNNING
         return ExecutionObservationState.WAITING
     if (
         status == "in_progress" and coordinator_active and plan is not None
@@ -291,6 +329,7 @@ async def read_workspace_task_evidence(
             TaskCoordinatorRun.phase, TaskCoordinatorRun.claim_token,
             TaskCoordinatorRun.claim_expires_at, TaskCoordinatorRun.claim_generation,
             TaskCoordinatorRun.wake_generation, TaskCoordinatorRun.lifecycle_generation,
+            TaskCoordinatorRun.engine,
         )).where(
             TaskCoordinatorRun.task_id.in_(task_ids),
             TaskCoordinatorRun.entity_id == scope.entity_id,
@@ -298,7 +337,30 @@ async def read_workspace_task_evidence(
         ))).all()
         run_by_task = {run.task_id: run for run in runs}
         # Only a parked run's wait key is read, never its whole transcript.
-        parked_runs = [run.task_id for run in runs if run.phase in _PARKED_PHASES]
+        parked_runs = [
+            run.task_id for run in runs
+            if run.phase in _PARKED_PHASES or (run.phase == _WAITING_CHILD and run.engine == "agent_loop")
+        ]
+        # A loop waiting on delegated agents: their phases and live claims.
+        children_by_task: dict[str, list[Any]] = {}
+        waiting_child_tasks = [
+            run.task_id for run in runs if run.phase == _WAITING_CHILD and run.engine == "agent_loop"
+        ]
+        if waiting_child_tasks:
+            from packages.core.models.task_agent_child import TaskAgentChildRun
+
+            for child in (await db.scalars(select(TaskAgentChildRun).options(load_only(
+                TaskAgentChildRun.task_id, TaskAgentChildRun.agent_label, TaskAgentChildRun.service_key,
+                TaskAgentChildRun.phase, TaskAgentChildRun.claim_token, TaskAgentChildRun.claim_generation,
+                TaskAgentChildRun.claim_expires_at, TaskAgentChildRun.wake_generation,
+                TaskAgentChildRun.depth, TaskAgentChildRun.item_index,
+            )).where(
+                TaskAgentChildRun.task_id.in_(waiting_child_tasks),
+                TaskAgentChildRun.entity_id == scope.entity_id,
+                TaskAgentChildRun.workspace_id == scope.workspace_id,
+                TaskAgentChildRun.phase.not_in(("completed", "failed", "cancelled")),
+            ).order_by(TaskAgentChildRun.depth, TaskAgentChildRun.item_index))).all():
+                children_by_task.setdefault(child.task_id, []).append(child)
         waits_by_task = dict((await db.execute(select(
             TaskCoordinatorRun.task_id, TaskCoordinatorRun.checkpoint["task_loop_wait"],
         ).where(
@@ -399,6 +461,7 @@ async def read_workspace_task_evidence(
                     ) for request in pending
                 ),
                 admitted=dedupe_by_task.get(task.id) in intents,
+                children=tuple(children_by_task.get(task.id, [])),
             )
             fact = {
                 "kind": "task", "id": task.id, "title": task.title,
@@ -406,7 +469,11 @@ async def read_workspace_task_evidence(
                 "origin": "current_turn" if same_turn else "existing_record",
             }
             if state is ExecutionObservationState.WAITING:
-                waiting = task_execution_wait(run.phase, waits_by_task.get(task.id))
+                wait = waits_by_task.get(task.id)
+                batch = set(wait.get("child_ids") or []) if isinstance(wait, dict) else set()
+                waiting = task_execution_wait(run.phase, wait, children=[
+                    child for child in children_by_task.get(task.id, []) if child.id in batch
+                ])
                 if waiting is not None:
                     fact["waiting"] = waiting
             # Heartbeat refreshes do not create different facts every second.
@@ -434,11 +501,12 @@ async def read_workspace_task_evidence(
 
 
 async def read_current_turn_task_references(scope: ExecutionEvidenceScope) -> list[dict[str, str]]:
-    """Tasks this Workspace Chat turn created, from the host's own ledger event.
+    """Tasks this Workspace Chat turn created or started, from the host's own ledger events.
 
-    Each Workspace Chat Task creation records one ``chat-task-created`` event
-    caused by the originating user message (workspace_task_actions). The model
-    never names these: a plain-text reply cannot add or drop a Task here.
+    Each Workspace Chat Task creation or start records one ``chat-task-created``
+    / ``chat-task-started`` event caused by the originating user message
+    (task_intents.record_chat_task_effect). The model never names these: a
+    plain-text reply cannot add or drop a Task here.
     """
     if not scope.origin_user_message_id:
         return []
@@ -455,11 +523,20 @@ async def read_current_turn_task_references(scope: ExecutionEvidenceScope) -> li
             WorkspaceEvent.causation_id == scope.origin_user_message_id,
             WorkspaceEvent.actor_kind == "user",
             WorkspaceEvent.actor_id == scope.user_id,
-            WorkspaceEvent.idempotency_key.like("chat-task-created:%"),
-        ).order_by(WorkspaceEvent.occurred_at, WorkspaceEvent.id).limit(8))).all()
-    references = []
+            or_(
+                WorkspaceEvent.idempotency_key.like("chat-task-created:%"),
+                WorkspaceEvent.idempotency_key.like("chat-task-started:%"),
+            ),
+        ).order_by(WorkspaceEvent.occurred_at, WorkspaceEvent.id).limit(16))).all()
+    references: dict[str, dict[str, str]] = {}
     for task_id, payload in rows:
         if not isinstance(payload, dict) or payload.get("conversation_id") != scope.conversation_id:
             continue
-        references.append({"kind": "task", "id": str(task_id), "scope": "current_turn"})
-    return references
+        effect = "started" if payload.get("kind") == "workspace_chat_started" else "created"
+        reference = references.setdefault(str(task_id), {
+            "kind": "task", "id": str(task_id), "scope": "current_turn", "effect": effect,
+        })
+        if effect == "started":
+            # Created and started in one turn reads as started.
+            reference["effect"] = "started"
+    return list(references.values())[:8]

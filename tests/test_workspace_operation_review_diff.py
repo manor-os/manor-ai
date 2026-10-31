@@ -13,8 +13,6 @@ draft's stale stored copy), and that a hard-block removal is called out.
 """
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from packages.core.constants.approvals import HitlType
@@ -175,31 +173,6 @@ def test_the_review_card_carries_the_payload_and_offers_no_always():
     assert pending["hitl_type"] == HitlType.REVIEW.value
     assert pending["payload"]["diff"]["removed_hard_blocks"] == ["payments.refund"]
     assert "always_approve" not in pending["options"]
-
-
-def test_the_internal_worker_path_builds_the_same_card():
-    """Two producers used to build this blob field by field. The one in the
-    internal worker dropped the typed payload — so the warning existed in the
-    tool result and nowhere the operator would ever look."""
-    from packages.core.ai.runtime.workspace_operation_actions import (
-        _operation_review_payload,
-    )
-    from packages.core.services.hitl_requests import (
-        workspace_operation_pending_action_from_data,
-    )
-    from packages.core.workers.internal import _pending_action_from_tool_payload
-
-    draft = _draft(
-        before_rules=[_HARD_BLOCK_RULE, _HITL_RULE],
-        after_rules=[_HITL_RULE],
-        never_allow=["payments.refund"],
-    )
-    result = json.loads(json.dumps(_operation_review_payload(
-        draft, prompt="Apply these workspace runtime changes?", content={},
-    ), default=str))
-    assert _pending_action_from_tool_payload(
-        result
-    ) == workspace_operation_pending_action_from_data(result)
 
 
 def test_the_review_diff_is_the_policy_apply_would_write():

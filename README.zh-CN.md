@@ -231,9 +231,10 @@ demo@manor.local / manor-demo
 [Sustainable Use License 1.0](LICENSE) —— Copyright (c) 2026 Manor AI。
 
 Manor AI 是 fair-code:源码可见、可自托管、可扩展,遵循 Sustainable Use
-License 1.0。允许内部业务、个人与非商业使用。将 Manor AI 白标、向他人
-收费提供托管的 Manor AI 服务,或以其他方式商业化提供本软件,需与
-Manor AI 另行签署书面协议。围绕客户内部部署的商业咨询与支持是允许的。
+License 1.0。允许内部业务、个人与非商业使用。按本许可证向他人分发或提供
+软件,仅限免费且用于非商业目的。收费提供托管访问或以其他方式商业化提供
+本软件,需与 Manor AI 另行签署书面协议。必须保留许可与版权声明,并标明
+修改。围绕客户内部部署的商业咨询与支持是允许的。
 Manor AI 名称与商标由 [TRADEMARKS.md](TRADEMARKS.md) 单独约束。
 
 许可证文本沿用

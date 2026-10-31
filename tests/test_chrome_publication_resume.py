@@ -76,22 +76,6 @@ def test_publication_resume_preserves_context_and_returns_control_to_agent():
     assert {PUBLISH, READ, FINALIZE} <= set(metadata["extra_tool_names"])
 
 
-def test_background_task_accepts_publication_resume_and_rejects_changed_content():
-    from copy import deepcopy
-    from packages.core.services.task_runtime_approvals import (
-        TaskRuntimeApprovalError, _freeze_approved_runtime_metadata,
-    )
-
-    continuation = runtime_approval_continuation(PUBLISH, ARGS)
-    request = SimpleNamespace(id="grant", context={"tool": PUBLISH, "continuation": continuation})
-    metadata = runtime_approval_runtime_metadata(request.context, request.id)
-    assert _freeze_approved_runtime_metadata(metadata, request=request) == metadata
-    changed = deepcopy(metadata)
-    changed["approved_tool_call"]["arguments"]["operation_intent"]["publication"]["text"] = "Other text"
-    with pytest.raises(TaskRuntimeApprovalError, match="does not match"):
-        _freeze_approved_runtime_metadata(changed, request=request)
-
-
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,6 @@ from packages.core.services.workspace_input_resolution import (
     dispatch_workspace_input_resolution,
     resolve_workspace_input_message,
 )
-from packages.core.workers.internal import _resume_checkpoint_with_answer
 
 pytestmark = pytest.mark.asyncio
 
@@ -96,10 +95,6 @@ async def _resolve(db, fx, **kwargs):
 def _capture_dispatch(monkeypatch):
     calls = []
 
-    async def plan_hint(db, plan_id, **kwargs):
-        calls.append(("plan", plan_id))
-
-    monkeypatch.setattr("packages.core.plans.wakeup.hint_pending_plan_cycle", plan_hint)
     monkeypatch.setattr("packages.core.services.task_input_resume.dispatch_task_input_resume",
                         lambda *args: calls.append(("task", *args)))
     monkeypatch.setattr("packages.core.services.human_queue_resume.dispatch_strategist_for_cleared_human_queue",
@@ -119,33 +114,21 @@ async def test_response_resumes_exact_step_and_task_once(db_session, monkeypatch
     await db_session.commit()
     await dispatch_workspace_input_resolution(db_session, result)
 
-    assert calls == [("plan", fx.plan.id)]
+    assert calls == []
     assert fx.message.resolved_by_user_id == fx.user.id
     assert fx.message.resolution["choice"] == "respond"
     assert fx.message.resolution["payload"]["response"] == "Use the original audio."
     assert fx.step.runtime_checkpoint == checkpoint
     assert fx.step.step_status == "pending"
     assert fx.plan.status == "running"
-    assert fx.task.status == "in_progress"
     assert fx.request.status == ApprovalStatus.CONSUMED.value
     assert fx.request.hitl_type == HitlType.INPUT.value
     assert fx.request.decided_by_user_id == fx.user.id
     if kind == "human_input":
         assert fx.step.human_input_response["response"] == "Use the original audio."
         assert fx.step.human_input_response["answers"] == payload["answers"]
-        params = {**fx.step.params, "human_input_response": fx.step.human_input_response}
     else:
         assert fx.step.params["answers"] == payload["answers"]
-        params = fx.step.params
-    resumed = RuntimeAgentCheckpoint.from_dict(_resume_checkpoint_with_answer({
-        "runtime_checkpoint": fx.step.runtime_checkpoint, "params": params,
-    }))
-    assert resumed.pending_tool_result["id"] == "original-input-call"
-    stored = json.loads(resumed.pending_tool_result["content"])
-    if kind == "human_input":
-        assert stored["answer"] == "Use the original audio."
-    else:
-        assert stored["fields"] == payload["answers"]
 
     saved_response = copy.deepcopy(fx.message.resolution)
     repeated = await _resolve(db_session, fx, response="A later duplicate must not replace the answer.")
@@ -153,12 +136,12 @@ async def test_response_resumes_exact_step_and_task_once(db_session, monkeypatch
     await dispatch_workspace_input_resolution(db_session, repeated)
     assert repeated.changed is False
     assert fx.message.resolution == saved_response
-    assert calls == [("plan", fx.plan.id)]
+    assert calls == []
     receipts = (await db_session.scalars(select(Message).where(
         Message.conversation_id == fx.conversation.id, Message.author_kind == "system",
     ))).all()
-    assert len(receipts) == 1
-    assert "Response submitted" in receipts[0].content
+    # The answered card shows the response; no separate receipt is posted.
+    assert receipts == []
 
 
 async def test_concurrent_responses_consume_original_input_once(db_session, monkeypatch):
@@ -175,7 +158,7 @@ async def test_concurrent_responses_consume_original_input_once(db_session, monk
 
     changed = await asyncio.wait_for(asyncio.gather(submit("First"), submit("Second")), timeout=15)
     assert sorted(changed) == [False, True]
-    assert calls == [("plan", fx.plan.id)]
+    assert calls == []
     await db_session.refresh(fx.message)
     await db_session.refresh(fx.step)
     await db_session.refresh(fx.request)
@@ -330,7 +313,7 @@ async def test_runtime_facade_persists_response_only_for_exact_target(db_session
         assert fx.message.resolution["payload"]["response"] == "Use original audio."
         assert fx.step.human_input_response["response"] == "Use original audio."
         assert fx.request.status == ApprovalStatus.CONSUMED.value
-        assert calls == [("plan", fx.plan.id)]
+        assert calls == []
     else:
         assert result["resolved"] is False, result
         assert result["reason"] == "target_not_found_or_ambiguous"
@@ -365,7 +348,7 @@ async def test_runtime_facade_requires_current_users_reply(db_session, monkeypat
     await db_session.refresh(fx.step)
     assert (fx.message.resolved_at is not None) is actor_reply
     assert fx.step.step_status == ("pending" if actor_reply else "waiting_human")
-    assert calls == ([("plan", fx.plan.id)] if actor_reply else [])
+    assert calls == []
 
 
 @pytest.mark.parametrize("attachment_state", ["deleted", "private"])

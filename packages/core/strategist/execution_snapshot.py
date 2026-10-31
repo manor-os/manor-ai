@@ -20,6 +20,7 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.task import Task, TaskLog
+from packages.core.models.task_agent_child import TASK_AGENT_CHILD_TERMINAL_PHASES, TaskAgentChildRun
 from packages.core.models.task_coordinator import TaskCoordinatorRun
 from packages.core.models.worker import WorkLease
 from packages.core.services.sensitive_data import sanitize_approval_credentials, sanitize_sensitive_payload
@@ -30,6 +31,7 @@ from packages.core.services.task_execution import (
 from packages.core.services.workspace_execution_evidence import (
     _current_pending_input, _current_task_recovery, task_execution_state,
 )
+from packages.core.services.workspace_work_reconciliation import is_waiting_on_human
 
 _MAX_TASKS = 80
 _BLOCKER_KINDS = {
@@ -193,10 +195,18 @@ async def gather_execution_snapshot(db, *, workspace, tasks, plans, outcomes, se
         task_ids = [task.id for task in rows]
         runs = await _read(db, _query(TaskCoordinatorRun,
             "id task_id current_plan_id phase state_version selection_fingerprint root_subscription_id root_agent_id "
-            "claim_token claim_expires_at claim_generation wake_generation lifecycle_generation"
+            "claim_token claim_expires_at claim_generation wake_generation lifecycle_generation engine"
         ).where(TaskCoordinatorRun.task_id.in_(task_ids), TaskCoordinatorRun.entity_id == workspace.entity_id,
                 TaskCoordinatorRun.workspace_id == workspace.id))
         runs_by_task = {run.task_id: run for run in runs}
+        # Delegated child runs of agent-loop Tasks (open ones decide the state).
+        child_rows = await _read(db, _query(TaskAgentChildRun,
+            "id task_id phase claim_token claim_generation claim_expires_at wake_generation"
+        ).where(TaskAgentChildRun.task_id.in_(task_ids), TaskAgentChildRun.entity_id == workspace.entity_id,
+                TaskAgentChildRun.workspace_id == workspace.id))
+        children_by_task: dict[str, list[Any]] = {}
+        for child in child_rows:
+            children_by_task.setdefault(child.task_id, []).append(child)
         plan_fields = "id task_id status dispatcher_state created_at"
         plan_scope = (ExecutionPlan.task_id.in_(task_ids), ExecutionPlan.entity_id == workspace.entity_id,
                       ExecutionPlan.workspace_id == workspace.id)
@@ -254,9 +264,11 @@ async def gather_execution_snapshot(db, *, workspace, tasks, plans, outcomes, se
                 )
             ) for request in pending
         )
+        task_children = children_by_task.get(task.id, [])
         state = task_execution_state(task, plan=plan, coordinator=run, steps=task_steps,
             leases=task_leases if task.status == TaskStatus.IN_PROGRESS else (), pending_input=pending_input,
-            admitted=intent_by_task.get(task.id) in intents, now=now)
+            admitted=intent_by_task.get(task.id) in intents, now=now,
+            children=tuple(child for child in task_children if child.phase not in TASK_AGENT_CHILD_TERMINAL_PHASES))
         fact = {
             "task_id": task.id, "title": task.title, "task_status": task.status, "observed_state": state.value,
             "owner_service_key": task.owner_service_key, "owner_subscription_id": task.owner_subscription_id,
@@ -268,10 +280,17 @@ async def gather_execution_snapshot(db, *, workspace, tasks, plans, outcomes, se
                     run.claim_token and run.claim_generation and run.claim_generation == run.wake_generation
                     and run.claim_expires_at and _utc(run.claim_expires_at) > now
                     and run.lifecycle_generation == task_execution_intent_generation(task)
-                )} if run is not None else None),
+                ), **({"children": {
+                    "total": len(task_children),
+                    "by_phase": dict(sorted(Counter(child.phase for child in task_children).items())),
+                }} if task_children else {})} if run is not None else None),
             "step_counts": dict(sorted(Counter(step.step_status for step in task_steps).items())),
             "current_blocker": _blocker_fact(task, run, service_capabilities or {}),
             "latest_error": _error_fact(task, logs_by_task.get(task.id), plans_by_id),
+            # Any open card this Task raised is already in front of a person;
+            # agent work cannot answer it, only re-ask it.
+            "waiting_on_human": is_waiting_on_human(task.status, has_open_human_request=any(
+                request.origin_task_id == task.id for request in pending)),
         }
         fact["revision"] = _digest({
             **{key: value for key, value in fact.items() if key != "updated_at"},

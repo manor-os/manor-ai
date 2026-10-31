@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import packages.core.ai.agentic_loop as loop_module
 from packages.core.ai.runtime import workspace_delegation_actions as actions
@@ -20,9 +19,15 @@ from packages.core.ai.runtime.nested_agent import (
 from packages.core.ai.runtime.tool_effect_intents import runtime_tool_effect_checkpoint_scope
 from packages.core.contracts.tool_effects import ToolEffectEvidenceFactory
 from packages.core.dispatcher.service import _recover_internal_file_effects
-from packages.core.workers.submit_result import SUBMIT_RESULT_TERMINAL_POLICY
 from test_nested_skill_durability import checkpoint
 from test_runtime_file_effect_recovery import ARGUMENTS, SCOPE, effect_ref, journal_row, session
+
+
+# A terminal ``submit_result`` call ends the resumed loop.
+SUBMIT_RESULT_TERMINAL_POLICY = {"terminal_tool_results": [{
+    "tool_names": ["submit_result"], "stop_reason": "submit_result",
+    "notice": "Result submitted.", "replace_visible_text": False,
+}]}
 
 
 def _tool(name):
@@ -169,53 +174,3 @@ async def test_journal_observation_resumes_shared_loop_without_native_reclassifi
     assert await _recover_internal_file_effects(db, lease, step) == (True, [])
     await _resume(monkeypatch, step.runtime_checkpoint, step.evidence_refs, SCOPE)
     assert ToolEffectEvidenceFactory.identity(step.evidence_refs[0]) == ToolEffectEvidenceFactory.identity(pending)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
-async def test_db_journal_loop_next_worker_round_preserves_settled_identity(db_session, monkeypatch, nested):
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.runtime_file_commit import RuntimeFileCommit
-    from packages.core.models.worker import WorkLease
-    from packages.core.workers import internal
-    from test_robust_worker2_partial_transcript import _seed_lease
-
-    snapshot = await _seed_lease(db_session, execution_claim_id=generate_ulid())
-    snapshot.update(workspace_id=generate_ulid(), task_id=generate_ulid(), action_effect_generation=3)
-    scope = {key: snapshot[key] for key in SCOPE if key != "effect_generation"}
-    scope["effect_generation"] = "3"
-    tree, pending, row = _pending(scope, nested)
-    row.id, row.transaction_id = generate_ulid(), generate_ulid()
-    db_session.add(RuntimeFileCommit(**vars(row)))
-    step = await db_session.get(ExecutionStep, snapshot["step_id"])
-    lease = await db_session.get(WorkLease, snapshot["lease_id"])
-    plan = await db_session.get(ExecutionPlan, snapshot["plan_id"])
-    plan.task_id = scope["task_id"]
-    step.workspace_id = scope["workspace_id"]
-    step.runtime_checkpoint, step.evidence_refs, lease.evidence_refs = tree, [pending], [pending]
-    await db_session.commit()
-    assert await _recover_internal_file_effects(db_session, lease, step) == (True, [])
-    tree, evidence = copy.deepcopy(step.runtime_checkpoint), copy.deepcopy(step.evidence_refs)
-    await db_session.commit()
-    monkeypatch.setattr(internal, "async_session", async_sessionmaker(db_session.bind, expire_on_commit=False))
-
-    async def persist_round(rounds, messages, usage, tools):
-        await internal._persist_worker_round_checkpoint(
-            snapshot, rounds=rounds, messages=messages, usage=usage, tool_calls_made=tools,
-        )
-
-    async def persist_nested(root, messages):
-        await internal._persist_worker_nested_checkpoint(snapshot, root, messages)
-
-    result, original = await _resume(
-        monkeypatch, tree, evidence, scope, persist_round=persist_round, persist_nested=persist_nested,
-    )
-    db_session.expire_all()
-    step = await db_session.get(ExecutionStep, snapshot["step_id"])
-    lease = await db_session.get(WorkLease, snapshot["lease_id"])
-    for owner in (step, lease):
-        effects = [ref for ref in owner.evidence_refs if ref.get("kind") == "tool_effect"]
-        assert effects == [original]
-    assert step.runtime_checkpoint["messages"] == [message for message in result.messages if message.get("role") != "system"]
-    assert internal.is_worker_transcript_checkpoint(step.runtime_checkpoint)

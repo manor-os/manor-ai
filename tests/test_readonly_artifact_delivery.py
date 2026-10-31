@@ -4,12 +4,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import inspect
-import json
 import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select, update
@@ -19,7 +16,6 @@ from packages.core.contracts.artifact_delivery import (
     ARTIFACT_DELIVERY_SOURCE,
     readonly_artifact_delivery,
     reused_artifact_evidence,
-    reused_artifact_snapshots,
 )
 from packages.core.contracts.step_execution import STEP_EXECUTION_CONTRACT_PARAM
 from packages.core.contracts.tool_effects import ToolEffectEvidenceFactory
@@ -91,25 +87,23 @@ def test_invalid_or_cross_entity_addresses_fail_closed(ref):
         _identity(ref, "entity")
 
 
-def test_host_receipt_is_bound_to_exact_step_and_submission_and_cannot_be_reported():
+def test_host_receipt_cannot_be_reported_by_a_worker():
     finished_at = datetime.now(timezone.utc)
     step = SimpleNamespace(id="step", plan_id="plan", params=REUSE, result={"document_id": "doc"}, attempt_count=1, finished_at=finished_at)
     snapshot = {"document_id": "doc", "fs_path": "file.md", "source_sha256": "a" * 64}
     step.evidence_refs = reused_artifact_evidence(step, step.result, [snapshot], lease_id="lease", completed_at=finished_at)
-    assert reused_artifact_snapshots(step) == [snapshot]
     assert ToolEffectEvidenceFactory.merge_untrusted([], step.evidence_refs) == []
     assert ToolEffectEvidenceFactory.merge_untrusted(step.evidence_refs, []) == step.evidence_refs
-    step.result = {"document_id": "other"}
-    assert reused_artifact_snapshots(step) == []
-    step.result = {"document_id": "doc"}
-    step.id = "other-step"
-    assert reused_artifact_snapshots(step) == []
-    step.id = "step"
-    step.attempt_count = 2
-    assert reused_artifact_snapshots(step) == []
-    step.attempt_count = 1
-    step.finished_at = None
-    assert reused_artifact_snapshots(step) == []
+
+
+def _reuse_receipts(step) -> list[dict]:
+    return [
+        ref for ref in step.evidence_refs or []
+        if ref.get("source") == ARTIFACT_DELIVERY_SOURCE
+        and ref.get("kind") == "artifact"
+        and ref["fields"].get("disposition") == "reused"
+        and ref["fields"].get("owner_step_id") == str(step.id)
+    ]
 
 
 async def _seed(db, tmp_path):
@@ -303,16 +297,15 @@ async def test_parallel_step_settlement_keeps_independent_receipts_and_original_
     assert await asyncio.gather(settle(ids["lease_id"]), settle(lease_id)) == ["completed", "completed"]
     for target in (ids["step_id"], step_id):
         step = await db_session.get(ExecutionStep, target, populate_existing=True)
-        assert reused_artifact_snapshots(step)[0]["document_id"] == source.id
+        assert _reuse_receipts(step)[0]["fields"]["snapshot"]["document_id"] == source.id
         assert step.evidence_refs[0]["fields"]["owner_step_id"] == target
     await db_session.refresh(source)
     assert (source.metadata_, source.updated_at) == before
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_mints_receipt_and_reconciliation_preserves_producer(db_session, tmp_path, monkeypatch):
+async def test_dispatcher_mints_receipt_without_rebinding_the_producer(db_session, tmp_path, monkeypatch):
     from packages.core.services import artifact_knowledge
-    from packages.core.services.task_execution_reconcile import _project_actual_output_artifacts
 
     ids = await _seed(db_session, tmp_path)
     source = await db_session.get(Document, ids["document_id"])
@@ -329,142 +322,7 @@ async def test_dispatcher_mints_receipt_and_reconciliation_preserves_producer(db
     assert lease.status == "completed" and step.step_status == "done"
     receipts = [ref for ref in step.evidence_refs if ref.get("source") == ARTIFACT_DELIVERY_SOURCE]
     assert len(receipts) == 1
-    assert reused_artifact_snapshots(step)
+    assert _reuse_receipts(step)[0]["fields"]["snapshot"]["document_id"] == source.id
     assert not any(ref.get("kind") == "tool_effect" for ref in step.evidence_refs)
-    task = await db_session.get(Task, ids["task_id"])
-    actual = {"plan_id": ids["plan_id"], "files": [payload]}
-    projected = await _project_actual_output_artifacts(task, actual, db=db_session)
-    await db_session.commit()
-    assert projected["files"][0]["document_id"] == source.id
-    unexpected = {**actual, "files": [payload, {"fs_path": "unsubmitted.md"}]}
-    rejected = await _project_actual_output_artifacts(task, unexpected, db=db_session)
-    assert rejected["artifact_knowledge_issues"] == [{"reason": "artifact_evidence_mismatch"}]
     await db_session.refresh(source)
     assert (source.metadata_, source.updated_at) == before
-
-
-@pytest.mark.asyncio
-async def test_worker_bad_reference_can_be_corrected_before_terminal_submit(monkeypatch):
-    from packages.core.services import artifact_delivery
-    from packages.core.workers import internal
-
-    calls = []
-
-    async def verify(_db, **kwargs):
-        calls.append(kwargs)
-        if kwargs["refs"][0]["document_id"] == "wrong":
-            raise ArtifactDeliveryError("artifact_unavailable", "Read and submit the correct Document.")
-        return SimpleNamespace()
-
-    monkeypatch.setattr(artifact_delivery, "verify_artifact_delivery_refs", verify)
-    handler, get_payload = internal._artifact_aware_submit_result_capture({"params": REUSE, "entity_id": "entity"})
-    bad = json.loads(await handler({"result": {"document_id": "wrong"}}))
-    assert bad["error"] == "artifact_unavailable" and get_payload() is None
-    good = {"result": {"document_id": "correct"}}
-    assert json.loads(await handler(good))["ok"] is True
-    assert get_payload() == good and len(calls) == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", [None, "missing_receipt", "bytes", "document_revision", "requester_revoked", "busy"])
-async def test_acceptance_requires_the_version_delivered_by_readonly_step(db_session, tmp_path, change):
-    from packages.core.services.task_acceptance_review import TaskAcceptanceError, build_task_acceptance_snapshot
-
-    ids = await _seed(db_session, tmp_path)
-    await Dispatcher().complete_lease(db_session, ids["lease_id"], result={"document_id": ids["document_id"], "fs_path": "existing.md"})
-    await db_session.commit()
-    step = await db_session.get(ExecutionStep, ids["step_id"])
-    task = await db_session.get(Task, ids["task_id"])
-    plan = await db_session.get(ExecutionPlan, ids["plan_id"])
-    if change == "missing_receipt":
-        step.evidence_refs = []
-    elif change == "bytes":
-        (tmp_path / ids["entity_id"] / "existing.md").write_text("changed before first review", encoding="utf-8")
-    elif change == "document_revision":
-        document = await db_session.get(Document, ids["document_id"])
-        document.name = "Changed Document revision"
-    elif change == "requester_revoked":
-        await db_session.execute(update(UserMembership).where(UserMembership.user_id == ids["user_id"]).values(status="inactive"))
-    await db_session.commit()
-    kwargs = {"task": task, "plan": plan, "steps": [step], "claim": SimpleNamespace(run_id="run", wake_generation=1, claim_token="claim")}
-    if change == "busy":
-        async with entity_filesystem_mutation_lock(canonical_entity_root(ids["entity_id"])):
-            with pytest.raises(TaskAcceptanceError) as error:
-                await build_task_acceptance_snapshot(db_session, **kwargs)
-            assert error.value.code == "artifact_busy" and error.value.retryable
-    elif change:
-        with pytest.raises(TaskAcceptanceError):
-            await build_task_acceptance_snapshot(db_session, **kwargs)
-    else:
-        snapshot = await build_task_acceptance_snapshot(db_session, **kwargs)
-        assert json.loads(snapshot.payload_json)["artifacts"][0]["source_sha256"] == reused_artifact_snapshots(step)[0]["source_sha256"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("readonly", [False, True])
-async def test_coordinator_submit_awaits_async_artifact_preflight_and_keeps_sync_compatibility(monkeypatch, readonly):
-    from packages.core.constants.execution import COORDINATOR_PARAM_KEY
-    from packages.core.services import artifact_delivery
-    from packages.core.workers import internal
-    from tests import test_robust_worker_exec_subagent as worker_tests
-
-    worker_tests.worker_env.__wrapped__(monkeypatch)
-    verified = []
-
-    async def verify(_db, **kwargs):
-        verified.append(kwargs["refs"])
-        return SimpleNamespace()
-
-    async def checklist_complete(_snapshot):
-        return None
-
-    async def fake_worker_loop(**kwargs):
-        reply = await kwargs["dynamic_tool_handlers"]["submit_result"]({"summary": "Existing file", "result": {"document_id": "doc"}})
-        assert not inspect.isawaitable(reply)
-        assert json.loads(reply)["ok"] is True
-        return SimpleNamespace(result=worker_tests._loop_result(), run=None)
-
-    monkeypatch.setattr(artifact_delivery, "verify_artifact_delivery_refs", verify)
-    monkeypatch.setattr(internal, "coordinator_submission_error", checklist_complete)
-    monkeypatch.setattr(internal, "runtime_execute_worker_subagent_loop", fake_worker_loop)
-    params = {"prompt": "Reuse the existing file", COORDINATOR_PARAM_KEY: True, "delegate_services": ["writer"]}
-    if readonly:
-        params.update(copy.deepcopy(REUSE))
-    outcome = await internal._exec_subagent(worker_tests._step(params=params))
-    assert "doc" in json.dumps(outcome["result"])
-    assert bool(verified) is readonly
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("with_producer", [False, True])
-async def test_runtime_hydration_never_mutates_verified_readonly_delivery(monkeypatch, with_producer):
-    from packages.core.plans import completion_contracts
-
-    finished_at = datetime.now(timezone.utc)
-    readonly = SimpleNamespace(
-        id="reuse", plan_id="plan", params=copy.deepcopy(REUSE), service_key="writer",
-        step_status="done", result={"document_id": "doc", "fs_path": "a.md"},
-        attempt_count=1, finished_at=finished_at,
-    )
-    readonly.evidence_refs = reused_artifact_evidence(
-        readonly, readonly.result,
-        [{"document_id": "doc", "fs_path": "a.md", "source_sha256": "a" * 64}],
-        lease_id="lease", completed_at=finished_at,
-    )
-    before = copy.deepcopy((readonly.result, readonly.evidence_refs))
-    producer = SimpleNamespace(params={}, service_key="writer", step_status="done", result={}, evidence_refs=[])
-    steps = [producer, readonly] if with_producer else [readonly]
-    task = SimpleNamespace(owner_service_key="writer", details={"completion_requirements": {"artifact_evidence": [{"tool": "generate_file"}]}})
-    event = SimpleNamespace(event_type="tool_end", tool_name="generate_file", event_data={"status": "success", "fs_path": "a.md"})
-    monkeypatch.setattr(completion_contracts, "task_runtime_events", AsyncMock(return_value=[event]))
-    db = SimpleNamespace(flush=AsyncMock())
-
-    await completion_contracts.hydrate_completion_artifacts(db, task, steps)
-
-    assert (readonly.result, readonly.evidence_refs) == before
-    assert reused_artifact_snapshots(readonly)
-    if with_producer:
-        assert producer.result["files"][0]["fs_path"] == "a.md"
-        db.flush.assert_awaited_once()
-    else:
-        db.flush.assert_not_awaited()

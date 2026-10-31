@@ -180,7 +180,7 @@ async def test_strategist_fallback_cannot_reintroduce_a_disabled_connected_accou
         "_open_proposed_items", "_recent_proposal_outcomes", "_gather_memory",
         "_gather_operating_memory", "_knowledge_nets", "_governance_policy",
         "_calibration_stats", "_recent_runtime_evidence", "_learning_candidates", "_workspace_evaluation",
-        "_declined_human_requests",
+        "_declined_human_requests", "_open_tasks",
     ):
         monkeypatch.setattr(context, name, AsyncMock(return_value=[]))
     monkeypatch.setattr(context, "_active_provider_keys", AsyncMock(return_value={"elevenlabs", "slack"}))
@@ -351,7 +351,7 @@ def test_both_agent_schemas_advertise_exact_executable_removal_shape():
     ]
     for description in descriptions:
         assert '"patches":[{"op":"integration.remove","payload":{"provider":"elevenlabs"}}]' in description
-        assert "current workspace is already supplied" in description
+        assert "The draft already names the Workspace; omit scope" in description
         assert "remove_bindings" in description and "invalid" in description
         assert "integration.enable alone" in description
         assert "do not add capability bindings" in description

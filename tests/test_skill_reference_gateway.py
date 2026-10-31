@@ -194,17 +194,19 @@ async def test_ordinary_generate_file_office_route_stages_attachment_and_search(
     async def list_skills(_db, _entity):
         return []
 
-    async def resolve(**_kwargs):
+    observed = {}
+
+    async def resolve(**kwargs):
+        observed.setdefault("resolve_kwargs", kwargs)
         return [SkillReferenceMaterial(
             "/skill/inputs/source-01.pdf", b"%PDF-original-reference",
             "chat_upload:uploads/brief.pdf", "brief.pdf", "application/pdf",
         )]
 
-    observed = {}
-
-    async def invoke(_db, skill, _entity, input_text, **_kwargs):
+    async def invoke(_db, skill, _entity, input_text, **kwargs):
         observed["skill"] = skill
         observed["input"] = input_text
+        observed["kwargs"] = kwargs
         return {"stop_reason": "sandbox_ready", "sandbox_id": "sandbox-one"}
 
     async def stage(_sandbox_id, files):
@@ -216,6 +218,8 @@ async def test_ordinary_generate_file_office_route_stages_attachment_and_search(
     monkeypatch.setattr(skill_reference_materials, "resolve_skill_reference_materials", resolve)
     monkeypatch.setattr(skill_reference_materials, "stage_skill_reference_files", stage)
     context = SimpleNamespace(
+        runtime_artifact_urls=frozenset({"/api/v1/fs/entity-one/media/run-chart.png"}),
+        dependency_artifact_urls=frozenset({"/api/v1/fs/entity-one/media/upstream.wav"}),
         active_user_message="Use my brief and today's market evidence",
         runtime_envelope=SimpleNamespace(
             metadata={}, discovered_tool_grants=SimpleNamespace(grant=lambda _names: None),
@@ -239,6 +243,12 @@ async def test_ordinary_generate_file_office_route_stages_attachment_and_search(
     assert manifest[1]["source"].startswith("web_search_snippets:market today")
     assert manifest[1]["complete_source"] is False
     assert "sandbox" in json.loads(result)["loaded_tools"]
+    # The run's own and dependency artifacts are host-collected context:
+    # optional references, never required ones.
+    assert sorted(observed["resolve_kwargs"]["context_artifact_urls"]) == [
+        "/api/v1/fs/entity-one/media/run-chart.png", "/api/v1/fs/entity-one/media/upstream.wav",
+    ]
+    assert not observed["resolve_kwargs"]["artifact_urls"]
 
 
 @pytest.mark.asyncio
@@ -286,6 +296,47 @@ async def test_reference_resolver_rechecks_file_acl_before_open(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reference_resolver_skips_host_internal_run_artifacts(monkeypatch, tmp_path):
+    """A video job's staged first frame is cited in its result but is not a
+    user file; it must not turn every later Skill call into reference_forbidden."""
+    from packages.core.ai.runtime import file_actions
+    from packages.core.services.skill_reference_materials import resolve_skill_reference_materials
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"mp4")
+    checked = []
+
+    async def guard(**kwargs):
+        checked.extend(kwargs["paths"])
+        return None
+
+    @contextmanager
+    def snapshot(_entity_id, _path):
+        descriptor = os.open(clip, os.O_RDONLY)
+        try:
+            yield SimpleNamespace(file_descriptor=descriptor, stat=os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(file_actions, "runtime_guard_file_read_access", guard)
+    monkeypatch.setattr(file_actions, "runtime_open_entity_file_snapshot", snapshot)
+    materials = await resolve_skill_reference_materials(
+        db=object(), entity_id="entity-one", user_id="user-one",
+        conversation_id="chat-one", workspace_id=None, runtime_envelope=None,
+        artifact_urls=[
+            "/api/v1/fs/entity-one/uploads/media-references/job-1/00-first-frame-a3cbebc675.png",
+            "/api/v1/fs/entity-one/Videos/clip.mp4",
+        ],
+    )
+
+    assert checked == ["Videos/clip.mp4"]
+    # References are metadata only; bytes are read at projection/staging.
+    assert [(material.file_path, material.size, material.sha256) for material in materials] == [
+        ("Videos/clip.mp4", 3, hashlib.sha256(b"mp4").hexdigest()),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reference_resolver_carries_current_attachment_original_bytes(monkeypatch, tmp_path):
     from packages.core.ai.runtime import file_actions
     from packages.core.services.skill_reference_materials import resolve_skill_reference_materials
@@ -318,9 +369,13 @@ async def test_reference_resolver_carries_current_attachment_original_bytes(monk
         conversation_id="chat-one", workspace_id=None,
         runtime_envelope=envelope,
     )
-    assert materials[0].data == original
+    # Resolution carries metadata only; the original bytes are read at staging.
+    assert materials[0].data is None
+    assert materials[0].size == len(original)
+    assert materials[0].sha256 == hashlib.sha256(original).hexdigest()
     assert materials[0].name == "report.pdf"
     assert materials[0].source == "chat_upload:uploads/chat/report.pdf"
+    assert build_skill_reference_files(materials)[0] == ("/skill/inputs/source-01.pdf", original)
 
 
 @pytest.mark.asyncio
@@ -357,8 +412,16 @@ async def test_reference_resolver_prioritizes_current_over_bounded_history(monke
         conversation_id="chat-one", workspace_id=None,
         runtime_envelope=envelope,
     )
-    assert [material.name for material in materials] == ["current.txt", "recent.txt"]
-    assert sum(len(material.data) for material in materials) == 12
+    # Every authorized reference is listed; the byte caps bound what is staged.
+    assert [material.name for material in materials] == ["current.txt", "recent.txt", "old.txt"]
+    assert [material.required for material in materials] == [True, False, False]
+    files = skill_reference_materials.build_skill_reference_files(materials)
+    assert [path for path, _ in files] == [
+        "/skill/inputs/source-01.txt", "/skill/inputs/source-02.txt", "/skill/inputs/manifest.json",
+    ]
+    manifest = json.loads(files[-1][1])["materials"]
+    assert [entry["staged"] for entry in manifest] == [True, True, False]
+    assert manifest[2]["not_staged_reason"] == "staging_byte_limit"
 
 
 @pytest.mark.asyncio

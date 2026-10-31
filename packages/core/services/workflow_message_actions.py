@@ -14,10 +14,12 @@ from packages.core.constants.pending_actions import (
     WORKFLOW_RUN_ACTION_KINDS,
     PendingActionKind,
 )
+from packages.core.constants.task import CancelSource
 from packages.core.models.task import Conversation, Message
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
 from packages.core.services.hitl_options import APPROVAL_CHOICE_ALWAYS_APPROVE
+from packages.core.services.workflow_run_control import cancel_run
 from packages.core.services.workspace_access import user_can_control_workspace_run
 from packages.core.workspace_chat import service as chat_service
 
@@ -113,6 +115,7 @@ async def _resolve_starter(
     payload: dict[str, Any] | None,
     user: User,
 ) -> str | None:
+    from packages.core.services.workflow_record_source import record_selection_errors
     from packages.core.services.workspace_workflow_router import (
         assemble_workspace_workflow_inputs,
         get_workspace_chat_entrypoint,
@@ -123,8 +126,7 @@ async def _resolve_starter(
     if run.status != "paused" or run.step_results:
         _fail(409, "Workflow Run is no longer waiting for its inputs")
     if choice in _CANCEL_CHOICES:
-        run.status = "cancelled"
-        run.completed_at = datetime.now(timezone.utc)
+        cancel_run(run, actor_id=user.id, source=CancelSource.USER)
         await _project_run(db, run)
         return None
     if choice not in {"run", "start", "submit", "confirm"}:
@@ -151,6 +153,15 @@ async def _resolve_starter(
         except Exception:
             errors = {"inputs": "Invalid workflow inputs."}
         _fail(422, {"message": "Invalid workflow inputs", "errors": errors})
+    record_errors = await record_selection_errors(
+        db,
+        entrypoint.run_inputs,
+        input_values,
+        entity_id=user.entity_id,
+        workspace_id=str(run.workspace_id),
+    )
+    if record_errors:
+        _fail(422, {"message": "Invalid workflow inputs", "errors": record_errors})
     mapped = assemble_workspace_workflow_inputs(entrypoint, input_values)
     trigger_data = dict(run.trigger_data or {})
     trigger_data.update(input_values)
@@ -185,13 +196,30 @@ async def _resolve_retry(
     if choice not in {"retry", "retry_now"}:
         if choice not in {"cancel", "skip"}:
             _fail(400, "Unsupported Workflow retry choice")
-        run.status = "cancelled"
-        run.completed_at = datetime.now(timezone.utc)
+        if run.status != "cancelled":
+            # A retry card is offered on a failed, needs-input or stalled run.
+            cancel_run(
+                run,
+                actor_id=user.id,
+                source=CancelSource.USER,
+                allow_problem_terminal=True,
+            )
         await _project_run(db, run)
         return run, None
     variables = (payload or {}).get("variables")
     if variables is not None and not isinstance(variables, dict):
         _fail(422, "Workflow retry variables must be an object")
+    from packages.core.services.workflow_run_trace import workflow_run_stalled
+
+    if workflow_run_stalled(run):
+        # Its frozen Flow would stall again: start over on the current one, as the run page does.
+        try:
+            fresh, launched = await workflow_service.restart_stalled_run(db, run, user=user, variables=variables)
+        except ValueError as exc:
+            _fail(409, str(exc))
+        # A launch still asking for inputs waits on its own starter card, like a manual start.
+        ready = launched is None or (launched.created and launched.starter_message is None)
+        return fresh, fresh.id if ready else None
     try:
         retry = await workflow_service.retry_workflow_run(
             db,
@@ -200,6 +228,7 @@ async def _resolve_retry(
             started_by=user.id,
             from_step_id=str(pending_action.get("retry_from_step_id") or "") or None,
             variables=variables,
+            definition="current",
         )
     except ValueError as exc:
         _fail(409, str(exc))
@@ -234,6 +263,17 @@ async def _resolve_retry(
     return retry, retry.id
 
 
+def split_revision_feedback(submitted_review: Any, note: str | None) -> tuple[Any, str | None]:
+    """Feedback sent as ``{"revision_request": ...}`` is the reviewer's note.
+
+    It is not an edit of the material, so a read-only review accepts it and
+    the Workflow reads it as ``<response>.note``.
+    """
+    if isinstance(submitted_review, dict) and set(submitted_review) == {"revision_request"}:
+        return None, note or str(submitted_review["revision_request"] or "").strip() or None
+    return submitted_review, note
+
+
 async def _resolve_wait(
     db: AsyncSession,
     *,
@@ -255,8 +295,7 @@ async def _resolve_wait(
     if run.status != "paused" or run.current_step_id != pending_action.get("step_id"):
         _fail(409, "Workflow Run is no longer waiting for this response")
     if choice in _CANCEL_CHOICES:
-        run.status = "cancelled"
-        run.completed_at = datetime.now(timezone.utc)
+        cancel_run(run, actor_id=user.id, source=CancelSource.USER)
         await _project_run(db, run)
         return None
     if kind == PendingActionKind.WORKFLOW_INPUT.value and choice not in {
@@ -292,6 +331,16 @@ async def _resolve_wait(
         if isinstance(payload, dict) and "review" in payload
         else None
     )
+    submitted_review, note = split_revision_feedback(submitted_review, note)
+    if submitted_review is None and isinstance(payload, dict) and "review" in payload:
+        payload = {key: value for key, value in payload.items() if key != "review"} or None
+    if (
+        kind == PendingActionKind.WORKFLOW_APPROVAL.value
+        and submitted_review is not None
+        and submitted_review == pending_action.get("review")
+    ):
+        # Sending back the review as shown is not an edit.
+        submitted_review = None
     if (
         kind == PendingActionKind.WORKFLOW_APPROVAL.value
         and submitted_review is not None
@@ -334,8 +383,35 @@ async def _resolve_wait(
         **({"payload": payload} if payload is not None else {}),
         **({"review_edited": True} if review_edited else {}),
     }
+    input_schema = current_config.get("input_schema")
+    input_value: dict[str, Any] | None = None
+    if (
+        kind == PendingActionKind.WORKFLOW_INPUT.value
+        and not collection_wait
+        and isinstance(input_schema, dict)
+        and input_schema.get("type") == "object"
+    ):
+        from packages.core.ai.workflow_runner import workflow_input_wait_value
+
+        submitted_input = None
+        if isinstance(payload, dict):
+            candidate = payload.get(response_variable)
+            if isinstance(candidate, dict):
+                submitted_input = candidate
+            elif isinstance(payload.get("inputs"), dict):
+                # Keep clients using the shared collection-card submit wrapper
+                # compatible while moving normal input waits to their schema.
+                submitted_input = payload["inputs"]
+        try:
+            _response_variable, input_value, _input_schema = workflow_input_wait_value(
+                current_config,
+                {response_variable: submitted_input},
+                context=run.variables,
+            )
+        except ValueError as exc:
+            _fail(422, {"message": "Invalid workflow input", "errors": {"inputs": str(exc)}})
     variables = dict(run.variables or {})
-    variables[response_variable] = response_value
+    variables[response_variable] = input_value if input_value is not None else response_value
     run.variables = variables
     approval_metadata: dict[str, Any] = {}
     if kind == PendingActionKind.WORKFLOW_APPROVAL.value:
@@ -459,15 +535,6 @@ async def resolve_workflow_message_action(
         resolution["note"] = note
     if payload is not None:
         resolution["payload"] = payload
-    resolved = await chat_service.resolve_pending_action(
-        db,
-        message_id=message.id,
-        user_id=user.id,
-        resolution=resolution,
-    )
-    if resolved is None:
-        _fail(404, "message not found")
-
     run_to_enqueue: str | None
     if kind == PendingActionKind.WORKFLOW_STARTER_INPUT.value:
         run_to_enqueue = await _resolve_starter(
@@ -503,6 +570,17 @@ async def resolve_workflow_message_action(
         )
     else:
         return None
+
+    # Validate and apply the Workflow response before resolving the card. A
+    # malformed input must leave the same card available for correction.
+    resolved = await chat_service.resolve_pending_action(
+        db,
+        message_id=message.id,
+        user_id=user.id,
+        resolution=resolution,
+    )
+    if resolved is None:
+        _fail(404, "message not found")
 
     await db.commit()
     await _enqueue_run(db, run, run_to_enqueue)

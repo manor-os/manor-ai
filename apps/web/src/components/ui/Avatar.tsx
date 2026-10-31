@@ -10,6 +10,7 @@
  * browser's broken-image icon.
  */
 import { useState } from "react";
+import { userAvatarImage } from "../../lib/userAvatar";
 
 const AVATAR_GRADIENTS = [
   { from: "#e5eeeb", to: "#ccded9", fg: "#436b65" },
@@ -39,7 +40,7 @@ const brokenAvatarUrls = new Set<string>();
 
 export default function Avatar({ name, size = 32, src, className }: AvatarProps) {
   const c = getAvatarColor(name);
-  const imageSrc = (src || "").trim();
+  const imageSrc = userAvatarImage(src);
   const [brokenSrc, setBrokenSrc] = useState<string | null>(() => (imageSrc && brokenAvatarUrls.has(imageSrc) ? imageSrc : null));
   const isBroken = !!imageSrc && (brokenSrc === imageSrc || brokenAvatarUrls.has(imageSrc));
   if (imageSrc && !isBroken) {

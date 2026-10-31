@@ -14,8 +14,8 @@ TASK_STATUSES = {
     # ``proposed``: Strategist suggested this task during a review cycle
     # but the operator hasn't approved it yet. Sits in the
     # workspace_chat as a card with [Approve] [Reject]; on approve
-    # dependency-ready rows flip to ``in_progress`` (which triggers
-    # plan_and_run_task), while rows waiting on predecessor task output
+    # dependency-ready rows flip to ``in_progress`` (which starts the
+    # Task agent loop), while rows waiting on predecessor task output
     # stay ``pending`` until the dependency gate releases them.
     "proposed":             {"label": "Proposed",             "color": "#a78bfa", "order": 1},
     "pending":              {"label": "Pending",              "color": "#f59e0b", "order": 2},
@@ -57,6 +57,18 @@ class TaskStatus(str, Enum):
 assert set(TaskStatus.values()) == set(TASK_STATUSES.keys()), (
     "TaskStatus and TASK_STATUSES drifted apart"
 )
+
+
+class CancelSource(str, Enum):
+    """Who ended a run by cancelling it. Feeds the user-cancel quality signal;
+    no source turns a cancel into a failure."""
+
+    USER = "user"          # a person cancelled it directly
+    SYSTEM = "system"      # the platform, an agent or a cascade cancelled it
+    PROPOSAL = "proposal"  # a person rejected a Strategist proposal (Tasks only)
+
+    __str__ = str.__str__
+    __format__ = str.__format__
 
 VALID_STATUSES = set(TaskStatus.values())
 
@@ -165,15 +177,12 @@ class TaskRuntimeKind(str, Enum):
     Every Task enters this closed factory instead.
     """
 
+    #: The Task's durable run (TaskCoordinatorRun), in a Workspace or assigned
+    #: directly to an Agent. The value is persisted in results.
     COORDINATED_PLAN = "coordinated_plan"
-    PLAN_RESUME = "plan_resume"
     INTERACTIVE_SESSION = "interactive_session"
     HUMAN_DECISION = "human_decision"
     MANUAL = "manual"
-    # Read compatibility for Tasks/checkpoints created before coordinated
-    # execution became the Workspace default. New Workspace work must not
-    # choose this adapter when a valid service scope exists.
-    LEGACY_AGENT = "legacy_agent"
 
 
 class TaskApprovalChoice(str, Enum):
@@ -276,10 +285,3 @@ HITL_REQUEST_LOG_TYPES = frozenset(
 )
 HITL_LOG_TYPES = HITL_REQUEST_LOG_TYPES | {TaskLogType.AI_HITL_RESUMED}
 
-
-def plan_terminal_log_type(plan_status: str) -> str:
-    """The log type for a plan reaching ``plan_status`` — the typed form of
-    the old f"plan_{status}" string construction. Raises if a plan status has
-    no log type, which is the point: a new terminal status must declare one.
-    """
-    return TaskLogType(f"plan_{plan_status}").value

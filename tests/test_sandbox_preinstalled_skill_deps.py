@@ -111,7 +111,8 @@ def test_image_installs_python_manifests_together_and_checks_them() -> None:
     source = DOCKERFILE.read_text()
 
     assert "/opt/manor/skill-deps/python/*.txt" in source
-    assert "pip install --no-cache-dir $requirements" in source
+    # One pip run resolves the Skills' requirements with the toolset's.
+    assert "pip install --no-cache-dir -r /opt/manor/toolset/requirements.txt $requirements" in source
     assert "pip check" in source
     assert "/opt/manor/skill-deps/node/*/" in source
     # Installed before the image drops to the unprivileged sandbox user.
@@ -145,7 +146,7 @@ async def test_preinstalled_manifests_skip_the_create_time_install(tmp_path, mon
     package = '{"dependencies": {"remotion": "4.0.506"}}\n'
     sandbox, skill = _sandbox(tmp_path, {"requirements.txt": requirements, "package.json": package})
     exec_mock = _exec_returning({})
-    monkeypatch.setattr(sandbox, "_exec_in_container", exec_mock)
+    monkeypatch.setattr(sandbox, "_run_in_container", exec_mock)
 
     result = await sandbox._install_dependencies(skill)
 
@@ -165,7 +166,7 @@ async def test_unknown_manifests_still_install(tmp_path, monkeypatch):
         {"requirements.txt": "left-pad-py==1.0\n", "package.json": '{"dependencies": {"x": "1"}}\n'},
     )
     exec_mock = _exec_returning({"test -f": 1, "exit 64": 64})
-    monkeypatch.setattr(sandbox, "_exec_in_container", exec_mock)
+    monkeypatch.setattr(sandbox, "_run_in_container", exec_mock)
 
     await sandbox._install_dependencies(skill)
 
@@ -178,12 +179,13 @@ async def test_unknown_manifests_still_install(tmp_path, monkeypatch):
 async def test_linking_keeps_entries_the_skill_installed_itself(tmp_path, monkeypatch):
     sandbox, skill = _sandbox(tmp_path, {"package.json": '{"dependencies": {"docx": "9.7.1"}}\n'})
     exec_mock = _exec_returning({})
-    monkeypatch.setattr(sandbox, "_exec_in_container", exec_mock)
+    monkeypatch.setattr(sandbox, "_run_in_container", exec_mock)
 
     assert await sandbox._link_preinstalled_node_modules(skill)
 
     script = exec_mock.await_args.args[0]
-    assert "dst=/skill/node_modules" in script
+    # Each Skill links its own node_modules in its own /skills/<name>.
+    assert "dst=/skills/pdf/node_modules" in script
     # Never replace something already in node_modules.
     assert 'link() { [ -e "$2" ] || [ -L "$2" ] || ln -s "$1" "$2"; }' in script
     # Per-package links inside real directories, never a link over
@@ -207,12 +209,12 @@ async def test_linking_runs_in_a_real_shell(tmp_path, monkeypatch):
 
     sandbox, skill = _sandbox(tmp_path, {"package.json": "{}\n"})
     captured = AsyncMock(return_value=models.ExecResponse(stdout="", stderr="", exit_code=0))
-    monkeypatch.setattr(sandbox, "_exec_in_container", captured)
+    monkeypatch.setattr(sandbox, "_run_in_container", captured)
     await sandbox._link_preinstalled_node_modules(skill)
     script = captured.await_args.args[0]
     script = script.replace(
         f"{docker_backend.PREINSTALLED_SKILL_DEPS_ROOT}/node/", f"{tmp_path}/digest-",
-    ).replace("/skill/node_modules", str(workdir / "node_modules"))
+    ).replace("/skills/pdf/node_modules", str(workdir / "node_modules"))
     digest = docker_backend.preinstalled_manifest_digest(b"{}\n")
     (tmp_path / f"digest-{digest}").mkdir()
     (tmp_path / f"digest-{digest}" / "node_modules").symlink_to(image)

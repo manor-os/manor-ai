@@ -55,6 +55,14 @@ def _load_bundled_guidance(skill_name: str) -> ToolGuidance:
     return ToolGuidance(skill_name, hashlib.sha256(content.encode()).hexdigest(), content)
 
 
+def _tool_error(content: object) -> dict:
+    try:
+        payload = json.loads(str(content or ""))
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def runtime_tool_guidance(tool_name: str) -> ToolGuidance | None:
     skill_name = runtime_tool_guidance_skill(tool_name)
     return _load_bundled_guidance(skill_name) if skill_name else None
@@ -68,7 +76,17 @@ class RuntimeToolGuidance:
     current guide; user/tool messages cannot stand in for that checkpoint.
     """
 
-    def __init__(self, checkpoint_messages: list[dict] | None = None):
+    def __init__(
+        self,
+        checkpoint_messages: list[dict] | None = None,
+        checkpoint_observed: dict[str, str] | None = None,
+    ):
+        # The host's record of what the parked loop's model had read, by exact
+        # bundle hash. Compaction may rewrite the system message, so the guide
+        # text alone cannot prove that a pending call was authored after it.
+        self._checkpoint_observed = {
+            str(name): str(sha) for name, sha in (checkpoint_observed or {}).items()
+        }
         self._checkpoint_system = (
             str(checkpoint_messages[0].get("content") or "")
             if checkpoint_messages and checkpoint_messages[0].get("role") == "system"
@@ -85,15 +103,25 @@ class RuntimeToolGuidance:
             if message.get("role") == "assistant"
             for call in message.get("tool_calls") or []
         }
-        self._requested: set[str] = set()
+        # A request outlives the loop that made it: a run that parks after the
+        # failed call resumes in a new loop, which must still load the guide.
+        # Only tool results carry it, and a request loads bundled text, never
+        # marks it observed.
+        self._requested: set[str] = {
+            str(payload["tool"])
+            for message in checkpoint_messages or []
+            if message.get("role") == "tool"
+            for payload in [_tool_error(message.get("content"))]
+            if payload.get("error") == "tool_guidance_required" and payload.get("tool")
+        }
         self._prepared: dict[str, ToolGuidance] = {}
         self._observed: dict[str, ToolGuidance] = {}
 
     def _resolve(self, name: str) -> ToolGuidance | None:
         guide = runtime_tool_guidance(name)
-        if (
-            guide is not None and name in self._checkpoint_calls
-            and guide.section(name) in self._checkpoint_system
+        if guide is not None and name in self._checkpoint_calls and (
+            guide.section(name) in self._checkpoint_system
+            or self._checkpoint_observed.get(name) == guide.source_sha256
         ):
             self._observed[name] = guide
         return guide
@@ -130,6 +158,14 @@ class RuntimeToolGuidance:
 
     def mark_observed(self) -> None:
         self._observed.update(self._prepared)
+
+    def checkpoint_state(self) -> dict[str, str]:
+        """``{tool: source_sha256}`` read so far, for a durable checkpoint."""
+
+        return {
+            **self._checkpoint_observed,
+            **{name: guide.source_sha256 for name, guide in self._observed.items()},
+        }
 
     def preflight(self, tool_name: str) -> RuntimePreflightValidationError | None:
         try:

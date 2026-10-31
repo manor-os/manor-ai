@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from packages.core.services.notification_routing import select_channels
+from packages.core.services.notification_routing import push_allowed_for_kind, select_channels
 
 
 def _now(hour: int, minute: int = 0, tz: str = "UTC") -> datetime:
@@ -327,3 +327,56 @@ def test_inapp_is_always_present(severity):
         user_prefs={"notifications": {"default_channels": ["telegram"]}},
     )
     assert "inapp" in chans
+
+
+# ── Mobile push gate (no push channel: follows per-kind opt-out and quiet hours) ─
+
+_QUIET_ALL_DAY = {"quiet_hours": {"from": "00:00", "to": "23:00", "tz": "UTC"}}
+
+
+@pytest.mark.parametrize(
+    ("notifications", "severity", "expect_push"),
+    [
+        ({}, "warn", True),
+        ({"by_kind": {"task_succeeded": {"enabled": False}}}, "info", False),
+        ({"by_kind": {"task_succeeded": {"enabled": False}}}, "critical", False),
+        (_QUIET_ALL_DAY, "info", False),
+        (_QUIET_ALL_DAY, "warn", True),
+        (_QUIET_ALL_DAY, "critical", True),
+        ({**_QUIET_ALL_DAY, "by_kind": {"task_succeeded": {"bypass_quiet_hours": True}}}, "info", True),
+    ],
+)
+def test_push_follows_per_kind_opt_out_and_quiet_hours(notifications, severity, expect_push):
+    # Fixed clock inside the quiet window so the result never depends on wall time.
+    now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    allowed = push_allowed_for_kind(
+        kind="task_succeeded",
+        severity=severity,
+        user_prefs={"notifications": notifications},
+        now=now,
+    )
+    assert allowed is expect_push
+
+
+def test_kind_default_channels_apply_until_the_user_overrides_the_kind(monkeypatch):
+    from packages.core.constants import notification_types
+
+    monkeypatch.setitem(notification_types.EVENTS_BY_KIND, "creator_update", {
+        "kind": "creator_update", "category": "system", "severity": "info",
+        "label": "x", "description": "x", "default_channels": ["email"],
+    })
+    prefs = {"notifications": {"default_channels": ["telegram"]}}
+    assert select_channels(kind="creator_update", severity="info", user_prefs=prefs) == ["inapp", "email"]
+    prefs["notifications"]["by_kind"] = {"creator_update": {"enabled": True, "channels": ["inapp"]}}
+    assert select_channels(kind="creator_update", severity="info", user_prefs=prefs) == ["inapp"]
+
+
+def test_quiet_hours_can_be_left_to_the_caller():
+    prefs = {"notifications": {
+        "default_channels": ["email"],
+        "quiet_hours": {"from": "00:00", "to": "23:59", "tz": "UTC"},
+    }}
+    assert select_channels(kind="task_failed", severity="info", user_prefs=prefs, now=_now(12)) == ["inapp"]
+    assert select_channels(
+        kind="task_failed", severity="info", user_prefs=prefs, now=_now(12), apply_quiet_hours=False,
+    ) == ["inapp", "email"]

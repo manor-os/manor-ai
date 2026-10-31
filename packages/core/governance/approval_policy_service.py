@@ -15,8 +15,9 @@ from types import SimpleNamespace
 from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.governance.action_effects import ACTION_CATALOG
 from packages.core.governance.approval_policy import (
-    ACTION_CATALOG, ActionFacts, ApprovalPolicy, ApprovalPolicyBinding,
+    ActionFacts, ApprovalPolicy, ApprovalPolicyBinding,
     ApprovalPolicyOverride, ApprovalRule, ApprovalScope, PolicyDraft,
     PolicySnapshot, PolicyVersion, ResolvedPolicyChain, evaluate_policy,
 )
@@ -338,6 +339,10 @@ async def update_approval_policy(db: AsyncSession, scope: ApprovalScope, draft: 
         resource_id=scope.id, details={'before': before.policy.model_dump(), 'after': policy,
             'previous_version': before.version, 'revision': revision, 'root_revision': chain.root.revision}))
     await db.flush()
+    if scope.kind != 'workspace':
+        # Workspace writes stage this in ``update_policy`` for every writer.
+        from packages.core.governance.approval_policy_reevaluation import stage_pending_approval_reevaluation
+        await stage_pending_approval_reevaluation(db, scope=scope, revision=revision, actor_id=actor.id)
     if scope.kind == 'account':
         _queue_root_changed(db, scope.entity_id, revision)
     updated, _ = await _load(db, scope)

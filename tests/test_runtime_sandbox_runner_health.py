@@ -48,7 +48,7 @@ def _runner():
     )
 
 
-def _wire(monkeypatch, runner, *, listing):
+def _wire(monkeypatch, runner, *, listing, health=None):
     session = _Session(runner)
     monkeypatch.setattr(
         "packages.core.database.create_worker_session", lambda: (lambda: session),
@@ -68,7 +68,7 @@ def _wire(monkeypatch, runner, *, listing):
             return None
 
         async def health(self):
-            return {"active_sandboxes": 0, "reserved_active": 0, "executing": 0}
+            return dict(health or {"active_sandboxes": 0, "reserved_active": 0, "executing": 0})
 
         async def list(self):
             if isinstance(listing, Exception):
@@ -113,3 +113,32 @@ async def test_health_refresh_skips_the_sweep_when_the_listing_fails(monkeypatch
     assert sweeps == []
     assert runner.status == SandboxRunnerStatus.HEALTHY.value
     assert session.commits == 1
+
+
+async def test_health_refresh_records_the_runners_memory_report(monkeypatch) -> None:
+    runner = _runner()
+    _wire(monkeypatch, runner, listing=[], health={
+        "active_sandboxes": 1, "reserved_active": 1, "executing": 0,
+        "memory_budget_mb": 3840, "memory_reserved_mb": 1024, "memory_available_mb": 2816,
+        "max_container_memory_mb": 1792, "largest_allocatable_mb": 1792,
+        "container_defaults": {"memory_mb": 512},
+    })
+
+    await runtime_tasks._refresh_runner_health("runner-1")
+
+    report = runner.config["memory"]
+    assert report["available_mb"] == 2816
+    assert report["max_container_mb"] == 1792
+    assert report["default_mb"] == 512
+    assert report["observed_at"] == runner.last_health_at.isoformat()
+
+
+async def test_health_refresh_drops_the_memory_report_of_a_runner_without_memory_fields(monkeypatch) -> None:
+    """A runner rolled back to a version without memory admission is placed by slots again."""
+    runner = _runner()
+    runner.config = {"memory": {"available_mb": 1, "max_container_mb": 1}}
+    _wire(monkeypatch, runner, listing=[])
+
+    await runtime_tasks._refresh_runner_health("runner-1")
+
+    assert "memory" not in runner.config

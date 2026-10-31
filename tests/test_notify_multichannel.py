@@ -1116,6 +1116,37 @@ async def test_media_job_notification_propagates_workspace_scope(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("outcome", "notifies"), [("completed", False), ("failed", True)])
+async def test_workflow_run_video_clip_notifies_only_on_failure(monkeypatch, outcome: str, notifies: bool) -> None:
+    from packages.core.models.media_job import MediaJobStatus
+    from packages.core.tasks import media_tasks
+
+    captured: dict[str, Any] = {}
+
+    async def fake_notify(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("packages.core.services.notify.notify", fake_notify)
+    job = SimpleNamespace(
+        id="media-job-2",
+        entity_id="entity-1",
+        user_id="user-1",
+        conversation_id=None,
+        prompt="Segment three of the music video",
+        status=MediaJobStatus(outcome),
+        error=None if outcome == "completed" else "Provider rejected the clip",
+        result_url="/files/segment-3.mp4",
+        duration_seconds=5,
+        model="bytedance/seedance-2.0",
+        params={"workflow_run_id": "run-1", "workspace_id": "workspace-1", "resolution": "720p"},
+    )
+
+    await media_tasks._push_notification(job)
+
+    assert bool(captured) is notifies
+
+
+@pytest.mark.asyncio
 async def test_legacy_channels_argument_still_works(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -1170,6 +1201,7 @@ async def test_preferences_round_trip(client: AsyncClient):
     body = get1.json()
     assert body["default_channels"] == []
     assert body["by_kind"] == {}
+    assert body["chat_email"] == {"enabled": True, "delay_minutes": 30}
     assert body["supported_channels"]
     assert body["configured_channels"] == []
     assert any(e["kind"] == "task_hitl_requested" for e in body["event_catalog"])
@@ -1215,6 +1247,19 @@ async def test_preferences_round_trip(client: AsyncClient):
     )
     assert drop_resp.status_code == 200
     assert "task_failed" not in drop_resp.json()["by_kind"]
+
+    for patch, expected in [
+        ({"enabled": False}, {"enabled": False, "delay_minutes": 30}),
+        ({"delay_minutes": 60}, {"enabled": False, "delay_minutes": 60}),
+        ({"enabled": True}, {"enabled": True, "delay_minutes": 60}),
+    ]:
+        updated = await client.put("/api/v1/notifications/preferences", headers=ctx["headers"], json={"chat_email": patch})
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["chat_email"] == expected
+        assert updated.json()["default_channels"] == ["telegram", "email"]
+    invalid = await client.put("/api/v1/notifications/preferences", headers=ctx["headers"], json={"chat_email": {"delay_minutes": 0}})
+    assert invalid.status_code == 422
+    assert (await client.get("/api/v1/notifications/preferences", headers=ctx["headers"])).json()["chat_email"] == {"enabled": True, "delay_minutes": 60}
 
 
 @pytest.mark.asyncio
@@ -1319,3 +1364,80 @@ async def test_preferences_persisted_on_user_row(
         "channels": ["email"],
         "enabled": True,
     }
+
+
+# ── Registered email: opt-in one-click unsubscribe ─────────────────────────
+
+
+class _EmailOnlySession:
+    """Just enough session for registered-email delivery: the user lookup and the MessageLog."""
+
+    def __init__(self, user: User) -> None:
+        self.user, self.logs = user, []
+
+    async def scalar(self, _statement):
+        return self.user
+
+    def add(self, row) -> None:
+        self.logs.append(row)
+
+    async def commit(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsubscribe_kind",
+    [
+        "task_failed",  # the notification's own catalog kind: honoured
+        None,  # absent: the email is exactly what it always was
+        "booking_confirmed",  # another kind than the notification's: ignored
+        "not_a_catalog_kind",  # unknown kind: ignored
+    ],
+)
+async def test_registered_email_unsubscribe_link_is_opt_in_per_catalog_kind(monkeypatch, unsubscribe_kind):
+    from packages.core.services import email_service, notification_routing
+    from packages.core.services.notification_routing import ChannelChoice
+
+    user = User(id="user-unsub", entity_id="entity-unsub", email="ada@manor.example")
+    session = _EmailOnlySession(user)
+    calls: list[tuple[str, tuple, dict]] = []
+
+    async def fake_send_notification_email(*args, **kwargs) -> bool:
+        calls.append(("notification", args, kwargs))
+        return True
+
+    async def fake_send_common_email(*args, **kwargs) -> bool:
+        calls.append(("common", args, kwargs))
+        return True
+
+    async def targets(*_args, **_kwargs):
+        return [ChannelChoice(channel_type="inapp"), ChannelChoice(channel_type="email", address=user.email)]
+
+    monkeypatch.setattr(email_service, "send_notification_email", fake_send_notification_email)
+    monkeypatch.setattr(email_service, "send_common_email", fake_send_common_email)
+    monkeypatch.setattr(notification_routing, "resolve_channel_targets", targets)
+    meta = {"email_unsubscribe_kind": unsubscribe_kind} if unsubscribe_kind else {}
+    await notify_module.dispatch_persisted_notification(
+        notification_id="n-unsub", entity_id=user.entity_id, user_id=user.id, type="task_failed",
+        title="Render <failed>", body="Step 2 {{ app_url }} timed out", meta=meta, workspace_id=None,
+        payload={"link": "/tasks/t-1"}, db=session,
+    )
+
+    [(helper, args, kwargs)] = calls
+    if unsubscribe_kind != "task_failed":
+        assert helper == "notification"
+        assert args == (user.email, "Render <failed>", "Render <failed>\n\nStep 2 {{ app_url }} timed out\n\n/tasks/t-1")
+        assert kwargs == {}
+        return
+    # Already-escaped HTML bypasses the plain-text helper, which would escape it again.
+    assert helper == "common"
+    to, subject, html = args
+    assert (to, subject) == (user.email, "Manor AI: Render <failed>")
+    assert "Render &lt;failed&gt;" in html and "{{" not in html
+    assert 'href="http' in html and "/tasks/t-1" in html  # the relative link was made absolute
+    assert "/api/v1/notifications/unsubscribe/" in html
+    headers = kwargs["headers"]
+    assert headers["List-Unsubscribe"].startswith("<http") and "/api/v1/notifications/unsubscribe/" in headers["List-Unsubscribe"]
+    assert headers["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+    assert [log.status for log in session.logs] == ["sent"]

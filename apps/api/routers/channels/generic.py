@@ -9,20 +9,19 @@ it to verify + parse the request, logs the inbound message, and kicks
 off ``dispatch_inbound`` in a FastAPI ``BackgroundTasks`` so the 200 OK
 comes back inside any provider's ack window.
 
-Channel-specific quirks that don't fit the plain POST shape (Telegram's
-bot_token_hash path, WeChat's XML handshake, WhatsApp's hub.verify_token
-GET) keep their dedicated routers. This generic endpoint handles the
-rest (Discord, In-App, SMS, Voice, email inbound). Slack uses its fixed,
-installation-routed Events endpoint.
-
-Discord interaction PING (``type == 1``) is handled inline because it is a
-first-packet handshake rather than a real message.
+This route has no auth of its own: a request is accepted only when the
+adapter's ``verify_inbound`` proves the sender, and the base adapter
+rejects. Channels with a dedicated router (Telegram's bot_token_hash path,
+WeChat's XML handshake, WhatsApp's hub.verify_token GET, Twilio's
+X-Twilio-Signature, Graph's clientState, Slack Events, Discord
+Interactions, the public webchat endpoint) answer 410 here, so their own
+verification can never be bypassed through this generic path. What remains
+here is signed email inbound and the WeChat Personal runner.
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict
+from typing import Dict
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -42,17 +41,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/channels", tags=["channels"])
 
-
-# ── Handshake sniffers ──────────────────────────────────────────────────────
-
-def _try_discord_ping(body: bytes) -> Dict[str, Any] | None:
-    try:
-        payload = json.loads(body.decode("utf-8")) if body else {}
-    except Exception:
-        return None
-    if payload.get("type") == 1:
-        return {"type": 1}
-    return None
+# Channel types whose inbound traffic has its own verified endpoint.
+DEDICATED_INBOUND_ENDPOINTS: Dict[str, str] = {
+    "slack": "/api/v1/channels/slack/events",
+    "discord": "/api/v1/channels/discord/interactions",
+    "telegram": "/api/v1/channels/telegram/webhook/{bot_token_hash}",
+    "wechat": "/api/v1/channels/wechat/callback",
+    "whatsapp": "/api/v1/channels/whatsapp/webhook",
+    "facebook": "/api/v1/channels/facebook/webhook",
+    "ms_teams": "/api/v1/channels/ms_teams/notifications",
+    "outlook": "/api/v1/channels/outlook/notifications",
+    "twilio_sms": "/api/v1/channels/twilio/sms",
+    "twilio_voice": "/api/v1/channels/twilio/voice",
+    "webchat": "/api/v1/public/chat/{token}/message",
+}
 
 
 # ── Main endpoint ───────────────────────────────────────────────────────────
@@ -63,15 +65,11 @@ async def channel_callback(
     request: Request,
     config_id: str = Query(..., description="ChannelConfig ID for this channel instance"),
 ):
-    if channel_type in {"slack", "discord"}:
-        fixed_endpoint = (
-            "/api/v1/channels/slack/events"
-            if channel_type == "slack"
-            else "/api/v1/channels/discord/interactions"
-        )
+    fixed_endpoint = DEDICATED_INBOUND_ENDPOINTS.get(channel_type)
+    if fixed_endpoint is not None:
         raise HTTPException(
             410,
-            f"{channel_type.title()} events must use {fixed_endpoint}",
+            f"{channel_type} events must use {fixed_endpoint}",
         )
 
     adapter = get_adapter(channel_type)
@@ -99,13 +97,6 @@ async def channel_callback(
     if not await adapter.verify_inbound(cc, headers=headers, query=query, body=body):
         raise HTTPException(403, "Signature verification failed")
 
-    # Discord handshakes must use the same authenticated Config as ordinary
-    # inbound events. Returning before verification would accept forged PINGs.
-    if channel_type == "discord":
-        ping = _try_discord_ping(body)
-        if ping is not None:
-            return JSONResponse(ping)
-
     parsed = await adapter.parse_inbound(cc, headers=headers, query=query, body=body)
     if not parsed:
         # Provider may send delivery receipts or unsupported events here
@@ -117,6 +108,10 @@ async def channel_callback(
     # idempotent, so the broker publish must happen before the commit. Other
     # generic channels keep the established commit-before-publish ordering.
     durable_receipt_channel = channel_type == "wechat_personal"
+    # Channels whose provider message ID is unique per Config under a partial
+    # unique index on message_logs. A repeated ID is a retry or a replay, so
+    # it is acknowledged without starting a second agent turn.
+    deduplicated_channel = channel_type in {"wechat_personal", "email"}
     dispatch_kwargs = {
         "entity_id": cc.entity_id,
         "channel_config_id": cc.id,
@@ -171,11 +166,13 @@ async def channel_callback(
                 await db.commit()
                 enqueue_or_raise()
     except IntegrityError:
-        if not durable_receipt_channel or not parsed.external_message_id:
+        if not deduplicated_channel or not parsed.external_message_id:
             raise
         # WeChat Personal's runner retries the same msg_id when its callback
-        # acknowledgement is delayed. The partial unique index makes that
-        # replay a harmless acknowledgement instead of a second agent turn.
+        # acknowledgement is delayed; an email forwarder retries the same
+        # Message-ID, and a signed email request can be replayed inside its
+        # timestamp window. The partial unique index makes each of these a
+        # harmless acknowledgement instead of a second agent turn.
         async with async_session() as db:
             duplicate = await db.scalar(
                 select(MessageLog.id).where(

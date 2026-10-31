@@ -24,6 +24,7 @@ import {
   shouldAutoReloadForRecoverableError,
 } from "../utils/recoverableErrors";
 import { t } from "../lib/i18n";
+import { appPath } from "../embed/embedContext";
 import { captureClientError } from "../lib/clientErrors";
 
 
@@ -100,7 +101,7 @@ export default function RouteErrorBoundary() {
             {t("component.error_boundary.reload")}</button>
           {!stale && (
             <button
-              onClick={() => (window.location.href = "/")}
+              onClick={() => (window.location.href = appPath("/"))}
               className="px-4 py-2 btn-manor-outline"
             >
               {t("component.error_boundary.go_home")}</button>

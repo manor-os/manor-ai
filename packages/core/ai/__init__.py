@@ -15,7 +15,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ChatMessage": ("packages.core.ai.engine", "ChatMessage"),
     "StreamChunk": ("packages.core.ai.engine", "StreamChunk"),
     "ToolCall": ("packages.core.ai.engine", "ToolCall"),
-    "TaskRunner": ("packages.core.ai.task_runner", "TaskRunner"),
     "chat_completion": ("packages.core.ai.llm_client", "chat_completion"),
     "chat_completion_with_tools": ("packages.core.ai.llm_client", "chat_completion_with_tools"),
     "EMPTY_USAGE": ("packages.core.ai.llm_client", "EMPTY_USAGE"),
@@ -45,8 +44,6 @@ __all__ = [
     "ChatMessage",
     "StreamChunk",
     "ToolCall",
-    # Runners
-    "TaskRunner",
     # LLM client (functional interface)
     "chat_completion",
     "chat_completion_with_tools",

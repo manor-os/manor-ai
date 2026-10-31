@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import copy
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from packages.core.contracts.artifact_delivery import reused_artifact_snapshots
-from packages.core.contracts.task_output import output_contract_for_schema, plan_output_contract_schema
+from packages.core.contracts.artifact_delivery import ARTIFACT_DELIVERY_SOURCE, artifact_submission_sha256
+from packages.core.contracts.task_output import plan_output_contract_schema
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
 from packages.core.dispatcher.validation import SchemaError, validate_step_output
 
@@ -68,85 +67,6 @@ def test_invalid_strict_artifact_submission_is_not_silently_repaired(malformatio
 
 
 @pytest.mark.asyncio
-async def test_worker_validation_accepts_exact_readonly_file_submission():
-    from packages.core.workers import internal
-    from tests.test_readonly_artifact_delivery import REUSE
-
-    payload = _payload()
-    schema = _schema(payload)
-    snapshot = {"kind": "subagent", "params": copy.deepcopy(REUSE), "expected_output_schema": schema}
-    result, value_kind = await internal._build_subagent_step_result(
-        snapshot, submit_payload={"summary": "Verified", "result": payload}, content="",
-        messages=[], artifact_refs=[], original_prompt="Read and deliver the existing file",
-        output_contract=output_contract_for_schema(schema),
-    )
-
-    assert result == payload
-    assert internal._output_contract_errors(schema, result, step_kind="subagent", task_output_value_kind=value_kind) == []
-
-
-@pytest.mark.asyncio
-async def test_readonly_worker_loop_preserves_business_summary_and_other_root_fields(monkeypatch):
-    from packages.core.services import artifact_delivery
-    from packages.core.workers import internal
-    from tests import test_robust_worker_exec_subagent as worker_tests
-    from tests.test_readonly_artifact_delivery import REUSE
-
-    worker_tests.worker_env.__wrapped__(monkeypatch)
-    payload = _payload()
-    payload.update(summary_zh="已经核实原始文件", confirmed_props=["coffee cup", "filter paper"])
-    schema = _schema(payload)
-    schema["properties"].update(summary_zh={"type": "string"}, confirmed_props={"const": payload["confirmed_props"]})
-    schema["required"].extend(["summary_zh", "confirmed_props"])
-    verified = []
-
-    async def verify(_db, **kwargs):
-        verified.append(kwargs["refs"])
-        return SimpleNamespace()
-
-    async def run(**kwargs):
-        reply = await kwargs["dynamic_tool_handlers"]["submit_result"]({
-            "summary": "Control-layer summary differs from business summary",
-            "result": copy.deepcopy(payload),
-        })
-        assert json.loads(reply)["ok"] is True
-        return SimpleNamespace(result=worker_tests._loop_result(), run=None)
-
-    async def unexpected_correction(**kwargs):
-        pytest.fail("A schema-valid submission must not require another model round")
-
-    monkeypatch.setattr(artifact_delivery, "verify_artifact_delivery_refs", verify)
-    monkeypatch.setattr(internal, "runtime_execute_worker_subagent_loop", run)
-    monkeypatch.setattr("packages.core.ai.runtime.runtime_execute_worker_subagent_followup", unexpected_correction)
-    outcome = await internal._exec_subagent(worker_tests._step(
-        schema, kind="subagent", params={"prompt": "Deliver the existing file without changing it", **REUSE},
-    ))
-
-    assert verified == [payload["files"]]
-    assert outcome["result"] == payload
-
-
-@pytest.mark.asyncio
-async def test_control_summary_does_not_substitute_for_missing_business_summary():
-    from packages.core.workers import internal
-    from tests.test_readonly_artifact_delivery import REUSE
-
-    payload = _payload()
-    schema = _schema(payload)
-    del payload["summary"]
-    result, value_kind = await internal._build_subagent_step_result(
-        {"params": REUSE, "expected_output_schema": schema},
-        submit_payload={"summary": "Only a control summary", "result": payload}, content="",
-        messages=[], artifact_refs=[], original_prompt="Deliver an existing file",
-        output_contract=output_contract_for_schema(schema),
-    )
-
-    assert result == payload
-    errors = internal._output_contract_errors(schema, result, step_kind="subagent", task_output_value_kind=value_kind)
-    assert len(errors) == 1 and errors[0]["path"] == "$" and "summary" in errors[0]["message"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("strict", [False, True])
 async def test_dispatcher_persists_exact_readonly_payload_and_matching_receipt(db_session, tmp_path, monkeypatch, strict):
     from packages.core.config import get_settings
@@ -169,4 +89,8 @@ async def test_dispatcher_persists_exact_readonly_payload_and_matching_receipt(d
 
     assert lease.status == "completed" and step.step_status == "done"
     assert lease.result == payload and step.result == payload
-    assert reused_artifact_snapshots(step)[0]["document_id"] == ids["document_id"]
+    receipts = [ref for ref in step.evidence_refs or [] if ref.get("source") == ARTIFACT_DELIVERY_SOURCE]
+    assert [ref["document_id"] for ref in receipts] == [ids["document_id"]]
+    assert receipts[0]["fields"]["disposition"] == "reused"
+    assert receipts[0]["fields"]["owner_step_id"] == step.id
+    assert receipts[0]["fields"]["submission_sha256"] == artifact_submission_sha256(payload)

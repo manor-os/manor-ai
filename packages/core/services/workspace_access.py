@@ -9,8 +9,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.staff import Staff, StaffRole
@@ -37,6 +38,34 @@ ENTITY_WORKSPACE_READ_ROLES = {"owner", "admin", "member", "viewer"}
 WORKSPACE_ARTIFACT_WRITE_ROLES = {"owner", "editor", "contributor"}
 # Workspace-level roles that may read but never create/modify workspace content.
 WORKSPACE_READONLY_ROLES = {"viewer"}
+
+
+async def set_link_columns(db: AsyncSession, row: UserMembership | WorkspaceStaff, **values: Any) -> None:
+    """Write bookkeeping columns (Staff link, primary flag) without touching updated_at.
+
+    A grant's issuer fingerprint hashes the issuer's membership and seat,
+    updated_at included, so a deactivate/reactivate cycle still voids it. A
+    link backfill is not an authority change and must not void every grant
+    the person issued. Authority columns (role, status, expiry, deletion) are
+    assigned normally by callers and still bump updated_at.
+    """
+    changed = {key: value for key, value in values.items() if getattr(row, key) != value}
+    if not changed:
+        return
+    model = type(row)
+    if row.id is None or row not in db or row in db.new:
+        for key, value in changed.items():
+            setattr(row, key, value)
+        return
+    # Naming updated_at in SET keeps TimestampMixin's onupdate from firing.
+    await db.execute(
+        update(model)
+        .where(model.id == row.id)
+        .values(**changed, updated_at=model.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    for key, value in changed.items():
+        set_committed_value(row, key, value)
 
 
 def workspace_access_mode(workspace: Workspace) -> str:
@@ -94,14 +123,22 @@ async def lock_workspace_recipient_authorization(
     workspace_id: str,
     entity_id: str,
     user_id: str,
+    user_lock: str = "share",
 ) -> None:
     """Freeze every persisted input to one Workspace read decision.
 
     Delivery holds these shared row locks through the provider call. Any
     Staff/role/membership/user revocation therefore commits either before the
     authorization check or after the send, never between them. Lock order is
-    stable and starts after the caller has locked the Workspace row.
+    stable (StaffRole -> Staff -> membership -> User -> WorkspaceStaff) and
+    starts after the caller has locked the Workspace row.
+
+    ``user_lock="update"`` takes the User row exclusively in its usual slot,
+    for a caller that writes the user's derived access later in the same
+    transaction (a share lock upgraded later could deadlock).
     """
+    if user_lock not in ("share", "update"):
+        raise ValueError(f"unknown user_lock: {user_lock!r}")
 
     statements = (
         select(StaffRole.id)
@@ -124,7 +161,7 @@ async def lock_workspace_recipient_authorization(
         .with_for_update(read=True),
         select(User.id)
         .where(User.id == user_id)
-        .with_for_update(read=True),
+        .with_for_update(read=user_lock == "share"),
         select(WorkspaceStaff.id)
         .where(
             WorkspaceStaff.workspace_id == workspace_id,
@@ -363,8 +400,12 @@ async def manageable_workspace_ids_for_user(
     user_id: str | None,
     entity_role: str | None = None,
     include_deleted: bool = False,
+    lifecycle: bool = False,
 ) -> set[str]:
     """Return manageable ids for an already-scoped Workspace batch.
+
+    ``lifecycle`` asks about deletion and recovery, which belong to the
+    customer: an owner seat derived from external collaboration does not count.
 
     This preserves :func:`user_can_manage_workspace` semantics while avoiding
     a role-resolution and membership query for every row in list responses.
@@ -392,7 +433,9 @@ async def manageable_workspace_ids_for_user(
     ):
         return workspace_ids
 
-    return await owned_workspace_ids_for_user(db, workspace_ids=workspace_ids, user_id=user_id)
+    return await owned_workspace_ids_for_user(
+        db, workspace_ids=workspace_ids, user_id=user_id, lifecycle=lifecycle,
+    )
 
 
 async def owned_workspace_ids_for_user(
@@ -400,21 +443,30 @@ async def owned_workspace_ids_for_user(
     *,
     workspace_ids: set[str],
     user_id: str | None,
+    lifecycle: bool = False,
 ) -> set[str]:
-    """Return active owner memberships within the caller's authorized scope."""
+    """Return active owner memberships within the caller's authorized scope.
+
+    With ``lifecycle`` (delete / restore), owner seats derived from an
+    external collaboration grant are ignored: the provider co-works in the
+    customer's Workspace but never decides whether it exists.
+    """
     if not workspace_ids or not user_id:
         return set()
+    conditions = [
+        WorkspaceStaff.workspace_id.in_(workspace_ids),
+        WorkspaceStaff.user_id == user_id,
+        WorkspaceStaff.status == "active",
+    ]
+    if lifecycle:
+        conditions.append(WorkspaceStaff.collaboration_id.is_(None))
     rows = list((await db.execute(
         select(
             WorkspaceStaff.workspace_id,
             WorkspaceStaff.role,
             WorkspaceStaff.expires_at,
         )
-        .where(
-            WorkspaceStaff.workspace_id.in_(workspace_ids),
-            WorkspaceStaff.user_id == user_id,
-            WorkspaceStaff.status == "active",
-        )
+        .where(*conditions)
         .order_by(WorkspaceStaff.workspace_id.asc(), WorkspaceStaff.created_at.asc())
     )).all())
     resolved_memberships: dict[str, tuple[str | None, datetime | None]] = {}
@@ -891,13 +943,17 @@ async def ensure_workspace_owner_membership(
         )
         db.add(membership)
     else:
-        membership.staff_id = membership.staff_id or (staff.id if staff else None)
-        membership.user_id = membership.user_id or user_id
         membership.role = "owner"
         membership.status = "active"
-        if not membership.added_by:
-            membership.added_by = added_by or user_id
-        if not membership.added_at:
-            membership.added_at = datetime.now(UTC)
+        # The creator's seat is customer-managed, never collaboration-derived.
+        membership.collaboration_id = None
+        await set_link_columns(
+            db,
+            membership,
+            staff_id=membership.staff_id or (staff.id if staff else None),
+            user_id=membership.user_id or user_id,
+            added_by=membership.added_by or added_by or user_id,
+            added_at=membership.added_at or datetime.now(UTC),
+        )
     await db.flush()
     return membership

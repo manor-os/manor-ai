@@ -21,6 +21,11 @@ type Mode = "date" | "time" | "datetime";
 type Panel = "calendar" | "time";
 
 interface DateTimePickerProps {
+  id?: string;
+  ariaLabel?: string;
+  ariaRequired?: boolean;
+  ariaInvalid?: boolean;
+  ariaDescribedBy?: string;
   value: string;
   onChange: (value: string) => void;
   mode?: Mode;
@@ -78,6 +83,7 @@ function formatDisplay(value: string, mode: Mode, placeholder: string) {
 export default function DateTimePicker({
   value, onChange, mode = "date", placeholder = "Select...", min, max, style, disabled,
   dropDirection = "auto",
+  id, ariaLabel, ariaRequired, ariaInvalid, ariaDescribedBy,
 }: DateTimePickerProps) {
   const [open, setOpen] = useState(false);
   const [panel, setPanel] = useState<Panel>(mode === "time" ? "time" : "calendar");
@@ -197,7 +203,13 @@ export default function DateTimePicker({
     <div ref={ref} style={{ position: "relative", ...style }}>
       {/* Trigger */}
       <button
+        id={id}
         type="button"
+        aria-label={ariaLabel}
+        aria-required={ariaRequired}
+        aria-invalid={ariaInvalid}
+        aria-describedby={ariaDescribedBy}
+        aria-expanded={open}
         disabled={disabled}
         onClick={() => { if (!disabled) { setOpen(!open); setPanel(mode === "time" ? "time" : "calendar"); } }}
         className="manor-input"
@@ -299,7 +311,7 @@ export default function DateTimePicker({
                       style={{
                         width: "100%", aspectRatio: "1", border: "none", borderRadius: 10, cursor: "pointer",
                         fontSize: 12, fontWeight: sel ? 700 : td ? 600 : 400,
-                        color: sel ? "#fff" : td ? "var(--accent)" : "var(--text-default)",
+                        color: sel ? "var(--on-accent, #fff)" : td ? "var(--accent)" : "var(--text-default)",
                         background: sel ? "var(--accent)" : "transparent",
                         boxShadow: td && !sel ? "inset 0 0 0 1.5px var(--accent)" : "none",
                         display: "flex", alignItems: "center", justifyContent: "center",

@@ -1,4 +1,5 @@
 import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
+import { getPreferredTimeZone } from "../lib/format";
 import { Fragment, Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
@@ -6,6 +7,7 @@ import { api } from "../lib/api";
 import type { ChatRoom, ChatRoomAgentRun, ChatRoomFile, ChatRoomInvite, ChatRoomMessage } from "../lib/chatRoomTypes";
 import type { Agent } from "../lib/types";
 import Button from "./ui/Button";
+import Checkbox from "./ui/Checkbox";
 import UserAvatar from "./ui/UserAvatar";
 import GroupChatAvatar from "./ui/GroupChatAvatar";
 import EmptyState from "./ui/EmptyState";
@@ -19,19 +21,23 @@ import ChatInputFooter, { type AttachedItem, type MentionOption } from "./ChatIn
 import AssistantMessageBlocks from "./AssistantMessageBlocks";
 import ChatMessageActions from "./chat/ChatMessageActions";
 import ChatActionButton from "./chat/ChatActionButton";
-import ChatTimestamp from "./chat/ChatTimestamp";
+import ChatTimestamp, { formatChatDateTime } from "./chat/ChatTimestamp";
 import MessageBubble from "./chat/MessageBubble";
 import { ArtifactSummaryCards, OutputPanel, type OutputArtifact } from "./EmbeddedChat";
 import { getFileReferenceIcon } from "./contentTypeIcons";
 import ResizablePaneGroup from "./ui/ResizablePaneGroup";
 import { IconChevronDown, IconDownload, IconMoreHorizontal, IconPaperclip, IconReply, IconSmilePlus, IconTrash, IconUsers } from "./icons";
-import { getLocale } from "../lib/i18n";
+import { getLocale, t } from "../lib/i18n";
 import { useDebounced } from "../lib/chatStream";
 import { fileReferenceKind } from "../lib/fileReferences";
 import { createFilePreviewSource } from "../lib/filePreviewSource";
+import { saveRoomFileSelection } from "../lib/roomFileSelectionDownload";
+import { ROOM_FILE_BATCH_MAX_BYTES, ROOM_FILE_PREVIEW_MAX_BYTES } from "../lib/roomFileLimits";
+import ImagePreview from "./file-preview/ImagePreview";
 import { useWebSocket } from "../lib/websocket";
 import { useEmailAccounts } from "../lib/emailAccounts";
 import DefaultEmailSender from "./integrations/DefaultEmailSender";
+import GroupPublicInvite from "./GroupPublicInvite";
 
 const fieldClass = "w-full rounded-xl bg-[var(--surface-muted)] px-3 py-2.5 text-sm text-[var(--text-strong)] outline-none focus:ring-2 focus:ring-[var(--accent-ring)]";
 const tr = (zh: string, en: string) => getLocale() === "zh" ? zh : en;
@@ -66,8 +72,9 @@ function inviteLink(token: string): string {
 
 function fileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 }
 
 function RoomFileTypeIcon({ file }: { file: ChatRoomFile }) {
@@ -79,21 +86,24 @@ function roomFileArtifact(roomId: string, file: ChatRoomFile, blob?: Blob): Outp
   const referenceKind = fileReferenceKind(file.name, file.mime_type);
   const kind = referenceKind === "archive" ? "file" : referenceKind;
   return { id: file.id, kind, title: file.name, status: "done", blob,
-    data: { room_id: roomId, room_file_id: file.id, mime_type: file.mime_type } };
+    data: { room_id: roomId, room_file_id: file.id, mime_type: file.mime_type, file_size: file.size } };
 }
 
-function RoomMessageAttachment({ roomId, file, onOpen }: {
+export function RoomMessageAttachment({ roomId, file, onOpen }: {
   roomId: string;
   file: ChatRoomFile;
   onOpen: (file: ChatRoomFile) => void;
 }) {
-  const mime = file.mime_type.split(";", 1)[0].toLowerCase();
-  const kind = /^(image\/(png|jpeg|gif|webp|avif))$/.test(mime) ? "image"
+  const mime = file.mime_type.split(";", 1)[0].trim().toLowerCase();
+  const previewTooLarge = file.size > ROOM_FILE_PREVIEW_MAX_BYTES;
+  const kind = previewTooLarge ? null : /^(image\/(png|jpeg|gif|webp|avif))$/.test(mime) ? "image"
     : mime.startsWith("video/") ? "video"
     : mime.startsWith("audio/") ? "audio" : null;
   const containerRef = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   const [source, setSource] = useState("");
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!kind) return;
     const element = containerRef.current;
@@ -112,22 +122,32 @@ function RoomMessageAttachment({ roomId, file, onOpen }: {
   }, [kind]);
   useEffect(() => {
     if (!visible || !kind) return;
-    let cancelled = false;
+    const controller = new AbortController();
     let objectUrl = "";
-    void api.chatRooms.downloadFile(roomId, file.id).then((blob) => {
+    setSource("");
+    setFailed(false);
+    void createFilePreviewSource({
+      fetchBinary: (signal) => api.chatRooms.downloadFile(roomId, file.id, { signal, force: attempt > 0 }),
+    }).getBlob(controller.signal).then((blob) => {
       objectUrl = URL.createObjectURL(new Blob([blob], { type: mime }));
-      if (cancelled) URL.revokeObjectURL(objectUrl);
+      if (controller.signal.aborted) URL.revokeObjectURL(objectUrl);
       else setSource(objectUrl);
-    }).catch(() => {});
+    }).catch(() => { if (!controller.signal.aborted) setFailed(true); });
     return () => {
-      cancelled = true;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file.id, kind, mime, roomId, visible]);
+  }, [file.id, kind, mime, roomId, visible, attempt]);
+  const mediaFailed = () => { setSource(""); setFailed(true); };
   return <div ref={containerRef} className="mt-2 max-w-sm overflow-hidden rounded-xl bg-[var(--surface-muted)]">
-    {kind === "image" && source && <button type="button" className="block w-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]" onClick={() => onOpen(file)} aria-label={`${tr("预览", "Preview")} ${file.name}`}><img src={source} alt={file.name} loading="lazy" className="max-h-72 w-full object-contain" /></button>}
-    {kind === "video" && source && <video src={source} controls preload="none" className="max-h-72 w-full" aria-label={file.name} />}
-    {kind === "audio" && source && <audio src={source} controls preload="none" className="w-full" aria-label={file.name} />}
+    {previewTooLarge && <p className="m-0 px-3 py-2 text-xs text-[var(--text-muted)]">{t("component.group_chat.large_file_preview")}</p>}
+    {kind && !source && <div className="flex items-center justify-between gap-2 px-3 py-2 text-xs text-[var(--text-muted)]">
+      <span role="status">{failed ? tr("预览加载失败", "Preview could not load") : tr("正在加载预览…", "Loading preview…")}</span>
+      {failed && <Button type="button" variant="ghost" size="sm" onClick={() => setAttempt((value) => value + 1)}>{tr("重试", "Retry")}</Button>}
+    </div>}
+    {kind === "image" && source && <ImagePreview src={source} alt={file.name} onError={mediaFailed} imageClassName="max-h-72 w-full object-contain" />}
+    {kind === "video" && source && <video src={source} onError={mediaFailed} controls preload="none" className="max-h-72 w-full" aria-label={file.name} />}
+    {kind === "audio" && source && <audio src={source} onError={mediaFailed} controls preload="none" className="w-full" aria-label={file.name} />}
     <button type="button" onClick={() => onOpen(file)} className="flex w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-xs text-[var(--text-default)] hover:bg-[var(--surface-sunken)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"><RoomFileTypeIcon file={file} /><span className="min-w-0 flex-1 truncate">{file.name}</span><span className="shrink-0 text-[var(--text-muted)]">{fileSize(file.size)}</span></button>
   </div>;
 }
@@ -542,6 +562,11 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
   const [deletingFileId, setDeletingFileId] = useState<string | null>(null);
   const [deleteFileError, setDeleteFileError] = useState("");
   const [downloadingFileId, setDownloadingFileId] = useState<string | null>(null);
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(() => new Set());
+  const [batchDownloadPhase, setBatchDownloadPhase] = useState<"preparing" | "downloading" | null>(null);
+  const [fileDownloadNotice, setFileDownloadNotice] = useState("");
+  const singleDownloadAbort = useRef<AbortController | null>(null);
+  const batchDownloadAbort = useRef<AbortController | null>(null);
   const [previewingFileId, setPreviewingFileId] = useState<string | null>(null);
   const [selectedArtifact, setSelectedArtifact] = useState<OutputArtifact | null>(null);
   const previewRequest = useRef(0);
@@ -604,8 +629,9 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
   const [error, setError] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteMode, setInviteMode] = useState("email");
   const [inviteResult, setInviteResult] = useState<ChatRoomInvite | null>(null);
-  const inviteSender = useGroupInviteSender(currentUserId, inviteOpen && room?.kind === "group");
+  const inviteSender = useGroupInviteSender(currentUserId, inviteOpen && inviteMode === "email" && room?.kind === "group");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detailsTab, setDetailsTab] = useState("members");
   const [membersOpen, setMembersOpen] = useState(false);
@@ -633,6 +659,8 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     setPreviewingFileId(null);
     setView("messages");
     setFileQuery("");
+    setFileDownloadNotice("");
+    setSelectedFileIds(new Set());
     setFileActionError("");
     setFileToDelete(null);
     setDeleteFileError("");
@@ -649,6 +677,16 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     setError("");
     setSendStatus(null);
   }, [roomId]);
+  useEffect(() => {
+    setBatchDownloadPhase(null);
+    setDownloadingFileId(null);
+    return () => {
+      singleDownloadAbort.current?.abort();
+      singleDownloadAbort.current = null;
+      batchDownloadAbort.current?.abort();
+      batchDownloadAbort.current = null;
+    };
+  }, [roomId, view]);
   useEffect(() => {
     if (view !== "messages" || !room || !latestMessages.length || searchedMessageQuery || anchoredLatestMessages) return;
     const latest = latestMessages[latestMessages.length - 1].id;
@@ -726,6 +764,7 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
       id: member.user_id,
       type: "user" as const,
       name: member.name,
+      avatarUrl: member.avatar_url,
       subtitle: tr("群成员", "Group member"),
     })) || []),
   ], [room, currentUserId]);
@@ -771,7 +810,16 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     getNextPageParam: (lastPage) => lastPage.length === 50 ? lastPage[lastPage.length - 1]?.id : undefined,
     enabled: !!room && room.kind === "group" && view === "files",
   });
-  const roomFiles = filePages?.pages.flat() || [];
+  const roomFiles = useMemo(() => filePages?.pages.flat() || [], [filePages]);
+  const selectedFiles = roomFiles.filter((file) => selectedFileIds.has(file.id));
+  const fileSelectionBusy = Boolean(batchDownloadPhase) || Boolean(downloadingFileId) || fileQuery.trim() !== debouncedFileQuery;
+  useEffect(() => {
+    setSelectedFileIds((current) => {
+      const available = new Set(roomFiles.map((file) => file.id));
+      const remaining = new Set([...current].filter((id) => available.has(id)));
+      return remaining.size === current.size ? current : remaining;
+    });
+  }, [roomFiles]);
 
   const loadOlderMessages = async () => {
     const page = anchoredLatestMessages || latestMessages;
@@ -914,19 +962,62 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
   };
 
   const downloadFile = async (file: ChatRoomFile) => {
-    setFileActionError(""); setDownloadingFileId(file.id);
+    if (singleDownloadAbort.current || batchDownloadAbort.current) return;
+    const controller = new AbortController();
+    singleDownloadAbort.current = controller;
+    setError("");
+    setFileActionError(""); setFileDownloadNotice(""); setDownloadingFileId(file.id);
     try {
-      const blob = await api.chatRooms.downloadFile(roomId, file.id);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = file.name;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    } catch (cause) { if (view === "files") setFileActionError(errorText(cause)); else setError(errorText(cause)); }
-    finally { setDownloadingFileId(null); }
+      const result = await saveRoomFileSelection(file.name,
+        (signal) => api.chatRooms.prepareFileDownload(roomId, [file.id], false, signal),
+        { signal: controller.signal });
+      if (!controller.signal.aborted && result !== "cancelled") setFileDownloadNotice(result === "saved"
+        ? tr("文件已保存。", "File saved.")
+        : tr("已请求下载，请查看浏览器下载列表。", "Download requested. Check your browser’s downloads."));
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        if (view === "files") setFileActionError(errorText(cause)); else setError(errorText(cause));
+      }
+    } finally {
+      if (singleDownloadAbort.current === controller) {
+        singleDownloadAbort.current = null;
+        setDownloadingFileId(null);
+      }
+    }
+  };
+  const downloadSelectedFiles = async () => {
+    if (!selectedFiles.length || fileSelectionBusy || batchDownloadAbort.current) return;
+    setFileActionError(""); setFileDownloadNotice("");
+    if (selectedFiles.reduce((total, file) => total + file.size, 0) > ROOM_FILE_BATCH_MAX_BYTES) {
+      setFileActionError(tr("单次批量下载最多 5 GiB，请减少所选文件。", "Batch downloads are limited to 5 GiB. Select fewer files."));
+      return;
+    }
+    const controller = new AbortController();
+    batchDownloadAbort.current = controller;
+    setBatchDownloadPhase("preparing");
+    try {
+      const name = `${(room?.title || "group").replace(/[\\/:*?"<>|\x00-\x1f]/g, "_")}-files.zip`;
+      const result = await saveRoomFileSelection(name,
+        (signal) => api.chatRooms.prepareFileDownload(roomId, selectedFiles.map((file) => file.id), true, signal),
+        { signal: controller.signal, onTransferStarted: () => {
+          if (!controller.signal.aborted) setBatchDownloadPhase("downloading");
+        } });
+      if (!controller.signal.aborted && result !== "cancelled") setFileDownloadNotice(result === "saved"
+        ? tr("文件已保存。", "Files saved.")
+        : tr("已请求下载，请查看浏览器下载列表。", "Download requested. Check your browser’s downloads."));
+    } catch (cause) {
+      if (!controller.signal.aborted) setFileActionError(`${tr("批量下载失败：", "Batch download failed: ")}${errorText(cause)}`);
+    } finally {
+      if (batchDownloadAbort.current === controller) {
+        batchDownloadAbort.current = null;
+        setBatchDownloadPhase(null);
+      }
+    }
+  };
+  const cancelBatchDownload = () => {
+    batchDownloadAbort.current?.abort();
+    batchDownloadAbort.current = null;
+    setBatchDownloadPhase(null);
   };
   const openFile = async (file: ChatRoomFile) => {
     const request = ++previewRequest.current;
@@ -934,7 +1025,13 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     const controller = new AbortController();
     previewAbort.current = controller;
     setPreviewingFileId(file.id);
+    setError("");
     setFileActionError("");
+    if (file.size > ROOM_FILE_PREVIEW_MAX_BYTES) {
+      setSelectedArtifact(roomFileArtifact(roomId, file));
+      setPreviewingFileId(null);
+      return;
+    }
     try {
       const blob = await createFilePreviewSource({
         fetchBinary: (signal) => api.chatRooms.downloadFile(roomId, file.id, { signal }),
@@ -1232,7 +1329,7 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     {room.kind === "group" && <div className="flex min-w-0 items-center gap-3 px-5 py-1.5 sm:px-6">
       <div className="shrink-0"><TabSwitcher appearance="minimal" size="sm" ariaLabel={tr("群聊视图", "Group chat views")} tabs={[{ key: "messages", label: tr("消息", "Messages") }, { key: "files", label: tr("文件", "Files") }]} value={view} onChange={(next) => { setView(next === "files" ? "files" : "messages"); setFileActionError(""); }} /></div>
       <Input appearance="quiet" ariaLabel={view === "messages" ? tr("搜索群消息", "Search group messages") : tr("搜索群文件", "Search group files")} value={view === "messages" ? messageQuery : fileQuery} onChange={(event) => {
-        if (view === "files") { setFileQuery(event.target.value); return; }
+        if (view === "files") { setFileQuery(event.target.value); setSelectedFileIds(new Set()); setFileActionError(""); return; }
         historyRequestRef.current += 1;
         setLoadingOlderMessages(false);
         setMessageQuery(event.target.value);
@@ -1240,20 +1337,34 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
         setAnchoredLatestMessages(null);
         setHasMoreMessages(true);
         setOlderMessagesError("");
-      }} maxLength={100} placeholder={view === "messages" ? tr("搜索消息", "Search messages") : tr("搜索文件", "Search files")} className="ml-auto min-w-0 w-56" />
+      }} disabled={view === "files" && Boolean(batchDownloadPhase)} maxLength={100} placeholder={view === "messages" ? tr("搜索消息", "Search messages") : tr("搜索文件", "Search files")} className="ml-auto min-w-0 w-56" />
     </div>}
     {room.kind === "group" && view === "files" ? <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-8 pt-5 sm:px-8">
       <div className="mx-auto w-full max-w-3xl space-y-4">
         <div><h2 className="m-0 text-base font-semibold text-[var(--text-strong)]">{tr("群文件", "Group files")}</h2><p className="m-0 mt-0.5 text-xs text-[var(--text-muted)]">{tr("仅显示本群聊天中分享的文件", "Only files shared in this group chat")}</p></div>
+        {roomFiles.length > 0 && <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+          <Checkbox checked={selectedFiles.length === roomFiles.length} disabled={fileSelectionBusy} label={tr("全选已加载文件", "Select loaded files")} onChange={(checked) => setSelectedFileIds(new Set(checked ? roomFiles.map((file) => file.id) : []))} style={{ minHeight: 32 }} />
+          <Button type="button" variant="outline" size="sm" disabled={!selectedFiles.length || fileSelectionBusy} loading={Boolean(batchDownloadPhase)} onClick={() => void downloadSelectedFiles()}><IconDownload size={14} />{batchDownloadPhase ? tr("准备下载中…", "Preparing download…") : `${tr("下载所选文件", "Download selected")} (${selectedFiles.length})`}</Button>
+        </div>}
+        {batchDownloadPhase && <div className="flex flex-wrap items-center gap-3 text-xs text-[var(--text-muted)]">
+          <span role="status">{batchDownloadPhase === "downloading" ? tr("下载中…", "Downloading…") : tr("准备下载中…", "Preparing download…")}</span>
+          <Button type="button" variant="ghost" size="sm" onClick={cancelBatchDownload}>{tr("取消", "Cancel")}</Button>
+        </div>}
+        {fileDownloadNotice && <p role="status" className="m-0 text-xs text-[var(--text-muted)]">{fileDownloadNotice}</p>}
         {fileActionError && <p role="alert" className="m-0 text-sm text-red-700">{fileActionError}</p>}
         {filesError && <p role="alert" className="m-0 text-sm text-red-700">{tr("无法加载群文件，请重试。", "Group files could not be loaded. Please retry.")}</p>}
         {filesLoading && <p role="status" className="m-0 py-5 text-sm text-[var(--text-muted)]">{tr("正在加载文件…", "Loading files…")}</p>}
         {!filesLoading && !filesError && roomFiles.length === 0 && <EmptyState icon={<IconPaperclip size={24} />} title={fileQuery ? tr("没有匹配的文件", "No matching files") : tr("还没有群文件", "No files yet")} description={fileQuery ? tr("试试其他文件名。", "Try another filename.") : tr("在消息中发送文件后，会显示在这里。Workspace 文件不会自动共享给群成员。", "Files sent in messages appear here. Workspace files are not shared automatically.")} />}
         {roomFiles.length > 0 && <div role="list" className="divide-y divide-[var(--border-subtle)]">{roomFiles.map((file) => <div role="listitem" key={file.id} className="flex min-w-0 items-center gap-3 rounded-lg px-2 py-3 hover:bg-[var(--surface-muted)]">
+          <Checkbox checked={selectedFileIds.has(file.id)} disabled={fileSelectionBusy} aria-label={`${tr("选择", "Select")} ${file.name}`} style={{ minWidth: 24, minHeight: 36 }} onChange={(checked) => setSelectedFileIds((current) => {
+            const next = new Set(current);
+            if (checked) next.add(file.id); else next.delete(file.id);
+            return next;
+          })} />
           <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--surface-sunken)] text-[var(--text-muted)]" aria-hidden="true"><RoomFileTypeIcon file={file} /></span>
-          <button type="button" disabled={previewingFileId === file.id} onClick={() => void openFile(file)} className="min-w-0 flex-1 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] disabled:opacity-50" aria-label={`${tr("预览", "Preview")} ${file.name}`}><span className="block truncate text-sm font-medium text-[var(--text-strong)]" title={file.name}>{file.name}</span><span className="block truncate text-xs text-[var(--text-muted)]">{file.sender_name} · {fileSize(file.size)} · {new Date(file.created_at).toLocaleDateString()}</span></button>
-          <button type="button" disabled={downloadingFileId === file.id} onClick={() => void downloadFile(file)} aria-label={`${tr("下载", "Download")} ${file.name}`} title={tr("下载", "Download")} className="rounded-lg p-2 text-[var(--text-muted)] hover:bg-[var(--surface-sunken)] hover:text-[var(--text-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] disabled:opacity-50"><IconDownload size={18} /></button>
-          {file.can_delete && <button type="button" onClick={() => { setFileToDelete(file); setDeleteFileError(""); }} aria-label={`${tr("删除", "Delete")} ${file.name}`} title={tr("删除", "Delete")} className="rounded-lg p-2 text-[var(--text-muted)] hover:bg-[var(--surface-sunken)] hover:text-[var(--editor-danger-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"><IconTrash size={18} /></button>}
+          <button type="button" disabled={previewingFileId === file.id} onClick={() => void openFile(file)} className="min-w-0 flex-1 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] disabled:opacity-50" aria-label={`${tr("预览", "Preview")} ${file.name}`}><span className="block truncate text-sm font-medium text-[var(--text-strong)]" title={file.name}>{file.name}</span><span className="block truncate text-xs text-[var(--text-muted)]">{file.sender_name} · {fileSize(file.size)} · <time dateTime={file.created_at} title={formatChatDateTime(file.created_at)}>{new Date(file.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}</time></span></button>
+          <button type="button" disabled={Boolean(downloadingFileId) || Boolean(batchDownloadPhase)} onClick={() => void downloadFile(file)} aria-label={`${tr("下载", "Download")} ${file.name}`} title={tr("下载", "Download")} className="shrink-0 rounded-lg p-2 text-[var(--text-muted)] hover:bg-[var(--surface-sunken)] hover:text-[var(--text-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] disabled:opacity-50"><IconDownload size={18} /></button>
+          {file.can_delete && <button type="button" disabled={Boolean(batchDownloadPhase)} onClick={() => { setFileToDelete(file); setDeleteFileError(""); }} aria-label={`${tr("删除", "Delete")} ${file.name}`} title={tr("删除", "Delete")} className="shrink-0 rounded-lg p-2 text-[var(--text-muted)] hover:bg-[var(--surface-sunken)] hover:text-[var(--editor-danger-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] disabled:opacity-50"><IconTrash size={18} /></button>}
         </div>)}</div>}
         {hasNextPage && <Button type="button" size="sm" variant="outline" disabled={isFetchingNextPage} onClick={() => void fetchNextPage()}>{isFetchingNextPage ? tr("加载中…", "Loading…") : tr("查看更多", "Load more")}</Button>}
       </div>
@@ -1313,7 +1424,7 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
                     {message.content && <ChatMessageActions align="right" copyText={message.content} copyLabel={tr("复制回复", "Copy response")} />}
                   </span>
                 </div>
-              ) : <div className="chat-message-meta-chips"><time className="chat-message-time" dateTime={message.created_at}>{new Date(message.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>{message.mentioned_user_ids.includes(currentUserId) && <span className="chat-message-meta-chip">{tr("提到了你", "Mentioned you")}</span>}{!message.deleted_at && reactionControls}</div>}
+              ) : <div className="chat-message-meta-chips"><ChatTimestamp timestamp={message.created_at} />{message.mentioned_user_ids.includes(currentUserId) && <span className="chat-message-meta-chip">{tr("提到了你", "Mentioned you")}</span>}{!message.deleted_at && reactionControls}</div>}
             </div>
           </div>
           {activeAgentRuns.map((run) => {
@@ -1347,7 +1458,8 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
       }] : [])]} />
     </div>
     <Modal open={inviteOpen} onClose={() => setInviteOpen(false)} title={canReissueDmInvite ? tr("重发邀请", "Reinvite") : tr("邀请成员", "Invite member")} maxWidth="460px">
-      {inviteResult ? <div className="space-y-4">{inviteResult.outcome === "added" ? <p role="status" className="m-0 text-sm text-[var(--text-default)]"><strong>{inviteResult.email}</strong>{tr(" 已加入群聊。", " has joined the group.")}</p> : <InviteLink token={inviteResult.invite_token} email={inviteResult.email} nextStep={inviteResult.invite_next_step} emailSent={inviteResult.email_sent} />}<Button onClick={() => setInviteOpen(false)}>{tr("完成", "Done")}</Button></div> : <form onSubmit={invite} className="space-y-3">
+      {canManageGroup && <TabSwitcher className="mb-4" ariaLabel={tr("邀请方式", "Invitation method")} tabs={[{ key: "email", label: tr("邮箱邀请", "Email invitation") }, { key: "link", label: tr("公开链接", "Public link") }]} value={inviteMode} onChange={setInviteMode} />}
+      {canManageGroup && inviteMode === "link" ? <GroupPublicInvite key={roomId} roomId={roomId} /> : inviteResult ? <div className="space-y-4">{inviteResult.outcome === "added" ? <p role="status" className="m-0 text-sm text-[var(--text-default)]"><strong>{inviteResult.email}</strong>{tr(" 已加入群聊。", " has joined the group.")}</p> : <InviteLink token={inviteResult.invite_token} email={inviteResult.email} nextStep={inviteResult.invite_next_step} emailSent={inviteResult.email_sent} />}<Button onClick={() => setInviteOpen(false)}>{tr("完成", "Done")}</Button></div> : <form onSubmit={invite} className="space-y-3">
         <Input type="email" label={tr("邮箱", "Email")} required disabled={canReissueDmInvite} value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="name@example.com" />
         {room.kind === "group" && <GroupInviteSenderPicker sender={inviteSender} disabled={busy} />}
         <p className="m-0 text-xs text-[var(--text-muted)]">{room.kind === "group" ? tr("邀请邮件会通过你的发送邮箱发给所有受邀人。已验证的 Manor 用户也会收到站内邀请。对方同意后加入；邀请可取消，不会授予公司或 Workspace 权限。", "Invitation emails are sent to all invitees through your sending account. Verified Manor users also receive an in-app invitation. They join after accepting; invitations can be canceled and grant no company or Workspace access.") : tr("受邀人验证该邮箱后加入；不会获得公司或 Workspace 权限。", "The invitee must verify this email to join. No company or Workspace access is granted.")}</p>

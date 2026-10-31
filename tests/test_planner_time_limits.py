@@ -7,23 +7,11 @@ cycles. That produced "Planning failed after 3 attempts: SoftTimeLimitExceeded()
 on heavy tasks and "Retry Strategist" after SoftTimeLimitExceeded on reviews.
 """
 from packages.core.tasks.ai_tasks import (
-    plan_and_run_task,
     resume_workflow,
     run_agent_task,
     run_strategist_review,
     run_workflow,
 )
-from packages.core.services.workflow_run_execution_claim import (
-    TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS,
-    TASK_PLAN_EXECUTION_RECHECK_SECONDS,
-)
-
-
-def test_plan_and_run_task_time_limits():
-    assert plan_and_run_task.soft_time_limit and plan_and_run_task.soft_time_limit >= 900
-    assert plan_and_run_task.time_limit and plan_and_run_task.time_limit > plan_and_run_task.soft_time_limit
-    assert TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS > plan_and_run_task.time_limit
-    assert TASK_PLAN_EXECUTION_RECHECK_SECONDS > TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS
 
 
 def test_run_agent_task_time_limits():

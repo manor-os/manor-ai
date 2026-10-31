@@ -34,6 +34,7 @@ from packages.core.ai.runtime.file_actions import (
     runtime_user_visible_file_path,
 )
 from packages.core.ai.runtime.file_contracts import FileMutationAction
+from packages.core.ai.runtime.file_images import FILE_IMAGE_DELIVERY_CONTRACT, file_image_not_delivered
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
 from packages.core.contracts.audio_generation import GenerateFileKind
 from packages.core.contracts.file_engine import (
@@ -1812,7 +1813,12 @@ async def _read_file_locked(entity_id: str, **kwargs: Any) -> str:
     }.get(os.path.splitext(abs_path)[1].lower())
     if image_mime_type:
         try:
-            if kwargs.get("include_image") is False or os.path.getsize(abs_path) > READ_FILE_MAX_IMAGE_BYTES:
+            omitted_reason = (
+                "include_image_false" if kwargs.get("include_image") is False
+                else "image_too_large" if os.path.getsize(abs_path) > READ_FILE_MAX_IMAGE_BYTES
+                else ""
+            )
+            if omitted_reason:
                 meta = _file_meta(abs_path)
                 if kwargs.get("expected_sha256") and kwargs["expected_sha256"] != meta["source_sha256"]:
                     return json.dumps({"error": "source_changed", "path": requested_path, **meta})
@@ -1820,6 +1826,11 @@ async def _read_file_locked(entity_id: str, **kwargs: Any) -> str:
                     "path": requested_path, "resolved_path": resolved_path, **meta,
                     **document_read_context(meta),
                     "read_mode": "metadata", "capabilities": file_type_capability(file_type_from_path(abs_path)),
+                    # Never silently metadata: say why the pixels were not sent.
+                    "image": file_image_not_delivered(
+                        omitted_reason,
+                        **({"max_bytes": READ_FILE_MAX_IMAGE_BYTES} if omitted_reason == "image_too_large" else {}),
+                    ),
                     "hint": "Full source hash is available for format conversion with generate_file source. Vision bytes were omitted; the original file is unchanged.",
                 })
             with open(abs_path, "rb") as image_file:
@@ -1858,7 +1869,7 @@ async def _read_file_locked(entity_id: str, **kwargs: Any) -> str:
                     "data_url": data_url,
                     "mime_type": image_mime_type,
                     "bytes": len(image_bytes),
-                    "delivery": "ephemeral_multimodal",
+                    "delivery": FILE_IMAGE_DELIVERY_CONTRACT,
                 },
             })
         except Exception as exc:  # noqa: BLE001
@@ -1869,12 +1880,27 @@ async def _read_file_locked(entity_id: str, **kwargs: Any) -> str:
         meta = _file_meta(abs_path)
         if kwargs.get("expected_sha256") and kwargs["expected_sha256"] != meta["source_sha256"]:
             return json.dumps({"error": "source_changed", "path": requested_path, **meta})
+        described: dict[str, Any] = {}
+        if document is not None:
+            from packages.core.services.knowledge_media_analysis import stored_media_text
+
+            # Uploaded video/audio carries a stored description + transcript
+            # written once at upload; reading it costs nothing per turn.
+            description = stored_media_text(document.metadata_)
+            if description:
+                described["content_description"] = description[:12_000]
         return json.dumps({
             "path": requested_path, "resolved_path": resolved_path, **meta,
             **document_read_context(meta),
             "read_mode": "metadata", "capabilities": file_type_capability(file_type),
-            "hint": "Binary/unknown content is not decoded as text; use a type-specific reader.",
-        })
+            **described,
+            "hint": (
+                "Binary content is not decoded as text; content_description is an automatic description "
+                "and transcript of this media file. Use a type-specific reader for exact details."
+                if described else
+                "Binary/unknown content is not decoded as text; use a type-specific reader."
+            ),
+        }, ensure_ascii=False)
 
     offset_arg = kwargs.get("offset")
     char_offset_arg = kwargs.get("char_offset")

@@ -643,17 +643,20 @@ def test_validate_accepts_v11():
     validate_payload(_v11_payload())  # should not raise
 
 
-def test_usage_guide_is_bounded_portable_text():
+@pytest.mark.parametrize("field, limit", [("usage_guide", 10000), ("release_notes", 1000)])
+def test_manifest_copy_fields_are_bounded_text(field, limit):
     payload = _v11_payload()
-    payload["manifest"]["usage_guide"] = "1. Open Workspace Chat.\n2. Review results."
+    payload["manifest"][field] = "1. Open Workspace Chat.\n2. Review results."
+    validate_payload(payload)
+    payload["manifest"][field] = "x" * limit
     validate_payload(payload)
 
-    payload["manifest"]["usage_guide"] = ["not text"]
-    with pytest.raises(PayloadError, match="manifest.usage_guide"):
+    payload["manifest"][field] = ["not text"]
+    with pytest.raises(PayloadError, match=f"manifest.{field}"):
         validate_payload(payload)
 
-    payload["manifest"]["usage_guide"] = "x" * 10001
-    with pytest.raises(PayloadError, match="manifest.usage_guide"):
+    payload["manifest"][field] = "x" * (limit + 1)
+    with pytest.raises(PayloadError, match=f"manifest.{field}"):
         validate_payload(payload)
 
 
@@ -1028,7 +1031,12 @@ def test_v11_governance_overlap_is_valid_and_deny_wins():
     validate_payload(p)
     chain = build_policy_chain(scope=ApprovalScope(kind="account", id="e", entity_id="e"),
         root={"revision": 1, "policy": {"mode": "automatic", **p["policy"]["governance"]["approval"]}})
-    assert evaluate_policy(chain, action_facts(action_key="purchase.buy")).outcome == "deny"
+    from packages.core.governance.action_effects import mcp_action_effect
+
+    payment = mcp_action_effect("stripe", "write")  # the MCP factory's declared effect
+    facts = action_facts(action_key="stripe.create_payment_link", impact=payment.impact, category=payment.category)
+    assert facts.category == "purchases"
+    assert evaluate_policy(chain, facts).outcome == "deny"
 
 
 @pytest.mark.parametrize("selector", [

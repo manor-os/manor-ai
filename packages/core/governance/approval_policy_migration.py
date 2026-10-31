@@ -41,8 +41,10 @@ def normalize_legacy_workspace_policy(raw: dict | None, *, root_entity_id: str |
     """Return current policy JSON, or fail with selector-level blockers.
 
     ``None`` means the *historical* DEFAULT_POLICY, not an empty opinion.
-    A safe Blueprint import always requires confirmation for old automatic or
-    unrepresentable configuration; live owners require an explicit resolution.
+    A safe Blueprint import grants nothing: old automatic configuration is
+    dropped so the installer's chosen mode decides, while unrepresentable
+    restrictions become a confirmation gate. Live owners require an explicit
+    resolution.
     """
     if raw is None:
         raw = {'auto_approve_capabilities': ['file.write', 'manor.composite']}
@@ -71,6 +73,10 @@ def normalize_legacy_workspace_policy(raw: dict | None, *, root_entity_id: str |
         if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
             blockers.append({'field': field, 'reason': f'{field} is not a string list'})
             continue
+        if safe_import and effect == 'allow':
+            # Template consent is nonportable. Turning it into review gates
+            # would override the installer's own execution choice.
+            continue
         for value in values:
             # Resource strings omit account/resource-kind evidence and cannot
             # be promoted to an account-independent exact target grant.
@@ -87,11 +93,8 @@ def normalize_legacy_workspace_policy(raw: dict | None, *, root_entity_id: str |
                 blockers.append({'field': field, 'selector': value, 'reason': f'{value!r} is not a canonical action'})
                 continue
             rules.append(ApprovalRule(id=_rule_id(field, value), effect='ask' if safe_import else effect, selector=selector))
-    if raw.get('automated_runs_always_allow'):
-        if safe_import:
-            global_review = True
-        else:
-            blockers.append({'field': 'automated_runs_always_allow', 'reason': 'unbounded scheduled-run consent requires a bounded replacement'})
+    if raw.get('automated_runs_always_allow') and not safe_import:
+        blockers.append({'field': 'automated_runs_always_allow', 'reason': 'unbounded scheduled-run consent requires a bounded replacement'})
     # Old allow beat ask; the new policy chooses ask within the same layer.
     by_action: dict[str, set[str]] = {}
     for rule in rules:

@@ -8,6 +8,7 @@ import pytest
 from httpx import AsyncClient
 from types import SimpleNamespace
 
+from tests.async_waits import LIVENESS_TIMEOUT_S
 from tests.auth_helpers import register_user_and_get_token
 
 
@@ -123,6 +124,27 @@ async def _execute_created_retry(
     return refreshed.json()
 
 
+async def _execute_queued_binding_run(
+    client: AsyncClient,
+    headers: dict,
+    response,
+) -> dict:
+    """Run what a binding run queued, as the ``run_workflow`` worker would."""
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["status"] in {"pending", "running"}, created
+    assert not created["step_results"], "the request must not execute nodes"
+    await WorkflowRunner().run(created["id"])
+    refreshed = await client.get(
+        f"/api/v1/workflows/runs/{created['id']}",
+        headers=headers,
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    return refreshed.json()
+
+
 @pytest.mark.asyncio
 async def test_start_workflow_rejects_workspace_from_another_entity(
     client: AsyncClient,
@@ -161,6 +183,150 @@ async def test_start_workflow_rejects_workspace_from_another_entity(
 
 
 @pytest.mark.asyncio
+async def test_start_workflow_inherits_definition_workspace_and_rejects_conflicts(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.services.workflow_service import start_workflow
+
+    headers = await _auth(client, "workflow_definition_workspace")
+    workflow_response = await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Workspace-owned workflow", "steps": _simple_steps([])},
+    )
+    first_workspace = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "First workspace"},
+    )
+    second_workspace = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Second workspace"},
+    )
+    assert workflow_response.status_code == first_workspace.status_code == second_workspace.status_code == 201
+
+    workflow = await db_session.get(WorkflowDefinition, workflow_response.json()["id"])
+    workflow.workspace_id = first_workspace.json()["id"]
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflow_definition_workspace@test.com")
+    )).scalar_one()
+    await db_session.flush()
+
+    run = await start_workflow(
+        db_session, str(owner.entity_id), workflow.id, started_by=owner.id,
+    )
+    assert run.workspace_id == first_workspace.json()["id"]
+
+    with pytest.raises(ValueError, match="belongs to another workspace"):
+        await start_workflow(
+            db_session,
+            str(owner.entity_id),
+            workflow.id,
+            started_by=owner.id,
+            workspace_id=second_workspace.json()["id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_owned_workflow_binding_cannot_cross_workspace(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.services.workflow_service import (
+        create_workflow_binding,
+        start_workflow_from_binding,
+    )
+
+    headers = await _auth(client, "workflow_binding_workspace_scope")
+    owned_response = await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Owned workflow", "steps": _simple_steps([])},
+    )
+    shared_response = await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Shared workflow", "steps": _simple_steps([])},
+    )
+    second_owned_response = await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Second owned workflow", "steps": _simple_steps([])},
+    )
+    first_workspace = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "First workspace"},
+    )
+    second_workspace = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Second workspace"},
+    )
+    assert all(response.status_code == 201 for response in (
+        owned_response, shared_response, second_owned_response, first_workspace, second_workspace,
+    ))
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflow_binding_workspace_scope@test.com")
+    )).scalar_one()
+    first_workspace_id = first_workspace.json()["id"]
+    second_workspace_id = second_workspace.json()["id"]
+    owned = await db_session.get(WorkflowDefinition, owned_response.json()["id"])
+    owned.workspace_id = first_workspace_id
+    second_owned = await db_session.get(WorkflowDefinition, second_owned_response.json()["id"])
+    second_owned.workspace_id = second_workspace_id
+    await db_session.commit()
+
+    inherited_binding = await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={"workflow_id": owned.id},
+    )
+    assert inherited_binding.status_code == 201, inherited_binding.text
+    owned_binding = await db_session.get(WorkflowBinding, inherited_binding.json()["id"])
+    assert owned_binding.workspace_id == first_workspace_id
+
+    create_conflict = await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={"workflow_id": owned.id, "workspace_id": second_workspace_id},
+    )
+    assert create_conflict.status_code == 409, create_conflict.text
+    workspace_update_conflict = await client.put(
+        f"/api/v1/workflows/bindings/{owned_binding.id}",
+        headers=headers,
+        json={"workspace_id": second_workspace_id},
+    )
+    assert workspace_update_conflict.status_code == 409, workspace_update_conflict.text
+    workflow_update_conflict = await client.put(
+        f"/api/v1/workflows/bindings/{owned_binding.id}",
+        headers=headers,
+        json={"workflow_id": second_owned.id},
+    )
+    assert workflow_update_conflict.status_code == 409, workflow_update_conflict.text
+
+    # Historical rows may predate the creation/update guard. The runtime must
+    # retain the same definition boundary before resolving Workspace resources.
+    owned_binding.workspace_id = second_workspace_id
+    await db_session.flush()
+    with pytest.raises(ValueError, match="belongs to another workspace"):
+        await start_workflow_from_binding(db_session, owned_binding, started_by=owner.id)
+
+    shared = await db_session.get(WorkflowDefinition, shared_response.json()["id"])
+    first_shared_binding = await create_workflow_binding(
+        db_session, str(owner.entity_id), shared.id, workspace_id=first_workspace_id,
+    )
+    second_shared_binding = await create_workflow_binding(
+        db_session, str(owner.entity_id), shared.id, workspace_id=second_workspace_id,
+    )
+    assert {first_shared_binding.workspace_id, second_shared_binding.workspace_id} == {
+        first_workspace_id, second_workspace_id,
+    }
+
+
+@pytest.mark.asyncio
 async def test_start_workflow_allows_manual_work_but_not_automatic_work_when_paused(
     client: AsyncClient,
     db_session,
@@ -192,25 +358,77 @@ async def test_start_workflow_allows_manual_work_but_not_automatic_work_when_pau
         select(User).where(User.email == "workflow_workspace_lifecycle@test.com")
     )).scalar_one()
     entity_id = str(owner.entity_id)
+    owner_id = owner.id
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+
+    scheduled_job = ScheduledJob(
+        job_id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.json()["id"],
+        execution_type="workflow",
+        execution_target={"workflow_id": workflow.json()["id"]},
+        enabled=True,
+    )
+    scheduled_job_run = ScheduledJobRun(
+        id=generate_ulid(),
+        job_id=scheduled_job.job_id,
+        status="running",
+        trigger_type="cron",
+    )
+    scheduled_job_id = scheduled_job.job_id
+    scheduled_job_run_id = scheduled_job_run.id
+    db_session.add_all([scheduled_job, scheduled_job_run])
+    await db_session.flush()
+
+    scheduled = await start_workflow(
+        db_session,
+        entity_id,
+        workflow.json()["id"],
+        workspace_id=workspace.json()["id"],
+        started_by=owner_id,
+        trigger_source="schedule",
+        trigger_data={
+            "scheduled_job_id": scheduled_job_id,
+            "scheduled_run_id": scheduled_job_run_id,
+        },
+    )
+    assert scheduled.trigger_source == "schedule"
 
     run = await start_workflow(
         db_session,
         entity_id,
         workflow.json()["id"],
         workspace_id=workspace.json()["id"],
-        started_by=owner.id,
+        started_by=owner_id,
     )
     assert run.workspace_id == workspace.json()["id"]
     assert run.trigger_source == "manual"
     await db_session.commit()
 
-    with pytest.raises(ValueError, match="active Workspace"):
+    with pytest.raises(ValueError, match="enabled configured Workflow"):
         await start_workflow(
             db_session,
             entity_id,
             workflow.json()["id"],
             workspace_id=workspace.json()["id"],
             trigger_source="event",
+        )
+    await db_session.rollback()
+
+    with pytest.raises(ValueError, match="enabled configured Workflow"):
+        await start_workflow(
+            db_session,
+            entity_id,
+            workflow.json()["id"],
+            workspace_id=workspace.json()["id"],
+            started_by=owner_id,
+            trigger_source="schedule",
+            trigger_data={
+                "scheduled_job_id": scheduled_job_id,
+                "scheduled_run_id": "forged-scheduled-run",
+            },
         )
     await db_session.rollback()
 
@@ -438,6 +656,185 @@ def test_trace_summary_redacts_headers_private_keys_and_free_text_tokens():
     assert encoded.count("[REDACTED]") >= 5
 
 
+def test_history_summary_projects_stages_waiting_point_deliverables_and_publications():
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import update_workflow_history_summary
+
+    run = WorkflowRun(
+        id="run-stages", workflow_id="wf", entity_id="entity", status="paused", current_step_id="approve",
+        trigger_data={},
+        definition_snapshot={"nodes": [
+            {"id": "start", "type": "trigger", "name": "Start"},
+            {"id": "draft", "type": "agent", "name": "Draft storyboard"},
+            {"id": "ready", "type": "condition", "name": "Storyboard ready?"},
+            {"id": "approve", "type": "wait", "name": "Approve storyboard"},
+            {"id": "render", "type": "stage", "name": "Render"},
+        ]},
+        step_results={
+            "start": {"status": "completed"},
+            "draft": {"status": "completed"},
+            "ready": {"status": "completed"},
+            "publish": {"status": "completed", "output": {
+                "schema_version": "publication-receipt/v1", "platform": "linkedin", "title": "Launch post",
+                "published_url": "https://www.linkedin.com/feed/update/1", "verification_status": "verified",
+                "external_id": "1", "payload_hash": "h", "evidence": [{"kind": "published_url"}],
+            }},
+        },
+        variables={"__result": {"files": [
+            {"document_id": "doc-1", "name": "cut.mp4", "role": "final_video", "storage": "ignored"},
+            {"name": "no id is not a delivered file"},
+        ]}},
+        execution_trace=[],
+    )
+    update_workflow_history_summary(run)
+    summary = run.trigger_data["_workflow_history_summary"]
+
+    assert summary["schema_version"] == 4
+    # Routing nodes are not stages a person would recognise.
+    assert [stage["name"] for stage in summary["stages"]] == ["Draft storyboard", "Approve storyboard", "Render"]
+    assert summary["current_stage"] == {
+        "id": "approve", "name": "Approve storyboard", "index": 1, "status": "paused", "waiting": True,
+    }
+    assert summary["deliverables"] == [{"document_id": "doc-1", "name": "cut.mp4", "role": "final_video"}]
+    assert summary["publications"] == [{
+        "platform": "linkedin", "title": "Launch post", "published_url": "https://www.linkedin.com/feed/update/1",
+        "verification_status": "verified",
+    }]
+
+
+def test_a_step_that_reports_it_was_blocked_is_not_just_completed():
+    """A Video Studio run failed while its render step said Completed: the step ran,
+    but its own result said blocked. Checks keep their yes/no answer."""
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import update_workflow_history_summary
+
+    run = WorkflowRun(
+        id="run-blocked", workflow_id="wf", entity_id="entity", status="failed", current_step_id="render_blocked",
+        trigger_data={}, execution_trace=[], variables={},
+        definition_snapshot={"nodes": [
+            {"id": "render", "type": "agent", "name": "Render"},
+            {"id": "render_ok", "type": "condition", "name": "Final video ready?"},
+            {"id": "render_blocked", "type": "stop", "name": "Render blocked"},
+        ]},
+        step_results={
+            "render": {"status": "completed", "output": {"status": "blocked", "summary": "Sandbox unavailable"}},
+            "render_ok": {"status": "completed", "condition_result": False, "output": False},
+            "render_blocked": {"status": "failed", "error": "Sandbox unavailable"},
+        },
+    )
+    update_workflow_history_summary(run)
+    steps = {step["id"]: step for step in run.trigger_data["_workflow_history_summary"]["workflow_steps"]}
+    assert steps["render"]["status"] == "completed" and steps["render"]["outcome"] == "blocked"
+    assert steps["render_ok"]["answer"] == "no" and "outcome" not in steps["render_ok"]
+
+
+def test_steps_that_need_the_person_read_as_the_run_does():
+    """An AI Podcast Studio run said Input needed while its production step and the
+    end that explained what was missing both said Completed."""
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import workflow_execution_steps
+
+    missing = {"status": "needs_input", "summary": "No source recording was attached."}
+    run = WorkflowRun(
+        id="run-needs-input", workflow_id="wf", entity_id="entity", status="completed", current_step_id="needs_input",
+        trigger_data={}, execution_trace=[], variables={"__result": missing},
+        definition_snapshot={"nodes": [
+            {"id": "produce", "type": "agent", "name": "Create the actual finished files"},
+            {"id": "ready", "type": "condition", "name": "Require actual deliverables"},
+            {"id": "needs_input", "type": "end", "name": "Explain the missing prerequisite"},
+        ]},
+        step_results={
+            "produce": {"status": "completed", "output": missing},
+            "ready": {"status": "completed", "condition_result": False, "output": False},
+            "needs_input": {"status": "completed", "output": missing},
+        },
+    )
+    steps = {step["id"]: step for step in workflow_execution_steps(run)}
+    assert steps["produce"]["outcome"] == steps["needs_input"]["outcome"] == "needs_input"
+    assert steps["ready"]["answer"] == "no" and "outcome" not in steps["ready"]
+
+
+def test_a_step_retried_in_a_running_run_is_running_not_its_last_failure():
+    """A Video Studio retry from the render said Running while the render row said
+    Failed: the row read the last attempt's result while the run ran it again."""
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import workflow_execution_steps
+
+    def steps(status):
+        run = WorkflowRun(
+            id="run-retry", workflow_id="wf", entity_id="entity", status=status, current_step_id="render",
+            trigger_data={}, execution_trace=[], variables={},
+            definition_snapshot={"nodes": [
+                {"id": "produce", "type": "agent", "name": "Produce"},
+                {"id": "render", "type": "agent", "name": "Render"},
+            ]},
+            step_results={
+                "produce": {"status": "completed", "output": {"status": "completed"}},
+                "render": {"status": "failed", "error": "Sandbox unavailable"},
+            },
+        )
+        return {step["id"]: step["status"] for step in workflow_execution_steps(run)}
+
+    assert steps("running") == {"produce": "completed", "render": "running"}
+    # Once the run has ended, its failure is the step's state again.
+    assert steps("failed") == {"produce": "completed", "render": "failed"}
+
+
+def test_history_summary_names_the_result_and_finds_files_the_result_nests():
+    """A Handbook result nests its files in a delivery package: the App listed it as
+    "Completed" with no files while Chat showed all three."""
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import update_workflow_history_summary
+
+    def run_with(result: object) -> dict:
+        run = WorkflowRun(
+            id="run-nested", workflow_id="wf", entity_id="entity", status="completed",
+            trigger_data={}, definition_snapshot={"nodes": []}, step_results={}, execution_trace=[],
+            variables={"__result": result},
+        )
+        update_workflow_history_summary(run)
+        return run.trigger_data["_workflow_history_summary"]
+
+    summary = run_with({"status": "accepted", "delivery": {"status": "completed", "artifacts": [
+        {"kind": "document", "name": "guide.pdf", "document_id": "01M5DHEK509JRZGST48HPR1651"},
+    ]}})
+    assert [item["name"] for item in summary["deliverables"]] == ["guide.pdf"]
+    assert summary["result_title"] is None
+
+    wrapped = run_with(
+        {"decision": {"choice": "revise"}, "topic_brief": {"title": "Approval-first AI", "thesis": "Why it matters"}},
+    )
+    assert (wrapped["result_title"], wrapped["result_summary"]) == ("Approval-first AI", "Why it matters")
+
+
+@pytest.mark.asyncio
+async def test_history_summary_refreshes_whichever_path_changes_the_run(db_session):
+    """A path that sets the final result directly still leaves a current summary."""
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowRun
+
+    run = WorkflowRun(
+        id=generate_ulid(), workflow_id=generate_ulid(), entity_id=generate_ulid(), status="running",
+        definition_snapshot={"nodes": [{"id": "make", "type": "agent", "name": "Make files"}]},
+        step_results={}, variables={}, execution_trace=[], trigger_data={},
+    )
+    db_session.add(run)
+    await db_session.commit()
+
+    run.status = "completed"
+    run.step_results = {"make": {"status": "completed"}}
+    run.variables = {"__result": {"files": [{"document_id": "doc-9", "name": "report.pdf"}]}}
+    await db_session.commit()
+
+    stored = (await db_session.execute(select(WorkflowRun.trigger_data).where(WorkflowRun.id == run.id))).scalar_one()
+    summary = stored["_workflow_history_summary"]
+    assert summary["deliverables"] == [{"document_id": "doc-9", "name": "report.pdf"}]
+    assert summary["stages"] == [{"id": "make", "name": "Make files", "type": "agent", "status": "completed"}]
+    assert summary["current_stage"] is None
+
+
 def test_execution_trace_records_transition_metadata_and_enforces_caps():
     from packages.core.models.workflow import WorkflowRun
     from packages.core.services.workflow_run_trace import append_execution_trace
@@ -504,7 +901,7 @@ def test_execution_trace_records_transition_metadata_and_enforces_caps():
     assert completed["artifact_refs"][0] == {"id": "artifact-0"}
     assert "do-not-store" not in json.dumps(completed["artifact_refs"])
     assert run.trigger_data["_workflow_history_summary"] == {
-        "schema_version": 2,
+        "schema_version": 4,
         "business_outcome": "needs_input",
         "processed_count": 1,
         "total_count": 1,
@@ -517,6 +914,12 @@ def test_execution_trace_records_transition_metadata_and_enforces_caps():
         }],
         "artifact_count": 64,
         "blocker": "Browser disconnected",
+        "stages": [{"id": "render", "name": "Render", "type": "tool", "status": "completed"}],
+        "current_stage": None,
+        "deliverables": [],
+        "publications": [],
+        "result_title": None,
+        "result_summary": None,
     }
 
     run.execution_trace = [{} for _ in range(2000)]
@@ -710,10 +1113,60 @@ def test_workflow_execution_steps_append_not_reached_nodes_and_share_counts():
         ("done", "pending"),
     ]
     assert steps[2]["child_run_ids"] == ["child-run-1"]
+    # Only the stages count: the wait and the subworkflow. The start, the stop and the end are routing.
     assert workflow_execution_progress(steps) == {
-        "processed_count": 3,
-        "total_count": 5,
+        "processed_count": 2,
+        "total_count": 2,
     }
+
+
+def test_routing_steps_never_move_the_stage_total():
+    from packages.core.services.workflow_run_trace import workflow_execution_progress
+
+    def steps(stage_status: str, routing_status: str) -> list[dict]:
+        return [
+            {"id": "start", "type": "trigger", "status": routing_status},
+            {"id": "check", "type": "condition", "status": routing_status},
+            {"id": "draft", "type": "agent", "status": stage_status},
+            {"id": "publish", "type": "tool", "status": "pending"},
+            {"id": "done", "type": "end", "status": "pending"},
+        ]
+
+    before = workflow_execution_progress(steps("running", "pending"))
+    during = workflow_execution_progress(steps("running", "completed"))
+    after = workflow_execution_progress(steps("completed", "completed"))
+    assert before == {"processed_count": 0, "total_count": 2}
+    assert during == {"processed_count": 0, "total_count": 2}
+    assert after == {"processed_count": 1, "total_count": 2}
+
+
+def test_a_check_step_carries_its_answer_not_just_that_it_ran():
+    from types import SimpleNamespace
+
+    from packages.core.services.workflow_run_trace import workflow_execution_steps
+
+    run = SimpleNamespace(
+        definition_snapshot={"nodes": [
+            {"id": "start", "name": "Start", "type": "trigger", "order": 0},
+            {"id": "suitable", "name": "Check material is suitable", "type": "condition", "order": 1},
+            {"id": "picked", "name": "Files picked?", "type": "condition", "order": 2},
+        ]},
+        execution_trace=[
+            {"sequence": 1, "node_id": "start", "status": "completed"},
+            {"sequence": 2, "node_id": "suitable", "status": "completed"},
+            {"sequence": 3, "node_id": "picked", "status": "completed"},
+        ],
+        step_results={
+            "start": {"status": "completed"},
+            "suitable": {"status": "completed", "output": False, "condition_result": False},
+            "picked": {"status": "completed", "output": True, "condition_result": True},
+        },
+        status="completed", current_step_id="picked", retry_of_run_id=None,
+    )
+    steps = {step["id"]: step for step in workflow_execution_steps(run)}
+    assert (steps["suitable"]["status"], steps["suitable"]["answer"]) == ("completed", "no")
+    assert steps["picked"]["answer"] == "yes"
+    assert "answer" not in steps["start"]
 
 
 def test_workflow_execution_steps_prepend_retry_receipts_and_keep_real_skips():
@@ -843,7 +1296,8 @@ async def test_runner_persists_structured_step_error_as_safe_text(
     assert len(encoded_error) <= TRACE_SUMMARY_BYTES
     assert b"runner-secret-value-123456" not in encoded_error
     assert b"runner-password-value" not in encoded_error
-    assert b"[REDACTED]" in encoded_error
+    # The run headline is the error's readable message, never its JSON.
+    assert failed["error"] == "Provider rejected the request"
     assert failed["step_results"]["fail"]["error"] == structured_error
 
 
@@ -940,11 +1394,63 @@ async def test_runner_claims_one_execution_across_concurrent_deliveries(
 
 
 @pytest.mark.asyncio
-async def test_runner_fails_closed_when_execution_claim_heartbeat_is_lost(
+@pytest.mark.parametrize("broker_accepts", [True, False])
+async def test_binding_run_returns_immediately_and_executes_on_a_worker(
+    client: AsyncClient,
+    monkeypatch,
+    broker_accepts: bool,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, f"wfbindingqueued{int(broker_accepts)}")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Queued binding", "steps": _simple_steps(["work"])},
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={"workflow_id": workflow["id"], "trigger_type": "manual"},
+    )).json()
+    queued: list[str] = []
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue",
+        staticmethod(lambda run_id, *_a, **_k: queued.append(run_id) or broker_accepts),
+    )
+
+    async def inline_execution_forbidden(*_args, **_kwargs):
+        pytest.fail("the request handler executed a workflow node")
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", inline_execution_forbidden)
+    # ``execute`` defaults to true; binding runs still go to the worker queue.
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={"variables": {}},
+    )
+
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert queued == [run["id"]]
+    if broker_accepts:
+        assert run["status"] in {"pending", "running"}
+        assert run["step_results"] == {}
+    else:
+        assert run["status"] == "failed"
+        assert run["error"] == "Workflow could not be queued. Please start it again."
+
+
+@pytest.mark.asyncio
+async def test_lost_owner_hands_replay_safe_step_to_exactly_one_successor(
     client: AsyncClient,
     monkeypatch,
 ):
-    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.ai.workflow_runner import (
+        WORKFLOW_RUN_EXECUTION_RESUMED_ELSEWHERE,
+        WorkflowRunner,
+    )
     from packages.core.services import workflow_run_execution_claim as claim_service
 
     headers = await _auth(client, "wfclaimheartbeat")
@@ -1003,16 +1509,65 @@ async def test_runner_fails_closed_when_execution_claim_heartbeat_is_lost(
         return await original_execute(self, step, run, db)
 
     monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", blocking_work)
+    queued: list[dict] = []
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue",
+        staticmethod(lambda run_id, *_a, **kwargs: queued.append(
+            {"run_id": run_id, **kwargs}
+        ) or True),
+    )
 
-    assert await WorkflowRunner().run(started["id"]) == "executed"
+    assert await WorkflowRunner().run(started["id"]) == (
+        WORKFLOW_RUN_EXECUTION_RESUMED_ELSEWHERE
+    )
+
+    # The interrupted transform is replay-safe: the run stays active and one
+    # worker delivery receives the recovery owner's retained lease.
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{started['id']}",
+        headers=headers,
+    )).json()
+    assert detail["status"] == "running"
+    assert detail["error"] is None
+    recovery = detail["trigger_data"]["_execution_recovery"]
+    assert recovery["attempts"] == 1
+    assert recovery["interrupted_step_ids"] == ["work"]
+    assert len(queued) == 1 and queued[0]["run_id"] == started["id"]
+    handoff_token = queued[0]["claim_handoff_token"]
+    assert handoff_token not in json.dumps(detail), "lease tokens stay private"
+    # Only the lost owner released; the recovery lease is retained.
+    assert len(released) == 1 and released[0][1] != handoff_token
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", original_execute)
+    monkeypatch.setattr(
+        claim_service, "_extend_postgres_execution_claim", original_extend,
+    )
+    adopted = asyncio.Event()
+    duplicate_outcome: list[str] = []
+
+    async def adopt_then_redeliver(self, step, run, db):
+        if step["id"] == "work" and not adopted.is_set():
+            adopted.set()
+            # A duplicate delivery of the same handoff cannot adopt it again.
+            duplicate_outcome.append(await WorkflowRunner().run(
+                started["id"], claim_handoff_token=handoff_token,
+            ))
+        return await original_execute(self, step, run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", adopt_then_redeliver)
+    assert await WorkflowRunner().run(
+        started["id"], claim_handoff_token=handoff_token,
+    ) == "executed"
+    assert duplicate_outcome == [claim_service.CLAIM_HELD]
 
     detail = (await client.get(
         f"/api/v1/workflows/runs/{started['id']}",
         headers=headers,
     )).json()
-    assert detail["status"] == "failed"
-    assert detail["error"] == "Workflow execution claim was lost"
-    assert len(released) == 2
+    assert detail["status"] == "completed", detail
+    assert detail["step_results"]["work"]["status"] == "completed"
+    assert detail["variables"]["work"]["work"] == "done"
 
 
 @pytest.mark.asyncio
@@ -1038,7 +1593,7 @@ async def test_claim_loss_settlement_cannot_fail_a_successor_owner(
 
     async with workflow_run_execution_claim(started["id"]) as successor:
         assert successor
-        assert await WorkflowRunner._fail_lost_execution_claim(started["id"]) is None
+        assert await WorkflowRunner._recover_lost_execution_claim(started["id"]) is None
 
         detail = (await client.get(
             f"/api/v1/workflows/runs/{started['id']}",
@@ -1086,7 +1641,7 @@ async def test_runner_reports_claim_held_when_loss_settlement_has_a_successor(
     monkeypatch.setattr(WorkflowRunner, "_run_claimed", lose_claim)
     monkeypatch.setattr(
         WorkflowRunner,
-        "_fail_lost_execution_claim",
+        "_recover_lost_execution_claim",
         staticmethod(successor_owns_recovery),
     )
 
@@ -1094,20 +1649,33 @@ async def test_runner_reports_claim_held_when_loss_settlement_has_a_successor(
 
 
 @pytest.mark.asyncio
-async def test_execution_claim_tolerates_one_transient_postgres_renewal_outage(
+@pytest.mark.parametrize(
+    ("lease_ttl_seconds", "outage_attempts", "lost"),
+    [
+        # 2026-10-13: three refused renewals within 4s of a 660s lease used to
+        # cancel a 25-minute workflow step. Unreachable is not lost.
+        (660, 8, False),
+        # No renewal confirmed before the lease's own deadline: stop working.
+        (0.2, None, True),
+    ],
+)
+async def test_execution_claim_survives_renewal_outage_until_its_lease_deadline(
     monkeypatch,
+    lease_ttl_seconds,
+    outage_attempts,
+    lost,
 ):
     from packages.core.services import workflow_run_execution_claim as claim_service
 
     renewal_succeeded = asyncio.Event()
     released: list[tuple[str, str]] = []
-    renewal_results = iter([None, True])
+    renewal_results = iter([None] * outage_attempts + [True] * 100 if outage_attempts else [])
 
     async def acquire(*_args, **_kwargs):
         return True
 
     async def extend(*_args, **_kwargs):
-        result = next(renewal_results)
+        result = next(renewal_results, None)
         if result is True:
             renewal_succeeded.set()
         return result
@@ -1141,12 +1709,24 @@ async def test_execution_claim_tolerates_one_transient_postgres_renewal_outage(
         "_WORKFLOW_RUN_EXECUTION_RENEWAL_RETRY_SECONDS",
         0.01,
     )
+    monkeypatch.setattr(
+        claim_service,
+        "WORKFLOW_RUN_EXECUTION_LEASE_TTL_SECONDS",
+        lease_ttl_seconds,
+    )
 
-    async with claim_service.workflow_run_execution_claim(
-        "workflow-transient-renewal"
-    ) as claim:
-        await asyncio.wait_for(renewal_succeeded.wait(), timeout=1)
-        assert claim.lost.is_set() is False
+    if lost:
+        with pytest.raises(claim_service.WorkflowRunExecutionClaimLost):
+            async with claim_service.workflow_run_execution_claim(
+                "workflow-renewal-deadline"
+            ):
+                await asyncio.sleep(5)
+    else:
+        async with claim_service.workflow_run_execution_claim(
+            "workflow-transient-renewal"
+        ) as claim:
+            await asyncio.wait_for(renewal_succeeded.wait(), timeout=5)
+            assert claim.lost.is_set() is False
 
     assert len(released) == 1
 
@@ -1233,6 +1813,158 @@ def test_retry_variables_restore_inherited_shared_checkpoint_output():
     assert variables["retry_segment_ids"] == ["SEG-002"]
 
 
+def test_retry_variables_restore_structured_wait_response_without_replacing_receipt_output():
+    from packages.core.services.workflow_service import _retry_variables
+
+    materials = {"primary_audio": [{"document_id": "audio-1"}]}
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["materials"]},
+        {
+            "id": "materials",
+            "type": "wait",
+            "config": {
+                "wait_type": "input",
+                "response_variable": "materials_input",
+                "output_var": "materials_record",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["primary_audio"],
+                    "properties": {
+                        "primary_audio": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "required": ["document_id"],
+                                "properties": {"document_id": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+            },
+            "next": ["publish"],
+        },
+        {"id": "publish", "type": "tool", "config": {}, "next": []},
+    ])
+    prior = SimpleNamespace(
+        variables={"materials_input": materials},
+        step_results={
+            "start": {"status": "completed", "output": {}},
+            "materials": {
+                "status": "completed",
+                "output": "Choose the primary audio.",
+                "workflow_response": {"choice": "submit", "payload": {"materials_input": materials}},
+            },
+            "publish": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(workflow, prior, {"start", "materials"}, None, "publish")
+
+    assert variables["materials"] == "Choose the primary audio."
+    assert variables["materials_record"] == "Choose the primary audio."
+    assert variables["materials_input"] == materials
+
+    same_name_workflow = SimpleNamespace(steps=deepcopy(workflow.steps))
+    same_name_config = same_name_workflow.steps[1]["config"]
+    same_name_config["response_variable"] = "materials"
+    same_name_config["output_var"] = "materials"
+    same_name_prior = SimpleNamespace(
+        variables={"materials": materials},
+        step_results={
+            "start": {"status": "completed", "output": {}},
+            "materials": {
+                "status": "completed",
+                "output": "Choose the primary audio.",
+                "workflow_response": {"choice": "submit", "payload": {"materials": materials}},
+            },
+            "publish": {"status": "failed"},
+        },
+    )
+
+    same_name_variables = _retry_variables(
+        same_name_workflow, same_name_prior, {"start", "materials"}, None, "publish",
+    )
+
+    assert same_name_variables["materials"] == materials
+
+
+def test_retry_variables_replay_collection_wait_clears_prior_customer_answers():
+    from packages.core.services.workflow_service import _retry_variables
+
+    workflow = SimpleNamespace(steps=[
+        {
+            "id": "start",
+            "type": "trigger",
+            "config": {"run_inputs": [{"key": "workspace_id"}]},
+            "next": ["collect_profile"],
+        },
+        {
+            "id": "collect_profile",
+            "type": "wait",
+            "config": {
+                "wait_type": "human_input",
+                "response_variable": "onboarding_response",
+                "output_var": "onboarding_answers",
+                "collection_fields": [
+                    {"key": "company_name"},
+                    {"key": "team_size"},
+                ],
+            },
+            "next": ["prepare_workspace"],
+        },
+        {
+            "id": "prepare_workspace",
+            "type": "agent",
+            "config": {"output_var": "proposal"},
+            "next": [],
+        },
+        {
+            "id": "unselected_sibling",
+            "type": "transform",
+            "config": {"set": {"sibling_value": "unused"}},
+            "next": [],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "workspace_id": "workspace-onboarding",
+            "company_name": "Old Company",
+            "team_size": "12",
+            "onboarding_response": {
+                "payload": {"inputs": {"company_name": "Old Company", "team_size": "12"}},
+            },
+            "onboarding_answers": {"company_name": "Old Company", "team_size": "12"},
+            "sibling_value": "keep-this-unselected-value",
+            "proposal": {"status": "failed"},
+        },
+        step_results={
+            "start": {"status": "completed", "output": {}},
+            "collect_profile": {
+                "status": "completed",
+                "output": {"company_name": "Old Company", "team_size": "12"},
+                "collection_values": {"company_name": "Old Company", "team_size": "12"},
+            },
+            "prepare_workspace": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "collect_profile",
+    )
+
+    assert variables["workspace_id"] == "workspace-onboarding"
+    assert variables["sibling_value"] == "keep-this-unselected-value"
+    assert "onboarding_response" not in variables
+    assert "onboarding_answers" not in variables
+    assert "company_name" not in variables
+    assert "team_size" not in variables
+
+
 def test_retry_variables_restore_inherited_automatic_and_named_outputs():
     from packages.core.services.workflow_service import _retry_variables
 
@@ -1264,6 +1996,43 @@ def test_retry_variables_restore_inherited_automatic_and_named_outputs():
 
     assert variables["upload"] == upload_receipt
     assert variables["published_video_id"] == "LC13h459jjI"
+
+
+def test_retry_variables_restore_shared_output_in_execution_order_not_definition_order():
+    from packages.core.services.workflow_service import _retry_variables
+
+    # ``restore`` is intentionally declared after ``plan`` although it runs
+    # first. Both write the same output variable; a retry must retain the
+    # result from the later, selected producer.
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "config": {}, "next": ["restore"]},
+        {
+            "id": "plan",
+            "type": "tool",
+            "config": {"output_var": "brief"},
+            "next": ["publish"],
+        },
+        {"id": "publish", "type": "agent", "config": {}, "next": []},
+        {
+            "id": "restore",
+            "type": "tool",
+            "config": {"output_var": "brief"},
+            "next": ["plan"],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={"brief": {"ready": True, "source": "plan"}},
+        step_results={
+            "start": {"status": "completed", "output": {}},
+            "restore": {"status": "completed", "output": {"ready": False, "source": "restore"}},
+            "plan": {"status": "completed", "output": {"ready": True, "source": "plan"}},
+            "publish": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(workflow, prior, {"start", "restore", "plan"}, None, "publish")
+
+    assert variables["brief"] == {"ready": True, "source": "plan"}
 
 
 def test_retry_inherits_completed_ancestors_through_unexecuted_condition():
@@ -2266,6 +3035,147 @@ async def test_retry_preserves_legacy_product_video_asset_evidence_for_validatio
 
 
 @pytest.mark.asyncio
+async def test_parent_retry_reuses_completed_foreach_child_retry(client, db_session):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "foreachrecovery")
+    child_steps = [
+        {"id": "start", "type": "trigger", "next": ["check"]},
+        {"id": "check", "type": "condition", "config": {"expression": "ready == true"},
+         "true_next": ["done"], "false_next": ["blocked"]},
+        {"id": "blocked", "type": "stop", "config": {"message": "Temporarily unavailable"}},
+        {"id": "done", "type": "end", "config": {}},
+    ]
+    child = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Equipment check", "steps": child_steps, "variables": {"ready": False},
+    })).json()
+    parent = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Equipment batch", "steps": [
+            {"id": "start", "type": "trigger", "next": ["batch"]},
+            {"id": "batch", "type": "foreach_subworkflow", "config": {
+                "workflow_id": child["id"], "over": [{"id": "equipment-a"}], "output_var": "checks",
+            }, "next": ["done"]},
+            {"id": "done", "type": "end", "config": {}},
+        ],
+    })).json()
+    initial = (await client.post(f"/api/v1/workflows/{parent['id']}/run", headers=headers,
+                                 json={"execute": False})).json()
+    await WorkflowRunner().run(initial["id"])
+    failed = (await client.get(f"/api/v1/workflows/runs/{initial['id']}", headers=headers)).json()
+    assert failed["status"] == "failed"
+    child_id = failed["variables"]["__foreach_subworkflow__batch"]["items"][0]["subrun_id"]
+    response = await client.post(f"/api/v1/workflows/runs/{child_id}/retry", headers=headers,
+                                 json={"from_step_id": "check", "variables": {"ready": True}, "execute": False})
+    assert response.status_code == 201, response.text
+    child_retry_id = response.json()["id"]
+    # Retrying the parent while its child has not completed must retain failure.
+    response = await client.post(f"/api/v1/workflows/runs/{initial['id']}/retry", headers=headers,
+                                 json={"from_step_id": "batch", "execute": False})
+    assert response.status_code == 201, response.text
+    blocked_parent_id = response.json()["id"]
+    await WorkflowRunner().run(blocked_parent_id)
+    blocked = await db_session.get(WorkflowRun, blocked_parent_id)
+    assert blocked.status == "failed"
+    await WorkflowRunner().run(child_retry_id)
+    response = await client.post(f"/api/v1/workflows/runs/{blocked_parent_id}/retry", headers=headers,
+                                 json={"from_step_id": "batch", "execute": False})
+    assert response.status_code == 201, response.text
+    retried = response.json()
+    await WorkflowRunner().run(retried["id"])
+    completed = (await client.get(f"/api/v1/workflows/runs/{retried['id']}", headers=headers)).json()
+    assert completed["status"] == "completed"
+    assert completed["variables"]["checks"][0]["ready"] is True
+    assert completed["step_results"]["batch"]["items"][0]["subrun_id"] == child_retry_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_definition", [True, False])
+async def test_scheduled_deployment_resolves_names_in_target_workspace(client, db_session, monkeypatch, local_definition):
+    import packages.core.database as db_module
+    import packages.core.ai.tools.workflow_tools as tools
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.models.scheduler import ScheduledJob
+
+    headers = await _auth(client, "scopeddeployment")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _create_workspace(client, headers, "Equipment maintenance")
+    other_workspace_id = await _create_workspace(client, headers, "Other equipment")
+    expected = WorkflowDefinition(
+        entity_id=me["entity_id"], workspace_id=workspace_id if local_definition else None,
+        name="Inspect equipment", steps=_simple_steps(["inspect"]),
+    )
+    db_session.add(expected)
+    await db_session.commit()
+    foreign = WorkflowDefinition(
+        entity_id=me["entity_id"], workspace_id=other_workspace_id,
+        name=expected.name, steps=expected.steps,
+    )
+    db_session.add(foreign)
+    await db_session.commit()
+    monkeypatch.setattr(tools, "async_session", db_module.async_session)
+    args = dict(
+        entity_id=me["entity_id"], user_id=me["id"], target_workspace_id=workspace_id,
+        trigger_type="schedule", cron="0 9 * * 1",
+    )
+    result = json.loads(await tools._deploy_workflow(**args, workflow=expected.name))
+    assert result["ok"] is True, result
+    job = await db_session.get(ScheduledJob, result["scheduled_job_id"])
+    assert job.workspace_id == workspace_id
+    assert job.execution_target["workflow_id"] == expected.id
+    denied = json.loads(await tools._deploy_workflow(**args, workflow=foreign.id))
+    assert denied["ok"] is False
+    duplicate = WorkflowDefinition(
+        entity_id=me["entity_id"], workspace_id=expected.workspace_id,
+        name=expected.name, steps=expected.steps,
+    )
+    db_session.add(duplicate)
+    await db_session.commit()
+    ambiguous = json.loads(await tools._deploy_workflow(**args, workflow=expected.name))
+    assert ambiguous["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_deployment_resolves_a_blueprint_flow_by_slug_in_its_workspace(client, db_session, monkeypatch):
+    """A Blueprint step names its own Flow by slug; renames and other installs do not change the target."""
+    import packages.core.database as db_module
+    import packages.core.ai.tools.workflow_tools as tools
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowTemplateInstallation
+    from packages.core.models.scheduler import ScheduledJob
+
+    headers = await _auth(client, "slugdeployment")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _create_workspace(client, headers, "Equipment maintenance")
+    other_workspace_id = await _create_workspace(client, headers, "Other equipment")
+    installed = {}
+    for target_workspace_id, name in ((workspace_id, "Weekly checks (renamed)"), (other_workspace_id, "Weekly checks")):
+        flow = WorkflowDefinition(
+            entity_id=me["entity_id"], workspace_id=target_workspace_id,
+            name=name, steps=_simple_steps(["inspect"]),
+        )
+        db_session.add(flow)
+        await db_session.flush()
+        db_session.add(WorkflowTemplateInstallation(
+            entity_id=me["entity_id"], template_id=f"workspace_blueprint:equipment:{target_workspace_id}",
+            component_key="equipment-weekly-checks", workflow_id=flow.id, source_type="workspace_blueprint",
+        ))
+        installed[target_workspace_id] = flow
+    await db_session.commit()
+    monkeypatch.setattr(tools, "async_session", db_module.async_session)
+    args = dict(
+        entity_id=me["entity_id"], user_id=me["id"], target_workspace_id=workspace_id,
+        trigger_type="schedule", cron="0 9 * * 1",
+    )
+
+    result = json.loads(await tools._deploy_workflow(**args, workflow="equipment-weekly-checks"))
+    assert result["ok"] is True, result
+    job = await db_session.get(ScheduledJob, result["scheduled_job_id"])
+    assert job.execution_target["workflow_id"] == installed[workspace_id].id
+    # The other Workspace's install keeps the old display name; it is never a fallback here.
+    assert json.loads(await tools._deploy_workflow(**args, workflow="Weekly checks"))["ok"] is False
+
+
+@pytest.mark.asyncio
 async def test_manor_agent_workflow_tools_crud_deploy_and_run(client: AsyncClient, monkeypatch):
     """Conversation tools can build, publish, execute, inspect, and remove a flow."""
     registration = (await client.post("/api/v1/auth/register", json={
@@ -3060,7 +3970,8 @@ async def test_workflow_status_settlement_survives_chat_projection_failure(
             events.append("chat_savepoint")
 
         async def __aexit__(self, exc_type, *_args):
-            events.append(f"chat_rollback:{exc_type.__name__}")
+            # A savepoint that exits cleanly is released, not rolled back.
+            events.append(f"chat_rollback:{exc_type.__name__}" if exc_type else "chat_release")
             return False
 
     class FakeDb:
@@ -3129,6 +4040,10 @@ async def test_workflow_status_settlement_survives_chat_projection_failure(
         "approval_projection",
         *(["chat_projection"] if projection == "chat" else []),
         "chat_rollback:RuntimeError",
+        # The stale-card cleanup runs in its own savepoint after the chat
+        # projection, and a run that is not ended closes nothing.
+        "chat_savepoint",
+        "chat_release",
     ]
 
 
@@ -3257,7 +4172,7 @@ async def test_manual_step_persists_structured_error_as_safe_text(
     assert len(encoded_error) <= TRACE_SUMMARY_BYTES
     assert b"manual-secret-value-123456" not in encoded_error
     assert b"manual-password-value" not in encoded_error
-    assert b"[REDACTED]" in encoded_error
+    assert failed["error"] == "Provider rejected the manual step"
     assert failed["step_results"]["fail"]["error"] == structured_error
 
 
@@ -3543,8 +4458,7 @@ async def test_workspace_manual_binding_run_projects_wait_to_workspace_chat(
         },
     )
 
-    assert response.status_code == 201, response.text
-    run = response.json()
+    run = await _execute_queued_binding_run(client, headers, response)
     assert run["status"] == "paused"
     assert run["current_step_id"] == "approve_video"
     origin = run["trigger_data"]["_workflow_chat_origin"]
@@ -3595,6 +4509,74 @@ async def test_workspace_manual_binding_run_projects_wait_to_workspace_chat(
     )).json()
     assert terminal["status"] == "cancelled"
     assert terminal["resume_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_approves_a_review_assembled_from_several_variables(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfworkspacecompositereview")
+    workspace_id = await _create_workspace(client, headers, "Composite review")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Review generated media",
+            "variables": {"image": {"title": "Feed image"}, "publish_after_approval": False},
+            "steps": [
+                {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["approve_media"]},
+                {
+                    "id": "approve_media",
+                    "type": "wait",
+                    "name": "Approve media",
+                    "config": {
+                        "wait_type": "approval",
+                        "message": "Review the generated media.",
+                        "review": {"image": "{{image}}", "publish_after_approval": "{{publish_after_approval}}"},
+                        "response_variable": "media_decision",
+                        "options": ["approve", "cancel"],
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
+            ],
+        },
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": workspace_id,
+            "trigger_type": "manual",
+            "config": {
+                "workspace_attached": True,
+                "chat_entrypoint": {"enabled": True, "title": "Review media", "wait_bridge": True},
+            },
+        },
+    )).json()
+    run = await _execute_queued_binding_run(client, headers, await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={"execute": True, "trigger_data": {"workspace_manual": True}},
+    ))
+    assert run["current_step_id"] == "approve_media"
+    messages = (await client.get(f"/api/v1/workspaces/{workspace_id}/chat/messages", headers=headers)).json()
+    approval = next(
+        message for message in messages
+        if (message.get("pending_action") or {}).get("workflow_run_id") == run["id"]
+    )
+    # The server cannot write edits back into several variables, so the card says so.
+    assert approval["pending_action"]["review_read_only"] is True
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{approval['id']}/resolve",
+        headers=headers,
+        json={"choice": "approve", "payload": {"review": approval["pending_action"]["review"]}},
+    )
+    assert resolved.status_code == 200, resolved.text
+    after = (await client.get(f"/api/v1/workflows/runs/{run['id']}", headers=headers)).json()
+    assert after["variables"]["media_decision"]["choice"] == "approve"
 
 
 @pytest.mark.asyncio
@@ -3750,6 +4732,63 @@ async def test_workspace_manual_binding_run_projects_enqueue_failure(
     )
     assert activity["meta"]["workflow_run_id"] == run["id"]
     assert activity["meta"]["workflow_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_run_cards_name_the_flow_and_steps_in_each_viewers_language(
+    client: AsyncClient,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *_args, **_kwargs: None),
+    )
+    headers = await _auth(client, "wfrunviewerlanguage")
+    workspace_id = (await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Viewer language"},
+    )).json()["id"]
+    steps = _simple_steps(["prepare"])
+    steps[0]["name"] = "Intake"
+    steps[0]["i18n"] = {"zh": {"name": "接收需求"}}
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers, json={"name": "Make a video", "steps": steps},
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings", headers=headers, json={
+            "workflow_id": workflow["id"], "workspace_id": workspace_id, "trigger_type": "manual",
+            "name": "Make a video", "config": {"i18n": {"zh": {"name": "做视频"}}},
+        },
+    )).json()
+    started = (await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers,
+        json={"execute": False, "trigger_data": {"_workflow_display_i18n": {"zh": {"name": "spoof"}}}},
+    ))
+    assert started.status_code == 201, started.text
+    run_id = started.json()["id"]
+
+    chinese = {**headers, "X-Language": "zh"}
+    history = (await client.get(
+        "/api/v1/workflows/runs", headers=chinese, params={"workspace_id": workspace_id},
+    )).json()
+    assert (history[0]["workflow_name"], history[0]["current_step_name"]) == ("做视频", "接收需求")
+    detail = (await client.get(f"/api/v1/workflows/runs/{run_id}", headers=chinese)).json()
+    assert detail["current_step_name"] == "接收需求"
+    assert {node["id"]: node["name"] for node in detail["definition_snapshot"]["nodes"]}["trigger"] == "接收需求"
+
+    english = (await client.get(
+        "/api/v1/workflows/runs", headers=headers, params={"workspace_id": workspace_id},
+    )).json()
+    assert (english[0]["workflow_name"], english[0]["current_step_name"]) == ("Make a video", "Intake")
+    # A translation is display text: it never changes which runs can resume on the Flow.
+    from packages.core.services.workflow_run_trace import workflow_definition_fingerprint
+
+    def fingerprint(steps):
+        return workflow_definition_fingerprint(SimpleNamespace(id="flow", version=1, steps=steps))
+
+    assert workflow["steps"][0]["i18n"] == {"zh": {"name": "接收需求"}}
+    assert fingerprint(workflow["steps"]) == fingerprint(
+        [{key: value for key, value in step.items() if key != "i18n"} for step in workflow["steps"]]
+    )
 
 
 @pytest.mark.asyncio
@@ -4456,8 +5495,9 @@ async def test_run_summary_does_not_use_the_full_detail_loader(
         "pending",
         "pending",
     ]
+    # The transform is routing, not a stage, so this flow has no stages to count.
     assert summary["processed_count"] == 0
-    assert summary["total_count"] == 3
+    assert summary["total_count"] == 0
     assert summary["business_outcome"] == "in_progress"
     assert summary["intervention"] is None
     for heavy_key in (
@@ -4533,8 +5573,9 @@ async def test_legacy_run_summary_recovers_trace_order_and_not_reached_nodes(
         "publish",
         "unused",
     ]
-    assert summary["processed_count"] == 3
-    assert summary["total_count"] == 4
+    # Stages only: the review wait and the publish agent. The start and the stop are routing.
+    assert summary["processed_count"] == 2
+    assert summary["total_count"] == 2
     assert "execution_trace" not in summary
 
 
@@ -4564,6 +5605,110 @@ async def test_run_detail_exposes_business_outcome(client: AsyncClient, db_sessi
 
     assert response.status_code == 200, response.text
     assert response.json()["business_outcome"] == "needs_input"
+
+
+@pytest.mark.asyncio
+async def test_run_progress_is_measured_against_the_longest_route_through_the_flow(client: AsyncClient, db_session):
+    """Three stages in the Flow, two on its longest route. The run took the short branch,
+    and the total is still the longest route, not the path taken or every stage."""
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfprogressgraph")
+
+    def stage(step_id: str, **routing) -> dict:
+        return {"id": step_id, "type": "code", "name": step_id, "config": {"code": "result = {}"}, **routing}
+
+    steps = [
+        {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["gate"]},
+        {"id": "gate", "type": "condition", "name": "Gate", "config": {"expression": "false"},
+         "true_next": ["review"], "false_next": ["publish"]},
+        stage("review", next=["review_more"]),
+        stage("review_more", next=["end"]),
+        stage("publish", next=["end"]),
+        {"id": "end", "type": "end", "name": "End", "config": {}, "next": []},
+    ]
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers, json={"name": "Progress graph", "steps": steps},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    stored = await db_session.get(WorkflowRun, run["id"])
+    stored.status = "running"
+    stored.step_results = {
+        "gate": {"status": "completed", "output": "false"},
+        "publish": {"status": "completed", "output": "{}"},
+    }
+    await db_session.commit()
+
+    # The Workspace App reads the compact run state, which carries the progress counts.
+    response = await client.get(f"/api/v1/workflows/runs/{run['id']}?detail=false", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert (response.json()["processed_count"], response.json()["total_count"]) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_runs_created_before_the_longest_route_keep_their_stage_total(client: AsyncClient, db_session):
+    """A run started before the change keeps the whole-Flow stage count it was shown with."""
+    from datetime import datetime, timezone
+
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfprogressolder")
+
+    def stage(step_id: str, **routing) -> dict:
+        return {"id": step_id, "type": "code", "name": step_id, "config": {"code": "result = {}"}, **routing}
+
+    steps = [
+        {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["gate"]},
+        {"id": "gate", "type": "condition", "name": "Gate", "config": {"expression": "false"},
+         "true_next": ["review"], "false_next": ["publish"]},
+        stage("review", next=["review_more"]),
+        stage("review_more", next=["end"]),
+        stage("publish", next=["end"]),
+        {"id": "end", "type": "end", "name": "End", "config": {}, "next": []},
+    ]
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers, json={"name": "Older progress graph", "steps": steps},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    stored = await db_session.get(WorkflowRun, run["id"])
+    stored.created_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    stored.status = "running"
+    stored.step_results = {"publish": {"status": "completed", "output": "{}"}}
+    await db_session.commit()
+
+    response = await client.get(f"/api/v1/workflows/runs/{run['id']}?detail=false", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert (response.json()["processed_count"], response.json()["total_count"]) == (1, 3)
+
+
+def test_longest_route_counts_stages_through_branches_and_cuts_loops():
+    from packages.core.services.workflow_run_trace import workflow_longest_path_stages
+
+    branching = [
+        {"id": "trigger", "type": "trigger", "targets": ["gate"]},
+        {"id": "gate", "type": "condition", "targets": ["short", "chain"]},
+        {"id": "short", "type": "tool", "targets": ["end"]},
+        {"id": "chain", "type": "tool", "targets": ["middle"]},
+        {"id": "middle", "type": "agent", "targets": ["end"]},
+        {"id": "end", "type": "end", "targets": []},
+    ]
+    # The loop-back edge from "second" to "first" is cut, so the body counts once.
+    looping = [
+        {"id": "trigger", "type": "trigger", "targets": ["first"]},
+        {"id": "first", "type": "tool", "targets": ["second"]},
+        {"id": "second", "type": "tool", "targets": ["first", "end"]},
+        {"id": "end", "type": "end", "targets": []},
+    ]
+
+    assert workflow_longest_path_stages(branching) == 2
+    assert workflow_longest_path_stages(looping) == 2
+    assert workflow_longest_path_stages([]) == 0
 
 
 @pytest.mark.asyncio
@@ -4744,6 +5889,33 @@ async def test_run_summary_exposes_same_run_resume_for_reexecute_pause(
     }
     assert "step_results" not in summary
     assert "execution_trace" not in summary
+
+
+@pytest.mark.asyncio
+async def test_a_run_paused_for_an_automatic_retry_asks_nobody_to_resume(client: AsyncClient, db_session):
+    """A temporary problem is retried on its own: no Attention required, no Resume, and the step is running."""
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wftransientretrypause")
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers,
+        json={"name": "Retrying step", "steps": _simple_steps(["plan"])},
+    )).json()
+    run = (await client.post(f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False})).json()
+    stored = await db_session.get(WorkflowRun, run["id"])
+    stored.status = "paused"
+    stored.current_step_id = "plan"
+    stored.step_results = {"plan": {
+        "status": "paused", "wait_type": "transient_retry", "code": "workflow_step_transient_retry",
+        "resume_strategy": "reexecute", "auto_resume_scheduled": True,
+        "output": "Retrying (2/3): the credit and budget check was temporarily unavailable.",
+    }}
+    await db_session.commit()
+
+    summary = (await client.get(f"/api/v1/workflows/runs/{run['id']}?detail=false", headers=headers)).json()
+
+    assert summary["status"] == "paused" and summary["intervention"] is None
+    assert next(step for step in summary["workflow_steps"] if step["id"] == "plan")["status"] == "running"
 
 
 @pytest.mark.asyncio
@@ -5339,12 +6511,14 @@ async def test_cancel_parent_returns_while_child_row_is_locked(
             .with_for_update()
         )).scalar_one()
         try:
+            # Keep the child lock until the response; a blocking cancellation
+            # still times out. Allow a loaded runner time for unrelated HTTP work.
             cancelled = await asyncio.wait_for(
                 client.post(
                     f"/api/v1/workflows/runs/{parent['id']}/cancel",
                     headers=headers,
                 ),
-                timeout=2,
+                timeout=30,
             )
             assert cancelled.status_code == 200, cancelled.text
             assert cancelled.json()["status"] == "cancelled"
@@ -5477,7 +6651,7 @@ async def test_claim_loss_reports_cancelled_when_parent_was_cancelled(
     db_session.add(child)
     await db_session.commit()
 
-    settled_status = await WorkflowRunner._fail_lost_execution_claim(child.id)
+    settled_status = await WorkflowRunner._recover_lost_execution_claim(child.id)
 
     assert settled_status == "cancelled"
     await db_session.refresh(child)
@@ -5827,6 +7001,15 @@ async def test_manual_pause_resumes_without_consuming_current_node_as_approval(
     persisted = await db_session.get(WorkflowRun, run["id"])
     assert persisted is not None
     assert persisted.continuation_token == enqueued[0][1]
+    # A delivered resume must not be republished by the 15 s sweep while it
+    # waits for a heavy worker; a failed publish stays due for the sweep.
+    sweep_delay = (
+        persisted.continuation_next_attempt_at - datetime.now(timezone.utc)
+    ).total_seconds()
+    if enqueue_succeeds:
+        assert sweep_delay > 30
+    else:
+        assert sweep_delay <= 0
 
     duplicate = await client.post(
         f"/api/v1/workflows/runs/{run['id']}/resume",
@@ -7259,13 +8442,16 @@ async def test_retry_queues_execution_and_returns_before_workflow_finishes(
     monkeypatch.setattr(WorkflowRunner, "run", never_finishes)
     monkeypatch.setattr(WorkflowRunner, "enqueue", staticmethod(enqueue))
 
+    # The inline runner never finishes, so a retry that awaited it would hang
+    # until this guard. The bound is not a latency budget for the request's
+    # own authorization and database work on a loaded runner.
     response = await asyncio.wait_for(
         client.post(
             f"/api/v1/workflows/runs/{failed['id']}/retry",
             headers=headers,
             json={"from_step_id": "work", "execute": True},
         ),
-        timeout=0.5,
+        timeout=LIVENESS_TIMEOUT_S,
     )
 
     assert response.status_code == 201, response.text
@@ -7273,6 +8459,69 @@ async def test_retry_queues_execution_and_returns_before_workflow_finishes(
     assert retried["status"] == "running"
     assert queued_run_ids == [retried["id"]]
     assert inline_execution_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_is_revised_into_its_next_version_only_where_its_workflow_says(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfrevise")
+    steps = _simple_steps(["plan", "make"])
+    steps[0]["config"] = {
+        "run_inputs": [{"key": "notes", "type": "string", "hidden": True, "default": ""},
+                       {"key": "picked", "type": "json", "hidden": True, "default": {}}],
+        "production": {"stages": [{"label": "Make", "steps": ["make"]}],
+                       # "check" was added after the run: it starts again from the first step it reached.
+                       "revise": {"from_step": ["check", "make"], "notes_input": "notes", "versions_input": "picked"}},
+    }
+    workflow = (await client.post("/api/v1/workflows", headers=headers,
+                                  json={"name": "Revisable", "steps": steps})).json()
+    plain = (await client.post("/api/v1/workflows", headers=headers,
+                               json={"name": "Plain", "steps": _simple_steps(["make"])})).json()
+    monkeypatch.setattr(WorkflowRunner, "enqueue", staticmethod(lambda run_id, delay_seconds=0: True))
+
+    async def finished(workflow_id: str) -> str:
+        run = (await client.post(f"/api/v1/workflows/{workflow_id}/run", headers=headers,
+                                 json={"execute": False})).json()
+        row = await db_session.get(WorkflowRun, run["id"])
+        row.status, row.current_step_id = "completed", "end"
+        row.step_results = {"plan": {"status": "completed", "output": {"plan": "done"}},
+                            "make": {"status": "completed", "output": {"make": "done"}}}
+        await db_session.commit()
+        return run["id"]
+
+    first = await finished(workflow["id"])
+    # Nothing to change is not a change.
+    assert (await client.post(f"/api/v1/workflows/runs/{first}/revise", headers=headers, json={})).status_code == 400
+    revised = await client.post(f"/api/v1/workflows/runs/{first}/revise", headers=headers,
+                                json={"notes": "Make it shorter", "unit_versions": {"s1": "job-2"}})
+    assert revised.status_code == 201, revised.text
+    second = revised.json()
+    row = await db_session.get(WorkflowRun, second["id"])
+    assert row.effective_retry_of_run_id == first
+    assert row.retry_from_step_id == "make"
+    # Marked as a new version, so per-attempt outputs (a take folder) are not reused.
+    assert row.trigger_data["_workflow_revision"] == {"of_run_id": first}
+    assert row.variables["notes"] == "Make it shorter" and row.variables["picked"] == {"s1": "job-2"}
+    # The earlier version is kept, and only the newest version can be changed again.
+    assert (await db_session.get(WorkflowRun, first)).status == "completed"
+    stale = await client.post(f"/api/v1/workflows/runs/{first}/revise", headers=headers, json={"notes": "Again"})
+    assert stale.status_code == 409
+    # A cancelled version made nothing, so the earlier finished one can be revised again.
+    row.status = "cancelled"
+    await db_session.commit()
+    again = await client.post(f"/api/v1/workflows/runs/{first}/revise", headers=headers, json={"notes": "Again"})
+    assert again.status_code == 201, again.text
+    assert (await db_session.get(WorkflowRun, again.json()["id"])).trigger_data["_workflow_revision"] == {"of_run_id": first}
+    # A Workflow that does not say how its result is revised keeps finished runs as they are.
+    other = await finished(plain["id"])
+    refused = await client.post(f"/api/v1/workflows/runs/{other}/revise", headers=headers, json={"notes": "x"})
+    assert refused.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -7452,6 +8701,7 @@ async def test_internal_retry_reloads_cancelled_latest_attempt_before_recovery(
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from packages.core.models.workflow import WorkflowRun
+    from packages.core.constants.task import CancelSource
     from packages.core.services.workflow_run_control import cancel_run
     from packages.core.services.workflow_service import retry_workflow_run
 
@@ -7481,6 +8731,7 @@ async def test_internal_retry_reloads_cancelled_latest_attempt_before_recovery(
         cancel_run(
             cancelled,
             actor_id=stale_failed.started_by,
+            source=CancelSource.USER,
             allow_problem_terminal=True,
         )
         await cancel_db.commit()
@@ -7504,6 +8755,43 @@ async def test_internal_retry_reloads_cancelled_latest_attempt_before_recovery(
     ) == 1
     await db_session.refresh(stale_failed)
     assert stale_failed.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_retry_keeps_frozen_workflow_effect_deadline(db_session, client: AsyncClient):
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    headers = await _auth(client, "workflow_deadline_retry")
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers,
+        json={"name": "Time-limited submission", "variables": {"deadline": ""}, "steps": _simple_steps(["submit"])},
+    )).json()
+    started = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={
+            "execute": False,
+            "trigger_data": {"_workflow_runtime_context": {
+                "workflow_effect_deadline_at": "2030-01-01T00:00:00Z",
+                "workflow_effect_deadline_action_keys": ["submission.send"],
+            }},
+        },
+    )).json()
+    prior = await db_session.get(WorkflowRun, started["id"])
+    assert "_workflow_runtime_context" not in prior.trigger_data
+    prior.status = "failed"
+    prior.current_step_id = "submit"
+    prior.trigger_data = {"_workflow_runtime_context": {
+        "workflow_effect_deadline_at": "2026-10-14T00:00:00Z",
+        "workflow_effect_deadline_action_keys": ["submission.send"],
+    }}
+    await db_session.commit()
+
+    retried = await retry_workflow_run(
+        db_session, run_id=prior.id, entity_id=prior.entity_id, started_by=prior.started_by,
+        from_step_id="submit", variables={"deadline": "2030-01-01T00:00:00Z"},
+    )
+    assert retried.trigger_data["_workflow_runtime_context"] == prior.trigger_data["_workflow_runtime_context"]
+    assert retried.trigger_data["input_patch"]["deadline"] == "2030-01-01T00:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -7592,6 +8880,171 @@ async def test_retry_rejects_step_with_uncertain_external_effect(
         )
 
 
+@pytest.mark.asyncio
+async def test_retry_rejects_unconfirmed_failed_effect_without_recovery_checkpoint(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    headers = await _auth(client, "wfretryunconfirmed")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Unconfirmed upload", "steps": _simple_steps(["upload"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "upload"
+    failed_row.step_results = {
+        "start": {"status": "completed", "effect_state": "confirmed"},
+        "upload": {"status": "failed", "effect_state": "unconfirmed", "do_not_replay": True},
+    }
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="prior effect must be reconciled"):
+        await retry_workflow_run(
+            db_session,
+            run_id=failed["id"],
+            entity_id=failed_row.entity_id,
+            started_by=failed_row.started_by,
+            from_step_id="upload",
+        )
+
+
+@pytest.mark.asyncio
+async def test_operator_review_retries_exact_failed_report_delivery_without_rewriting_history(
+    client: AsyncClient, db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    headers = await _auth(client, "report_review")
+    steps = _simple_steps(["deliver_report"])
+    steps[1].update(type="agent", config={"prompt": "Deliver the approved client report."})
+    response = await client.post("/api/v1/workflows", headers=headers, json={"name": "Client report delivery", "steps": steps})
+    assert response.status_code == 201, response.text
+    workflow = response.json()
+    failed = (await client.post(f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={
+        "execute": False, "trigger_data": {"_workflow_effect_review": {"decision": "not_applied"}},
+    })).json()
+    prior = await db_session.get(WorkflowRun, failed["id"])
+    assert "_workflow_effect_review" not in prior.trigger_data
+    original_result = {"status": "failed", "effect_state": "unconfirmed", "do_not_replay": True, "retry_blocked": True}
+    prior.status, prior.current_step_id = "failed", "deliver_report"
+    prior.step_results = {"trigger": {"status": "completed"}, "deliver_report": original_result}
+    frozen_scope = {"workflow_effect_deadline_at": "2026-10-14T00:00:00Z", "workflow_effect_deadline_action_keys": ["submission.send"]}
+    prior.trigger_data = {"_workflow_runtime_context": frozen_scope}
+    await db_session.commit()
+    path = f"/api/v1/workflows/runs/{prior.id}"
+    compact = (await client.get(path + "?detail=false", headers=headers)).json()
+    action = compact["intervention"]
+    assert action["kind"] == "workflow_effect_review"
+    assert compact["retry_from_step_id"] is None
+    review = {"step_id": action["step_id"], "effect_fingerprint": action["effect_fingerprint"], "decision": "not_applied", "confirmed": True, "note": "Checked the delivery provider audit log and outbound queue: no report was sent and no operation remains pending."}
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False})).status_code == 409
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": {**review, "confirmed": False}})).status_code == 422
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": {**review, "effect_fingerprint": "0" * 64}})).status_code == 409
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review, "variables": {"deadline": "2030-01-01"}})).status_code == 409
+    other_headers = await _auth(client, "report_review_other")
+    assert (await client.post(path + "/retry", headers=other_headers, json={"execute": False, "effect_review": review})).status_code in {403, 404}
+    # A producer receipt arriving after the review invalidates its fingerprint.
+    prior.step_results = {**prior.step_results, "deliver_report": {**original_result, "effect_state": "confirmed"}}
+    await db_session.commit()
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review})).status_code == 409
+    assert (await client.get(path + "?detail=false", headers=headers)).json()["intervention"] is None
+    prior.step_results = {**prior.step_results, "deliver_report": deepcopy(original_result)}
+    await db_session.commit()
+    response = await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review})
+    assert response.status_code == 201, response.text
+    retried = await db_session.get(WorkflowRun, response.json()["id"])
+    audit = retried.trigger_data["_workflow_effect_review"]
+    assert audit["reviewed_by"] == prior.started_by and audit["source_run_id"] == prior.id
+    assert audit["effect_fingerprint"] == action["effect_fingerprint"] and audit["note"] == review["note"]
+    assert retried.trigger_data["_workflow_runtime_context"] == frozen_scope
+    assert retried.execution_snapshot == prior.execution_snapshot
+    assert retried.step_results["trigger"] == {"status": "completed"}
+    recovery = retried.step_results["deliver_report"]
+    assert recovery["effect_state"] == "none" and recovery["do_not_replay"] is False
+    assert recovery["agent_recovery"]["operator_effect_review"] == audit
+    assert recovery["agent_recovery"]["attempts"][0]["result"] == original_result
+    await db_session.refresh(prior)
+    assert prior.step_results["deliver_report"] == original_result
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review})).status_code == 409
+    # A failed dispatch of the new attempt can retry without resurrecting the
+    # already reviewed ambiguity. The immutable old attempt stays unchanged.
+    retried.status = "failed"
+    await db_session.commit()
+    continued = await retry_workflow_run(db_session, run_id=retried.id, entity_id=retried.entity_id, started_by=retried.started_by)
+    assert continued.retry_of_run_id == retried.id
+
+
+@pytest.mark.asyncio
+async def test_operator_applied_review_continues_report_without_repeating_delivery(client, db_session, monkeypatch):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "report_applied")
+    schema = {"type": "object", "required": ["receipt_id"], "additionalProperties": False,
+              "properties": {"receipt_id": {"type": "string", "minLength": 1}}}
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Client report delivery", "steps": [
+            {"id": "start", "type": "trigger", "next": ["deliver"]},
+            {"id": "deliver", "type": "agent", "config": {
+                "prompt": "Deliver a client report", "output_schema": schema, "output_var": "delivery",
+            }, "next": ["end"]},
+            {"id": "end", "type": "end", "next": []},
+        ],
+    })).json()
+    created = (await client.post(f"/api/v1/workflows/{workflow['id']}/run", headers=headers,
+                                json={"execute": False})).json()
+    prior = await db_session.get(WorkflowRun, created["id"])
+    prior.status, prior.current_step_id = "failed", "deliver"
+    original = {"status": "failed", "effect_state": "unconfirmed", "do_not_replay": True}
+    prior.step_results = {"start": {"status": "completed"}, "deliver": original}
+    frozen = {"workflow_effect_deadline_at": "2020-01-01T00:00:00Z", "workflow_effect_deadline_action_keys": ["submission.send"]}
+    prior.trigger_data = {"_workflow_runtime_context": frozen}
+    await db_session.commit()
+    path = f"/api/v1/workflows/runs/{prior.id}"
+    action = (await client.get(path + "?detail=false", headers=headers)).json()["intervention"]
+    assert "review_applied" in action["options"] and action["result_schema"] == schema
+    review = {"step_id": "deliver", "effect_fingerprint": action["effect_fingerprint"], "decision": "applied",
+              "confirmed": True, "note": "Verified the exact report and recipient in the provider delivery receipt; no delivery remains pending.",
+              "result": {"receipt_id": "report-receipt-42"}}
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": {**review, "result": {}}})).status_code == 409
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": {**review, "effect_fingerprint": "0" * 64}})).status_code == 409
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review, "variables": {"deadline": "2999-01-01"}})).status_code == 409
+    other = await _auth(client, "report_applied_other")
+    assert (await client.post(path + "/retry", headers=other, json={"execute": False, "effect_review": review})).status_code in {403, 404}
+    response = await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review})
+    assert response.status_code == 201, response.text
+    retried = await db_session.get(WorkflowRun, response.json()["id"])
+    assert retried.step_results["deliver"]["status"] == "completed"
+    assert retried.step_results["deliver"]["do_not_replay"] is True
+    assert retried.variables["delivery"] == review["result"]
+    assert retried.trigger_data["_workflow_runtime_context"] == frozen
+    assert retried.execution_snapshot == prior.execution_snapshot
+    assert retried.step_results["deliver"]["agent_recovery"]["attempts"][0]["result"] == original
+
+    async def must_not_deliver(*args, **kwargs):
+        pytest.fail("The verified delivery must not execute again")
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_agent_step", must_not_deliver)
+    await WorkflowRunner().run(retried.id)
+    finished = (await client.get(f"/api/v1/workflows/runs/{retried.id}", headers=headers)).json()
+    assert finished["status"] == "completed", finished.get("error")
+    assert finished["step_results"]["end"]["status"] == "completed"
+    await db_session.refresh(prior)
+    assert prior.status == "failed" and prior.step_results["deliver"] == original
+    assert (await client.post(path + "/retry", headers=headers, json={"execute": False, "effect_review": review})).status_code == 409
+
+
 
 
 @pytest.mark.asyncio
@@ -7658,7 +9111,7 @@ async def test_agent_retry_hydrates_legacy_history_then_preserves_it_on_later_fa
 
 
 @pytest.mark.asyncio
-async def test_retry_uses_prior_execution_snapshot_when_live_prompt_changes(
+async def test_original_definition_retry_keeps_prior_snapshot_when_live_prompt_changes(
     client: AsyncClient,
     db_session,
 ):
@@ -7698,7 +9151,7 @@ async def test_retry_uses_prior_execution_snapshot_when_live_prompt_changes(
     retried = await client.post(
         f"/api/v1/workflows/runs/{failed['id']}/retry",
         headers=headers,
-        json={"from_step_id": "work", "execute": False},
+        json={"from_step_id": "work", "execute": False, "definition": "original"},
     )
 
     assert retried.status_code == 201, retried.text
@@ -7712,9 +9165,12 @@ async def test_retry_uses_prior_execution_snapshot_when_live_prompt_changes(
 
 
 @pytest.mark.asyncio
-async def test_retry_executes_original_execution_snapshot_not_live_definition(
+@pytest.mark.parametrize(("definition", "expected"), [(None, "changed"), ("original", "original")])
+async def test_retry_runs_current_definition_unless_original_requested(
     client: AsyncClient,
     db_session,
+    definition,
+    expected,
 ):
     from packages.core.models.workflow import WorkflowRun
 
@@ -7760,16 +9216,16 @@ async def test_retry_executes_original_execution_snapshot_not_live_definition(
     retried = await client.post(
         f"/api/v1/workflows/runs/{failed['id']}/retry",
         headers=headers,
-        json={"from_step_id": "work", "execute": False},
+        json={"from_step_id": "work", "execute": False, **({"definition": definition} if definition else {})},
     )
 
     retried_result = await _execute_created_retry(client, headers, retried)
     assert retried_result["status"] == "completed"
-    assert retried_result["variables"]["result"] == "original"
+    assert retried_result["variables"]["result"] == expected
 
 
 @pytest.mark.asyncio
-async def test_retry_uses_prior_execution_snapshot_when_live_graph_changes(
+async def test_original_definition_retry_keeps_prior_snapshot_when_live_graph_changes(
     client: AsyncClient,
     db_session,
 ):
@@ -7811,7 +9267,7 @@ async def test_retry_uses_prior_execution_snapshot_when_live_graph_changes(
     retried = await client.post(
         f"/api/v1/workflows/runs/{failed['id']}/retry",
         headers=headers,
-        json={"from_step_id": "work", "execute": False},
+        json={"from_step_id": "work", "execute": False, "definition": "original"},
     )
 
     assert retried.status_code == 201, retried.text
@@ -7822,7 +9278,7 @@ async def test_retry_uses_prior_execution_snapshot_when_live_graph_changes(
 
 
 @pytest.mark.asyncio
-async def test_retry_rejects_legacy_run_when_definition_changed(
+async def test_legacy_run_retries_only_on_current_definition_after_change(
     client: AsyncClient,
     db_session,
 ):
@@ -7859,11 +9315,134 @@ async def test_retry_rejects_legacy_run_when_definition_changed(
     retried = await client.post(
         f"/api/v1/workflows/runs/{failed['id']}/retry",
         headers=headers,
-        json={"from_step_id": "work", "execute": False},
+        json={"from_step_id": "work", "execute": False, "definition": "original"},
     )
 
     assert retried.status_code == 409
     assert "legacy run has no immutable execution snapshot" in retried.text.lower()
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+    assert retried.status_code == 201, retried.text
+    retry_row = await db_session.get(WorkflowRun, retried.json()["id"])
+    assert retry_row.execution_snapshot["steps"] == updated.json()["steps"]
+
+
+@pytest.mark.asyncio
+async def test_retry_on_edited_workflow_resumes_at_checkpoint(
+    client: AsyncClient,
+    db_session,
+):
+    """An edited upstream node keeps its receipt, a removed one leaves no output,
+    a node added before the checkpoint runs first, and the checkpoint runs as edited."""
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretryeditedcheckpoint")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Retry edited workflow", "steps": [
+            {"id": "trigger", "type": "trigger", "next": ["prep"]},
+            {"id": "prep", "type": "transform", "config": {"set": {"prep_value": "v1"}}, "next": ["extra"]},
+            {"id": "extra", "type": "transform", "config": {"set": {"extra_value": "v1"}}, "next": ["work"]},
+            {"id": "work", "type": "transform", "config": {"set": {"work_value": "v1"}}, "next": ["end"]},
+            {"id": "end", "type": "end", "next": []},
+        ]},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    source_fingerprint = failed_row.execution_snapshot["fingerprint"]
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    failed_row.variables = {**(failed_row.variables or {}), "prep_value": "v1", "extra_value": "v1"}
+    failed_row.step_results = {
+        "trigger": {"status": "completed", "output": {}},
+        "prep": {"status": "completed", "output": {"prep_value": "v1"}},
+        "extra": {"status": "completed", "output": {"extra_value": "v1"}},
+        "work": {"status": "failed", "error": "Bad prompt"},
+    }
+    await db_session.commit()
+
+    steps = {step["id"]: step for step in deepcopy(workflow["steps"])}
+    steps["prep"]["config"] = {"set": {"prep_value": "edited"}}
+    steps["prep"]["next"] = ["fresh"]
+    steps["work"]["config"] = {"set": {"work_value": "fixed"}}
+    fresh = {"id": "fresh", "type": "transform", "config": {"set": {"fresh_value": "added"}}, "next": ["work"]}
+    updated_steps = [steps["trigger"], steps["prep"], fresh, steps["work"], steps["end"]]
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": updated_steps},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+    assert retried.status_code == 201, retried.text
+    retry_row = await db_session.get(WorkflowRun, retried.json()["id"])
+    context = retry_row.trigger_data["_workflow_retry_context"]
+    assert context["fingerprint"] == retry_row.execution_snapshot["fingerprint"] != source_fingerprint
+    assert context["source_fingerprint"] == source_fingerprint
+    assert context["entry_step_ids"] == ["fresh"]
+    assert context["inherited_step_ids"] == ["trigger", "prep"]
+    assert "extra_value" not in retry_row.variables
+
+    result = await _execute_created_retry(client, headers, retried)
+    assert result["status"] == "completed"
+    assert result["variables"]["prep_value"] == "v1"
+    assert result["variables"]["fresh_value"] == "added"
+    assert result["variables"]["work_value"] == "fixed"
+    assert "extra_value" not in result["variables"]
+
+
+@pytest.mark.asyncio
+async def test_retry_refuses_checkpoint_removed_from_workflow(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretryremovedcheckpoint")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Retry removed checkpoint", "steps": _simple_steps(["prep", "work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": _simple_steps(["prep"])},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+
+    assert retried.status_code == 409
+    assert "no longer part of the workflow" in retried.text
+    assert (await db_session.get(WorkflowRun, failed["id"])).status == "failed"
 
 
 @pytest.mark.asyncio
@@ -7909,6 +9488,150 @@ async def test_retry_attempt_can_resume_cancelled_run(client: AsyncClient):
     assert retried["retry_from_step_id"] == "start"
     assert retried["attempt_number"] == 2
     assert retried["variables"]["recovered"] is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_without_result_requires_review_before_retry(client: AsyncClient, db_session):
+    headers = await _auth(client, "wfcancelledreview")
+    schema = {
+        "type": "object",
+        "required": ["receipt_id"],
+        "properties": {"receipt_id": {"type": "string", "minLength": 1}},
+    }
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Cancelled delivery",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["deliver"]},
+                {"id": "deliver", "type": "agent", "config": {
+                    "prompt": "Deliver the approved report.",
+                    "output_schema": schema,
+                    "output_var": "delivery",
+                }, "next": ["end"]},
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    pending = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    from packages.core.models.workflow import WorkflowRun
+
+    interrupted = await db_session.get(WorkflowRun, pending["id"])
+    interrupted.status, interrupted.current_step_id = "running", "deliver"
+    interrupted.step_results = {"start": {"status": "completed"}}
+    await db_session.commit()
+    cancelled = (await client.post(
+        f"/api/v1/workflows/runs/{pending['id']}/cancel",
+        headers=headers,
+    )).json()
+    assert cancelled["status"] == "cancelled"
+
+    path = f"/api/v1/workflows/runs/{pending['id']}"
+    compact = (await client.get(path + "?detail=false", headers=headers)).json()
+    action = compact["intervention"]
+    assert compact["retry_from_step_id"] is None
+    assert action["kind"] == "workflow_effect_review"
+    assert "review" in action["options"] and "review_applied" in action["options"]
+
+    # The endpoint enforces the same boundary as the presentation layer.
+    blocked = await client.post(path + "/retry", headers=headers, json={"execute": False})
+    assert blocked.status_code == 409
+    review = {
+        "step_id": action["step_id"],
+        "effect_fingerprint": action["effect_fingerprint"],
+        "decision": "not_applied",
+        "confirmed": True,
+        "note": "Checked the delivery audit and provider log; no report was sent or queued.",
+    }
+    retried = await client.post(path + "/retry", headers=headers, json={
+        "execute": False,
+        "effect_review": review,
+    })
+    assert retried.status_code == 201, retried.text
+    assert retried.json()["retry_from_step_id"] == "deliver"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_applied_review_skips_delivery_and_continues_downstream(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfcancelledapplied")
+    schema = {
+        "type": "object",
+        "required": ["receipt_id"],
+        "properties": {"receipt_id": {"type": "string", "minLength": 1}},
+    }
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Cancelled report delivery",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["deliver"]},
+                {"id": "deliver", "type": "agent", "config": {
+                    "prompt": "Deliver the approved report.",
+                    "output_schema": schema,
+                    "output_var": "delivery",
+                }, "next": ["record"]},
+                {"id": "record", "type": "transform", "config": {
+                    "set": {"recorded_receipt": "{{delivery.receipt_id}}"},
+                }, "next": ["end"]},
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    pending = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    interrupted = await db_session.get(WorkflowRun, pending["id"])
+    interrupted.status, interrupted.current_step_id = "running", "deliver"
+    interrupted.step_results = {"start": {"status": "completed"}}
+    await db_session.commit()
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{pending['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    path = f"/api/v1/workflows/runs/{pending['id']}"
+    action = (await client.get(path + "?detail=false", headers=headers)).json()["intervention"]
+    review = {
+        "step_id": "deliver",
+        "effect_fingerprint": action["effect_fingerprint"],
+        "decision": "applied",
+        "confirmed": True,
+        "note": "Verified the exact report receipt and recipient; no delivery remains pending.",
+        "result": {"receipt_id": "report-receipt-42"},
+    }
+    response = await client.post(path + "/retry", headers=headers, json={
+        "execute": False,
+        "effect_review": review,
+    })
+    assert response.status_code == 201, response.text
+    retried = await db_session.get(WorkflowRun, response.json()["id"])
+    assert retried.step_results["deliver"]["status"] == "completed"
+    assert retried.step_results["deliver"]["do_not_replay"] is True
+
+    async def must_not_deliver(*args, **kwargs):
+        pytest.fail("The verified delivery must not execute again")
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_agent_step", must_not_deliver)
+    await WorkflowRunner().run(retried.id)
+    finished = (await client.get(f"/api/v1/workflows/runs/{retried.id}", headers=headers)).json()
+    assert finished["status"] == "completed", finished.get("error")
+    assert finished["variables"]["recorded_receipt"] == "report-receipt-42"
 
 
 @pytest.mark.asyncio
@@ -8187,11 +9910,15 @@ async def test_business_retry_reexecutes_completed_stage_with_durable_project(
             "trigger_type": "manual",
         },
     )).json()
-    prior = (await client.post(
-        f"/api/v1/workflows/bindings/{binding['id']}/run",
-        headers=headers,
-        json={},
-    )).json()
+    prior = await _execute_queued_binding_run(
+        client,
+        headers,
+        await client.post(
+            f"/api/v1/workflows/bindings/{binding['id']}/run",
+            headers=headers,
+            json={},
+        ),
+    )
 
     assert prior["status"] == "completed", json.dumps(
         {
@@ -8229,6 +9956,79 @@ async def test_business_retry_reexecutes_completed_stage_with_durable_project(
     assert retried["variables"]["__stage_execution"]["check_browser"][
         "operation_results"
     ]["record_check"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_retry_refuses_to_write_a_project_back_over_a_newer_run(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowProject, WorkflowRun
+
+    headers = await _auth(client, "wfretrystaleproject")
+    state_schema = {"type": "object", "additionalProperties": True}
+    project_step = {"project_type": "episode", "schema_version": 1, "state_schema": state_schema, "output_var": "project"}
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Make an episode",
+        "steps": [
+            {"id": "start", "type": "trigger", "next": ["open"]},
+            {"id": "open", "type": "workflow_project", "next": ["make"],
+             "config": {**project_step, "operation": "create", "state": {"take": ""}}},
+            {"id": "make", "type": "transform", "next": ["finish"], "config": {"set": {"made": "yes"}}},
+            {"id": "finish", "type": "workflow_project", "next": [],
+             "config": {**project_step, "operation": "patch", "project_id": "{{project.project_id}}",
+                        "expected_revision": "{{project.revision}}", "patch": {"take": "first"}}},
+        ],
+    })).json()
+    workspace = (await client.post("/api/v1/workspaces", headers=headers, json={"name": "Episodes"})).json()
+    binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
+        "workflow_id": workflow["id"], "workspace_id": workspace["id"], "trigger_type": "manual",
+    })).json()
+    prior = await _execute_queued_binding_run(client, headers, await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers, json={},
+    ))
+    assert prior["status"] == "completed", prior.get("error")
+    # Say it failed while making, before it finished the project.
+    row = await db_session.get(WorkflowRun, prior["id"])
+    row.status, row.current_step_id = "failed", "make"
+    row.step_results = {key: value for key, value in row.step_results.items() if key not in {"make", "finish"}}
+    await db_session.commit()
+    project = await db_session.get(WorkflowProject, prior["variables"]["project"]["project_id"])
+
+    def retry():
+        return client.post(f"/api/v1/workflows/runs/{prior['id']}/retry", headers=headers,
+                           json={"from_step_id": "make", "execute": False})
+
+    # The run read the project before it failed; a later run made it again since.
+    revision = prior["step_results"]["open"]["output"]["revision"]
+    newer = await _execute_queued_binding_run(client, headers, await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers, json={},
+    ))
+    project.revision, project.last_run_id = revision + 1, newer["id"]
+    await db_session.commit()
+    refused = await retry()
+    assert refused.status_code == 409, refused.text
+    assert "newer version was made after it" in refused.text
+    # Nor is going on offered: the run reads as replaced, with no retry action.
+    shown = (await client.get(f"/api/v1/workflows/runs/{prior['id']}?detail=false", headers=headers)).json()
+    assert shown["superseded"] is True
+    assert (shown.get("intervention") or {}).get("kind") != "workflow_retry"
+    # Nothing newer: the retry goes ahead.
+    project.revision, project.last_run_id = revision, prior["id"]
+    await db_session.commit()
+    allowed = await retry()
+    assert allowed.status_code == 201, allowed.text
+    assert "superseded" not in (await client.get(f"/api/v1/workflows/runs/{prior['id']}", headers=headers)).json()
+    # A newer run made the project while the retry ran: it closes quietly
+    # instead of failing on a write that would overwrite that version.
+    project.revision, project.last_run_id = revision + 1, newer["id"]
+    await db_session.commit()
+    await WorkflowRunner().run(allowed.json()["id"])
+    closed = await db_session.get(WorkflowRun, allowed.json()["id"])
+    await db_session.refresh(closed)
+    assert (closed.status, closed.current_step_id) == ("cancelled", "finish")
+    assert closed.error == "Replaced by a newer version"
 
 
 @pytest.mark.asyncio
@@ -8508,6 +10308,80 @@ async def test_foreach_subworkflow_cancelled_child_fails_parent(client: AsyncCli
     )).json()
     assert failed_parent["status"] == "failed", failed_parent
     assert "cancelled" in failed_parent["error"]
+
+
+@pytest.mark.asyncio
+async def test_foreach_subworkflow_continue_on_failure_runs_every_item(client: AsyncClient):
+    headers = await _auth(client, "wfforeachcontinue")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Produce one episode",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["check"]},
+                {
+                    "id": "check",
+                    "type": "condition",
+                    "config": {"expression": "episode.id == 'EP.02'"},
+                    "true_next": "broken",
+                    "false_next": "produce",
+                },
+                {"id": "broken", "type": "stop", "config": {"message": "EP.02 script missing"}, "next": []},
+                {
+                    "id": "produce",
+                    "type": "transform",
+                    "config": {"set": {"made": "{{episode.id}}"}},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Produce a batch",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["each"]},
+                {
+                    "id": "each",
+                    "type": "foreach_subworkflow",
+                    "config": {
+                        "workflow_id": child["id"],
+                        "over": "episodes",
+                        "item_var": "episode",
+                        "concurrency": 1,
+                        "continue_on_failure": True,
+                        "output_var": "results",
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+
+    async def run(ids: list[str]) -> dict:
+        response = await client.post(
+            f"/api/v1/workflows/{parent['id']}/run", headers=headers,
+            json={"variables": {"episodes": [{"id": value} for value in ids]}, "execute": True},
+        )
+        return response.json()
+
+    # One broken episode does not stop the episodes after it.
+    batch = await run(["EP.01", "EP.02", "EP.03"])
+    assert batch["status"] == "completed", batch
+    results = batch["variables"]["results"]
+    assert [result.get("made") for result in results] == ["EP.01", None, "EP.03"]
+    assert results[1]["key"] == "EP.02" and results[1]["status"] == "failed"
+    assert "EP.02 script missing" in results[1]["error"]
+    assert batch["step_results"]["each"]["failed_count"] == 1
+
+    # When nothing could be produced, the step still fails.
+    only_broken = await run(["EP.02"])
+    assert only_broken["status"] == "failed", only_broken
 
 
 @pytest.mark.asyncio
@@ -8964,6 +10838,26 @@ async def test_list_workflow_project_candidates_is_workspace_scoped_and_minimal(
         created_by=owner.id,
         current_stage="publishing",
     )
+    # A project without publication data is still named by its own title.
+    titled = await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="stickman_video",
+        state={"title": "Draft for review"},
+        created_by=owner.id,
+        current_stage="video_ready",
+    )
+    # A numbered project (a series episode) shows its code first.
+    numbered = await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="stickman_video",
+        state={"title": "The City That Needed Everyone", "code": "E02"},
+        created_by=owner.id,
+        current_stage="video_ready",
+    )
     await create_workflow_project(
         db_session,
         entity_id=owner.entity_id,
@@ -8997,10 +10891,12 @@ async def test_list_workflow_project_candidates_is_workspace_scoped_and_minimal(
 
     assert response.status_code == 200, response.text
     candidates = response.json()
-    assert {item["id"] for item in candidates} == {ready.id, published.id}
+    assert {item["id"] for item in candidates} == {ready.id, published.id, titled.id, numbered.id}
     assert {item["title"] for item in candidates} == {
         "Ready video",
         "Published video",
+        "Draft for review",
+        "E02 · The City That Needed Everyone",
     }
     published_candidate = next(
         item for item in candidates if item["id"] == published.id
@@ -9018,6 +10914,136 @@ async def test_list_workflow_project_candidates_is_workspace_scoped_and_minimal(
         },
     )
     assert forbidden.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_record_select_run_inputs_offer_and_enforce_workspace_ledger_records(
+    client: AsyncClient, db_session, monkeypatch, tmp_path,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.services import relationship_ledger
+
+    async def ledger_location(**kwargs):
+        root = tmp_path / kwargs["entity_id"] / kwargs["workspace_id"] / kwargs["storage"].directory
+        root.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(storage_path="relationship-ledger", display_path="relationship-ledger"), str(root), str(tmp_path)
+
+    async def sync_projection(**_kwargs):
+        return SimpleNamespace(synced=True, document_id=None)
+
+    monkeypatch.setattr(relationship_ledger, "ensure_ledger_location", ledger_location)
+    monkeypatch.setattr(relationship_ledger, "runtime_sync_entity_file_to_knowledge", sync_projection)
+    headers = await _auth(client, "workflowrecordselect")
+    other_headers = await _auth(client, "workflowrecordselectother")
+    workspace_id = await _create_workspace(client, headers, "Record select")
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflowrecordselect@test.com")
+    )).scalar_one()
+    configured = await client.put(
+        f"/api/v1/workspaces/{workspace_id}/ledgers/configuration", headers=headers,
+        json={"ledger_contracts": ["manor.relationship_ledger/v1"]},
+    )
+    assert configured.status_code == 200, configured.text
+
+    async def record(identity_key, display_name, *, status="active", stage=None, subject_type="person", instagram=None):
+        await relationship_ledger.record_relationship_event(
+            entity_id=owner.entity_id, workspace_id=workspace_id, identity_key=identity_key,
+            event="recorded", idempotency_key=f"{identity_key}:{status}", display_name=display_name,
+            subject_type=subject_type, status=status, stage=stage,
+            contact_points=[{"kind": "instagram", "value": instagram}] if instagram else None,
+        )
+
+    await record("creator:natgeo", "National Geographic", instagram="natgeo")
+    await record("creator:nasa", "NASA", instagram="nasa")
+    await record("creator:spacex", "SpaceX", status="paused", instagram="spacex")
+    # An unrelated CRM-style pick from the same Ledger.
+    await record("lead:acme", "Acme Corp", subject_type="lead", stage="proposal")
+    await record("customer:globex", "Globex", subject_type="customer", stage="won")
+    await record("lead:initech", "Initech", subject_type="lead", stage="lost")
+
+    created = await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Pick records",
+        "workspace_id": workspace_id,
+        "steps": [
+            {"id": "start", "type": "trigger", "next": ["done"], "config": {"run_inputs": [
+                {"key": "creators", "type": "json", "required": False, "schema": {
+                    "type": "array", "items": {"type": "string"},
+                    "x-ui": {"control": "record_select", "record_source": {
+                        "ledger": "relationship_ledger",
+                        "filter": {"contact_points.kind": "instagram", "status": {"$ne": "paused"}},
+                    }},
+                }},
+                {"key": "account", "type": "string", "required": False, "schema": {
+                    "type": "string",
+                    "x-ui": {"control": "record_select", "record_source": {
+                        "ledger": "relationship_ledger",
+                        "filter": {"subject_type": {"$in": ["lead", "customer"]}, "stage": {"$ne": "lost"}},
+                        "secondary_field": "stage",
+                    }},
+                }},
+            ]}},
+            {"id": "done", "type": "end", "config": {}, "next": []},
+        ],
+    })
+    assert created.status_code == 201, created.text
+    workflow_id = created.json()["id"]
+
+    async def choices(key, request_headers=headers):
+        return await client.get(
+            f"/api/v1/workflows/{workflow_id}/run-inputs/{key}/choices",
+            headers=request_headers, params={"workspace_id": workspace_id},
+        )
+
+    creators = await choices("creators")
+    assert creators.status_code == 200, creators.text
+    assert {(item["value"], item["label"]) for item in creators.json()} == {
+        ("creator:natgeo", "National Geographic"), ("creator:nasa", "NASA"),
+    }
+    accounts = (await choices("account")).json()
+    assert {(item["value"], item.get("description")) for item in accounts} == {
+        ("lead:acme", "proposal"), ("customer:globex", "won"),
+    }
+    assert (await choices("missing")).status_code == 404
+    assert (await choices("creators", other_headers)).status_code == 404
+
+    async def run(trigger_data):
+        return await client.post(
+            f"/api/v1/workflows/{workflow_id}/run", headers=headers,
+            json={"trigger_data": trigger_data, "execute": False},
+        )
+
+    # A typed key passes like a picked one; an empty optional pick means "all matching".
+    for trigger_data in ({"creators": ["creator:nasa"], "account": "lead:acme"}, {"creators": []}):
+        accepted = await run(trigger_data)
+        assert accepted.status_code == 201, accepted.text
+    for trigger_data in ({"creators": ["creator:spacex"]}, {"account": "lead:initech"}):
+        rejected = await run(trigger_data)
+        assert rejected.status_code == 422, rejected.text
+        assert "Not an available record" in rejected.text
+    # The Workspace Run dialog starts runs through the binding, which checks too.
+    binding = await client.post("/api/v1/workflows/bindings", headers=headers,
+                                json={"workflow_id": workflow_id, "workspace_id": workspace_id})
+    assert binding.status_code in {200, 201}, binding.text
+    binding_rejected = await client.post(
+        f"/api/v1/workflows/bindings/{binding.json()['id']}/run", headers=headers,
+        json={"trigger_data": {"creators": ["creator:spacex"]}},
+    )
+    assert binding_rejected.status_code == 422, binding_rejected.text
+    # The error names the valid keys, so a typed (mobile/API) value can be corrected.
+    assert "lead:acme (Acme Corp)" in rejected.text and "customer:globex (Globex)" in rejected.text
+
+    from packages.core.services import ledger_query_service, workflow_record_source
+
+    async def slow_query(*_args, **_kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(workflow_record_source, "RECORD_READ_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(ledger_query_service, "query_installed_workspace_ledger", slow_query)
+    unavailable = await choices("creators")
+    assert unavailable.status_code == 503, unavailable.text
+    assert unavailable.json()["detail"]["code"] == "record_source_unavailable"
 
 
 @pytest.mark.asyncio
@@ -9196,6 +11222,99 @@ async def test_workspace_workflow_attachment_is_unique_referenced_and_lists_runs
         f"/api/v1/workflows/bindings/{attached['id']}",
         headers=headers,
     )).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_binding_history_can_include_only_unbound_direct_runs(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    headers = await _auth(client, "bindingunboundhistory")
+    workspace_id = await _create_workspace(client, headers, "Campaign history")
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Campaign workflow", "workspace_id": workspace_id,
+        "steps": _simple_steps(["prepare"]),
+    })).json()
+    target = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
+        "workflow_id": workflow["id"], "workspace_id": workspace_id,
+        "name": "Campaign action", "trigger_type": "manual",
+    })).json()
+    other = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
+        "workflow_id": workflow["id"], "workspace_id": workspace_id,
+        "name": "Other campaign action", "trigger_type": "workspace_event",
+        "trigger_config": {"event": "campaign.changed"},
+    })).json()
+    target_run = (await client.post(
+        f"/api/v1/workflows/bindings/{target['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    other_run = (await client.post(
+        f"/api/v1/workflows/bindings/{other['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    direct_run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    historical_workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Historical campaign workflow", "workspace_id": workspace_id,
+        "steps": _simple_steps(["prepare"]),
+    })).json()
+    db_session.add(WorkflowRun(
+        id="scheduled-unbound-history", workflow_id=workflow["id"],
+        entity_id=target_run["entity_id"], workspace_id=workspace_id,
+        trigger_source="schedule", status="completed", current_step_id="end",
+    ))
+    db_session.add(WorkflowRun(
+        id="old-bound-history", workflow_id=historical_workflow["id"],
+        entity_id=target_run["entity_id"], workspace_id=workspace_id,
+        binding_id=target["id"], trigger_source="manual", status="completed", current_step_id="end",
+    ))
+    await db_session.commit()
+
+    default_history = (await client.get("/api/v1/workflows/runs", headers=headers, params={
+        "workspace_id": workspace_id, "binding_id": target["id"],
+    })).json()
+    assert {row["id"] for row in default_history} == {target_run["id"], "old-bound-history"}
+
+    history = (await client.get("/api/v1/workflows/runs", headers=headers, params={
+        "workspace_id": workspace_id, "binding_id": target["id"],
+        "workflow_id": workflow["id"], "include_unbound": "true",
+    })).json()
+    assert {row["id"] for row in history} == {target_run["id"], direct_run["id"]}
+    assert other_run["id"] not in {row["id"] for row in history}
+    assert "old-bound-history" not in {row["id"] for row in history}
+
+    # Two App entries share this binding; each lists only the runs it started,
+    # and the binding's own entry also keeps runs no entry claims.
+    started = {}
+    for key in ("action:howto", "action:tips"):
+        started[key] = (await client.post(
+            f"/api/v1/workflows/bindings/{target['id']}/run", headers=headers,
+            json={"execute": False, "trigger_data": {"_workspace_app_action": key}},
+        )).json()["id"]
+    entry_history = {key: {row["id"] for row in (await client.get("/api/v1/workflows/runs", headers=headers, params={
+        "workspace_id": workspace_id, "binding_id": target["id"], "workflow_id": workflow["id"],
+        "include_unbound": "true", "app_action": key, **params,
+    })).json()} for key, params in (("action:howto", {}), ("action:tips", {}),
+                                    (f"workflow:{target['id']}", {"include_unlabelled": "true"}))}
+    assert entry_history == {
+        "action:howto": {started["action:howto"]},
+        "action:tips": {started["action:tips"]},
+        f"workflow:{target['id']}": {target_run["id"], direct_run["id"]},
+    }
+
+    invalid = await client.get("/api/v1/workflows/runs", headers=headers, params={"include_unbound": "true"})
+    assert invalid.status_code == 422
+    mismatched = await client.get("/api/v1/workflows/runs", headers=headers, params={
+        "workspace_id": workspace_id, "binding_id": target["id"],
+        "workflow_id": "another-workflow", "include_unbound": "true",
+    })
+    assert mismatched.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -9563,6 +11682,21 @@ async def test_workflow_continuation_sweep_claims_persisted_intent(
     )
     monkeypatch.setattr(database, "create_worker_session", lambda: sessions)
 
+    # A live execution owner is already continuing the run: republishing it
+    # would only add a heavy-queue delivery that ends as claim_held.
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
+
+    owner = RuntimeExecutionClaim(
+        claim_key=f"workflow-run:{run_id}",
+        claim_token=generate_ulid(),
+        expires_at=now + timedelta(minutes=5),
+    )
+    db_session.add(owner)
+    await db_session.commit()
+    assert await _claim_due_workflow_continuations(limit=10) == []
+    owner.expires_at = now - timedelta(seconds=1)
+    await db_session.commit()
+
     before_claim = datetime.now(timezone.utc)
     claimed = await _claim_due_workflow_continuations(limit=10)
 
@@ -9571,6 +11705,16 @@ async def test_workflow_continuation_sweep_claims_persisted_intent(
     persisted = await db_session.get(WorkflowRun, run_id)
     assert persisted.continuation_token == token
     assert persisted.continuation_next_attempt_at > before_claim
+
+    # A continuation that has waited a long time is still queued, not lost;
+    # the sweep backs off instead of republishing it every minute.
+    persisted.continuation_due_at = now - timedelta(hours=1)
+    persisted.continuation_next_attempt_at = now - timedelta(seconds=1)
+    await db_session.commit()
+    assert await _claim_due_workflow_continuations(limit=10) == [(run_id, token)]
+    db_session.expire_all()
+    persisted = await db_session.get(WorkflowRun, run_id)
+    assert persisted.continuation_next_attempt_at >= now + timedelta(seconds=590)
 
     # A worker may crash after committing the business terminal state but
     # before clearing the token. The same sweep must still deliver cleanup.
@@ -9696,3 +11840,34 @@ async def test_run_single_node_is_a_real_running_run_that_tools_accept(client: A
     runs = (await client.get("/api/v1/workflows/runs", headers=headers)).json()
     rows = runs if isinstance(runs, list) else runs.get("runs") or runs.get("items") or []
     assert all(row.get("id") != seen["run_id"] for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_run_its_own_flow_cannot_advance_offers_no_retry(client, db_session):
+    """Without a Flow binding to start over from, a stalled run offers no Retry."""
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfstalledretry")
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers,
+        json={"name": "Stalled", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    stalled = await db_session.get(WorkflowRun, run["id"])
+    stalled.status = "failed"
+    stalled.current_step_id = "work"
+    stalled.error = ("No runnable steps and workflow not complete (current step: work). "
+                     "Steps: trigger [trigger]: completed; work [agent]: not run")
+    await db_session.commit()
+
+    summary = (await client.get(f"/api/v1/workflows/runs/{run['id']}?detail=false", headers=headers)).json()
+    assert summary["intervention"] is None
+    refused = await client.post(f"/api/v1/workflows/runs/{run['id']}/retry", headers=headers, json={})
+    assert refused.status_code == 409, refused.text
+    # Any other failure is still retryable from the run page.
+    stalled.error = "Provider timed out"
+    await db_session.commit()
+    summary = (await client.get(f"/api/v1/workflows/runs/{run['id']}?detail=false", headers=headers)).json()
+    assert summary["intervention"]["kind"] == "workflow_retry"

@@ -1,0 +1,20 @@
+{
+  "name": "manor",
+  "interface": {
+    "displayName": "Manor"
+  },
+  "plugins": [
+    {
+      "name": "manor",
+      "source": {
+        "source": "local",
+        "path": "./plugins/manor"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

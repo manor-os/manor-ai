@@ -26,6 +26,7 @@ from PIL import Image, ImageChops, ImageStat
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from deck_engine import is_template_deck, verify_template_deck
 from layout_plan import load_layout_plan, validate_layout_plan
 from svg_quality_checker import SVGQualityChecker
 from svg_to_pptx.native_charts import (
@@ -887,6 +888,19 @@ def _unintended_overlap(first, second) -> bool:
     return ratio >= 0.22
 
 
+DECOR_PREFIXES = ("tpl:chrome-", "tpl:deco-")
+TEMPLATE_BODY_MIN_PT = 14
+
+
+def _is_decor(shape) -> bool:
+    """Template chrome (page index, brand label) and decorative type.
+
+    Template decks are verified shape by shape against their plan, so these
+    named layers may be small or sit behind content by design.
+    """
+    return str(getattr(shape, "name", "")).startswith(DECOR_PREFIXES)
+
+
 def _looks_like_footer(shape, slide_h: int) -> bool:
     return int(shape.top) >= int(slide_h * 0.88)
 
@@ -894,6 +908,8 @@ def _looks_like_footer(shape, slide_h: int) -> bool:
 def _title_candidate(slide, slide_w: int, slide_h: int):
     candidates: list[tuple[float, int, str, object]] = []
     for shape in _walk_shapes(slide.shapes):
+        if _is_decor(shape):
+            continue
         text, sizes = _text_and_sizes(shape)
         if not text or int(shape.top) > slide_h * 0.46:
             continue
@@ -928,6 +944,18 @@ def _estimated_text_width_points(text: str, font_size: float) -> float:
     return units * font_size
 
 
+def _title_line_points(shape, title_size: float) -> float:
+    """Line pitch of a title: its exact line spacing when set in points, else 1.12x."""
+    try:
+        spacing = shape.text_frame.paragraphs[0].line_spacing
+    except (AttributeError, IndexError):
+        spacing = None
+    points = getattr(spacing, "pt", None)
+    if points:
+        return float(points)
+    return title_size * 1.12
+
+
 def _title_fit_error(text: str, title_size: float | None, shape) -> str | None:
     if not text or title_size is None or shape is None:
         return None
@@ -941,7 +969,7 @@ def _title_fit_error(text: str, title_size: float | None, shape) -> str | None:
     )
     required_lines = max(1, math.ceil(widest / max(1.0, available_width_points * 1.08)))
     box_height_points = (int(shape.height) / EMU_PER_INCH) * 72
-    line_capacity = max(1, math.floor(box_height_points / max(1.0, title_size * 1.12)))
+    line_capacity = max(1, math.floor(box_height_points / max(1.0, _title_line_points(shape, title_size))))
     if required_lines > min(2, line_capacity):
         return (
             f"title needs approximately {required_lines} lines but its box safely "
@@ -1079,8 +1107,9 @@ def _detect_mode(prs: Presentation) -> str:
     return "full_page_image"
 
 
-def _inspect_editable_deck(prs: Presentation, result: GateResult) -> None:
+def _inspect_editable_deck(prs: Presentation, result: GateResult, *, template: bool = False) -> None:
     slide_w, slide_h = int(prs.slide_width), int(prs.slide_height)
+    body_min = TEMPLATE_BODY_MIN_PT if template else 16
     signatures: list[tuple] = []
     slides_without_editable_text: list[int] = []
     undersized_body_slides: list[int] = []
@@ -1133,8 +1162,10 @@ def _inspect_editable_deck(prs: Presentation, result: GateResult) -> None:
                     }
                 )
 
+            decor = template and _is_decor(shape)
             if text:
-                text_shapes.append(shape)
+                if not decor:
+                    text_shapes.append(shape)
                 text_frame_defect = _text_frame_fit_defect(shape)
                 if text_frame_defect is not None:
                     text_frame_overflow_slides.append(slide_index)
@@ -1171,7 +1202,7 @@ def _inspect_editable_deck(prs: Presentation, result: GateResult) -> None:
                     result.error(f"Slide {slide_index}: unresolved placeholder or draft copy: {text[:80]!r}")
                 if PROCESS_COPY_RE.search(text):
                     result.error(f"Slide {slide_index}: internal production language is visible: {text[:80]!r}")
-                if sizes and not _looks_like_footer(shape, slide_h) and min(sizes) < 16:
+                if sizes and not decor and not _looks_like_footer(shape, slide_h) and min(sizes) < body_min:
                     small_body = True
                 if sizes and min(sizes) < 9:
                     result.error(f"Slide {slide_index}: text below 9 pt is not readable")
@@ -1235,6 +1266,7 @@ def _inspect_editable_deck(prs: Presentation, result: GateResult) -> None:
             for shape in flattened
             if int(shape.width) * int(shape.height) < slide_w * slide_h * 0.90
             and shape.shape_type not in {MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.GROUP}
+            and not (template and _is_decor(shape))
         ]
         overlap_found = False
         for first_index, first in enumerate(content_shapes):
@@ -1279,7 +1311,7 @@ def _inspect_editable_deck(prs: Presentation, result: GateResult) -> None:
             + ", ".join(map(str, sorted(set(slides_without_editable_text))))
         )
     if undersized_body_slides:
-        result.error("Body or label text below 16 pt on slide(s): " + ", ".join(map(str, sorted(set(undersized_body_slides)))))
+        result.error(f"Body or label text below {body_min} pt on slide(s): " + ", ".join(map(str, sorted(set(undersized_body_slides)))))
     if text_overflow_slides:
         result.error(
             "Text crosses the slide boundary on slide(s): "
@@ -1582,12 +1614,28 @@ def run_gate(
         mode = _detect_mode(prs)
         result.mode = mode
 
+    template = mode != "full_page_image" and is_template_deck(prs)
+    result.metrics["pipeline"] = "template" if template else "svg"
     if mode == "full_page_image":
         _inspect_image_deck(prs, result)
     else:
         _inspect_font_portability(pptx_path, result)
         _inspect_character_spacing(pptx_path, result)
-        _inspect_editable_deck(prs, result)
+        _inspect_editable_deck(prs, result, template=template)
+    if template:
+        # Template decks are verified by re-planning deck.json instead of a
+        # raster render: geometry and text are fixed by construction, so an
+        # exact shape-by-shape match proves what a render would only sample.
+        resolved_render_dir = render_dir.expanduser().resolve() if render_dir is not None else None
+        if resolved_render_dir is not None and resolved_render_dir.is_dir():
+            _inspect_render_dir(resolved_render_dir, result.slide_count, result)
+        if project is not None:
+            template_errors = verify_template_deck(prs, project.expanduser().resolve())
+            for message in template_errors:
+                result.error(f"Template build: {message}")
+            if not template_errors:
+                result.metrics["template_verified_slide_count"] = result.slide_count
+        return result.payload(min_score)
     if render_dir is not None:
         _inspect_render_dir(render_dir.expanduser().resolve(), result.slide_count, result)
     if project is not None:

@@ -61,10 +61,14 @@ async def test_browse_page_cursor_counts_raw_rows_after_permission_filter(monkey
     async def plan(_db, _entity_id, _feature):
         return SimpleNamespace(current=0, limit=100)
 
+    async def blocked_folders(_db, _entity_id):
+        return set()
+
     monkeypatch.setattr(routes, "list_documents", list_documents)
     monkeypatch.setattr(routes, "_filter_readable_local_documents", readable)
     monkeypatch.setattr(routes.ResourcePermissionGate, "authorize_document_batch_read", authorize)
     monkeypatch.setattr(routes, "_visible_document_folders_for_user", folders)
+    monkeypatch.setattr(routes, "_workspace_delete_blocked_folder_ids", blocked_folders)
     monkeypatch.setattr(routes, "_doc_resp_for_user", response)
     monkeypatch.setattr(plan_gate, "check", plan)
 

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from packages.core.ai.runtime.context_compaction import CHECKPOINT_FIELDS
+from tests.async_waits import LIVENESS_TIMEOUT_S, wait_for_signal
 
 loop = importlib.import_module("packages.core.ai.agentic_loop")
 pytestmark = pytest.mark.asyncio
@@ -65,9 +66,11 @@ async def test_cancel_interrupts_inflight_compaction(compaction, checker):
     model.side_effect = blocked
     task = asyncio.create_task(run(original, on_context_checkpoint=checkpoint, **{checker: cancelled.is_set}))
     try:
-        await asyncio.wait_for(started.wait(), 2)
+        await wait_for_signal(started, task)
         cancelled.set()
-        result = await asyncio.wait_for(asyncio.shield(task), 2)
+        # The blocked model never returns: only cancellation can end the task.
+        # Its checker is polled once a second, so this bound is a hang guard.
+        result = await asyncio.wait_for(asyncio.shield(task), LIVENESS_TIMEOUT_S)
         assert result.stop_reason == "cancelled"
         assert result.error == "chat_turn_cancelled"
         assert result.control == {"kind": "cancelled", "reason": "user_cancelled"}
@@ -120,7 +123,7 @@ async def test_response_arriving_during_cancel_query_keeps_usage(compaction):
         return True
 
     model.side_effect = complete
-    result = await asyncio.wait_for(run(history(), is_cancelled=is_cancelled), 3)
+    result = await asyncio.wait_for(run(history(), is_cancelled=is_cancelled), LIVENESS_TIMEOUT_S)
     assert result.stop_reason == "cancelled"
     assert result.usage["total"] == 120
     assert model.await_count == 1
@@ -184,10 +187,26 @@ async def test_cancel_during_context_hooks_does_not_publish_or_accept(compaction
 
 
 async def test_context_ownership_failure_without_cancel_is_not_hidden(compaction):
-    checkpoint = AsyncMock(side_effect=RuntimeError("Runtime context writer no longer owns the active run."))
-    with pytest.raises(RuntimeError, match="no longer owns"):
+    from packages.core.ai.runtime.control import RuntimeContextWriterFenced
+
+    checkpoint = AsyncMock(side_effect=RuntimeContextWriterFenced("Runtime context writer no longer owns the active run."))
+    with pytest.raises(RuntimeContextWriterFenced):
         await run(history(large=False), is_cancelled=lambda: False, on_context_checkpoint=checkpoint)
     compaction[1].assert_not_awaited()
+
+
+async def test_checkpoint_storage_failure_keeps_the_turn_running(compaction):
+    _, normal = compaction
+    checkpoint = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    memory = SimpleNamespace(prepare=AsyncMock(), refresh=AsyncMock(side_effect=lambda messages: messages), accept=Mock())
+    result = await run(
+        history(large=False), is_cancelled=lambda: False,
+        on_context_checkpoint=checkpoint, context_memory=memory,
+    )
+    assert result.stop_reason == "completed"
+    normal.assert_awaited()
+    # Without a durable checkpoint the memory manifest must not advance.
+    memory.accept.assert_not_called()
 
 
 async def test_outer_task_cancel_drains_compaction_provider(compaction):
@@ -204,7 +223,7 @@ async def test_outer_task_cancel_drains_compaction_provider(compaction):
     model.side_effect = blocked
     task = asyncio.create_task(run(history(), is_cancelled=lambda: False))
     try:
-        await asyncio.wait_for(started.wait(), 2)
+        await wait_for_signal(started, task)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -289,12 +308,14 @@ async def test_durable_chat_cancel_persists_interrupted_and_streams_cancelled(
     monkeypatch.setattr(runtime_tasks, "append_runtime_sse_event", append)
     task = asyncio.create_task(runtime_tasks.execute_runtime_run_once(run_id=run_id, worker_id="cancel-worker"))
     try:
-        await asyncio.wait_for(started.wait(), 5)
+        await wait_for_signal(started, task)
         async with database.async_session() as db:
             cancelled = await request_runtime_run_cancel(db, run_id=run_id, entity_id="cancel-entity", user_id="cancel-user")
             assert cancelled.status == "cancel_requested"
             await db.commit()
-        result = await asyncio.wait_for(asyncio.shield(task), 3)
+        # A hang guard: the run sees the request at its next once-a-second
+        # check, then persists the interrupted reply and terminal state.
+        result = await asyncio.wait_for(asyncio.shield(task), LIVENESS_TIMEOUT_S)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

@@ -1,372 +1,14 @@
 """First execution and recovery use the same Workspace team routing contract."""
-import asyncio
 import json
-import hashlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
 
 from packages.core.constants.task import TaskRuntimeKind, TaskType
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Task
 from packages.core.models.workspace import Agent, AgentSubscription
-
-
-async def _failed_v3_acceptance_fixture(client, db_session, monkeypatch):
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-    from packages.core import database
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from packages.core.tasks import runtime_tasks
-
-    headers, me, workspace, _ = await _workspace(client, db_session)
-    created = await client.post("/api/v1/tasks", headers=headers, json={
-        "title": "Retry read-only acceptance only",
-        "workspace_id": workspace["id"],
-        "owner_service_key": "content_creation",
-    })
-    assert created.status_code == 201, created.text
-    task = await db_session.get(Task, created.json()["id"])
-    start = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task.id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    await db_session.commit()
-    session_factory = async_sessionmaker(
-        db_session.bind, class_=AsyncSession, expire_on_commit=False,
-    )
-    monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    assert (await runtime_tasks.consume_task_execution_intent_once(
-        event_id=start.id, task_id=task.id,
-        intent_generation=start.payload["intent_generation"],
-    ))["status"] == "admitted"
-
-    run = (await db_session.execute(select(TaskCoordinatorRun).where(
-        TaskCoordinatorRun.task_id == task.id,
-    ))).scalar_one()
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=me["entity_id"],
-        workspace_id=workspace["id"], task_id=task.id,
-        status="failed", plan_dag={"steps": []},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-        last_error={
-            "type": "ActionOutcomeReconciliationRequired",
-            "message": "The prior action cannot be replayed in a replacement Plan",
-            "reconciliation": None,
-        },
-        completed_at=datetime.now(timezone.utc),
-    )
-    effect = {"kind": "tool_effect", "effect": "action", "fields": {"tool_call_id": "file-call"}}
-    step = ExecutionStep(
-        id=generate_ulid(), plan_id=plan.id, entity_id=task.entity_id,
-        workspace_id=task.workspace_id, step_key="write", kind="subagent",
-        step_status="done", depends_on=[], params={"prompt": "write"},
-        result={"text": "Saved draft"}, evidence_refs=[effect],
-    )
-    db_session.add_all([plan, step])
-    raw = json.dumps({
-        "status": "retryable", "code": "review_invalid",
-        "reason": "The read-only content assessment was invalid",
-    })
-    run.current_plan_id = plan.id
-    run.phase = TaskCoordinatorPhase.WAITING_HUMAN.value
-    run.checkpoint = {"messages": [
-        {"role": "assistant", "tool_calls": [{
-            "id": "submit-1", "function": {"name": "submit_task", "arguments": "{}"},
-        }]},
-        {"role": "tool", "tool_call_id": "submit-1", "content": raw},
-        {"role": "assistant", "tool_calls": [{
-            "id": "submit-2", "function": {"name": "submit_task", "arguments": "{}"},
-        }]},
-        {"role": "tool", "tool_call_id": "submit-2", "content": json.dumps({
-            "repeated_tool_result": True, "tool": "submit_task",
-            "result_digest": hashlib.sha256(raw.encode()).hexdigest()[:16],
-            "preview": raw,
-        })},
-    ]}
-    task.status = "waiting_on_customer"
-    task.status_changed_at = datetime.now(timezone.utc)
-    await db_session.commit()
-    return headers, task, plan, step, run, effect
-
-
-@pytest.mark.asyncio
-async def test_v3_failed_acceptance_retry_reopens_only_original_plan(
-    client, db_session, monkeypatch,
-):
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from packages.core.tasks import runtime_tasks
-
-    headers, task, plan, step, run, effect = await _failed_v3_acceptance_fixture(
-        client, db_session, monkeypatch,
-    )
-    retried = await client.post(
-        f"/api/v1/tasks/{task.id}/retry", headers=headers, json={},
-    )
-    assert retried.status_code == 200, retried.text
-    await db_session.refresh(task)
-    await db_session.refresh(plan)
-    await db_session.refresh(step)
-    await db_session.refresh(run)
-    assert task.status == "in_progress"
-    assert plan.status == "running"
-    assert plan.completed_at is None
-    assert plan.last_error is None
-    assert step.step_status == "done"
-    assert step.result == {"text": "Saved draft"}
-    assert step.evidence_refs == [effect]
-    assert run.current_plan_id == plan.id
-    assert run.checkpoint["task_acceptance_retry"] == {
-        "version": 1, "plan_id": plan.id,
-        "attempts": 0, "code": "manual_recovery",
-    }
-    assert (await db_session.execute(select(ExecutionPlan.id).where(
-        ExecutionPlan.task_id == task.id,
-    ))).scalars().all() == [plan.id]
-
-    intent = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task.id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    await db_session.commit()
-    assert (await runtime_tasks.consume_task_execution_intent_once(
-        event_id=intent.id, task_id=task.id,
-        intent_generation=intent.payload["intent_generation"],
-    ))["status"] == "admitted"
-    await db_session.refresh(run)
-    assert run.current_plan_id == plan.id
-    assert run.checkpoint["task_acceptance_retry"]["code"] == "manual_recovery"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "unsafe", ["bad_checkpoint", "bad_digest", "pending_effect", "live_lease"],
-)
-async def test_v3_failed_acceptance_retry_rejects_unsettled_evidence(
-    client, db_session, monkeypatch, unsafe,
-):
-    from packages.core.models.worker import WorkLease
-
-    headers, task, plan, step, run, _ = await _failed_v3_acceptance_fixture(
-        client, db_session, monkeypatch,
-    )
-    if unsafe == "bad_checkpoint":
-        run.checkpoint = {"messages": [{
-            "role": "tool", "tool_call_id": "unknown", "content": "{}",
-        }]}
-    elif unsafe == "bad_digest":
-        messages = list(run.checkpoint["messages"])
-        messages[-1] = {
-            **messages[-1],
-            "content": json.dumps({
-                **json.loads(messages[-1]["content"]),
-                "result_digest": "0" * 16,
-            }),
-        }
-        run.checkpoint = {"messages": messages}
-    elif unsafe == "pending_effect":
-        step.evidence_refs = [{
-            "kind": "tool_effect", "effect": "pending",
-            "fields": {"tool_call_id": "file-call"},
-        }]
-    else:
-        db_session.add(WorkLease(
-            id=generate_ulid(), step_id=step.id, plan_id=plan.id,
-            entity_id=task.entity_id, workspace_id=task.workspace_id,
-            worker_id=generate_ulid(), status="active",
-            lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-        ))
-    await db_session.commit()
-    retried = await client.post(
-        f"/api/v1/tasks/{task.id}/retry", headers=headers, json={},
-    )
-    assert retried.status_code == 409, retried.text
-    await db_session.refresh(task)
-    await db_session.refresh(plan)
-    await db_session.refresh(step)
-    assert task.status == "waiting_on_customer"
-    assert plan.status == "failed"
-    assert step.step_status == "done"
-
-
-@pytest.mark.asyncio
-async def test_v3_manual_retry_renews_saved_acceptance_budget(
-    client, db_session, monkeypatch,
-):
-    headers, task, plan, step, run, _ = await _failed_v3_acceptance_fixture(
-        client, db_session, monkeypatch,
-    )
-    plan.status = "running"
-    plan.completed_at = None
-    plan.last_error = None
-    run.checkpoint = {
-        **run.checkpoint,
-        "task_acceptance_retry": {
-            "version": 1, "plan_id": plan.id,
-            "attempts": 3, "code": "review_invalid",
-            "evidence_digest": "old-content",
-        },
-    }
-    await db_session.commit()
-    retried = await client.post(
-        f"/api/v1/tasks/{task.id}/retry", headers=headers, json={},
-    )
-    assert retried.status_code == 200, retried.text
-    await db_session.refresh(run)
-    await db_session.refresh(step)
-    assert run.current_plan_id == plan.id
-    assert run.checkpoint["task_acceptance_retry"] == {
-        "version": 1, "plan_id": plan.id,
-        "attempts": 0, "code": "manual_recovery",
-    }
-    assert step.step_status == "done"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("call_count", [2, 8])
-async def test_concurrent_v3_acceptance_retries_admit_one_same_plan_resume(
-    client, db_session, monkeypatch, call_count,
-):
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-
-    headers, task, plan, step, run, effect = await _failed_v3_acceptance_fixture(
-        client, db_session, monkeypatch,
-    )
-    responses = await asyncio.gather(*(
-        client.post(f"/api/v1/tasks/{task.id}/retry", headers=headers, json={})
-        for _ in range(call_count)
-    ))
-    assert sorted(response.status_code for response in responses) == [200] + [409] * (call_count - 1)
-    await db_session.refresh(plan)
-    await db_session.refresh(step)
-    await db_session.refresh(run)
-    assert plan.status == "running"
-    assert step.step_status == "done"
-    assert step.evidence_refs == [effect]
-    assert run.current_plan_id == plan.id
-    assert (await db_session.execute(select(ExecutionPlan.id).where(
-        ExecutionPlan.task_id == task.id,
-    ))).scalars().all() == [plan.id]
-    pending = (await db_session.execute(select(RuntimeOutboxEvent.id).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task.id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalars().all()
-    assert len(pending) == 1
-
-
-@pytest.mark.asyncio
-async def test_v3_task_retry_preserves_active_plan_and_step_evidence(
-    client, db_session, monkeypatch,
-):
-    from datetime import datetime, timezone
-
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-    from packages.core import database
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from packages.core.tasks import runtime_tasks
-
-    headers, me, workspace, _subs = await _workspace(client, db_session)
-    created = await client.post("/api/v1/tasks", headers=headers, json={
-        "title": "Resume V3 evidence", "workspace_id": workspace["id"],
-        "owner_service_key": "content_creation",
-    })
-    assert created.status_code == 201, created.text
-    task = await db_session.get(Task, created.json()["id"])
-    start = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task.id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    await db_session.commit()
-    session_factory = async_sessionmaker(
-        db_session.bind, class_=AsyncSession, expire_on_commit=False,
-    )
-    monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    assert (await runtime_tasks.consume_task_execution_intent_once(
-        event_id=start.id, task_id=task.id,
-        intent_generation=start.payload["intent_generation"],
-    ))["status"] == "admitted"
-
-    run = (await db_session.execute(select(TaskCoordinatorRun).where(
-        TaskCoordinatorRun.task_id == task.id,
-    ))).scalar_one()
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=me["entity_id"],
-        workspace_id=workspace["id"], task_id=task.id,
-        status="running", plan_dag={"steps": []},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-    )
-    step = ExecutionStep(
-        id=generate_ulid(), plan_id=plan.id, entity_id=task.entity_id,
-        workspace_id=task.workspace_id, step_key="write", kind="llm",
-        step_status="failed", depends_on=[], params={"prompt": "write"},
-        error={"type": "OutputSchemaError", "message": "Missing field"},
-        evidence_refs=[{"kind": "agent_output", "id": "prior-output"}],
-    )
-    db_session.add_all([plan, step])
-    checkpoint = {"messages": [{"role": "assistant", "content": "Inspect failed Step"}]}
-    run.current_plan_id = plan.id
-    run.phase = TaskCoordinatorPhase.WAITING_HUMAN.value
-    run.checkpoint = checkpoint
-    task.status = "blocked"
-    task.status_changed_at = datetime.now(timezone.utc)
-    await db_session.commit()
-
-    retried = await client.post(
-        f"/api/v1/tasks/{task.id}/retry", headers=headers,
-        json={"note": "Repair the output shape"},
-    )
-    assert retried.status_code == 200, retried.text
-    await db_session.refresh(step)
-    await db_session.refresh(plan)
-    assert step.step_status == "failed"
-    assert step.error["type"] == "OutputSchemaError"
-    assert step.evidence_refs == [{"kind": "agent_output", "id": "prior-output"}]
-    assert plan.status == "running"
-    retry_event = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task.id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    await db_session.commit()
-    assert (await runtime_tasks.consume_task_execution_intent_once(
-        event_id=retry_event.id, task_id=task.id,
-        intent_generation=retry_event.payload["intent_generation"],
-    ))["status"] == "admitted"
-    await db_session.refresh(run)
-    assert run.current_plan_id == plan.id
-    assert run.checkpoint == checkpoint
-    assert run.phase == TaskCoordinatorPhase.READY.value
-
-pytestmark = pytest.mark.oss_regression
 
 
 @pytest.mark.parametrize(
@@ -378,35 +20,11 @@ pytestmark = pytest.mark.oss_regression
     ],
 )
 def test_non_dispatchable_task_runtimes_fail_closed(runtime_kind, mode):
-    from packages.core.services.task_execution import (
-        TaskExecutionDispatch,
-        dispatch_task_execution,
-    )
+    from packages.core.services.task_execution import TaskExecutionDispatch
 
     route = TaskExecutionDispatch(runtime_kind=runtime_kind, task_id="task-1")
     assert route.mode == mode
     assert route.is_dispatchable is False
-    with pytest.raises(ValueError, match="not dispatchable"):
-        dispatch_task_execution("task-1", route)
-
-
-def test_coordinated_workspace_task_cannot_bypass_durable_start_intent():
-    from packages.core.services.task_execution import (
-        CoordinatorRuntimeSelection,
-        TaskExecutionDispatch,
-        TaskPlanServiceBinding,
-        dispatch_task_execution,
-    )
-
-    root = TaskPlanServiceBinding(
-        subscription_id="subscription-1", service_key="owner", agent_id="agent-1",
-    )
-    route = TaskExecutionDispatch(
-        runtime_kind=TaskRuntimeKind.COORDINATED_PLAN, task_id="task-1",
-        coordinator=CoordinatorRuntimeSelection(root=root, bindings=(root,)),
-    )
-    with pytest.raises(ValueError, match="transactionally staged Task execution intent"):
-        dispatch_task_execution("task-1", route)
 
 
 async def _workspace(client, db):
@@ -432,107 +50,14 @@ async def _workspace(client, db):
     return headers, me, workspace, subscriptions
 
 
-async def _legacy_task(client, db, headers, me, workspace):
+async def _waiting_task(client, db, headers, workspace):
     created = (await client.post("/api/v1/tasks", headers=headers, json={
         "title": "Publish a post", "workspace_id": workspace["id"],
     })).json()
     task = await db.get(Task, created["id"])
     task.status = "waiting_on_customer"
-    dag = [{
-        "key": key, "kind": "subagent", "service_key": service,
-        "params": {"prompt": "Prepare the post"}, "output_shape": "TextResult",
-        "depends_on": depends,
-    } for key, service, depends in (
-        ("prepare_post", "content_creation", []),
-        ("publish_post", "product_promotion", ["prepare_post"]),
-    )]
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace["id"],
-        task_id=task.id, status="completed", plan_dag={"steps": dag},
-    )
-    db.add(plan)
-    steps = []
-    for spec in dag:
-        step = ExecutionStep(
-            id=generate_ulid(), plan_id=plan.id, entity_id=me["entity_id"],
-            workspace_id=workspace["id"], step_key=spec["key"], kind=spec["kind"],
-            service_key=spec["service_key"], depends_on=spec["depends_on"],
-            params=spec["params"], step_status="done", result={"text": "Draft only; not published."},
-        )
-        db.add(step)
-        steps.append(step)
     await db.commit()
-    return task, plan, steps
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["task", "chat"])
-@pytest.mark.parametrize("paused", [False, True])
-@pytest.mark.parametrize("saved_plan_owner", [False, True])
-async def test_completed_unowned_plan_uses_team_and_replans(
-    client, db_session, monkeypatch, surface, paused, saved_plan_owner,
-):
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from packages.core.services.task_chat_hitl import ensure_task_recovery_hitl
-    from packages.core.tasks import ai_tasks
-    from packages.core.tasks import runtime_tasks
-    from packages.core.models.workspace import Workspace
-
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
-    headers, me, workspace, subs = await _workspace(client, db_session)
-    task, plan, steps = await _legacy_task(client, db_session, headers, me, workspace)
-    expected_owner = "content_creation" if saved_plan_owner else "product_promotion"
-    if saved_plan_owner:
-        plan.agent_subscription_id = subs[expected_owner].id
-    if paused:
-        row = await db_session.get(Workspace, workspace["id"])
-        row.status = "paused"
-    await db_session.commit()
-    if surface == "chat":
-        card = await ensure_task_recovery_hitl(
-            db_session, task, plan_id=plan.id, prompt="Publishing is not confirmed.",
-        )
-        await db_session.commit()
-        response = await client.post(
-            f"/api/v1/workspaces/{workspace['id']}/chat/messages/{card.id}/resolve",
-            headers=headers, json={"choice": "retry", "note": "Use the prepared draft"},
-        )
-    else:
-        response = await client.post(
-            f"/api/v1/tasks/{task.id}/retry", headers=headers, json={"note": "Use the prepared draft"},
-        )
-    assert response.status_code == 200, response.text
-    retry_event = (await db_session.execute(
-        select(RuntimeOutboxEvent).where(
-            RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-            RuntimeOutboxEvent.aggregate_id == task.id,
-            RuntimeOutboxEvent.delivered_at.is_(None),
-        )
-    )).scalar_one()
-    await db_session.commit()
-    retry_delivery = await runtime_tasks.consume_task_execution_intent_once(
-        event_id=retry_event.id,
-        task_id=task.id,
-        intent_generation=retry_event.payload["intent_generation"],
-    )
-    assert retry_delivery["status"] == "admitted"
-    assert dispatched == []
-    await db_session.refresh(task)
-    await db_session.refresh(plan)
-    assert task.status == "in_progress"
-    assert task.owner_service_key is None
-    assert task.owner_subscription_id is None
-    assert task.delegate_service_keys == []
-    context = task.details["_replan_context"]
-    assert context["prior_plan_id"] == plan.id
-    assert context["succeeded_steps"][-1]["result_summary"] == "Draft only; not published."
-    assert plan.status == "completed"
-    assert all(step.step_status == "done" for step in steps)
-    again = await client.post(f"/api/v1/tasks/{task.id}/retry", headers=headers, json={})
-    assert again.status_code == 409
-    assert dispatched == []
+    return task
 
 
 @pytest.mark.asyncio
@@ -541,13 +66,9 @@ async def test_team_retry_rejects_unavailable_routes(
     client, db_session, monkeypatch, invalid_route,
 ):
     from packages.core.models.workspace import Workspace
-    from packages.core.tasks import ai_tasks
-    from datetime import datetime, timezone
 
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
     headers, me, workspace, subs = await _workspace(client, db_session)
-    task, plan, steps = await _legacy_task(client, db_session, headers, me, workspace)
+    task = await _waiting_task(client, db_session, headers, workspace)
     if invalid_route == "inactive":
         for sub in subs.values():
             sub.status = "inactive"
@@ -562,7 +83,6 @@ async def test_team_retry_rejects_unavailable_routes(
     await db_session.commit()
     response = await client.post(f"/api/v1/tasks/{task.id}/retry", headers=headers, json={})
     assert response.status_code == (403 if invalid_route == "deleted_workspace" else 409), response.text
-    assert dispatched == []
     await db_session.refresh(task)
     assert task.status == "waiting_on_customer"
     assert task.owner_subscription_id is None
@@ -574,11 +94,8 @@ async def test_first_execution_and_retry_have_identical_routes(client, db_sessio
     from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_create_task_action
     from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from packages.core.tasks import ai_tasks
     from packages.core.tasks import runtime_tasks
 
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
     _headers, me, workspace, subs = await _workspace(client, db_session)
     kwargs = {"entity_id": me["entity_id"], "workspace_id": workspace["id"], "user_id": me["id"]}
     accepted = json.loads(await runtime_workspace_create_task_action(
@@ -602,7 +119,6 @@ async def test_first_execution_and_retry_have_identical_routes(client, db_sessio
         intent_generation=event.payload["intent_generation"],
     )
     assert delivered["status"] == "admitted"
-    assert dispatched == []
     from packages.core.services.task_execution import resolve_task_execution, task_plan_subscriptions
 
     task = await db_session.get(Task, accepted["task"]["id"])
@@ -636,7 +152,6 @@ async def test_first_execution_and_retry_have_identical_routes(client, db_sessio
         intent_generation=retry_event.payload["intent_generation"],
     )
     assert retry_delivery["status"] == "admitted"
-    assert dispatched == []
 
 
 @pytest.mark.asyncio
@@ -697,10 +212,10 @@ async def test_task_runtime_factory_separates_business_type_from_execution_surfa
         task_type=TaskType.GENERAL.value,
         delegate_service_keys=[],
     )
-    legacy = Task(
+    standalone = Task(
         id=generate_ulid(),
         entity_id=me["entity_id"],
-        title="Legacy standalone Agent",
+        title="Standalone Agent",
         task_type=TaskType.GENERAL.value,
         agent_id=generate_ulid(),
         delegate_service_keys=[],
@@ -709,7 +224,7 @@ async def test_task_runtime_factory_separates_business_type_from_execution_surfa
     interactive_route = await resolve_task_execution(db_session, interactive)
     approval_route = await resolve_task_execution(db_session, approval)
     manual_route = await resolve_task_execution(db_session, manual)
-    legacy_route = await resolve_task_execution(db_session, legacy)
+    standalone_route = await resolve_task_execution(db_session, standalone)
 
     assert interactive_route.runtime_kind is TaskRuntimeKind.INTERACTIVE_SESSION
     assert interactive_route.mode == "interactive_session"
@@ -720,9 +235,11 @@ async def test_task_runtime_factory_separates_business_type_from_execution_surfa
     assert manual_route.runtime_kind is TaskRuntimeKind.MANUAL
     assert manual_route.mode == "manual"
     assert manual_route.is_dispatchable is False
-    assert legacy_route.runtime_kind is TaskRuntimeKind.LEGACY_AGENT
-    assert legacy_route.mode == "agent"
-    assert legacy_route.is_dispatchable is True
+    # A Task outside any Workspace runs as its Agent alone, on the same run.
+    assert standalone_route.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+    assert standalone_route.mode == "plan_new"
+    assert standalone_route.coordinator.is_agent_only
+    assert standalone_route.coordinator.root.agent_id == standalone.agent_id
 
 
 @pytest.mark.asyncio
@@ -769,100 +286,6 @@ async def test_legacy_transport_routes_workspace_task_through_coordinator_factor
         )
     )).scalar_one()
     assert event.payload["task_id"] == task_id
-
-
-@pytest.mark.asyncio
-async def test_legacy_transport_only_monitors_an_existing_workspace_plan(
-    client,
-    db_session,
-    monkeypatch,
-):
-    import packages.core.database as db_module
-    from packages.core.services import task_execution
-    from packages.core.tasks import ai_tasks
-
-    _headers, me, workspace, _subscriptions = await _workspace(client, db_session)
-    task = Task(
-        id=generate_ulid(),
-        entity_id=me["entity_id"],
-        workspace_id=workspace["id"],
-        title="Already coordinated work",
-        status="in_progress",
-        task_type=TaskType.SCHEDULED.value,
-        owner_service_key="content_creation",
-        delegate_service_keys=[],
-    )
-    plan = ExecutionPlan(
-        id=generate_ulid(),
-        entity_id=task.entity_id,
-        workspace_id=task.workspace_id,
-        task_id=task.id,
-        status="running",
-        plan_dag={},
-    )
-    db_session.add_all([task, plan])
-    await db_session.commit()
-
-    async def forbidden_stage(*_args, **_kwargs):
-        pytest.fail("an existing Plan must not restage initial Task dispatch")
-
-    monkeypatch.setattr(
-        task_execution,
-        "stage_task_execution_intent",
-        forbidden_stage,
-    )
-
-    legacy_dispatch, result = await ai_tasks._prepare_agent_task_runtime(
-        db_module.async_session,
-        task.id,
-    )
-
-    assert legacy_dispatch is None
-    assert result == {
-        "task_id": task.id,
-        "status": "in_progress",
-        "runtime_kind": TaskRuntimeKind.COORDINATED_PLAN.value,
-        "coordinator_monitor": True,
-        "duplicate_suppressed": True,
-        "reason": "active_plan_owns_task_execution",
-        "plan_id": plan.id,
-    }
-
-
-@pytest.mark.asyncio
-async def test_task_runner_final_fence_rejects_workspace_runtime_before_provider(
-    client,
-    db_session,
-):
-    import packages.core.database as db_module
-    from packages.core.ai.task_runner import TaskRunner
-
-    _headers, me, workspace, _subscriptions = await _workspace(client, db_session)
-    task = Task(
-        id=generate_ulid(),
-        entity_id=me["entity_id"],
-        workspace_id=workspace["id"],
-        title="Never enter the legacy provider loop",
-        status="in_progress",
-        task_type=TaskType.GENERAL.value,
-        owner_service_key="content_creation",
-        delegate_service_keys=[],
-    )
-    db_session.add(task)
-    await db_session.commit()
-
-    class ForbiddenEngine:
-        def __getattr__(self, name):
-            raise AssertionError(f"legacy provider engine was accessed: {name}")
-
-    result = await TaskRunner(
-        engine=ForbiddenEngine(),
-        session_factory=db_module.async_session,
-    ).run(task.id)
-
-    assert result["reason"] == "task_runtime_requires_factory"
-    assert result["runtime_kind"] == TaskRuntimeKind.COORDINATED_PLAN.value
-    assert result["runtime_factory_recheck"] is True
 
 
 @pytest.mark.asyncio
@@ -940,17 +363,13 @@ async def test_initial_status_dispatch_waits_for_owning_transaction(client, db_s
     from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
     from packages.core.services.task_service import update_task
-    from packages.core.tasks import ai_tasks
 
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
     headers, me, workspace, _subs = await _workspace(client, db_session)
     created = (await client.post("/api/v1/tasks", headers=headers, json={
         "title": "Team execution", "workspace_id": workspace["id"],
     })).json()
     nested = await db_session.begin_nested() if transaction == "savepoint_rollback" else None
     await update_task(db_session, created["id"], me["entity_id"], status="in_progress")
-    assert dispatched == []
     if nested:
         await nested.rollback()
     if transaction == "rollback":
@@ -963,28 +382,6 @@ async def test_initial_status_dispatch_waits_for_owning_transaction(client, db_s
         )
     )).scalars().all())
     assert len(events) == (1 if transaction == "commit" else 0)
-    assert dispatched == []
-
-
-async def test_retry_blocks_unreconciled_effect_instead_of_replaying_failed_step(client, db_session, monkeypatch):
-    from packages.core.tasks import ai_tasks
-
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
-    monkeypatch.setattr(ai_tasks.run_plan, "delay", lambda plan_id: pytest.fail("must not replay the side effect"))
-    headers, me, workspace, _subs = await _workspace(client, db_session)
-    task, plan, steps = await _legacy_task(client, db_session, headers, me, workspace)
-    plan.status = "failed"
-    steps[-1].step_status = "failed"
-    steps[-1].evidence_refs = [{"kind": "tool_effect", "effect": "publish", "fields": {"tweet_id": "123"}}]
-    await db_session.commit()
-    response = await client.post(f"/api/v1/tasks/{task.id}/retry", headers=headers, json={})
-    assert response.status_code == 409, response.text
-    await db_session.refresh(task)
-    await db_session.refresh(plan)
-    assert dispatched == []
-    assert plan.status == "failed"
-    assert "not safely replayable" in response.json()["detail"]
 
 
 async def test_api_creation_with_agent_and_service_uses_same_planner_as_retry(client, db_session, monkeypatch):
@@ -993,9 +390,7 @@ async def test_api_creation_with_agent_and_service_uses_same_planner_as_retry(cl
     from packages.core.tasks import ai_tasks
     from packages.core.tasks import runtime_tasks
 
-    dispatched = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
-    monkeypatch.setattr(ai_tasks.run_agent_task, "delay", lambda *args: pytest.fail("must use the Task's Plan route"))
+    monkeypatch.setattr(ai_tasks.run_agent_task, "delay", lambda *args: pytest.fail("must use the Task's agent-loop route"))
     headers, _me, workspace, subs = await _workspace(client, db_session)
     response = await client.post("/api/v1/tasks", headers=headers, json={
         "title": "Owner and assigned Agent", "workspace_id": workspace["id"],
@@ -1010,7 +405,6 @@ async def test_api_creation_with_agent_and_service_uses_same_planner_as_retry(cl
             RuntimeOutboxEvent.aggregate_id == task.id,
         )
     )).scalar_one()
-    assert dispatched == []
     await db_session.commit()
     delivered = await runtime_tasks.consume_task_execution_intent_once(
         event_id=event.id,
@@ -1018,7 +412,6 @@ async def test_api_creation_with_agent_and_service_uses_same_planner_as_retry(cl
         intent_generation=event.payload["intent_generation"],
     )
     assert delivered["status"] == "admitted"
-    assert dispatched == []
     from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
     run = (await db_session.execute(
         select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task.id)
@@ -1042,7 +435,6 @@ async def test_api_creation_with_agent_and_service_uses_same_planner_as_retry(cl
         intent_generation=retry_event.payload["intent_generation"],
     )
     assert retry_delivery["status"] == "admitted"
-    assert dispatched == []
 
 
 @pytest.mark.parametrize("assignment", ["owner_service_key", "owner_subscription_id"])

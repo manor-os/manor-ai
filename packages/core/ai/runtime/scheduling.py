@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from packages.core.ai.runtime.billing import (
     runtime_ensure_goal_billing_context,
-    runtime_ensure_task_billing_context,
     runtime_ensure_workspace_billing_context,
 )
 from packages.core.ai.runtime.sources import (
@@ -373,6 +372,18 @@ async def _runtime_scoped_job_writable(
     return True
 
 
+async def _collaborator_job_workspace(db, *, entity_id: str, user_id: str | None, workspace_id: str | None) -> str | None:
+    """The only Workspace a collaborator-involved listing may show ('' for none), else None."""
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+    from packages.core.services.runtime_authorization.collaborator import is_runtime_collaborator
+
+    if collaborators_acting_now(entity_id) or (
+        user_id and await is_runtime_collaborator(str(user_id), entity_id, db=db)
+    ):
+        return str(workspace_id or "")
+    return None
+
+
 async def runtime_list_scheduled_jobs_action(
     *,
     entity_id: str,
@@ -403,10 +414,17 @@ async def runtime_list_scheduled_jobs_action(
         )
         if scope:
             readable_workspace_ids &= {scope[0]}
+        listed_workspace_id = scope[0] if scope else (str(workspace_id) if not user_id and workspace_id else None)
+        pinned = await _collaborator_job_workspace(db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id)
+        if pinned is not None:
+            # A collaborator's run lists its own Workspace's Jobs only.
+            if not pinned or (listed_workspace_id and listed_workspace_id != pinned):
+                return "No scheduled jobs found."
+            listed_workspace_id, readable_workspace_ids = pinned, {pinned}
         jobs, _total = await list_scheduled_jobs(
             db,
             entity_id,
-            workspace_id=scope[0] if scope else (str(workspace_id) if not user_id and workspace_id else None),
+            workspace_id=listed_workspace_id,
             readable_workspace_ids=readable_workspace_ids,
         )
 
@@ -523,6 +541,15 @@ async def runtime_query_scheduled_jobs_action(
                     user_id=user_id,
                     role=None,
                 )
+            pinned = await _collaborator_job_workspace(
+                session, entity_id=entity_id, user_id=user_id, workspace_id=runtime_workspace_id,
+            )
+            if pinned is not None:
+                # A collaborator's run lists its own Workspace's Jobs only.
+                requested = ({resolved_workspace_id} if resolved_workspace_id else set()) | set(map(str, workspace_ids or ()))
+                if not pinned or requested - {pinned}:
+                    return json.dumps({"ok": True, "automations": [], "total": 0, "count": 0})
+                resolved_workspace_id, workspace_ids, readable_workspace_ids = pinned, None, {pinned}
             jobs, total = await list_scheduled_jobs(
                 session,
                 entity_id,
@@ -896,18 +923,3 @@ async def runtime_ensure_goal_measurement_billing_context(
         ],
     )
 
-
-async def runtime_ensure_plan_and_run_task_billing_context(
-    db: Any,
-    task_id: str,
-) -> Any:
-    """Bind billing context for the plan-and-run task planner job."""
-
-    return await runtime_ensure_task_billing_context(
-        db,
-        task_id,
-        source=RUNTIME_SCHEDULED_SCOPED_AI_BILLING_SOURCES[
-            RUNTIME_PLAN_AND_RUN_TASK_SOURCE
-        ],
-        model_role="primary",
-    )

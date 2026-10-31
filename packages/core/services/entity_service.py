@@ -109,14 +109,19 @@ async def update_entity(db: AsyncSession, entity_id: str, **fields) -> Optional[
 
 # ── Workspace ──
 
-async def list_workspaces(db: AsyncSession, entity_id: str) -> list[Workspace]:
+async def list_workspaces(
+    db: AsyncSession, entity_id: str, *, initialize_artifact_folder: bool = True,
+) -> list[Workspace]:
     result = await db.execute(
         select(Workspace)
         .where(Workspace.entity_id == entity_id, Workspace.deleted_at.is_(None))
         .order_by(Workspace.created_at.desc())
     )
     workspaces = list(result.scalars().all())
-    missing = [workspace for workspace in workspaces if not workspace.artifact_folder_id]
+    missing = [
+        workspace for workspace in workspaces
+        if initialize_artifact_folder and not workspace.artifact_folder_id
+    ]
     if missing:
         from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
         for workspace in missing:
@@ -127,7 +132,13 @@ async def list_workspaces(db: AsyncSession, entity_id: str) -> list[Workspace]:
     return workspaces
 
 
-async def get_workspace(db: AsyncSession, workspace_id: str, entity_id: str) -> Optional[Workspace]:
+async def get_workspace(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+    *,
+    initialize_artifact_folder: bool = True,
+) -> Optional[Workspace]:
     result = await db.execute(
         select(Workspace).where(
             Workspace.id == workspace_id,
@@ -136,7 +147,7 @@ async def get_workspace(db: AsyncSession, workspace_id: str, entity_id: str) -> 
         )
     )
     workspace = result.scalar_one_or_none()
-    if workspace is not None and not workspace.artifact_folder_id:
+    if initialize_artifact_folder and workspace is not None and not workspace.artifact_folder_id:
         from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
         await ensure_workspace_artifact_folder(db, workspace)
         await db.refresh(workspace)
@@ -248,6 +259,9 @@ async def update_workspace(
             ws.settings,
             fields["settings"],
         )
+        from packages.core.services.collaborator_scope import refuse_collaborator_settings_change
+
+        refuse_collaborator_settings_change(ws.settings, fields["settings"], entity_id=entity_id)
     for k, v in fields.items():
         if hasattr(ws, k) and (v is not None or k in clear_fields):
             old = getattr(ws, k, None)
@@ -296,8 +310,14 @@ async def soft_delete_workspace(
         return False
     ws.deleted_at = datetime.now(timezone.utc)
     from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+    from packages.core.services.external_collaboration_access import (
+        lock_access_grant_workspaces,
+        sync_access_grants,
+    )
+    access_grant_ids = await lock_access_grant_workspaces(db, WorkspaceCollaboration.workspace_id == ws.id)
     await db.execute(update(WorkspaceCollaboration).where(WorkspaceCollaboration.workspace_id == ws.id)
         .values(status="revoked", snapshot={}))
+    await sync_access_grants(db, access_grant_ids)
     from sqlalchemy import delete as sa_delete
     from packages.core.services.scheduler_service import delete_workspace_automations
     from packages.core.models.workflow import WorkflowActionGrant
@@ -1580,18 +1600,40 @@ async def purge_workspace(
     await db.execute(sa_delete(RuntimeEvidence).where(
         RuntimeEvidence.workspace_id == workspace_id,
     ))
+    # Credit rows are another company's ledger when that company paid for
+    # spend here (a provider sponsoring a client delivery trial). Only the
+    # Workspace owner's own charges go with the Workspace.
     workspace_credit_usage_ids = sa_select(CreditUsageLog.id).where(
         CreditUsageLog.workspace_id == workspace_id,
+        CreditUsageLog.entity_id == ws.entity_id,
     )
     await db.execute(sa_delete(CreditUsageAllocation).where(
         CreditUsageAllocation.usage_log_id.in_(workspace_credit_usage_ids),
+        CreditUsageAllocation.entity_id == ws.entity_id,
     ))
     await db.execute(sa_delete(CreditUsageLog).where(
         CreditUsageLog.workspace_id == workspace_id,
+        CreditUsageLog.entity_id == ws.entity_id,
     ))
     await db.execute(sa_delete(CreditReservation).where(
         CreditReservation.workspace_id == workspace_id,
+        CreditReservation.entity_id == ws.entity_id,
     ))
+    # Another company's holds for work here can never settle once the
+    # Workspace is gone (some never expire), so release them; its consumed
+    # reservations stay as history.
+    from packages.core.services.credit_reservations import (
+        RESERVATION_STATUS_ACTIVE,
+        release_reservation,
+    )
+
+    foreign_holds = (await db.execute(sa_select(CreditReservation.id).where(
+        CreditReservation.workspace_id == workspace_id,
+        CreditReservation.entity_id != ws.entity_id,
+        CreditReservation.status == RESERVATION_STATUS_ACTIVE,
+    ))).scalars().all()
+    for reservation_id in foreign_holds:
+        await release_reservation(db, reservation_id=reservation_id, reason="Workspace purged")
     await db.execute(sa_delete(TokenUsageLog).where(
         TokenUsageLog.workspace_id == workspace_id,
     ))
@@ -1734,6 +1776,15 @@ async def purge_workspace(
     ))
 
     from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
+    from packages.core.services.external_collaboration_access import (
+        lock_access_grant_workspaces,
+        sync_access_grants,
+    )
+    # Derived memberships outlive the Workspace unless cleared before the grants go.
+    access_grant_ids = await lock_access_grant_workspaces(db, WorkspaceCollaboration.workspace_id == workspace_id)
+    await db.execute(sa_update(WorkspaceCollaboration).where(WorkspaceCollaboration.id.in_(access_grant_ids))
+        .values(status="revoked"))
+    await sync_access_grants(db, access_grant_ids)
     for model in (WorkspaceCollaborationEntry, WorkspaceCollaboration):
         await db.execute(sa_delete(model).where(model.workspace_id == workspace_id))
 

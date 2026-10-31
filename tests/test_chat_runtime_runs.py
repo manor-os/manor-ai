@@ -8,10 +8,12 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from apps.api.routers.chat import (
+    _background_approval_reply_meta,
     _durable_runtime_event_stream,
+    _runtime_approval_rejected_stream,
     _terminal_runtime_approval_outcome,
     cancel_chat_runtime_run,
     get_chat_runtime_run_status,
@@ -63,6 +65,19 @@ def test_host_resolved_runtime_approval_has_typed_terminal_routing() -> None:
         "approval_kind": "task_runtime",
         "task_runtime_resume": {"choice": "approved"},
     }) is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_background_approval_reply_is_a_hidden_receipt() -> None:
+    """The card's "You chose" line answers an approval that resumed a Task or
+    Workflow; a Workspace conversation streams and shows no reply of its own."""
+
+    assert _background_approval_reply_meta(SimpleNamespace(workspace_id="ws")) == {"approval_receipt": True}
+    assert _background_approval_reply_meta(SimpleNamespace(workspace_id=None)) is None
+    silent = [frame async for frame in _runtime_approval_rejected_stream("conv", "", "msg")]
+    assert len(silent) == 2 and "text_delta" not in "".join(silent)
+    spoken = [frame async for frame in _runtime_approval_rejected_stream("conv", "Approved.", "msg")]
+    assert any("text_delta" in frame and "Approved." in frame for frame in spoken)
 
 
 def _run(*, run_id: str, user_id: str = "user_chat_run") -> RuntimeRun:
@@ -302,11 +317,6 @@ async def test_outbox_dispatch_commits_recovery_before_publishing(monkeypatch) -
     monkeypatch.setattr(runtime_tasks, "_durable_external_sandbox_enabled", lambda: True)
     monkeypatch.setattr(runtime_tasks, "expire_runtime_human_input_requests", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        runtime_tasks,
-        "_recover_task_runtime_resume_outbox",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(
         "packages.core.database.create_worker_session",
         lambda: lambda: FakeSession(),
     )
@@ -372,11 +382,6 @@ async def test_outbox_dispatch_runs_when_external_sandbox_is_disabled(monkeypatc
     expiry = AsyncMock(return_value=[])
     monkeypatch.setattr("packages.core.services.runtime_run_service.recover_expired_runtime_run_leases", recovery)
     monkeypatch.setattr(runtime_tasks, "expire_runtime_human_input_requests", expiry)
-    monkeypatch.setattr(
-        runtime_tasks,
-        "_recover_task_runtime_resume_outbox",
-        AsyncMock(return_value=0),
-    )
     monkeypatch.setattr(
         "packages.core.database.create_worker_session",
         lambda: lambda: FakeSession(),
@@ -448,11 +453,6 @@ async def test_outbox_dispatch_backs_off_failed_oldest_event(monkeypatch) -> Non
     monkeypatch.setattr("packages.core.services.runtime_run_service.recover_expired_runtime_run_leases", AsyncMock(return_value=(0, 0)))
     monkeypatch.setattr(runtime_tasks, "expire_runtime_human_input_requests", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        runtime_tasks,
-        "_recover_task_runtime_resume_outbox",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(
         "packages.core.database.create_worker_session",
         lambda: lambda: FakeSession(),
     )
@@ -492,61 +492,6 @@ def test_runtime_outbox_retry_backoff_is_exponential_and_bounded(
         now,
         attempt_count=attempt_count,
     ) == now + timedelta(seconds=delay_seconds)
-
-
-@pytest.mark.integration
-async def test_invalid_resume_recovery_rows_do_not_starve_oldest_batch(
-    db_session,
-    monkeypatch,
-) -> None:
-    from packages.core.services import task_runtime_approvals
-    from packages.core.tasks import runtime_tasks
-
-    now = datetime.now(timezone.utc)
-    older = RuntimeOutboxEvent(
-        event_type=task_runtime_approvals.TASK_RUNTIME_RESUME_EVENT,
-        aggregate_id="invalid-resume-older",
-        dedupe_key=f"invalid-resume:{generate_ulid()}",
-        payload={"task_id": "task-older"},
-        delivered_at=now - timedelta(minutes=10),
-        available_at=now - timedelta(minutes=10),
-    )
-    newer = RuntimeOutboxEvent(
-        event_type=task_runtime_approvals.TASK_RUNTIME_RESUME_EVENT,
-        aggregate_id="invalid-resume-newer",
-        dedupe_key=f"invalid-resume:{generate_ulid()}",
-        payload={"task_id": "task-newer", "runtime_hitl_id": "hitl-newer"},
-        delivered_at=now - timedelta(minutes=9),
-        available_at=now - timedelta(minutes=9),
-    )
-    db_session.add_all([older, newer])
-    await db_session.commit()
-
-    async def invalid_delivery(*_args, **_kwargs):
-        return False
-
-    monkeypatch.setattr(
-        task_runtime_approvals,
-        "validate_task_runtime_resume_delivery",
-        invalid_delivery,
-    )
-
-    assert await runtime_tasks._recover_task_runtime_resume_outbox(
-        db_session,
-        now=now,
-        batch_size=1,
-    ) == 0
-    await db_session.flush()
-    assert older.last_error == runtime_tasks._TASK_RUNTIME_RESUME_INVALID_SENTINEL
-    assert newer.last_error is None
-
-    assert await runtime_tasks._recover_task_runtime_resume_outbox(
-        db_session,
-        now=now,
-        batch_size=1,
-    ) == 0
-    await db_session.flush()
-    assert newer.last_error == runtime_tasks._TASK_RUNTIME_RESUME_INVALID_SENTINEL
 
 
 @pytest.mark.integration
@@ -594,8 +539,21 @@ async def test_runtime_execution_claim_is_exclusive_and_terminal_write_is_idempo
     assert repeated.result == {"message_id": run.assistant_message_id}
 
 
+@pytest.fixture
+async def empty_runtime_lease_pool(db_session):
+    """Global sweep tests own the run pool, including previously committed rows.
+
+    Keep this baseline transactional so the test session rollback restores rows
+    from other scenarios; ordinary run-specific tests do not need this reset.
+    """
+    await db_session.execute(delete(RuntimeRun))
+    await db_session.flush()
+
+
 @pytest.mark.integration
-async def test_expired_runtime_lease_is_requeued_once_with_versioned_outbox(db_session) -> None:
+async def test_expired_runtime_lease_is_requeued_once_with_versioned_outbox(
+    db_session, empty_runtime_lease_pool,
+) -> None:
     now = datetime.now(timezone.utc)
     run = _run(run_id=generate_ulid())
     run.status = RuntimeRunStatus.RUNNING.value
@@ -637,7 +595,9 @@ async def test_expired_runtime_lease_is_requeued_once_with_versioned_outbox(db_s
 
 
 @pytest.mark.integration
-async def test_runtime_lease_recovery_is_bounded_and_finalizes_expired_cancel(db_session) -> None:
+async def test_runtime_lease_recovery_is_bounded_and_finalizes_expired_cancel(
+    db_session, empty_runtime_lease_pool,
+) -> None:
     now = datetime.now(timezone.utc)
     exhausted = _run(run_id=generate_ulid())
     exhausted.status = RuntimeRunStatus.RUNNING.value
@@ -960,9 +920,11 @@ def test_runtime_event_frames_preserve_sse_type_payload_and_replay_id() -> None:
 
 
 @pytest.mark.unit
-async def test_runtime_event_stream_timeout_is_treated_as_an_idle_read() -> None:
+@pytest.mark.parametrize("socket_timeout", [None, 0.5])
+async def test_runtime_event_stream_timeout_is_treated_as_an_idle_read(socket_timeout) -> None:
     class TimeoutRedis:
         block_ms: int | None = None
+        connection_pool = SimpleNamespace(connection_kwargs={"socket_timeout": socket_timeout})
 
         async def xread(self, streams, *, count, block):
             self.block_ms = block
@@ -971,7 +933,10 @@ async def test_runtime_event_stream_timeout_is_treated_as_an_idle_read() -> None
     redis = TimeoutRedis()
 
     assert await read_runtime_sse_events("run-timeout", redis_client=redis) == []
-    assert redis.block_ms == 4000
+    if socket_timeout is None:
+        assert redis.block_ms == 4000
+    else:
+        assert 0 < redis.block_ms / 1000 + 0.2 < socket_timeout
 
 
 @pytest.mark.unit

@@ -14,6 +14,20 @@ class RuntimeMediaCredentials:
     is_byok: bool = False
 
 
+def _trusted_workflow_arguments(workflow_context: dict[str, Any] | None) -> dict[str, Any]:
+    """The trusted Workflow arguments (run, project) a media call was made under.
+
+    Generation reads them to use what the project keeps: its voices and its
+    named images. Anything else a caller passes is dropped.
+    """
+    from packages.core.ai.runtime.workflow_tools import RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS
+
+    return {
+        key: value for key, value in (workflow_context or {}).items()
+        if key in RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS.values() and value is not None
+    }
+
+
 async def runtime_generate_image_media(
     *,
     entity_id: str,
@@ -26,6 +40,7 @@ async def runtime_generate_image_media(
     agent_id: str | None = None,
     conversation_id: str | None = None,
     workspace_shared: bool = False,
+    workflow_context: dict[str, Any] | None = None,
 ) -> str:
     """Run image generation through the Runtime media boundary."""
 
@@ -42,6 +57,7 @@ async def runtime_generate_image_media(
         conversation_id=conversation_id,
         _workspace_shared_from_context=workspace_shared,
         **dict(params or {}),
+        **_trusted_workflow_arguments(workflow_context),
     )
 
 
@@ -56,6 +72,7 @@ async def runtime_generate_audio_media(
     task_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
+    workflow_context: dict[str, Any] | None = None,
 ) -> str:
     """Run audio generation through the Runtime media boundary."""
 
@@ -71,6 +88,7 @@ async def runtime_generate_audio_media(
         task_id=task_id,
         agent_id=agent_id,
         **dict(params or {}),
+        **_trusted_workflow_arguments(workflow_context),
     )
 
 
@@ -88,12 +106,19 @@ async def runtime_generate_video_media(
     active_user_message: str | None = None,
     runtime_artifact_urls: Iterable[str] | None = None,
     dependency_artifact_urls: Iterable[str] | None = None,
+    workflow_context: dict[str, Any] | None = None,
+    lineage: dict[str, str] | None = None,
 ) -> str:
-    """Run video generation through the Runtime media boundary."""
+    """Run video generation through the Runtime media boundary.
+
+    ``lineage`` (``regenerated_from``/``lineage_root``) marks the job as a new
+    version of an earlier one; only server code that loaded that job sets it.
+    """
 
     from packages.core.ai.tools.extended_tools import _generate_video_handler
 
     return await _generate_video_handler(
+        _media_lineage_from_context=dict(lineage or {}),
         entity_id=entity_id,
         user_id=user_id,
         prompt=prompt,
@@ -105,39 +130,9 @@ async def runtime_generate_video_media(
         _active_user_message_from_context=active_user_message,
         _runtime_artifact_urls_from_context=list(runtime_artifact_urls or []),
         _dependency_artifact_urls_from_context=list(dependency_artifact_urls or []),
-        **dict(params or {}),
-    )
-
-
-async def runtime_resolve_suno_audio_credentials(
-    *,
-    user_id: str,
-    entity_id: str,
-    byok: bool,
-) -> RuntimeMediaCredentials:
-    """Resolve the role-scoped BYOK key or Manor's managed Suno key."""
-
-    from packages.core.ai.tools.extended_tools import (
-        _platform_native_media_credential_async,
-        _resolve_user_media_credentials,
-    )
-
-    if byok:
-        api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
-            user_id,
-            entity_id,
-            role="audio",
-        )
-    else:
-        api_key, native_base_url = await _platform_native_media_credential_async("suno")
-        base_url_override = native_base_url
-        is_byok = False
-    return RuntimeMediaCredentials(
-        api_key=api_key,
-        provider="suno",
-        catalog_provider="suno",
-        base_url_override=base_url_override,
-        is_byok=is_byok,
+        # Caller params cannot claim a lineage; only ``lineage`` sets it.
+        **{key: value for key, value in (params or {}).items() if key != "_media_lineage_from_context"},
+        **_trusted_workflow_arguments(workflow_context),
     )
 
 
@@ -155,6 +150,8 @@ async def runtime_resolve_video_recovery_credentials(
         _platform_native_media_credential_async,
         _prefer_native_video_credentials,
         _resolve_user_media_credentials,
+        _resolve_user_video_model,
+        _selectable_media_model,
     )
 
     catalog_provider = _catalog_provider(model)
@@ -177,7 +174,18 @@ async def runtime_resolve_video_recovery_credentials(
         user_id,
         entity_id,
         role="video",
+        **({"require_saved_base": True} if catalog_provider == "xai" else {}),
     )
+    if catalog_provider == "xai":
+        if not is_byok or await _resolve_user_video_model(user_id, entity_id) != model:
+            api_key, is_byok = "", False
+        return RuntimeMediaCredentials(api_key, "xai", catalog_provider, base_url_override, is_byok)
+    if not _selectable_media_model(model, "video"):
+        # Outside the catalog there is no managed route: only the Account's own
+        # key, saved for this exact model.
+        if not is_byok or await _resolve_user_video_model(user_id, entity_id) != model:
+            api_key, is_byok = "", False
+        return RuntimeMediaCredentials(api_key, catalog_provider, catalog_provider, base_url_override, is_byok)
     if provider_hint != "openrouter":
         if not is_byok and catalog_provider in {"bytedance", "kwaivgi"}:
             native_key, native_base_url = await _platform_native_media_credential_async(catalog_provider)
@@ -226,6 +234,8 @@ async def runtime_resolve_video_generation_credentials(
         _platform_native_media_credential_async,
         _prefer_native_video_credentials,
         _resolve_user_media_credentials,
+        _resolve_user_video_model,
+        _selectable_media_model,
     )
 
     catalog_provider = _catalog_provider(model)
@@ -248,7 +258,18 @@ async def runtime_resolve_video_generation_credentials(
         user_id,
         entity_id,
         role="video",
+        **({"require_saved_base": True} if catalog_provider == "xai" else {}),
     )
+    if catalog_provider == "xai":
+        if not is_byok or await _resolve_user_video_model(user_id, entity_id) != model:
+            api_key, is_byok = "", False
+        return RuntimeMediaCredentials(api_key, "xai", catalog_provider, base_url_override, is_byok)
+    if not _selectable_media_model(model, "video"):
+        # Outside the catalog there is no managed route: only the Account's own
+        # key, saved for this exact model.
+        if not is_byok or await _resolve_user_video_model(user_id, entity_id) != model:
+            api_key, is_byok = "", False
+        return RuntimeMediaCredentials(api_key, catalog_provider, catalog_provider, base_url_override, is_byok)
     if adapter_name == openrouter_adapter_name:
         if not api_key.startswith("sk-or-"):
             api_key, _openrouter_base_url = await _platform_native_media_credential_async("openrouter")
@@ -310,3 +331,36 @@ async def runtime_recording_source_path(reference: str, ctx: dict) -> tuple[str,
     from packages.core.ai.tools.recording_tools import _source_path
 
     return await _source_path(reference, ctx)
+
+
+async def runtime_document_ref_paths(refs: Any, entity_id: str, *, limit: int) -> list[str]:
+    """Knowledge paths of picked Documents, in order and without repeats.
+
+    A ``documents`` run input carries refs as the browser sent them, so only the
+    ``document_id`` is trusted: each path comes from the Document row. Callers
+    still open each path through their normal file access check.
+    """
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+
+    if refs in (None, "", []):
+        return []
+    if not isinstance(refs, list) or not all(isinstance(ref, dict) for ref in refs):
+        raise ValueError("Pick files from Knowledge or upload them")
+    ids = list(dict.fromkeys(str(ref.get("document_id") or "").strip() for ref in refs))
+    if "" in ids:
+        raise ValueError("Each picked file needs its Knowledge document")
+    if len(ids) > limit:
+        raise ValueError(f"Pick at most {limit} file{'s' if limit != 1 else ''}")
+    async with async_session() as db:
+        rows = (await db.execute(select(Document.id, Document.fs_path).where(
+            Document.entity_id == entity_id, Document.id.in_(ids), Document.is_trashed.is_(False),
+        ))).all()
+    found = dict(rows)
+    if any(document_id not in found for document_id in ids):
+        raise ValueError("A picked file is no longer in Knowledge; pick it again")
+    if any(not found[document_id] for document_id in ids):
+        raise ValueError("A picked Knowledge document has no stored file to read; upload the file instead")
+    return [found[document_id] for document_id in ids]

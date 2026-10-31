@@ -2891,9 +2891,29 @@ async def get_external_calendar_events(
     end: date = Query(..., description="Visible range end date, exclusive."),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    provider: CalendarProvider | None = None,
+    connection_id: str | None = None,
+    include_bookings: bool = False,
 ):
     """Return external calendar events for the user's visible Task calendar range."""
     settings = _normalize_settings(user)
+    connection_snapshot = None
+    # A read-only picker may select another of this user's connected accounts
+    # without changing their booking defaults. Credential resolution below still
+    # enforces user ownership; an unknown account never falls back to a default.
+    if provider is not None:
+        connection_snapshot = await _CalendarConnectionSnapshotFactory.create(db, user, providers=[provider.value])
+        selected = connection_snapshot.select(provider.value, connection_id)
+        if selected is None:
+            raise HTTPException(503, _CALENDAR_SYNC_ERROR)
+        saved = connection_snapshot.select(provider.value, settings.connection_id)
+        same_account = provider.value == settings.provider and saved is not None and selected.id == saved.id
+        settings = settings.model_copy(update={
+            "provider": provider.value, "connection_id": selected.id,
+            **({} if same_account else {"visible_calendar_ids": ["primary"], "conflict_calendar_ids": [], "default_calendar_id": "primary"}),
+        })
+    elif connection_id is not None:
+        raise HTTPException(400, "Calendar provider is required when selecting an account")
     provider = settings.provider
     tz = _timezone(settings.timezone)
     local_start = datetime.combine(start, time.min, tzinfo=tz)
@@ -2919,6 +2939,7 @@ async def get_external_calendar_events(
         user,
         provider,
         settings.connection_id,
+        snapshot=connection_snapshot,
     )
     if not credential:
         raise HTTPException(503, _CALENDAR_SYNC_ERROR)
@@ -2959,7 +2980,7 @@ async def get_external_calendar_events(
             )
             raise HTTPException(503, _CALENDAR_SYNC_ERROR) from exc
         for item in items:
-            if str(item.get("id") or "") in booking_event_ids:
+            if not include_bookings and str(item.get("id") or "") in booking_event_ids:
                 continue
             event = adapter.normalize_event(
                 item,

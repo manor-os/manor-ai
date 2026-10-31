@@ -7,6 +7,8 @@ export interface AuthTokenClaims {
   role?: string;
   token_version?: number;
   typ?: string;
+  /** A scoped collaborator session (typ "collaborator_session"): the one Workspace it opens and what authorized it. */
+  cs?: { workspace_id?: string; kind?: string; ref?: string };
   amr?: string[];
   iat?: number;
   exp?: number;

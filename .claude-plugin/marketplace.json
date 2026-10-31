@@ -1,0 +1,15 @@
+{
+  "name": "manor",
+  "description": "Manor's plugins for building and delivering Workspaces from coding agents.",
+  "owner": {
+    "name": "Manor AI",
+    "url": "https://github.com/manor-os/manor-os"
+  },
+  "plugins": [
+    {
+      "name": "manor",
+      "source": "./plugins/manor",
+      "description": "Build, version, test and deliver Manor Workspaces for your customers."
+    }
+  ]
+}

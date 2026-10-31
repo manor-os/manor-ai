@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -252,7 +253,9 @@ async def test_email_attachment_is_atomically_saved_and_projected(
         }),
     )
     assert len(materials) == 1
-    assert materials[0].data == stored.read_bytes()
+    assert materials[0].size == len(stored.read_bytes())
+    assert materials[0].sha256 == hashlib.sha256(stored.read_bytes()).hexdigest()
+    assert materials[0].document_id == saved["document_id"]
     assert materials[0].source == f"document:{saved['document_id']}"
 
     from packages.core.database import async_session

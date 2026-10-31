@@ -11,6 +11,7 @@ import { IconCheckCircle, IconChevronLeft, IconChevronRight, IconDownload, IconM
 import { t } from "../lib/i18n";
 import { normalizeSignatureFields, type DocumentSignatureField } from "../lib/signatureFields";
 import "../components/permissions/signature.css";
+import { getPreferredTimeZone } from "../lib/format";
 
 interface PublicSignatureRequest {
   id: string;
@@ -447,7 +448,7 @@ export default function SignDocument() {
                     : t("sign.completed_hint", { email: state.data.recipient_email })}
                 </p>
                 {state.data.signed_at && (
-                  <p className="mt-2 font-mono text-xs text-stone-500">{new Date(state.data.signed_at).toLocaleString()}</p>
+                  <p className="mt-2 font-mono text-xs text-stone-500">{new Date(state.data.signed_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() })}</p>
                 )}
                 {state.data.group_finalized === false ? (
                   <Button variant="outline" className="mt-5" onClick={() => setVerificationVersion((version) => version + 1)}>

@@ -865,6 +865,55 @@ async def test_workspace_operation_draft_budget_requires_apply(client: AsyncClie
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "initial_heartbeat", "patch", "expected_status"),
+    [
+        ("", True, {"enabled": False}, "paused"),
+        ("sandbox", True, {"enabled": False}, "active"),
+        ("", False, {"cadence": "weekly"}, "active"),
+    ],
+)
+async def test_workspace_operation_disabling_strategist_preserves_runtime_mode(
+    client: AsyncClient, db_session, kind, initial_heartbeat, patch, expected_status,
+):
+    from sqlalchemy import select
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "ws_op_pause_strategist")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Strategist runtime",
+            "kind": kind,
+            "heartbeat_enabled": initial_heartbeat,
+        },
+    )
+    assert created.status_code == 201, created.text
+    workspace_id = created.json()["id"]
+
+    draft = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/operation/drafts",
+        headers=headers,
+        json={"patches": [{"op": "heartbeat_policy.update", "payload": patch}]},
+    )
+    assert draft.status_code == 200, draft.text
+
+    applied = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/operation/drafts/{draft.json()['id']}/apply",
+        headers=headers,
+        json={"user_confirmation": True},
+    )
+    assert applied.status_code == 200, applied.text
+
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    assert workspace.heartbeat_enabled is False
+    assert workspace.status == expected_status
+
+
+@pytest.mark.asyncio
 async def test_workspace_operation_rule_apply_syncs_governance(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.governance import GovernancePolicy
@@ -4177,6 +4226,7 @@ async def test_workspace_credit_usage_summary_returns_integer_zeros(client: Asyn
         "week_credits": 0,
         "all_time_credits": 0,
         "timezone": "UTC",
+        "paid_by_provider": False,
     }
 
 
@@ -4213,6 +4263,7 @@ async def test_workspace_credit_usage_summary_missing_timezone_falls_back_to_utc
         "week_credits": 0,
         "all_time_credits": 0,
         "timezone": "UTC",
+        "paid_by_provider": False,
     }
 
 
@@ -4291,6 +4342,7 @@ async def test_workspace_credit_usage_summary_uses_user_local_day_and_week(
         "week_credits": 15,
         "all_time_credits": 17,
         "timezone": "Asia/Shanghai",
+        "paid_by_provider": False,
     }
 
 
@@ -7845,650 +7897,6 @@ async def test_workspace_agent_create_task_respects_dependency_outputs_before_di
 
 
 @pytest.mark.asyncio
-async def test_plan_finalize_updates_waiting_task_after_successful_replan(db_session, monkeypatch):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-    from packages.core.plans.executor import PlanExecutor
-
-    async def _completed_supervisor(_db, _plan, _status):
-        from packages.core.constants.supervisor import (
-            SupervisorDecision,
-            SupervisorDecisionSource,
-            SupervisorVerdict,
-        )
-        return SupervisorDecision(
-            verdict=SupervisorVerdict.COMPLETED,
-            evidence="test double",
-            source=SupervisorDecisionSource.MODEL,
-        )
-
-    monkeypatch.setattr(PlanExecutor, "_supervise_outcome", staticmethod(_completed_supervisor))
-
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Next wave: prepare social draft pack",
-            status="waiting_on_customer",
-            actual_output={
-                "plan_id": generate_ulid(),
-                "plan_status": "failed",
-                "summary": "Old failed replan output should be replaced.",
-            },
-        )
-    )
-    plan = ExecutionPlan(
-        id=plan_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        status="running",
-        plan_dag={},
-    )
-    db_session.add(plan)
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="draft_pack",
-            kind="llm",
-            step_status="done",
-            result={
-                "text": "Draft pack ready for review.",
-                "artifact_materialized": True,
-                "files": [
-                    {
-                        "name": "draft-pack.md",
-                        "type": "file",
-                        "fs_path": "Workspaces/Social Ops/Artifacts/draft-pack.md",
-                    }
-                ],
-            },
-        )
-    )
-    await db_session.commit()
-
-    event = await PlanExecutor._finalize(db_session, plan, "completed")
-    await db_session.flush()
-
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "completed"
-    assert task.actual_output["plan_id"] == plan_id
-    assert task.actual_output["plan_status"] == "completed"
-    assert task.actual_output["files"] == [
-        {
-            "type": "file",
-            "step": "draft_pack",
-            "source": "fs_path",
-            "name": "draft-pack.md",
-            "fs_path": "Workspaces/Social Ops/Artifacts/draft-pack.md",
-            "open_url": f"/api/v1/fs/{entity_id}/Workspaces/Social%20Ops/Artifacts/draft-pack.md",
-            "markdown_link": f"[draft-pack.md](/api/v1/fs/{entity_id}/Workspaces/Social%20Ops/Artifacts/draft-pack.md)",
-        }
-    ]
-    assert event["event_type"] == "task.succeeded"
-    assert event["payload"]["task_status"] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session, monkeypatch):
-    from sqlalchemy import select
-    from packages.core.constants.supervisor import (
-        SupervisorDecision,
-        SupervisorDecisionSource,
-        SupervisorVerdict,
-    )
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.models.task import Task
-    from packages.core.models.workspace import Workspace
-    from packages.core.plans.executor import PlanExecutor
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from tests.test_workspace_write_authz import _add_workspace_plan_runtime
-
-    async def _needs_replan_supervisor(_db, _plan, _status):
-        return SupervisorDecision(
-            verdict=SupervisorVerdict.NEEDS_REPLAN,
-            evidence="the structured deliverable needs a different plan",
-            source=SupervisorDecisionSource.MODEL,
-        )
-
-    monkeypatch.setattr(PlanExecutor, "_supervise_outcome", staticmethod(_needs_replan_supervisor))
-
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    db_session.add(Workspace(
-        id=workspace_id, entity_id=entity_id, name="Supervisor replan",
-        status="active", settings={},
-    ))
-    await db_session.flush()
-    subscription = await _add_workspace_plan_runtime(
-        db_session, entity_id=entity_id, workspace_id=workspace_id,
-    )
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    task = Task(
-        id=task_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        title="Select today's Stickman video topic",
-        status="in_progress",
-        task_type="general",
-        owner_service_key=subscription.service_key,
-        owner_subscription_id=subscription.id,
-    )
-    plan = ExecutionPlan(
-        id=plan_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        status="running",
-        plan_dag={},
-    )
-    db_session.add_all([
-        task,
-        plan,
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="select_topic_brief",
-            kind="subagent",
-            step_status="done",
-            result={
-                "status": "succeeded",
-                "summary": "Selected one producer-ready topic.",
-            },
-        ),
-    ])
-    await db_session.commit()
-
-    event = await PlanExecutor._finalize(db_session, plan, "completed")
-    await db_session.flush()
-
-    refreshed_task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    refreshed_plan = (
-        await db_session.execute(select(ExecutionPlan).where(ExecutionPlan.id == plan_id))
-    ).scalar_one()
-    assert event is None
-    assert refreshed_task.status == "in_progress"
-    assert refreshed_plan.status == "replanned"
-    staged = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task_id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    assert staged.payload["task_id"] == task_id
-    assert refreshed_task.details["_replan_context"]["reason"] == "supervisor_review"
-    assert refreshed_task.actual_output["supervisor_verdict"] == "needs_replan"
-
-
-@pytest.mark.asyncio
-async def test_task_detail_does_not_complete_stale_output_without_verified_artifact(client: AsyncClient, db_session):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-
-    headers = await _register(client, "task_detail_reconcile")
-    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task Reconcile"})
-    ws_body = ws.json()
-    entity_id = ws_body["entity_id"]
-    workspace_id = ws_body["id"]
-    task_id = generate_ulid()
-    old_plan_id = generate_ulid()
-    new_plan_id = generate_ulid()
-
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Stale waiting task should reconcile",
-            status="waiting_on_customer",
-            actual_output={
-                "plan_id": old_plan_id,
-                "plan_status": "failed",
-                "steps": [{"key": "assemble", "status": "failed"}],
-            },
-        )
-    )
-    db_session.add(
-        ExecutionPlan(
-            id=new_plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            status="completed",
-            plan_dag={},
-        )
-    )
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=new_plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="assemble",
-            kind="subagent",
-            step_status="done",
-            result={
-                "summary": "Draft pack assembled.",
-                "artifact_materialized": True,
-                "files": [
-                    {
-                        "name": "draft-pack.md",
-                        "type": "file",
-                        "fs_path": "workspace/social_ops/draft-pack.md",
-                    }
-                ],
-            },
-        )
-    )
-    await db_session.commit()
-
-    resp = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "waiting_on_customer"
-    assert body["actual_output"]["plan_id"] == new_plan_id
-    assert body["actual_output"]["plan_status"] == "completed"
-    assert body["actual_output"]["files"][0]["fs_path"] == "workspace/social_ops/draft-pack.md"
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "waiting_on_customer"
-    assert task.actual_output["plan_id"] == new_plan_id
-
-
-@pytest.mark.asyncio
-async def test_task_detail_keeps_open_supervisor_input_request_waiting(client: AsyncClient, db_session):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-    from packages.core.constants.task_actors import TaskActor
-    from packages.core.services.task_service import add_task_log
-
-    headers = await _register(client, "task_detail_open_supervisor_hitl")
-    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task HITL Reconcile"})
-    ws_body = ws.json()
-    entity_id = ws_body["entity_id"]
-    workspace_id = ws_body["id"]
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Completed plan still needs the artifact",
-            status="waiting_on_customer",
-            actual_output={
-                "plan_id": plan_id,
-                "plan_status": "completed",
-                "supervisor_verdict": "needs_human",
-                "needs_input": True,
-                "steps": [{"key": "compile", "status": "done", "result_summary": "Draft text only"}],
-                "files": None,
-            },
-        )
-    )
-    db_session.add(
-        ExecutionPlan(
-            id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            status="completed",
-            plan_dag={},
-        )
-    )
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="compile",
-            kind="subagent",
-            step_status="done",
-            result={"summary": "Draft text only", "artifact_materialized": False},
-        )
-    )
-    await db_session.flush()
-    await add_task_log(
-        db_session,
-        task_id,
-        "ai_hitl_requested",
-        "The plan ran into issues and needs your input.",
-        actor=TaskActor.SUPERVISOR,
-        created_by="AI Supervisor",
-        metadata={"verdict": "needs_human", "plan_id": plan_id, "artifact_required": True},
-    )
-    await db_session.commit()
-
-    resp = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "waiting_on_customer"
-    assert body["actual_output"]["supervisor_verdict"] == "needs_human"
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "waiting_on_customer"
-
-
-@pytest.mark.asyncio
-async def test_plan_finalize_retries_missing_output_without_synthetic_human_input(db_session, monkeypatch):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task, TaskLog
-    from packages.core.plans.executor import PlanExecutor
-
-    supervisor_prompts: list[str] = []
-
-    async def fake_chat_completion(messages, **kwargs):
-        supervisor_prompts.append(messages[0]["content"])
-        return "needs_human", {}
-
-    monkeypatch.setattr("packages.core.ai.llm_client.chat_completion", fake_chat_completion)
-
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Schedule the 7 drafted posts across the first publishing week",
-            status="in_progress",
-            priority=3,
-            task_type="general",
-        )
-    )
-    plan = ExecutionPlan(
-        id=plan_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        status="running",
-        plan_dag={},
-    )
-    db_session.add(plan)
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="build_schedule",
-            kind="subagent",
-            step_status="done",
-            result={
-                "text": (
-                    "The execution reached the scheduling step, but the source "
-                    "draft material was not available in the workspace run context. "
-                    "The schedule was not produced."
-                )
-            },
-        )
-    )
-    await db_session.commit()
-
-    event = await PlanExecutor._finalize(db_session, plan, "completed")
-    await db_session.flush()
-
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    logs = list(
-        (
-            await db_session.execute(
-                select(TaskLog).where(TaskLog.task_id == task_id, TaskLog.log_type == "ai_hitl_requested")
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert task.status == "in_progress"
-    assert task.actual_output is None
-    assert plan.status == "running"
-    assert supervisor_prompts
-    assert "judge the task itself, not the subject it reports on" in supervisor_prompts[-1]
-    assert not logs
-    assert event is None
-
-
-@pytest.mark.asyncio
-async def test_plan_finalize_replans_structured_claim_without_human_input(db_session, monkeypatch):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
-    from packages.core.models.task import Task, TaskLog
-    from packages.core.models.workspace import Workspace
-    from packages.core.plans.executor import PlanExecutor
-    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
-    from tests.test_workspace_write_authz import _add_workspace_plan_runtime
-
-    async def fake_chat_completion(*_args, **_kwargs):
-        raise AssertionError("structured blockers should not need supervisor LLM")
-
-    monkeypatch.setattr("packages.core.ai.llm_client.chat_completion", fake_chat_completion)
-
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    db_session.add(Workspace(
-        id=workspace_id, entity_id=entity_id, name="Structured blocker",
-        status="active", settings={},
-    ))
-    await db_session.flush()
-    subscription = await _add_workspace_plan_runtime(
-        db_session, entity_id=entity_id, workspace_id=workspace_id,
-    )
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Collect source CSV before drafting report",
-            status="in_progress",
-            priority=3,
-            task_type="general",
-            owner_service_key=subscription.service_key,
-            owner_subscription_id=subscription.id,
-        )
-    )
-    plan = ExecutionPlan(
-        id=plan_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        status="running",
-        plan_dag={},
-    )
-    db_session.add(plan)
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="collect_source",
-            kind="subagent",
-            step_status="done",
-            result={
-                "status": "needs_input",
-                "pending_action": {
-                    "kind": "needs_input",
-                    "prompt": "Attach the source CSV.",
-                },
-            },
-        )
-    )
-    await db_session.commit()
-
-    event = await PlanExecutor._finalize(db_session, plan, "completed")
-    await db_session.flush()
-
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    logs = list(
-        (
-            await db_session.execute(
-                select(TaskLog).where(TaskLog.task_id == task_id, TaskLog.log_type == "ai_hitl_requested")
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert task.status == "in_progress"
-    assert task.actual_output["supervisor_verdict"] == "needs_replan"
-    assert plan.status == "replanned"
-    assert logs == []
-    assert event is None
-    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == task_id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    assert wake.payload["task_id"] == task_id
-
-
-def test_task_output_artifact_refs_preserve_document_id_for_viewer_links():
-    from packages.core.plans.executor import _artifact_refs_from_result
-
-    refs = _artifact_refs_from_result(
-        {
-            "artifact_materialized": True,
-            "files": [
-                {
-                    "name": "Maya Chen Follow-up Draft.md",
-                    "type": "file",
-                    "fs_path": "workspace/artifacts/maya-chen-follow-up.md",
-                    "document_id": "01DOCVIEWABLE000000000000",
-                }
-            ],
-        },
-        step_key="draft_follow_up",
-    )
-
-    assert refs == [
-        {
-            "type": "file",
-            "step": "draft_follow_up",
-            "source": "fs_path",
-            "name": "Maya Chen Follow-up Draft.md",
-            "fs_path": "workspace/artifacts/maya-chen-follow-up.md",
-            "document_id": "01DOCVIEWABLE000000000000",
-            "viewer_url": "/viewer/01DOCVIEWABLE000000000000",
-            "open_url": "/viewer/01DOCVIEWABLE000000000000",
-            "markdown_link": "[Maya Chen Follow-up Draft.md](/viewer/01DOCVIEWABLE000000000000)",
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_task_detail_reconciles_duplicate_file_refs(client: AsyncClient, db_session):
-    from sqlalchemy import select
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-
-    headers = await _register(client, "task_detail_dedupe_files")
-    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task File Dedupe"})
-    ws_body = ws.json()
-    entity_id = ws_body["entity_id"]
-    workspace_id = ws_body["id"]
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    file_path = "workspace/social_ops/x_drafts_next_week.md"
-
-    duplicate_ref = {
-        "type": "file",
-        "step": "draft",
-        "source": "fs_path",
-        "fs_path": file_path,
-    }
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            title="Completed task with duplicate file refs",
-            status="completed",
-            actual_output={
-                "plan_id": plan_id,
-                "plan_status": "completed",
-                "files": [duplicate_ref, dict(duplicate_ref)],
-            },
-        )
-    )
-    db_session.add(
-        ExecutionPlan(
-            id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            status="completed",
-            plan_dag={},
-        )
-    )
-    db_session.add(
-        ExecutionStep(
-            id=generate_ulid(),
-            plan_id=plan_id,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            step_key="draft",
-            kind="subagent",
-            step_status="done",
-            result={
-                "summary": "Draft pack ready.",
-                "artifact_materialized": True,
-                "fs_path": file_path,
-                "files": [
-                    {
-                        "name": "x_drafts_next_week.md",
-                        "type": "file",
-                        "fs_path": file_path,
-                    }
-                ],
-            },
-        )
-    )
-    await db_session.commit()
-
-    resp = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
-
-    assert resp.status_code == 200
-    body = resp.json()
-    expected_ref = {
-        **duplicate_ref,
-        "open_url": f"/api/v1/fs/{entity_id}/{file_path}",
-        "markdown_link": f"[x_drafts_next_week.md](/api/v1/fs/{entity_id}/{file_path})",
-    }
-    assert body["actual_output"]["files"] == [expected_ref]
-    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.actual_output["files"] == [expected_ref]
-
-
-@pytest.mark.asyncio
 async def test_goal_progress_does_not_complete_task_without_verified_artifact(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
@@ -8585,10 +7993,6 @@ async def test_workspace_agent_rejects_unknown_owner_or_delegate_before_dispatch
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Task
     from packages.core.models.workspace import Agent, AgentSubscription
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
 
     headers = await _register(client, "ws_agent_owner_safe")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Owner Safety"})
@@ -8650,58 +8054,7 @@ async def test_workspace_agent_rejects_unknown_owner_or_delegate_before_dispatch
     assert invalid_owner["available_service_keys"] == ["leasing_consultant"]
     assert invalid_delegate["error"] == "delegate_service_not_found"
     assert invalid_delegate["missing_delegate_service_keys"] == ["missing_delegate"]
-    assert dispatched == []
     assert tasks == []
-
-
-@pytest.mark.asyncio
-async def test_planner_context_filters_subscriptions_by_task_entity(db_session):
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.task import Task
-    from packages.core.models.workspace import Agent, AgentSubscription
-    from packages.core.plans.planner import _gather_context
-
-    entity_id = generate_ulid()
-    foreign_entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    local_agent_id = generate_ulid()
-    foreign_agent_id = generate_ulid()
-    task = Task(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        title="Entity-scoped planning",
-    )
-    db_session.add_all(
-        [
-            task,
-            Agent(id=local_agent_id, entity_id=entity_id, name="Local Agent", status="active"),
-            Agent(id=foreign_agent_id, entity_id=foreign_entity_id, name="Foreign Agent", status="active"),
-            AgentSubscription(
-                id=generate_ulid(),
-                entity_id=entity_id,
-                agent_id=local_agent_id,
-                workspace_id=workspace_id,
-                service_key="local_service",
-                status="active",
-            ),
-            AgentSubscription(
-                id=generate_ulid(),
-                entity_id=foreign_entity_id,
-                agent_id=foreign_agent_id,
-                workspace_id=workspace_id,
-                service_key="foreign_service",
-                status="active",
-            ),
-        ]
-    )
-    await db_session.flush()
-
-    ctx = await _gather_context(db_session, task)
-
-    assert ctx.allowed_service_keys == {"local_service"}
-    assert [sub.service_key for sub in ctx.subscriptions] == ["local_service"]
-    assert set(ctx.agents_by_id) == {local_agent_id}
 
 
 @pytest.mark.asyncio
@@ -9517,7 +8870,9 @@ async def test_workspace_chat_feedback_resolution_posts_feedback_message(client:
         .scalars()
         .all()
     )
-    assert rows[-1].content == "✓ Feedback sent — Make the proposal narrower."
+    # The card keeps the feedback on its own resolution; no receipt is posted.
+    assert rows == []
+    assert resolved.json()["resolution"]["note"] == "Make the proposal narrower."
     db_session.expire_all()
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
     assert task.status == "cancelled"
@@ -9675,14 +9030,8 @@ async def test_workspace_chat_approve_all_closes_already_consumed_proposal_card(
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Conversation, Message, Task
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.plan_and_run_task,
-        "delay",
-        lambda task_id: dispatched.append(task_id),
-    )
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
 
     headers = await _register(client, "ws_chat_approve_consumed_proposal_card")
     ws = await client.post(
@@ -9751,7 +9100,10 @@ async def test_workspace_chat_approve_all_closes_already_consumed_proposal_card(
         await db_session.execute(select(Message).where(Message.id == message_id))
     ).scalar_one()
     assert task.status == "completed"
-    assert dispatched == []
+    assert (await db_session.execute(select(RuntimeOutboxEvent.id).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+    ))).first() is None
     assert message.resolved_at is not None
 
 
@@ -9764,14 +9116,8 @@ async def test_workspace_chat_approve_all_keeps_card_when_proposed_tickets_unmov
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Conversation, Message, Task
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.plan_and_run_task,
-        "delay",
-        lambda task_id: dispatched.append(task_id),
-    )
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
 
     headers = await _register(client, "ws_chat_approve_drifted_proposal_card")
     ws = await client.post(
@@ -9837,7 +9183,10 @@ async def test_workspace_chat_approve_all_keeps_card_when_proposed_tickets_unmov
         await db_session.execute(select(Message).where(Message.id == message_id))
     ).scalar_one()
     assert task.status == "proposed"
-    assert dispatched == []
+    assert (await db_session.execute(select(RuntimeOutboxEvent.id).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+    ))).first() is None
     assert message.resolved_at is None
 
 
@@ -9948,194 +9297,6 @@ async def test_workspace_chat_retired_always_approve_leaves_proposal_pending(
         .all()
     )
     assert "strategist_proposal.approved" not in activity_events
-
-
-@pytest.mark.asyncio
-async def test_plan_completed_notifications_include_task_ref(monkeypatch):
-    from packages.core.workspace_chat import notifiers
-
-    posted: list[dict] = []
-
-    async def fake_safe_post(**kwargs):
-        posted.append(kwargs)
-
-    monkeypatch.setattr(notifiers, "_safe_post", fake_safe_post)
-    monkeypatch.setattr(notifiers, "_safe_post_completion", fake_safe_post)
-
-    await notifiers.notify_plan_completed(
-        entity_id="entity_1",
-        workspace_id="workspace_1",
-        plan_id="plan_1",
-        task_id="task_1",
-        task_title="Follow up with lead",
-        duration_seconds=12.0,
-        cost_usd=None,
-        steps=[],
-    )
-
-    assert len(posted) == 2
-    assert posted[0]["refs"] == [
-        {"type": "plan", "id": "plan_1"},
-        {"type": "task", "id": "task_1"},
-    ]
-    assert posted[1]["refs"] == [
-        {"type": "plan", "id": "plan_1"},
-        {"type": "task", "id": "task_1"},
-    ]
-    assert posted[0]["meta"]["feedback_target_kind"] == "none"
-    assert posted[1]["meta"]["feedback_target_kind"] == "task_completion"
-
-    posted.clear()
-    await notifiers.notify_plan_completed(
-        entity_id="entity_1",
-        workspace_id="workspace_1",
-        plan_id="plan_without_task",
-        duration_seconds=3.0,
-        cost_usd=None,
-        steps=[],
-    )
-    assert posted[0]["meta"]["feedback_target_kind"] == "none"
-    assert posted[1]["meta"]["feedback_target_kind"] == "plan_completion"
-
-
-@pytest.mark.asyncio
-async def test_plan_completion_notifier_posts_only_for_completed_lineage(
-    client: AsyncClient,
-    db_session,
-    monkeypatch,
-):
-    from sqlalchemy import select
-
-    import packages.core.database as database
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan
-    from packages.core.models.task import Conversation, Message, Task
-    from packages.core.workspace_chat import notifiers
-
-    headers = await _register(client, "completion_notifier_lineage")
-    workspace = await client.post(
-        "/api/v1/workspaces",
-        headers=headers,
-        json={"name": "Completion Notifier Lineage"},
-    )
-    workspace_body = workspace.json()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    db_session.add_all(
-        [
-            Task(
-                id=task_id,
-                entity_id=workspace_body["entity_id"],
-                workspace_id=workspace_body["id"],
-                title="Completed notification task",
-                status="completed",
-            ),
-            ExecutionPlan(
-                id=plan_id,
-                entity_id=workspace_body["entity_id"],
-                workspace_id=workspace_body["id"],
-                task_id=task_id,
-                status="completed",
-            ),
-        ]
-    )
-    await db_session.commit()
-
-    monkeypatch.setattr(notifiers, "async_session", database.async_session)
-    await notifiers.notify_plan_completed(
-        entity_id=workspace_body["entity_id"],
-        workspace_id=workspace_body["id"],
-        plan_id=plan_id,
-        task_id=task_id,
-        task_title="Completed notification task",
-        duration_seconds=2.0,
-        cost_usd=None,
-        steps=[],
-    )
-
-    rows = (
-        await db_session.execute(
-            select(Message)
-            .join(Conversation, Conversation.id == Message.conversation_id)
-            .where(Conversation.workspace_id == workspace_body["id"])
-        )
-    ).scalars().all()
-    completion_rows = [
-        message
-        for message in rows
-        if {"type": "plan", "id": plan_id} in (message.refs or [])
-    ]
-    assert len(completion_rows) == 2
-    assert {
-        (message.meta or {}).get("feedback_target_kind")
-        for message in completion_rows
-    } == {"none", "task_completion"}
-
-
-@pytest.mark.asyncio
-async def test_plan_attention_notification_does_not_claim_task_complete(monkeypatch):
-    from packages.core.workspace_chat import notifiers
-
-    posted: list[dict] = []
-
-    async def fake_safe_post(**kwargs):
-        posted.append(kwargs)
-
-    monkeypatch.setattr(notifiers, "_safe_post", fake_safe_post)
-
-    await notifiers.notify_plan_needs_attention(
-        entity_id="entity_1",
-        workspace_id="workspace_1",
-        plan_id="plan_1",
-        task_id="task_1",
-        task_title="Produce final video",
-        issue="The final MP4 is still missing.",
-        steps=[],
-    )
-
-    assert len(posted) == 2
-    assert all("Task needs attention" in item["body"] for item in posted)
-    assert all("Task complete" not in item["body"] for item in posted)
-
-
-@pytest.mark.asyncio
-async def test_plan_announce_uses_attention_copy_when_supervisor_holds_task(monkeypatch):
-    from packages.core.plans.executor import PlanExecutor
-    from packages.core.workspace_chat import notifiers
-
-    calls: list[tuple[str, dict]] = []
-
-    async def fake_completed(**kwargs):
-        calls.append(("completed", kwargs))
-
-    async def fake_attention(**kwargs):
-        calls.append(("attention", kwargs))
-
-    monkeypatch.setattr(notifiers, "notify_plan_completed", fake_completed)
-    monkeypatch.setattr(notifiers, "notify_plan_needs_attention", fake_attention)
-
-    await PlanExecutor._announce(
-        "entity_1",
-        "workspace_1",
-        "plan_1",
-        task_id="task_1",
-        started=False,
-        step_count=1,
-        execution_mode="live",
-        chat_events=[],
-        plan_done="completed",
-        plan_started_at=None,
-        plan_completed_at=None,
-        plan_cost=None,
-        plan_error=None,
-        task_title="Produce final video",
-        step_snapshots=[],
-        task_status="waiting_on_customer",
-        task_issue="The final MP4 is still missing.",
-    )
-
-    assert [kind for kind, _ in calls] == ["attention"]
-    assert calls[0][1]["issue"] == "The final MP4 is still missing."
 
 
 @pytest.mark.asyncio
@@ -11011,38 +10172,6 @@ async def test_task_delete_retires_completion_feedback_evidence_and_message_mark
     )
     assert rerated.status_code == 422, rerated.text
 
-    # A worker can finish after the API transaction deleted its Task. The
-    # completion producer must share the feedback-subject lock and revalidate
-    # lineage instead of recreating a rateable main-chat projection.
-    import packages.core.database as database
-    from packages.core.workspace_chat import notifiers
-
-    monkeypatch.setattr(notifiers, "async_session", database.async_session)
-    await notifiers.notify_plan_completed(
-        entity_id=workspace_body["entity_id"],
-        workspace_id=workspace_body["id"],
-        plan_id=plan_id,
-        task_id=task_id,
-        task_title="Delete completed task",
-        duration_seconds=1.0,
-        cost_usd=None,
-        steps=[],
-    )
-
-    await db_session.rollback()
-    completion_messages = (
-        await db_session.execute(
-            select(Message)
-            .join(Conversation, Conversation.id == Message.conversation_id)
-            .where(Conversation.workspace_id == workspace_body["id"])
-        )
-    ).scalars().all()
-    assert all(
-        (message.meta or {}).get("feedback_target_kind")
-        not in {"task_completion", "plan_completion"}
-        for message in completion_messages
-    )
-
 
 def test_task_completion_feedback_policy_requires_a_typed_target():
     from packages.core.models.task import Message
@@ -11546,7 +10675,8 @@ async def test_workspace_list_stats_counts_visible_workspace_chat_actions(client
     assert resp.status_code == 200
     stats = next(w["stats"] for w in resp.json() if w["id"] == workspace_id)
     assert stats["chat_pending_actions"] == 2
-    assert stats["pending_actions"] == 2
+    # Every bucket the badge shows.
+    assert stats["pending_actions"] == 4
     assert stats["hitl_tasks"] == 1
     assert stats["proposal_actions"] == 1
     assert stats["failed_actions"] == 1
@@ -11662,11 +10792,17 @@ async def test_workspace_heartbeat_enable_disable_manages_runtime_schedules(clie
 
     disabled = await client.post(f"/api/v1/workspaces/{ws_id}/heartbeat/disable", headers=headers)
     jobs_after_disable = (
-        (await db_session.execute(select(ScheduledJob).where(ScheduledJob.workspace_id == ws_id))).scalars().all()
+        (await db_session.execute(
+            select(ScheduledJob)
+            .where(ScheduledJob.workspace_id == ws_id)
+            .execution_options(populate_existing=True)
+        )).scalars().all()
     )
 
     assert disabled.status_code == 200
-    assert jobs_after_disable == []
+    by_job_id = {job.job_id: job for job in jobs_after_disable}
+    assert set(by_job_id) == {f"sr:{ws_id}", f"oe:{ws_id}", f"cie:{ws_id}"}
+    assert all(not job.enabled for job in by_job_id.values())
 
 
 @pytest.mark.asyncio
@@ -11702,7 +10838,9 @@ async def test_workspace_update_heartbeat_syncs_runtime_schedules(client: AsyncC
     )
 
     assert disabled.status_code == 200
-    assert jobs_after_disable == []
+    by_job_id = {job.job_id: job for job in jobs_after_disable}
+    assert set(by_job_id) == {f"sr:{ws_id}", f"oe:{ws_id}", f"cie:{ws_id}"}
+    assert all(not job.enabled for job in by_job_id.values())
 
 
 @pytest.mark.asyncio
@@ -11752,10 +10890,8 @@ async def test_paused_workspace_accepts_manual_input_without_resuming_autonomy(
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Conversation, Message, Task
     from packages.core.models.workspace import Workspace
-    from packages.core.plans.wakeup import PLAN_CYCLE_OUTBOX_EVENT
 
     headers = await _register(client, "ws_paused_pending_action")
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()
@@ -11828,7 +10964,6 @@ async def test_paused_workspace_accepts_manual_input_without_resuming_autonomy(
     assert response.status_code == 200, response.text
     step_id = step.id
     plan_id = plan.id
-    task_id = task.id
     message_id = message.id
     db_session.expire_all()
     stored_step = (await db_session.execute(
@@ -11840,27 +10975,18 @@ async def test_paused_workspace_accepts_manual_input_without_resuming_autonomy(
     stored_message = (await db_session.execute(
         select(Message).where(Message.id == message_id)
     )).scalar_one()
-    stored_task = await db_session.get(Task, task_id)
     stored_workspace = await db_session.get(Workspace, workspace["id"])
     assert stored_step.step_status == "pending"
     assert stored_step.params["answers"] == {"answer": "ready"}
+    # The worker that owns the job checks the pending Step out again; the
+    # Task's own state belongs to its agent loop, not to the Step resume.
     assert stored_plan.status == "running"
-    assert stored_task.status == "in_progress"
-    for receipt in (
-        stored_task.details["_manual_execution"],
-        stored_plan.dispatcher_state["_manual_execution"],
-    ):
-        assert receipt["user_id"] == me["id"]
-        assert receipt["action"] == "step_resume"
+    receipt = stored_plan.dispatcher_state["_manual_execution"]
+    assert receipt["user_id"] == me["id"]
+    assert receipt["action"] == "step_resume"
     assert stored_workspace.status == "paused"
     assert stored_message.resolved_at is not None
     assert stored_message.resolved_by_user_id == me["id"]
-    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == plan_id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    assert wake.payload["plan_id"] == plan_id
 
     repeated = await client.post(
         f"/api/v1/workspaces/{workspace['id']}/chat/messages/{message_id}/resolve",
@@ -11868,12 +10994,6 @@ async def test_paused_workspace_accepts_manual_input_without_resuming_autonomy(
         json={"choice": "provide_answers", "payload": {"answers": {"answer": "ready"}}},
     )
     assert repeated.status_code == 200, repeated.text
-    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
-        RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
-        RuntimeOutboxEvent.aggregate_id == plan_id,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ))).scalar_one()
-    assert wake.payload["plan_id"] == plan_id
 
 
 @pytest.mark.asyncio

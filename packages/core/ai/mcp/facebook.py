@@ -17,8 +17,8 @@ Auth model
 (returned by Manor's provider OAuth flow). Page-level operations need a
 **Page Access Token**, fetched on demand via ``GET /me/accounts`` (or
 ``GET /{page_id}?fields=access_token``) and cached in-process by
-``(user_token, page_id)``. Instagram Business calls reuse the Page
-token of the linked Page (Meta's design).
+``(user_token, page_id)``. Instagram profile/media calls reuse the
+linked Page's token; linked-account discovery uses the user token.
 
 Scopes (Meta App Review required for non-Test users)
 ───────────────────────────────────────────────────
@@ -56,14 +56,20 @@ https://developers.facebook.com/docs/app-review.
 """
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json  # noqa: F401
 import logging
 import time
+from enum import StrEnum
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
+from urllib.parse import quote, urlsplit
 
 import httpx  # noqa: F401
 
 from packages.core.external_api_versions import META_GRAPH as _META_PIN
+from packages.core.services.file_refs import signed_file_url_capability
 from packages.core.services.meta_graph import MetaGraphError, graph as _graph
 
 logger = logging.getLogger(__name__)
@@ -74,13 +80,75 @@ _PAGE_TOKEN_TTL_SEC = 30 * 60   # cache page tokens for 30 min
 _IG_ACCOUNT_TTL_SEC = 30 * 60   # cache page→IG mapping similarly
 
 
-# Cache: (user_token_prefix, page_id) → (page_token, expires_at)
+# Cache: (full_user_token_digest, page_id) → (page_token, expires_at)
 _page_token_cache: Dict[tuple[str, str], tuple[str, float]] = {}
-# Cache: (user_token_prefix, page_id) → (ig_user_id, expires_at)
+# Cache: (full_user_token_digest, page_id) → (ig_user_id, expires_at)
 _ig_account_cache: Dict[tuple[str, str], tuple[str, float]] = {}
+_call_ctx_var: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "facebook_mcp_call_ctx", default={}
+)
+
+
+def set_call_context(ctx: Dict[str, Any]) -> None:
+    _call_ctx_var.set(dict(ctx or {}))
+
+
+def clear_call_context() -> None:
+    _call_ctx_var.set({})
 
 
 # ── Tool definitions ───────────────────────────────────────────────────────
+
+class InstagramAccountDiscoveryMode(StrEnum):
+    MANAGED_PAGES = "managed_pages"
+    PAGE = "page"
+
+
+class InstagramMediaSourceKind(StrEnum):
+    CHAT_ATTACHMENT = "chat_attachment"
+    KNOWLEDGE_DOCUMENT = "knowledge_document"
+    WORKSPACE_DOCUMENT = "workspace_document"
+
+
+def _instagram_media_reference_schema(media_label: str) -> Dict[str, Any]:
+    is_image = media_label == "image"
+    schema = {
+        "description": (
+            f"Public HTTPS {media_label} URL or exact Manor media reference. "
+            "Use chat_attachment with the uploaded path for current-chat attachments; "
+            "knowledge_document with document_id for saved files in ordinary chat; "
+            "workspace_document with document_id for active Workspace Knowledge. "
+            "Images must be JPEG and at most 8 MiB."
+        ) if is_image else (
+            "Public HTTPS video URL or an active Workspace Knowledge document "
+            "with source_kind=workspace_document and document_id."
+        ),
+        "oneOf": [
+            {"type": "string", "minLength": 1},
+            {
+                "type": "object", "required": ["source_kind", "document_id"],
+                "additionalProperties": False,
+                "properties": {
+                    "source_kind": {"type": "string", "enum": [
+                        *([InstagramMediaSourceKind.KNOWLEDGE_DOCUMENT.value] if is_image else []),
+                        InstagramMediaSourceKind.WORKSPACE_DOCUMENT.value,
+                    ]},
+                    "document_id": {"type": "string", "minLength": 1},
+                },
+            },
+        ],
+    }
+    if is_image:
+        schema["oneOf"].append({
+            "type": "object", "required": ["source_kind", "path"],
+            "additionalProperties": False,
+            "properties": {
+                "source_kind": {"type": "string", "enum": [InstagramMediaSourceKind.CHAT_ATTACHMENT.value]},
+                "path": {"type": "string", "pattern": r"^uploads/chat/[0-9a-f]{16}\.[a-zA-Z0-9]+$"},
+            },
+        })
+    return schema
+
 
 def _prop(desc: str, type_: str = "string", **extra) -> Dict[str, Any]:
     out: Dict[str, Any] = {"type": type_, "description": desc}
@@ -94,7 +162,8 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "List the Facebook Pages the connected user manages. Returns "
             "id, name, category, tasks (perms granted). Run this once "
-            "before posting to find the right page_id."
+            "before posting to find the right page_id. An empty list does "
+            "not prove a known Page is inaccessible; use get_page with its id."
         ),
         "properties": {},
         "required": [],
@@ -104,7 +173,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
             "Fetch a single Page's profile (about, category, fan count, "
             "website, location, picture URL)."
         ),
-        "properties": {"page_id": _prop("Page id from list_pages")},
+        "properties": {"page_id": _prop("Known Page id provided by the user or returned by a tool")},
         "required": ["page_id"],
     },
     "update_page": {
@@ -468,14 +537,23 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     # ── Instagram Business ──
     "list_instagram_accounts": {
         "description": (
-            "List Instagram Business accounts linked to the user's "
-            "managed Pages. Returns ig_user_id, username, follower count."
+            "List Instagram professional accounts (Business or Creator) linked "
+            "to the user's managed Pages. Supply a known page_id to read that "
+            "Page directly, including when Page enumeration is empty. Returns "
+            "ig_user_id, username, follower count; read access does not prove publishing access."
         ),
-        "properties": {},
+        "properties": {
+            "discovery_mode": _prop(
+                "Query managed_pages or a single page. When omitted, uses page if page_id is supplied, "
+                "otherwise managed_pages. page requires page_id; managed_pages must omit page_id.",
+                enum=[mode.value for mode in InstagramAccountDiscoveryMode],
+            ),
+            "page_id": _prop("Optional known numeric Facebook Page id for a direct lookup", pattern="^[0-9]+$"),
+        },
         "required": [],
     },
     "get_instagram_account": {
-        "description": "Profile of an Instagram Business account.",
+        "description": "Profile of an Instagram professional account (Business or Creator).",
         "properties": {
             "page_id": _prop("Page id linked to the IG account (for token)"),
             "ig_user_id": _prop("Instagram user id"),
@@ -499,6 +577,18 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["page_id", "media_id"],
     },
+    "get_instagram_container_status": {
+        "description": (
+            "Read the processing status of an Instagram publishing media "
+            "container. Use the creation_id returned by create_instagram_media "
+            "before calling publish_instagram_media."
+        ),
+        "properties": {
+            "page_id": _prop("Page id (for token)"),
+            "creation_id": _prop("Container id from create_instagram_media"),
+        },
+        "required": ["page_id", "creation_id"],
+    },
     "create_instagram_media": {
         "description": (
             "Step 1 of IG publishing — create a media container from a "
@@ -509,8 +599,8 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "properties": {
             "page_id": _prop("Page id (for token)"),
             "ig_user_id": _prop("Instagram user id"),
-            "image_url": _prop("Public image URL (mutually exclusive with video_url)"),
-            "video_url": _prop("Public video URL (for REELS / VIDEO)"),
+            "image_url": _instagram_media_reference_schema("image"),
+            "video_url": _instagram_media_reference_schema("video"),
             "caption": _prop("Caption (≤2200 chars)"),
             "media_type": _prop("REELS, STORIES, IMAGE (default: image if image_url, REELS if video_url)"),
             "thumb_offset_ms": _prop("Reel thumbnail offset (ms)", "integer"),
@@ -1008,28 +1098,52 @@ async def _get_post_insights(user_token: str, args: Dict[str, Any]) -> Dict[str,
 
 # ── Instagram Business ──
 
-async def _list_instagram_accounts(user_token: str, _args: Dict[str, Any]) -> Dict[str, Any]:
-    """Walk managed Pages and surface IG accounts linked to each."""
-    pages = await _graph_get(
-        "/me/accounts",
-        params={
-            "fields": (
-                "id,name,access_token,"
-                "instagram_business_account{"
-                "id,username,name,profile_picture_url,followers_count,"
-                "follows_count,media_count}"
-            ),
-        },
-        token=user_token,
+async def _list_instagram_accounts(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a known Page's linked IG account, or discover accounts via managed Pages."""
+    ig_fields = (
+        "instagram_business_account{"
+        "id,username,name,profile_picture_url,followers_count,"
+        "follows_count,media_count}"
     )
+    page_id = args.get("page_id")
+    default_mode = (
+        InstagramAccountDiscoveryMode.PAGE if "page_id" in args else InstagramAccountDiscoveryMode.MANAGED_PAGES
+    )
+    try:
+        mode = InstagramAccountDiscoveryMode(args.get("discovery_mode", default_mode))
+    except (TypeError, ValueError):
+        allowed = ", ".join(mode.value for mode in InstagramAccountDiscoveryMode)
+        raise ValueError(f"discovery_mode must be one of: {allowed}.") from None
+    if mode == InstagramAccountDiscoveryMode.PAGE:
+        if not isinstance(page_id, str) or not page_id.isascii() or not page_id.isdecimal():
+            raise ValueError("page_id must be a nonempty numeric Facebook Page id string.")
+        # Meta may omit an accessible Page from /me/accounts. Read the
+        # specified Page using this connection's own grant; do not require
+        # a Page publishing token just to discover its linked account.
+        page = await _graph_get(
+            f"/{page_id}",
+            params={"fields": f"id,name,{ig_fields}"},
+            token=user_token,
+        )
+        pages = [page]
+    else:
+        if "page_id" in args:
+            raise ValueError("page_id is only valid when discovery_mode='page'.")
+        data = await _graph_get(
+            "/me/accounts",
+            params={"fields": f"id,name,access_token,{ig_fields}"},
+            token=user_token,
+        )
+        pages = data.get("data", [])
     out = []
-    for p in pages.get("data", []):
+    for p in pages:
         ig = p.get("instagram_business_account")
         if not ig:
             continue
         if p.get("id") and p.get("access_token"):
             _cache_page_token(user_token, p["id"], p["access_token"])
-            _cache_ig_account(user_token, p["id"], ig.get("id", ""))
+        if p.get("id") and ig.get("id"):
+            _cache_ig_account(user_token, p["id"], ig["id"])
         out.append({
             "page_id": p.get("id"),
             "page_name": p.get("name"),
@@ -1041,7 +1155,16 @@ async def _list_instagram_accounts(user_token: str, _args: Dict[str, Any]) -> Di
             "follows_count": ig.get("follows_count"),
             "media_count": ig.get("media_count"),
         })
-    return {"count": len(out), "accounts": out}
+    result: Dict[str, Any] = {"count": len(out), "accounts": out}
+    if not out:
+        result["note"] = (
+            f"Page {page_id} did not return a linked Instagram professional account."
+            if page_id else
+            "Page enumeration returned no linked Instagram accounts. This does not prove "
+            "the connection is disconnected or a known Page is inaccessible. If its Page id "
+            "is known, retry list_instagram_accounts with page_id for a direct lookup."
+        )
+    return result
 
 
 async def _get_instagram_account(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1088,6 +1211,16 @@ async def _get_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict[st
     )
 
 
+async def _get_instagram_container_status(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Read only the field supported by a media creation container."""
+    page_token = await _resolve_page_token(user_token, args["page_id"])
+    return await _graph_get(
+        f"/{args['creation_id']}",
+        params={"fields": "status_code"},
+        token=page_token,
+    )
+
+
 async def _create_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
     image_url = args.get("image_url")
     video_url = args.get("video_url")
@@ -1100,11 +1233,11 @@ async def _create_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict
     body: Dict[str, Any] = {}
     media_type = args.get("media_type")
     if image_url:
-        body["image_url"] = image_url
+        body["image_url"] = await _provider_readable_image_url(image_url)
         if media_type:
             body["media_type"] = media_type   # e.g. STORIES
     else:
-        body["video_url"] = video_url
+        body["video_url"] = await _provider_readable_video_url(video_url)
         body["media_type"] = media_type or "REELS"
         if args.get("thumb_offset_ms") is not None:
             body["thumb_offset"] = int(args["thumb_offset_ms"])
@@ -1114,9 +1247,154 @@ async def _create_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict
     if args.get("caption"):
         body["caption"] = args["caption"]
 
-    return await _graph_post(
-        f"/{args['ig_user_id']}/media", body, token=page_token,
+    media_url = body.get("image_url") or body["video_url"]
+    try:
+        return await _graph_post(
+            f"/{args['ig_user_id']}/media", body, token=page_token,
+        )
+    except _GraphError as exc:
+        if signed_file_url_capability(media_url) is None:
+            raise
+        # A provider error can echo the private download capability. Keep
+        # Graph diagnostics, but do not retain its unfiltered response body.
+        raise _GraphError(
+            exc.code, _redact_instagram_media_url(exc.message, media_url),
+            subcode=exc.subcode,
+        ) from None
+    except Exception as exc:
+        redacted = _redact_instagram_media_url(str(exc), media_url)
+        if redacted == str(exc):
+            raise
+        # ValueError uses the clean tool-error path without logging the
+        # original exception (which may also contain the capability).
+        raise ValueError(f"{type(exc).__name__}: {redacted}") from None
+
+
+def _redact_instagram_media_url(text: str, media_url: str) -> str:
+    """Remove only the signed source handed to this media-creation request."""
+    capability = signed_file_url_capability(media_url)
+    if capability:
+        return text.replace(media_url, "[signed media URL]").replace(capability, "[file token]")
+    return text
+
+
+async def _provider_readable_video_url(reference: Any) -> str:
+    if isinstance(reference, str) and reference.startswith("https://"):
+        return reference
+    if (
+        not isinstance(reference, dict)
+        or reference.get("source_kind") != InstagramMediaSourceKind.WORKSPACE_DOCUMENT
+    ):
+        raise ValueError(
+            "Instagram video publishing requires an HTTPS video URL "
+            "or Workspace Knowledge document."
+        )
+    return await _provider_readable_media_url(
+        reference,
+        media_label="video",
+        allowed_suffixes={".mp4", ".mov", ".webm"},
+        max_bytes=512 * 1024 * 1024,
     )
+
+
+async def _provider_readable_image_url(reference: Any) -> str:
+    return await _provider_readable_media_url(
+        reference,
+        media_label="image",
+        allowed_suffixes={".jpg", ".jpeg"},
+        max_bytes=8 * 1024 * 1024,
+        inspect_snapshot=_inspect_instagram_image_snapshot,
+    )
+
+
+async def _provider_readable_media_url(
+    reference: Any,
+    *,
+    media_label: str,
+    allowed_suffixes: set[str],
+    max_bytes: int,
+    inspect_snapshot: Any = None,
+) -> str:
+    ctx = _call_ctx_var.get()
+    from packages.core.config import get_settings
+    from packages.core.services.ai_file_permissions import is_chat_upload_path
+    from packages.core.services.chat_attachment_media import inspect_chat_attachment_media
+    from packages.core.services.file_access_tokens import create_file_access_token
+    from packages.core.services.file_refs import parse_file_reference
+    from packages.core.services.workspace_document_media import (
+        inspect_knowledge_document_media, inspect_workspace_document_media,
+    )
+
+    if isinstance(reference, str):
+        file_ref = parse_file_reference(reference)
+        if file_ref is not None:
+            if file_ref.entity_id and file_ref.entity_id != ctx.get("entity_id"):
+                raise ValueError("The media reference belongs to another Entity.")
+            if file_ref.document_id:
+                kind = InstagramMediaSourceKind.WORKSPACE_DOCUMENT if ctx.get("workspace_id") else InstagramMediaSourceKind.KNOWLEDGE_DOCUMENT
+                reference = {"source_kind": kind.value, "document_id": file_ref.document_id}
+            elif is_chat_upload_path(file_ref.fs_path):
+                reference = {"source_kind": InstagramMediaSourceKind.CHAT_ATTACHMENT.value, "path": file_ref.fs_path}
+            else:
+                raise ValueError("Use the saved media's exact Knowledge document reference.")
+        elif is_chat_upload_path(reference):
+            reference = {"source_kind": InstagramMediaSourceKind.CHAT_ATTACHMENT.value, "path": reference}
+        elif reference.startswith("https://"):
+            return reference
+        else:
+            raise ValueError(f"Instagram {media_label} publishing requires an HTTPS URL or an exact Manor media reference.")
+    try:
+        source_kind = InstagramMediaSourceKind(reference.get("source_kind"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Use a chat_attachment, knowledge_document, or workspace_document media reference.") from None
+    inspector = {
+        InstagramMediaSourceKind.CHAT_ATTACHMENT: inspect_chat_attachment_media,
+        InstagramMediaSourceKind.KNOWLEDGE_DOCUMENT: inspect_knowledge_document_media,
+        InstagramMediaSourceKind.WORKSPACE_DOCUMENT: inspect_workspace_document_media,
+    }[source_kind]
+
+    public_base = str(get_settings().PUBLIC_BASE_URL or "").rstrip("/")
+    parsed = urlsplit(public_base)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"Instagram {media_label} publishing requires a public HTTPS base URL.")
+    media = await inspector(
+        reference,
+        entity_id=str(ctx.get("entity_id") or ""),
+        user_id=str(ctx.get("user_id") or ""),
+        conversation_id=str(ctx.get("conversation_id") or ""),
+        workspace_id=ctx.get("workspace_id") or None,
+        tool_name="mcp__facebook__create_instagram_media",
+        allowed_suffixes=allowed_suffixes,
+        max_bytes=max_bytes,
+        inspect_snapshot=inspect_snapshot,
+    )
+    token = create_file_access_token(
+        entity_id=str(ctx["entity_id"]), rel_path=media["rel_path"],
+        user_id=str(ctx["user_id"]), conversation_id=str(ctx["conversation_id"]),
+        workspace_id=ctx.get("workspace_id") or None, source_sha256=media["source_sha256"],
+        source_kind=source_kind.value if source_kind != InstagramMediaSourceKind.CHAT_ATTACHMENT else None,
+        document_id=media.get("document_id"),
+        expires_in_seconds=900,
+    )
+    return f"{public_base}/api/v1/fs/public/{token}/{quote(Path(media['rel_path']).name)}"
+
+
+def _inspect_instagram_image_snapshot(path: str) -> dict[str, int]:
+    """Verify the exact bytes are a JPEG before Meta fetches the signed URL."""
+    try:
+        from PIL import Image, UnidentifiedImageError
+
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            if image.format != "JPEG":
+                raise ValueError("Instagram images must be JPEG files.")
+            width, height = image.size
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ValueError("Instagram image bytes are invalid.") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("Instagram image dimensions are invalid.")
+    return {"width": width, "height": height}
 
 
 async def _publish_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1217,6 +1495,7 @@ _HANDLERS = {
     "get_instagram_account": _get_instagram_account,
     "list_instagram_media": _list_instagram_media,
     "get_instagram_media": _get_instagram_media,
+    "get_instagram_container_status": _get_instagram_container_status,
     "create_instagram_media": _create_instagram_media,
     "publish_instagram_media": _publish_instagram_media,
     "list_instagram_comments": _list_instagram_comments,
@@ -1276,13 +1555,17 @@ async def call_tool(
 
 # ── Page token + IG account resolution ─────────────────────────────────────
 
+def _token_cache_key(user_token: str, page_id: str) -> tuple[str, str]:
+    return (hashlib.sha256(user_token.encode("utf-8")).hexdigest(), page_id)
+
+
 def _cache_page_token(user_token: str, page_id: str, page_token: str) -> None:
-    key = (user_token[:16], page_id)
+    key = _token_cache_key(user_token, page_id)
     _page_token_cache[key] = (page_token, time.time() + _PAGE_TOKEN_TTL_SEC)
 
 
 def _cache_ig_account(user_token: str, page_id: str, ig_user_id: str) -> None:
-    key = (user_token[:16], page_id)
+    key = _token_cache_key(user_token, page_id)
     _ig_account_cache[key] = (ig_user_id, time.time() + _IG_ACCOUNT_TTL_SEC)
 
 
@@ -1291,7 +1574,7 @@ async def _resolve_page_token(user_token: str, page_id: str) -> str:
     access token. Cached briefly so repeated tool calls in the same
     conversation don't hammer ``/me/accounts``.
     """
-    key = (user_token[:16], page_id)
+    key = _token_cache_key(user_token, page_id)
     cached = _page_token_cache.get(key)
     if cached and cached[1] > time.time():
         return cached[0]

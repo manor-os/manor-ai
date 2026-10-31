@@ -11,6 +11,7 @@ from packages.core.ai.runtime import (
     runtime_assistant_stream_error_content,
     runtime_invoke_skill,
 )
+from packages.core.ai.runtime.capability_search import SKILL_DESCRIPTION_MAX_CHARS
 from packages.core.database import get_db
 from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.scheduler import ScheduledJob
@@ -164,7 +165,8 @@ class SkillCreateRequest(BaseModel):
     system_prompt: str
     slug: str = ""
     display_name: str = ""
-    description: str = ""
+    # Callers read only this before invoking the skill; search shows it whole.
+    description: str = Field("", max_length=SKILL_DESCRIPTION_MAX_CHARS)
     tools: list[str] = []
     input_schema: dict = {}
     output_format: str = "text"
@@ -188,7 +190,7 @@ class SkillUpdateRequest(BaseModel):
     system_prompt: str | None = None
     slug: str | None = None
     display_name: str | None = None
-    description: str | None = None
+    description: str | None = Field(None, max_length=SKILL_DESCRIPTION_MAX_CHARS)
     tools: list[str] | None = None
     input_schema: dict | None = None
     output_format: str | None = None
@@ -1195,6 +1197,32 @@ class BindingResponse(BaseModel):
     status: str
 
 
+async def _collaborator_invocable(db: AsyncSession, user: User, agent_id: str, skills) -> list[Skill]:
+    """For an external collaborator, only Skills invocable in a granted Workspace of the Agent."""
+    from apps.api.collaborator_boundary import collaborator_scope
+    from packages.core.services.collaborator_scope import agent_workspace_ids, skills_invocable_in_workspace
+
+    skills = list(skills)
+    scope = collaborator_scope(user)
+    if scope is None:
+        return skills
+    invocable: set[str] = set()
+    for workspace_id in sorted(scope & await agent_workspace_ids(db, agent_id=agent_id, entity_id=user.entity_id)):
+        invocable |= await skills_invocable_in_workspace(
+            db, [skill.id for skill in skills], entity_id=user.entity_id, workspace_id=workspace_id
+        )
+    return [skill for skill in skills if skill.id in invocable]
+
+
+async def _agent_skill_binding_contexts(db: AsyncSession, user: User, skills: list[Skill]) -> dict[str, list[dict]]:
+    from apps.api.collaborator_boundary import collaborator_scope
+
+    if collaborator_scope(user) is not None:
+        # Provenance names the company's other Agents and Workspaces using each Skill.
+        return {}
+    return await _binding_contexts_for_skills(db, skills, entity_id=user.entity_id, user=user)
+
+
 @router.get("/agents/{agent_id}/bindings", response_model=list[SkillResponse])
 async def list_agent_bindings(
     agent_id: str,
@@ -1202,8 +1230,10 @@ async def list_agent_bindings(
     db: AsyncSession = Depends(get_db),
 ):
     """List skills bound to a specific agent."""
-    skills = await list_agent_skill_bindings(db, agent_id, user.entity_id)
-    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id, user=user)
+    skills = await _collaborator_invocable(
+        db, user, agent_id, await list_agent_skill_bindings(db, agent_id, user.entity_id)
+    )
+    bindings = await _agent_skill_binding_contexts(db, user, skills)
     return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
 
 
@@ -1214,8 +1244,10 @@ async def list_agent_available_skills(
     db: AsyncSession = Depends(get_db),
 ):
     """List entity skills not yet bound to the agent."""
-    skills = await list_available_skills_for_agent(db, agent_id, user.entity_id)
-    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id, user=user)
+    skills = await _collaborator_invocable(
+        db, user, agent_id, await list_available_skills_for_agent(db, agent_id, user.entity_id)
+    )
+    bindings = await _agent_skill_binding_contexts(db, user, skills)
     return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
 
 

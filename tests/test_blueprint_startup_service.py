@@ -98,12 +98,21 @@ async def test_reconcile_is_noop_without_explicit_startup_contract(
 
 
 @pytest.mark.asyncio
+# A fresh install starts with its Strategist paused: setup the installing
+# person asked for runs as their request; background triggers still wait.
+@pytest.mark.parametrize(("status", "requested_by", "key_prefix"), [
+    ("active", None, ""),
+    ("paused", "user-1", "manual:"),
+])
 async def test_reconcile_dispatches_only_incomplete_setup_job(
     db_session,
     monkeypatch,
+    status,
+    requested_by,
+    key_prefix,
 ) -> None:
     service = _service()
-    workspace = _workspace(settings={
+    workspace = _workspace(status=status, settings={
         "blocking_setup": {
             "checks": [{
                 "key": "identity",
@@ -134,13 +143,19 @@ async def test_reconcile_dispatches_only_incomplete_setup_job(
         db_session,
         workspace_id=workspace.id,
         trigger="install",
+        requested_by=requested_by,
     )
 
     assert result.state == "setup_dispatched"
     assert result.dispatched_job_ids == (setup_job.job_id,)
     assert dispatched == [
-        (setup_job.id, service.BLUEPRINT_SETUP_OCCURRENCE_KEY),
+        (setup_job.id, key_prefix + service.BLUEPRINT_SETUP_OCCURRENCE_KEY),
     ]
+    if status == "paused":
+        # Without a person behind it, a paused Workspace's setup waits.
+        assert (await service.reconcile_blueprint_startup(
+            db_session, workspace_id=workspace.id, trigger="monitor",
+        )).state == "workspace_paused"
 
 
 @pytest.mark.asyncio
@@ -305,9 +320,12 @@ async def test_reconcile_rejects_modified_startup_contract(
 
 
 @pytest.mark.asyncio
+# A cancelled attempt is over too: asking for setup again starts a new one.
+@pytest.mark.parametrize("ended", ["error", "cancelled"])
 async def test_reconcile_retries_setup_after_terminal_error(
     db_session,
     monkeypatch,
+    ended,
 ) -> None:
     service = _service()
     workspace = _workspace(settings={
@@ -331,7 +349,7 @@ async def test_reconcile_retries_setup_after_terminal_error(
         id=generate_ulid(),
         job_id=setup_job.job_id,
         idempotency_key=service.BLUEPRINT_SETUP_OCCURRENCE_KEY,
-        status="error",
+        status=ended,
         trigger_type="blueprint_startup",
     )
     db_session.add_all([workspace, setup_job, failed])
@@ -596,7 +614,7 @@ async def test_workspace_repair_endpoint_uses_generic_reconciler(
     router = importlib.import_module("apps.api.routers.blueprints")
     service = _service()
     workspace = _workspace(settings={})
-    user = SimpleNamespace(entity_id=workspace.entity_id)
+    user = SimpleNamespace(id="user-1", entity_id=workspace.entity_id)
     authorized: list[str] = []
     calls: list[tuple[str, str]] = []
 
@@ -606,7 +624,9 @@ async def test_workspace_repair_endpoint_uses_generic_reconciler(
     async def require_writable(_db, _user, workspace_id):
         authorized.append(workspace_id)
 
-    async def reconcile(_db, *, workspace_id: str, trigger: str):
+    async def reconcile(_db, *, workspace_id: str, trigger: str, requested_by: str | None = None):
+        # Start setup is the person's own request.
+        assert requested_by
         calls.append((workspace_id, trigger))
         return service.BlueprintStartupResult(
             state="not_configured",

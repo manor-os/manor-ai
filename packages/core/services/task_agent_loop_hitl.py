@@ -20,9 +20,22 @@ Task thread. Only the routing back into this run is new:
 Every resolution re-checks, under the Task -> Run locks, that the run is still
 parked on exactly that request and call; a stale card never resumes a newer
 park.
+
+With durable delegation a delegated agent's child run parks the same way on
+its own cards ("Asked by {agent}"): its question has its own dedup key and
+names its run, its approval carries a v2 tag (``run_kind="child"`` and the
+root run). Only that child waits; the Task stays in progress while anything
+else in the run tree can move, and waits on the person once nothing can
+(``sync_task_human_wait_status``). An answer or decision reaches exactly the
+run that asked (a card names its request; a comment answers the earliest
+question) and wakes only it; its parent keeps waiting on it. Each card is
+judged as before: a question's answer is the user's own input, an approval
+is the guarded operation's own request under the user's mode and rules.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -43,7 +56,9 @@ from packages.core.models.task_coordinator import (
     TaskCoordinatorPhase,
     TaskCoordinatorRun,
 )
-from packages.core.services.durable_run import reopen_run
+from packages.core.models.task_run_journal import TaskRunJournalKind
+from packages.core.services.durable_run import DurableRunSpec, reopen_run
+from packages.core.services.task_run_journal import append_run_journal, wake_payload
 from packages.core.services.task_coordinator_wakeup import (
     TASK_COORDINATOR_RUN_SPEC,
     TASK_LOOP_WAIT_KEY,
@@ -96,45 +111,84 @@ def runtime_checkpoint_digest(runtime_checkpoint: Any) -> str:
     return hashlib.sha256(_canonical(runtime_checkpoint or {})).hexdigest()
 
 
-_SIGNED_TAG_FIELDS = (
-    "version", "run_id", "task_id", "tool_call_id", "hitl_request_id", "checkpoint_digest",
-)
+#: Approval park tag versions: v1 names a Task's root run, v2 a delegated
+#: child run (``run_kind="child"``) and the root run of its tree.
+ROOT_APPROVAL_TAG_VERSION = 1
+CHILD_APPROVAL_TAG_VERSION = 2
+RUN_KIND_ROOT = "root"
+RUN_KIND_CHILD = "child"
+_SIGNED_TAG_FIELDS = {
+    ROOT_APPROVAL_TAG_VERSION: (
+        "version", "run_id", "task_id", "tool_call_id", "hitl_request_id", "checkpoint_digest",
+    ),
+    CHILD_APPROVAL_TAG_VERSION: (
+        "version", "run_kind", "run_id", "root_run_id", "task_id", "tool_call_id",
+        "hitl_request_id", "checkpoint_digest",
+    ),
+}
+_SIGNATURE_DOMAINS = {
+    ROOT_APPROVAL_TAG_VERSION: _SIGNATURE_DOMAIN,
+    CHILD_APPROVAL_TAG_VERSION: b"manor.task-agent-loop-hitl.v2\0",
+}
 
 
-def _tag_signature(tag: dict[str, Any]) -> str:
-    # Keyed by JWT_SECRET_KEY, as TaskRunner's checkpoint signatures: rotating
+def _tag_signature(tag: dict[str, Any]) -> str | None:
+    # Keyed by JWT_SECRET_KEY: rotating
     # the secret makes every parked approval "not current", so approving it
     # expires the card instead of resuming (the Task can be retried).
     from packages.core.config import get_settings
 
-    signed = {key: tag.get(key) for key in _SIGNED_TAG_FIELDS}
+    version = tag.get("version")
+    fields = _SIGNED_TAG_FIELDS.get(version) if isinstance(version, int) else None
+    if fields is None:
+        return None
+    signed = {key: tag.get(key) for key in fields}
     return hmac.new(
         get_settings().JWT_SECRET_KEY.encode("utf-8"),
-        _SIGNATURE_DOMAIN + _canonical(signed),
+        _SIGNATURE_DOMAINS[version] + _canonical(signed),
         hashlib.sha256,
     ).hexdigest()
 
 
 def approval_tag(
-    *, run_id: str, task_id: str, tool_call_id: str, hitl_request_id: str, checkpoint_digest: str,
+    *,
+    run_id: str,
+    task_id: str,
+    tool_call_id: str,
+    hitl_request_id: str,
+    checkpoint_digest: str,
+    run_kind: str = RUN_KIND_ROOT,
+    root_run_id: str | None = None,
 ) -> dict[str, Any]:
-    tag = {
-        "version": HUMAN_WAIT_VERSION,
-        "run_id": run_id,
+    """The signed park tag an approval request carries (v1 root, v2 child)."""
+
+    if run_kind == RUN_KIND_CHILD:
+        if not root_run_id:
+            raise ValueError("a child run's approval tag names its root run")
+        tag = {
+            "version": CHILD_APPROVAL_TAG_VERSION,
+            "run_kind": RUN_KIND_CHILD,
+            "run_id": run_id,
+            "root_run_id": root_run_id,
+        }
+    elif run_kind == RUN_KIND_ROOT:
+        tag = {"version": ROOT_APPROVAL_TAG_VERSION, "run_id": run_id}
+    else:
+        raise ValueError(f"unknown run kind {run_kind!r}")
+    tag.update({
         "task_id": task_id,
         "tool_call_id": tool_call_id,
         "hitl_request_id": hitl_request_id,
         "checkpoint_digest": checkpoint_digest,
-    }
+    })
     tag["signature"] = _tag_signature(tag)
     return tag
 
 
-def is_task_agent_loop_request(request: Any) -> bool:
-    """Whether this approval was parked by a Task agent loop (no DB access)."""
+def tag_run_kind(tag: dict[str, Any]) -> str:
+    """Which run a verified tag parks: the root run (v1) or a child run (v2)."""
 
-    context = getattr(request, "context", None)
-    return isinstance(context, dict) and isinstance(context.get(TASK_AGENT_LOOP_HITL_CONTEXT_KEY), dict)
+    return RUN_KIND_CHILD if tag.get("version") == CHILD_APPROVAL_TAG_VERSION else RUN_KIND_ROOT
 
 
 def verified_request_tag(request: Any) -> dict[str, Any] | None:
@@ -145,12 +199,17 @@ def verified_request_tag(request: Any) -> dict[str, Any] | None:
     if not isinstance(tag, dict):
         return None
     signature = tag.get("signature")
+    expected = _tag_signature(tag)
     if (
-        tag.get("version") != HUMAN_WAIT_VERSION
+        expected is None
         or not isinstance(signature, str)
-        or not hmac.compare_digest(signature, _tag_signature(tag))
+        or not hmac.compare_digest(signature, expected)
         or tag.get("hitl_request_id") != getattr(request, "id", None)
         or tag.get("task_id") != getattr(request, "origin_task_id", None)
+        or (
+            tag.get("version") == CHILD_APPROVAL_TAG_VERSION
+            and (tag.get("run_kind") != RUN_KIND_CHILD or not tag.get("root_run_id"))
+        )
     ):
         return None
     return tag
@@ -165,8 +224,10 @@ def human_wait(
     checkpoint_digest: str | None,
     summary: str,
     parked_at: str | None = None,
+    run_kind: str | None = None,
+    agent_label: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    wait = {
         "version": HUMAN_WAIT_VERSION,
         "kind": kind,
         "tool_call_id": tool_call_id,
@@ -176,14 +237,37 @@ def human_wait(
         "summary": str(summary or "")[:_SUMMARY_MAX_CHARS],
         "parked_at": parked_at or utcnow().isoformat(),
     }
+    if run_kind == RUN_KIND_CHILD:
+        # A delegated child's park: its own card, asked by its own agent.
+        wait["run_kind"] = RUN_KIND_CHILD
+        if agent_label:
+            wait["agent_label"] = str(agent_label)[:100]
+    return wait
 
 
-def parked_human_wait(run: Any, *, kinds: frozenset[str] = HUMAN_WAIT_KINDS) -> dict[str, Any] | None:
-    """The human wait a WAITING_HUMAN agent loop is parked on, if any."""
+def _hosted_by_task_loop(run: Any, spec: DurableRunSpec) -> bool:
+    """Whether the Task agent loop drives this run row.
+
+    A Task's root run is loop-hosted only when its frozen engine is
+    ``agent_loop`` (the Plan/Step DAG coordinator owns the others).
+    """
+
+    if spec.model is TaskCoordinatorRun:
+        return getattr(run, "engine", None) == TaskCoordinatorEngine.AGENT_LOOP.value
+    return True
+
+
+def parked_human_wait(
+    run: Any,
+    *,
+    kinds: frozenset[str] = HUMAN_WAIT_KINDS,
+    spec: DurableRunSpec = TASK_COORDINATOR_RUN_SPEC,
+) -> dict[str, Any] | None:
+    """The human wait a WAITING_HUMAN loop-hosted run of ``spec`` is parked on, if any."""
 
     if (
         run is None
-        or getattr(run, "engine", None) != TaskCoordinatorEngine.AGENT_LOOP.value
+        or not _hosted_by_task_loop(run, spec)
         or getattr(run, "phase", None) != TaskCoordinatorPhase.WAITING_HUMAN.value
     ):
         return None
@@ -213,16 +297,55 @@ async def task_agent_loop_run(
         TaskCoordinatorRun.task_id == task_id,
         TaskCoordinatorRun.engine == TaskCoordinatorEngine.AGENT_LOOP.value,
     )
+    # Always the row as stored (a long-lived session may hold an older copy).
+    statement = statement.execution_options(populate_existing=True)
     if for_update:
-        statement = statement.with_for_update().execution_options(populate_existing=True)
+        statement = statement.with_for_update()
     return (await db.execute(statement)).scalar_one_or_none()
 
 
+INPUT_WAIT_KINDS = frozenset({INPUT_WAIT_KIND, DELEGATED_INPUT_WAIT_KIND})
+
+
+def _child_spec() -> DurableRunSpec:
+    from packages.core.services.task_agent_child_wakeup import TASK_AGENT_CHILD_RUN_SPEC
+
+    return TASK_AGENT_CHILD_RUN_SPEC
+
+
+def parked_child_human_wait(child: Any, *, kinds: frozenset[str] = HUMAN_WAIT_KINDS) -> dict[str, Any] | None:
+    """The human wait a delegated child run is parked on, if any."""
+
+    return parked_human_wait(child, kinds=kinds, spec=_child_spec())
+
+
+async def _live_children(db: AsyncSession, task_id: str) -> list[Any]:
+    from packages.core.models.task_agent_child import (
+        TASK_AGENT_CHILD_TERMINAL_PHASES,
+        TaskAgentChildRun,
+    )
+
+    return list((await db.execute(
+        select(TaskAgentChildRun).where(
+            TaskAgentChildRun.task_id == task_id,
+            TaskAgentChildRun.phase.not_in(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+        ).order_by(TaskAgentChildRun.depth, TaskAgentChildRun.id)
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+
+
 async def task_agent_loop_waiting_on_input(db: AsyncSession, task: Task) -> bool:
-    """Whether this Task's agent loop is parked on a question (any input kind)."""
+    """Whether this Task's agent loop, or one of its delegated agents, waits on a question."""
 
     run = await task_agent_loop_run(db, str(task.id))
-    return parked_human_wait(run, kinds=frozenset({INPUT_WAIT_KIND, DELEGATED_INPUT_WAIT_KIND})) is not None
+    if run is None:
+        return False
+    if parked_human_wait(run, kinds=INPUT_WAIT_KINDS) is not None:
+        return True
+    return any(
+        parked_child_human_wait(child, kinds=frozenset({INPUT_WAIT_KIND})) is not None
+        for child in await _live_children(db, str(task.id))
+    )
 
 
 # ── answer and rejection results the model reads ───────────────────────
@@ -318,23 +441,192 @@ def approval_not_run_result(request: HitlRequest, *, reason: str) -> dict[str, A
 # ── resuming the run ────────────────────────────────────────────────────
 
 
+def rebind_task_lifecycle(task: Task, run: Any, children: Any = ()) -> str:
+    """Bind a loop-hosted run tree to its Task's current lifecycle.
+
+    A Task status change makes a new lifecycle (``task_execution_intent_generation``)
+    and admission refuses a run of an older one. A run that continues across
+    such a change (a parked run resumed by its person, a paused Task resumed)
+    is rebound here, in the transaction that changed the status, together
+    with every non-terminal child row of the Task (``children``, locked by
+    the caller). This is the only writer of an agent-loop run's
+    ``lifecycle_generation`` (guarded in test_task_agent_durable_delegation).
+    Returns the new generation.
+    """
+
+    from packages.core.models.task_agent_child import TASK_AGENT_CHILD_TERMINAL_PHASES
+
+    generation = task_execution_intent_generation(task)
+    run.lifecycle_generation = generation
+    for child in children:
+        if child.phase not in TASK_AGENT_CHILD_TERMINAL_PHASES:
+            child.lifecycle_generation = generation
+    return generation
+
+
+async def lock_live_task_children(db: AsyncSession, task_id: str) -> list[Any]:
+    """The Task's non-terminal child rows, locked in (depth, id) order (after its root run)."""
+
+    from packages.core.models.task_agent_child import (
+        TASK_AGENT_CHILD_TERMINAL_PHASES,
+        TaskAgentChildRun,
+    )
+
+    return list((await db.execute(
+        select(TaskAgentChildRun)
+        .where(
+            TaskAgentChildRun.task_id == task_id,
+            TaskAgentChildRun.phase.not_in(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+        )
+        .order_by(TaskAgentChildRun.depth, TaskAgentChildRun.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+
+
+#: Child phases that move forward on their own (a wake is due or running).
+_SELF_DRIVEN_PHASES = frozenset({
+    TaskCoordinatorPhase.READY.value,
+    TaskCoordinatorPhase.RUNNING.value,
+    TaskCoordinatorPhase.WAITING_TIMER.value,
+    TaskCoordinatorPhase.WAITING_JOB.value,
+})
+
+
+def _parked_order(entry: tuple[Any, dict[str, Any]]) -> tuple[str, str]:
+    run, wait = entry
+    return str(wait.get("parked_at") or ""), str(getattr(run, "id", "") or "")
+
+
+def input_parks(root: Any, children: list[Any]) -> list[tuple[Any, dict[str, Any]]]:
+    """Every unanswered question of a run tree, earliest park first."""
+
+    parks: list[tuple[Any, dict[str, Any]]] = []
+    root_wait = parked_human_wait(root, kinds=INPUT_WAIT_KINDS)
+    if root_wait is not None:
+        parks.append((root, root_wait))
+    for child in children:
+        wait = parked_child_human_wait(child, kinds=frozenset({INPUT_WAIT_KIND}))
+        if wait is not None:
+            parks.append((child, wait))
+    return sorted(parks, key=_parked_order)
+
+
+def tree_waits_on_a_person(root: Any, children: list[Any]) -> bool:
+    """Whether no run of the tree can move forward without a person (Q3).
+
+    The root waits on its delegated children, no child is runnable or parked
+    on a timer or a job, no run holds a live claim, and at least one child
+    waits, undecided, on a person. Children waiting on their own children
+    are waiting on whatever those wait on.
+    """
+
+    from packages.core.services.durable_run import claim_is_live
+
+    if root is None or root.phase != TaskCoordinatorPhase.WAITING_CHILD.value or claim_is_live(root):
+        return False
+    waiting_on_person = False
+    for child in children:
+        if claim_is_live(child) or child.phase in _SELF_DRIVEN_PHASES:
+            return False
+        if child.phase == TaskCoordinatorPhase.WAITING_HUMAN.value:
+            if parked_child_human_wait(child) is None:
+                # Decided (e.g. while the Task was paused): it runs next.
+                return False
+            waiting_on_person = True
+    return waiting_on_person
+
+
+async def _earliest_question(db: AsyncSession, task: Task, parks: list[tuple[Any, dict[str, Any]]]) -> dict | None:
+    """The card question of the earliest unanswered park (what the Task page shows)."""
+
+    for _run, wait in parks:
+        context = (await db.execute(
+            select(HitlRequest.context).where(
+                HitlRequest.id == wait["hitl_request_id"],
+                HitlRequest.entity_id == task.entity_id,
+                HitlRequest.origin_task_id == task.id,
+                HitlRequest.status == ApprovalStatus.PENDING.value,
+            )
+        )).scalar_one_or_none()
+        question = context.get("question") if isinstance(context, dict) else None
+        if isinstance(question, dict) and str(question.get("question") or "").strip():
+            return question
+    return None
+
+
+async def sync_task_human_wait_status(db: AsyncSession, *, task: Task) -> bool:
+    """Put a Task on its person exactly when its whole run tree waits on one.
+
+    Called whenever a delegated child parks on a person or ends, and after a
+    person's answer reached a child. The caller holds the Task lock (and the
+    root run's, or it is taken here, then every open child in (depth, id)
+    order). While any run can still move forward the Task stays in progress
+    (a status change would make a new lifecycle and fence its running
+    children); once none can, the Task goes to WAITING_ON_CUSTOMER in this
+    transaction and the whole tree is rebound to that lifecycle
+    (``rebind_task_lifecycle``). The Task page's question is the earliest
+    unanswered one of the tree. Returns True when the status changed.
+    """
+
+    from packages.core.services.task_input_resume import TASK_INPUT_QUESTION_KEY
+
+    root = await task_agent_loop_run(db, str(task.id), for_update=True)
+    if root is None:
+        return False
+    children = await lock_live_task_children(db, str(task.id))
+    # Always current, None once no question of the tree is open.
+    question = await _earliest_question(db, task, input_parks(root, children))
+    details = dict(task.details or {})
+    if details.get(TASK_INPUT_QUESTION_KEY) != question:
+        details[TASK_INPUT_QUESTION_KEY] = question
+        task.details = details
+    if (
+        not children
+        or task.status != TaskStatus.IN_PROGRESS.value
+        or not tree_waits_on_a_person(root, children)
+    ):
+        return False
+    from packages.core.services.task_state_machine import apply_task_status_transition
+
+    await apply_task_status_transition(task, TaskStatus.WAITING_ON_CUSTOMER.value, db=db, actor_kind="system")
+    rebind_task_lifecycle(task, root, children)
+    return True
+
+
 async def _resume_parked_run(
     db: AsyncSession,
     *,
     task: Task,
-    run: TaskCoordinatorRun,
+    run: Any,
     wait: dict[str, Any],
     resolution: str,
     pending_tool_result: dict[str, Any] | None = None,
     pending_arguments: dict[str, Any] | None = None,
     note: str | None = None,
     reason: str,
+    decided_by: str | None = None,
+    spec: DurableRunSpec = TASK_COORDINATOR_RUN_SPEC,
 ) -> bool:
     """Write the decision into the park and wake the run when its Task waits.
 
-    The caller holds Task -> Run locks. A paused Task (not waiting on the
-    person any more) only records the decision: resuming the Task rebinds the
-    run with this checkpoint and its wake replays it.
+    ``run`` is any loop-hosted run row of ``spec``: the Task's root run or a
+    delegated child run. The caller holds the Task -> root Run -> child rows
+    locks.
+
+    * Root run: it wakes when its Task waits on the person (the Task goes
+      back in progress and the run tree is rebound to the new lifecycle).
+    * Child run: when its Task waits on the person (every runnable run of
+      the tree was waiting on someone) the Task goes back in progress and
+      the whole tree is rebound; in progress or back in progress, only this
+      child wakes (ready, its wake staged). Its parent keeps waiting on it.
+
+    A paused Task only records the decision: resuming the Task rebinds the
+    run with this checkpoint and its wake (or, for a child, its parent's
+    re-park) replays it.
+
+    Journaled as one ``wake`` row (``decided_by`` is the deciding user), after
+    the rebind: the row carries the lifecycle the run continues in.
     """
 
     checkpoint = copy.deepcopy(run.checkpoint if isinstance(run.checkpoint, dict) else {})
@@ -357,18 +649,32 @@ async def _resume_parked_run(
     }
     run.checkpoint = checkpoint
     run.state_version += 1
-    if task.status != TaskStatus.WAITING_ON_CUSTOMER.value:
-        return True
-    from packages.core.services.task_state_machine import apply_task_status_transition
+    is_child = spec is not TASK_COORDINATOR_RUN_SPEC
+    task_resumes = task.status == TaskStatus.WAITING_ON_CUSTOMER.value
+    wake = None
+    if task_resumes:
+        from packages.core.services.task_state_machine import apply_task_status_transition
 
-    await apply_task_status_transition(task, TaskStatus.IN_PROGRESS.value, db=db, actor_kind="system")
-    # The status change made a new Task lifecycle; the run continues it.
-    run.lifecycle_generation = task_execution_intent_generation(task)
-    wake = await reopen_run(
-        db, TASK_COORDINATOR_RUN_SPEC, run,
-        phase=TaskCoordinatorPhase.READY.value, reason=reason,
+        await apply_task_status_transition(task, TaskStatus.IN_PROGRESS.value, db=db, actor_kind="system")
+        # The status change made a new Task lifecycle; the run tree (the root
+        # run and every child of the Task still open) continues it.
+        root = run if not is_child else await task_agent_loop_run(db, str(task.id), for_update=True)
+        rebind_task_lifecycle(task, root, await lock_live_task_children(db, str(task.id)))
+    wakes = task_resumes or (is_child and task.status == TaskStatus.IN_PROGRESS.value)
+    if wakes:
+        # Only the decided run wakes: a child's parent keeps waiting on it.
+        wake = await reopen_run(
+            db, spec, run,
+            phase=TaskCoordinatorPhase.READY.value, reason=reason,
+        )
+    # The decision reaching the run is its own journaled transition.
+    await append_run_journal(
+        db, run=run, kind=TaskRunJournalKind.WAKE,
+        payload=wake_payload(
+            wait, resolution=resolution, task_resumed=task_resumes, decided_by=decided_by,
+        ),
     )
-    return wake is not None
+    return wake is not None if wakes else True
 
 
 async def apply_task_agent_loop_input_answer(
@@ -379,13 +685,20 @@ async def apply_task_agent_loop_input_answer(
     user_label: str,
     response_text: str,
     payload: dict[str, Any],
+    request_id: str | None = None,
 ) -> dict[str, Any] | None:
     """``apply_task_input_answer`` for an agent-loop Task; None for any other Task.
 
     The answer is the pending call's result, written into the parked
-    checkpoint. The Task is re-read under its lock (Task -> Run, as the park)
-    and its status re-checked there, so an answer never revives a Task that
-    was cancelled after the answering surface loaded it.
+    checkpoint. The Task is re-read under its lock (Task -> root Run ->
+    child rows, as the parks) and its status re-checked there, so an answer
+    never revives a Task that was cancelled after the answering surface
+    loaded it.
+
+    Which park it answers: the one waiting on ``request_id`` (a card names
+    its request), else the earliest unanswered question of the run tree (a
+    comment or the Task page). The root run's question, or a delegated
+    child's: only that run wakes; the other questions stay open.
 
     A Task waiting on the person resumes in this same transaction. A paused
     Task (on hold, not terminal) keeps the answer in its checkpoint, as an
@@ -406,10 +719,17 @@ async def apply_task_agent_loop_input_answer(
     )).scalar_one_or_none()
     if task is None or task.status in TERMINAL_STATUSES:
         return not_resumed
-    run = await task_agent_loop_run(db, str(task.id), for_update=True)
-    wait = parked_human_wait(run, kinds=frozenset({INPUT_WAIT_KIND, DELEGATED_INPUT_WAIT_KIND}))
-    if run is None or wait is None:
+    root = await task_agent_loop_run(db, str(task.id), for_update=True)
+    if root is None:
         return not_resumed
+    parks = input_parks(root, await lock_live_task_children(db, str(task.id)))
+    if request_id:
+        parks = [park for park in parks if park[1].get("hitl_request_id") == request_id]
+    if not parks:
+        return not_resumed
+    run, wait = parks[0]
+    is_child = run is not root
+    spec = _child_spec() if is_child else TASK_COORDINATOR_RUN_SPEC
     request = (await db.execute(
         select(HitlRequest).where(
             HitlRequest.id == wait["hitl_request_id"],
@@ -437,12 +757,15 @@ async def apply_task_agent_loop_input_answer(
                 ),
             },
             reason="human_input_answered",
+            decided_by=user_id,
+            spec=spec,
         )
     else:
         resumed = await _resume_parked_run(
             db, task=task, run=run, wait=wait, resolution="declined" if refused else "answered",
             note=delegated_answer_note(wait=wait, response_text=response_text, payload=clean_payload),
             reason="human_input_answered",
+            decided_by=user_id,
         )
     if not resumed:
         return not_resumed
@@ -452,11 +775,13 @@ async def apply_task_agent_loop_input_answer(
     details["_hitl_payload"] = clean_payload
     details["_hitl_responded_by"] = user_label
     task.details = details
+    agent = str(wait.get("agent_label") or "").strip() if is_child else ""
+    received = f"Human input received for {agent}" if agent else "Human input received"
     await add_task_log(
         db,
         task.id,
         TaskLogType.AI_HITL_RESUMED,
-        f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
+        f"{received}: {response_text[:300]}" if response_text else f"{received}.",
         actor=TaskActor.USER,
         created_by=user_label,
         metadata={
@@ -467,38 +792,37 @@ async def apply_task_agent_loop_input_answer(
             "submitted_at": utcnow().isoformat(),
             "mode": "agent_loop",
             "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
+            "hitl_request_id": wait["hitl_request_id"],
+            **({"run_id": run.id, "run_kind": RUN_KIND_CHILD, "agent_label": agent} if is_child else {}),
         },
     )
     await resolve_task_input_hitl(
         db, task=task, user_id=user_id, answer=response_text, payload=clean_payload,
+        # A child's question closes alone: its siblings' cards stay open.
+        request_id=wait["hitl_request_id"] if is_child else None,
     )
+    if is_child:
+        # The Task page now shows the next open question of the tree, if any.
+        await sync_task_human_wait_status(db, task=task)
     return {"resumed": True, "dispatch_agent_id": TASK_AGENT_LOOP_INPUT_DISPATCH}
 
 
 # ── approvals ──────────────────────────────────────────────────────────
 
 
-async def task_agent_loop_owns_request(db: AsyncSession, *, request: HitlRequest) -> bool:
-    """Whether a Task-origin request belongs to a Task run by an agent loop.
-
-    Such a request is never resolved through TaskRunner's checkpoint path: an
-    untagged or stale one is closed without failing the Task.
-    """
-
-    if is_task_agent_loop_request(request):
-        return True
-    task_id = str(getattr(request, "origin_task_id", None) or "").strip()
-    if not task_id:
-        return False
-    return await task_agent_loop_run(db, task_id) is not None
-
-
 async def _locked_approval_park(
     db: AsyncSession, *, request: HitlRequest,
-) -> tuple[Task, TaskCoordinatorRun, dict[str, Any], dict[str, Any]] | None:
-    """Task, run, wait and tag when the run is parked on exactly this request.
+) -> tuple[Task, Any, dict[str, Any], dict[str, Any], DurableRunSpec] | None:
+    """Task, run, wait, tag and run spec when the run is parked on exactly this request.
 
-    Lock order Task -> Run (the caller already holds the request).
+    The tag says which run: the Task's root run (v1) or a delegated child
+    run of that root (v2). Lock order Task -> root Run -> child rows (the
+    caller already holds the request). A child that ended (cancelled with its
+    Task or by its parent) is no longer parked: its card is not current. A
+    child that holds a claim while its unresolved wait still names this
+    request (woken, about to re-park on the same card) is current: the
+    decision reopens it with a fresh wake and the racing owner's re-park
+    loses its CAS, so an approval never turns into a denial by racing it.
     """
 
     tag = verified_request_tag(request)
@@ -511,8 +835,21 @@ async def _locked_approval_park(
     )).scalar_one_or_none()
     if task is None or task.status in TERMINAL_STATUSES:
         return None
-    run = await task_agent_loop_run(db, str(task.id), for_update=True)
-    wait = parked_human_wait(run, kinds=frozenset({APPROVAL_WAIT_KIND}))
+    root = await task_agent_loop_run(db, str(task.id), for_update=True)
+    if root is None:
+        return None
+    if tag_run_kind(tag) == RUN_KIND_CHILD:
+        if root.id != tag["root_run_id"]:
+            return None
+        spec = _child_spec()
+        run = next(
+            (child for child in await lock_live_task_children(db, str(task.id)) if child.id == tag["run_id"]),
+            None,
+        )
+        wait = parked_child_human_wait(run, kinds=frozenset({APPROVAL_WAIT_KIND})) if run is not None else None
+    else:
+        spec, run = TASK_COORDINATOR_RUN_SPEC, root
+        wait = parked_human_wait(run, kinds=frozenset({APPROVAL_WAIT_KIND}))
     if (
         run is None
         or wait is None
@@ -522,7 +859,7 @@ async def _locked_approval_park(
         or wait.get("checkpoint_digest") != tag["checkpoint_digest"]
     ):
         return None
-    return task, run, wait, tag
+    return task, run, wait, tag, spec
 
 
 async def task_agent_loop_approval_is_current(db: AsyncSession, *, request: HitlRequest) -> bool:
@@ -549,7 +886,7 @@ def existing_task_agent_loop_resolution(request: Any) -> dict[str, Any] | None:
 
 
 def _resolution_metadata(tag: dict[str, Any], *, choice: str) -> dict[str, Any]:
-    # The same kind as TaskRunner's: a background Task owns the continuation,
+    # A background Task owns the continuation,
     # so Chat never replays it and a rejection never reaches a chat model.
     return {
         "approval_kind": "task_runtime",
@@ -565,7 +902,7 @@ def _resolution_metadata(tag: dict[str, Any], *, choice: str) -> dict[str, Any]:
 def _approved_call_arguments(request: HitlRequest, pending_call: dict[str, Any]) -> dict[str, Any] | None:
     """The parked call's arguments for its approved re-execution.
 
-    Built as chat and TaskRunner build an approved retry
+    Built as chat builds an approved retry
     (``runtime_approval_retry_args``): the request's frozen continuation (a
     review may have finalized it) plus ``approval_token=<request id>``. The
     guard then spends exactly this request on its token path, which checks
@@ -623,7 +960,7 @@ async def stage_task_agent_loop_approval_resolution(
     park = await _locked_approval_park(db, request=request)
     if park is None:
         return None
-    task, run, wait, tag = park
+    task, run, wait, tag, spec = park
     normalized = "approved" if approved else "rejected"
     if approved:
         parked = (run.checkpoint or {}).get(RUNTIME_CHECKPOINT_KEY) or {}
@@ -634,6 +971,8 @@ async def stage_task_agent_loop_approval_resolution(
             db, task=task, run=run, wait=wait, resolution=normalized,
             pending_arguments=arguments,
             reason="runtime_approval_approved",
+            decided_by=request.decided_by_user_id,
+            spec=spec,
         )
     else:
         resumed = await _resume_parked_run(
@@ -646,6 +985,8 @@ async def stage_task_agent_loop_approval_resolution(
                 "gate": True,
             },
             reason="runtime_approval_rejected",
+            decided_by=request.decided_by_user_id,
+            spec=spec,
         )
     if not resumed:
         return None
@@ -656,14 +997,17 @@ async def stage_task_agent_loop_approval_resolution(
     }
     request.context = context
     tool = str(wait.get("tool_name") or "the action")
+    is_child = tag_run_kind(tag) == RUN_KIND_CHILD
+    agent = str(wait.get("agent_label") or "").strip() if is_child else ""
+    who = f"{agent} continues" if agent else "the Task continues"
     await add_task_log(
         db,
         task.id,
         TaskLogType.AI_AGENT_TURN,
         (
-            f"Approval granted for {tool}; the Task continues and runs it."
+            f"Approval granted for {tool}; {who} and runs it."
             if approved
-            else f"Approval not granted for {tool} ({reason or 'rejected'}); the Task continues without it."
+            else f"Approval not granted for {tool} ({reason or 'rejected'}); {who} without it."
         ),
         actor=TaskActor.USER if request.decided_by_user_id else TaskActor.SYSTEM,
         created_by=request.decided_by_user_id,
@@ -672,8 +1016,11 @@ async def stage_task_agent_loop_approval_resolution(
             "hitl_request_id": request.id,
             "choice": normalized,
             "reason": reason,
+            **({"run_id": run.id, "run_kind": RUN_KIND_CHILD, "agent_label": agent} if is_child else {}),
         },
     )
+    if is_child:
+        await sync_task_human_wait_status(db, task=task)
     return _resolution_metadata(tag, choice=normalized)
 
 
@@ -681,14 +1028,17 @@ async def stage_task_agent_loop_approval_resolution(
 
 
 async def lock_agent_loop_input_requests(db: AsyncSession, *, task: Task) -> list[HitlRequest]:
-    """An agent-loop Task's open input requests, locked; [] for any other Task.
+    """A durable Task loop's open input requests; [] for legacy Task runners.
 
     Taken in the HitlRequest -> Task order of the terminal approval cleanup.
     """
 
     from packages.core.services.task_chat_hitl import TASK_INPUT_ACTION_KEY
 
-    if await task_agent_loop_run(db, str(task.id)) is None:
+    run = (await db.execute(select(TaskCoordinatorRun).where(
+        TaskCoordinatorRun.task_id == str(task.id),
+    ))).scalar_one_or_none()
+    if run is None or run.engine != TaskCoordinatorEngine.AGENT_LOOP.value:
         return []
     return list((await db.execute(
         select(HitlRequest).where(
@@ -713,18 +1063,23 @@ async def close_agent_loop_input_requests(
     from packages.core.services.task_runtime_approvals import _expire_locked_runtime_request
 
     expired = [request for request in requests if await _expire_locked_runtime_request(db, request, reason=reason)]
-    if expired and task.workspace_id:
+    if expired and (task.workspace_id or task.conversation_id):
         from packages.core.constants.pending_actions import PendingActionKind
         from packages.core.models.task import Conversation, Message
         from packages.core.workspace_chat import service as chat_service
 
         ids = {request.id for request in expired}
+        # Outside a Workspace the cards are in the Task's own conversation.
+        card_scope = (
+            (Conversation.entity_id == task.entity_id, Conversation.workspace_id == task.workspace_id)
+            if task.workspace_id
+            else (Conversation.id == task.conversation_id,)
+        )
         rows = list((await db.execute(
             select(Message)
             .join(Conversation, Message.conversation_id == Conversation.id)
             .where(
-                Conversation.entity_id == task.entity_id,
-                Conversation.workspace_id == task.workspace_id,
+                *card_scope,
                 Message.resolved_at.is_(None),
                 Message.pending_action.isnot(None),
             )
@@ -737,9 +1092,312 @@ async def close_agent_loop_input_requests(
             ):
                 await chat_service.resolve_pending_action(
                     db, message_id=message.id, user_id=None,
-                    resolution={"choice": "expired", "note": reason}, emit_followup=False,
+                    resolution={"choice": "expired", "note": reason}, publish_resolution=False,
                 )
     return len(expired)
+
+
+def request_child_run_id(request: Any) -> str | None:
+    """The delegated child run a card belongs to (its question or its approval), if any."""
+
+    context = request.context if isinstance(getattr(request, "context", None), dict) else {}
+    if (
+        getattr(request, "origin_kind", None) == ApprovalOriginKind.TASK.value
+        and context.get("run_kind") == RUN_KIND_CHILD
+        and context.get("run_id")
+    ):
+        return str(context["run_id"])
+    tag = verified_request_tag(request)
+    if tag is not None and tag_run_kind(tag) == RUN_KIND_CHILD:
+        return str(tag["run_id"])
+    return None
+
+
+ENDED_CHILD_CARD_REASON = "agent_child_ended"
+
+#: ``task_loop_wait.resolution`` of a child park whose card closed undecided.
+CLOSED_RESOLUTION = "closed"
+
+CLOSED_INPUT_INSTRUCTION = (
+    "This question was closed without an answer. Continue without it if you can; "
+    "otherwise say exactly what is blocked. Ask again only if the answer is still required."
+)
+
+
+def closed_input_result(request: HitlRequest) -> str:
+    """The stored result of a question whose card closed without an answer."""
+
+    return json.dumps({
+        "status": "unanswered",
+        "answer": "",
+        "reason": str(request.resolved_reason or request.status or "closed")[:200],
+        "instruction": CLOSED_INPUT_INSTRUCTION,
+    }, ensure_ascii=False)
+
+
+async def settle_closed_park(
+    db: AsyncSession,
+    *,
+    task: Task,
+    run: Any,
+    wait: dict[str, Any],
+    request: HitlRequest,
+    spec: DurableRunSpec,
+) -> bool:
+    """Wake a run whose card is no longer pending although no decision reached it.
+
+    ``run`` is the Task's root run (``spec`` the coordinator's) or a
+    delegated child run. The caller holds HitlRequest -> Task -> root Run ->
+    child rows. What the request says decides the pending call's result,
+    exactly as the card would have:
+
+    * an approval granted elsewhere (still unspent): the call re-runs with
+      its approval token and spends the grant once;
+    * denied: the host-written "rejected, did not run" gate result;
+    * expired, withdrawn, spent elsewhere, or anything else: the "closed
+      without approval, did not run" gate result (the model may ask again);
+    * a question answered elsewhere (the answer is on the request): that
+      answer; refused: the declined result; otherwise "closed unanswered".
+
+    Only this run wakes. A root run's Task goes back in progress with it
+    (``_resume_parked_run``); a child's Task follows its run tree
+    (``sync_task_human_wait_status``). Returns True when the run was woken
+    (or, while its Task is paused, when the result was recorded).
+    """
+
+    is_child = spec is not TASK_COORDINATOR_RUN_SPEC
+    status = request.status
+    context = request.context if isinstance(request.context, dict) else {}
+    if wait.get("kind") == APPROVAL_WAIT_KIND:
+        resumed = False
+        if status == ApprovalStatus.GRANTED.value:
+            parked = (run.checkpoint or {}).get(RUNTIME_CHECKPOINT_KEY) or {}
+            arguments = _approved_call_arguments(request, parked.get("pending_tool_call") or {})
+            if arguments is not None:
+                resumed = await _resume_parked_run(
+                    db, task=task, run=run, wait=wait, resolution="approved",
+                    pending_arguments=arguments, reason="runtime_approval_approved",
+                    decided_by=request.decided_by_user_id, spec=spec,
+                )
+        if not resumed and status != ApprovalStatus.GRANTED.value:
+            denied = status == ApprovalStatus.DENIED.value
+            reason = "rejected" if denied else str(request.resolved_reason or status or CLOSED_RESOLUTION)
+            resumed = await _resume_parked_run(
+                db, task=task, run=run, wait=wait,
+                resolution="rejected" if denied else CLOSED_RESOLUTION,
+                pending_tool_result={
+                    "id": wait["tool_call_id"],
+                    "content": json.dumps(approval_not_run_result(request, reason=reason), ensure_ascii=False),
+                    "gate": True,
+                },
+                reason="runtime_approval_closed",
+                decided_by=request.decided_by_user_id, spec=spec,
+            )
+    else:
+        answer = context.get("answer") if isinstance(context.get("answer"), dict) else None
+        payload: dict[str, Any] = {}
+        response_text = ""
+        if status in {ApprovalStatus.GRANTED.value, ApprovalStatus.CONSUMED.value} and answer is not None:
+            payload = answer.get("payload") if isinstance(answer.get("payload"), dict) else {}
+            response_text = str(answer.get("answer") or "")
+            resolution = "answered"
+            content = input_answer_result(
+                response_text=response_text, payload=payload,
+                answered_by=str(answer.get("answered_by") or "the user"),
+            )
+        elif status == ApprovalStatus.DENIED.value:
+            resolution, payload = "declined", {"choice": "refuse"}
+            content = input_answer_result(response_text="", payload=payload, answered_by="the user")
+        else:
+            resolution, content = CLOSED_RESOLUTION, closed_input_result(request)
+        if wait.get("kind") == DELEGATED_INPUT_WAIT_KIND:
+            # An inline-delegated agent's question (no pending call of its
+            # own): the loop reads a note, as for an answer.
+            note = (
+                delegated_answer_note(wait=wait, response_text=response_text, payload=payload)
+                if resolution != CLOSED_RESOLUTION
+                else (
+                    "The delegated agent's question was closed without an answer. Continue "
+                    "without it if you can; otherwise say exactly what is blocked."
+                )
+            )
+            resumed = await _resume_parked_run(
+                db, task=task, run=run, wait=wait, resolution=resolution, note=note,
+                reason="human_input_closed", decided_by=request.decided_by_user_id, spec=spec,
+            )
+        else:
+            resumed = await _resume_parked_run(
+                db, task=task, run=run, wait=wait, resolution=resolution,
+                pending_tool_result={"id": wait["tool_call_id"], "content": content},
+                reason="human_input_closed", decided_by=request.decided_by_user_id, spec=spec,
+            )
+    if not resumed:
+        return False
+    from packages.core.services.task_service import add_task_log
+
+    what = "approval" if wait.get("kind") == APPROVAL_WAIT_KIND else "question"
+    if is_child:
+        agent = str(wait.get("agent_label") or "The delegated agent")
+        line = f"{agent}'s {what} card closed ({request.status}); {agent} continues."
+    else:
+        line = f"The Task's {what} card closed ({request.status}); the Task continues."
+    await add_task_log(
+        db, task.id, TaskLogType.AI_AGENT_TURN, line,
+        actor=TaskActor.SYSTEM,
+        metadata={
+            "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
+            "hitl_request_id": request.id,
+            "request_status": request.status,
+            "run_id": run.id,
+            "run_kind": RUN_KIND_CHILD if is_child else RUN_KIND_ROOT,
+            **({"agent_label": str(wait.get("agent_label") or "")} if is_child else {}),
+        },
+    )
+    if is_child:
+        await sync_task_human_wait_status(db, task=task)
+    return True
+
+
+#: Set while a Task's own terminal cleanup closes its cards: its runs stop
+#: with it (reconcile), so a closed card must not wake them.
+_CLOSING_FOR_TERMINAL_TASK: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "task_agent_loop_closing_for_terminal_task", default=False,
+)
+
+
+@contextlib.contextmanager
+def closing_for_terminal_task():
+    """Close a terminal Task's cards without waking the runs parked on them."""
+
+    token = _CLOSING_FOR_TERMINAL_TASK.set(True)
+    try:
+        yield
+    finally:
+        _CLOSING_FOR_TERMINAL_TASK.reset(token)
+
+
+async def wake_run_for_closed_request(db: AsyncSession, request: Any) -> bool:
+    """A Task agent loop run's card left PENDING without its decision reaching the run.
+
+    Called in the same transaction by every writer that closes a request
+    undecided (expiry, withdrawal, an approval that can no longer run),
+    right after it set the request's status; the caller holds the request
+    (HitlRequest -> Task -> root Run -> child rows follow here). The run
+    parked on exactly this request (the Task's root run, or the delegated
+    child the request names) wakes with the outcome the request carries
+    (``settle_closed_park``). A request no run waits on, a terminal Task:
+    nothing to do. The recovery sweep (``recover_runs_on_closed_cards_once``)
+    is the backstop for any close path that did not call this.
+    """
+
+    if (
+        _CLOSING_FOR_TERMINAL_TASK.get()
+        or getattr(request, "status", None) == ApprovalStatus.PENDING.value
+        or not getattr(request, "origin_task_id", None)
+    ):
+        return False
+    run_id = request_child_run_id(request)
+    task = (await db.execute(
+        select(Task).where(
+            Task.id == request.origin_task_id, Task.entity_id == request.entity_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if task is None or task.status in TERMINAL_STATUSES:
+        return False
+    root = await task_agent_loop_run(db, str(task.id), for_update=True)
+    if root is None:
+        return False
+    if run_id is None:
+        wait = parked_human_wait(root)
+        if wait is None or wait.get("hitl_request_id") != request.id:
+            return False
+        return await settle_closed_park(
+            db, task=task, run=root, wait=wait, request=request, spec=TASK_COORDINATOR_RUN_SPEC,
+        )
+    child = next(
+        (row for row in await lock_live_task_children(db, str(task.id)) if row.id == run_id), None,
+    )
+    wait = parked_child_human_wait(child) if child is not None else None
+    if wait is None or wait.get("hitl_request_id") != request.id:
+        return False
+    return await settle_closed_park(db, task=task, run=child, wait=wait, request=request, spec=_child_spec())
+
+
+async def close_ended_child_cards(db: AsyncSession, *, task_id: str, reason: str = ENDED_CHILD_CARD_REASON) -> int:
+    """Expire the open cards of a Task's delegated child runs that have ended.
+
+    A child stopped by its parent or its Task can no longer be resumed by its
+    question or approval. Runs in its own transaction after the one that
+    stopped the child (the approval-boundary -> HitlRequest -> Task lock
+    order does not allow it inside), and from the recovery sweep as the
+    backstop. Approving such a card later finds no park either and expires
+    it. Returns how many cards it closed.
+    """
+
+    from packages.core.constants.approvals import APPROVAL_LIVE_STATUSES
+    from packages.core.models.task_agent_child import (
+        TASK_AGENT_CHILD_TERMINAL_PHASES,
+        TaskAgentChildRun,
+    )
+    from packages.core.services.task_chat_hitl import TASK_INPUT_ACTION_KEY
+    from packages.core.services.task_runtime_approvals import (
+        _expire_locked_runtime_request,
+        lock_task_runtime_approval_boundary,
+    )
+
+    from sqlalchemy import or_
+
+    await lock_task_runtime_approval_boundary(db, task_id=task_id)
+    # Only child-owned cards are locked (a question naming its run, or a v2
+    # approval tag): the Task's other requests stay free for their own
+    # resolvers (e.g. answer_task_blocker takes HitlRequest -> Task).
+    requests = list((await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.origin_task_id == task_id,
+            HitlRequest.status.in_(tuple(status.value for status in APPROVAL_LIVE_STATUSES)),
+            HitlRequest.origin_kind.in_((ApprovalOriginKind.TASK.value, ApprovalOriginKind.TOOL_CALL.value)),
+            or_(
+                HitlRequest.context["run_kind"].astext == RUN_KIND_CHILD,
+                HitlRequest.context[(TASK_AGENT_LOOP_HITL_CONTEXT_KEY, "run_kind")].astext == RUN_KIND_CHILD,
+            ),
+        ).order_by(HitlRequest.id.asc()).with_for_update().execution_options(populate_existing=True)
+    )).scalars().all())
+    owned = {
+        request.id: run_id for request in requests
+        if (run_id := request_child_run_id(request)) is not None
+        and (
+            request.origin_kind == ApprovalOriginKind.TOOL_CALL.value
+            or (
+                request.action_key == TASK_INPUT_ACTION_KEY
+                and request.status == ApprovalStatus.PENDING.value
+            )
+        )
+    }
+    if not owned:
+        return 0
+    task = (await db.execute(
+        select(Task).where(Task.id == task_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if task is None:
+        return 0
+    live = set((await db.execute(
+        select(TaskAgentChildRun.id).where(
+            TaskAgentChildRun.task_id == task_id,
+            TaskAgentChildRun.id.in_(sorted(set(owned.values()))),
+            TaskAgentChildRun.phase.not_in(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+        )
+    )).scalars().all())
+    ended = [request for request in requests if request.id in owned and owned[request.id] not in live]
+    closed = 0
+    questions = [request for request in ended if request.origin_kind == ApprovalOriginKind.TASK.value]
+    if questions:
+        closed += await close_agent_loop_input_requests(db, task=task, requests=questions, reason=reason)
+    for request in ended:
+        if request.origin_kind == ApprovalOriginKind.TOOL_CALL.value and await _expire_locked_runtime_request(
+            db, request, reason=reason,
+        ):
+            closed += 1
+    return closed
 
 
 async def expire_task_agent_loop_input_requests(db: AsyncSession, *, task: Task, reason: str) -> int:
@@ -749,15 +1407,33 @@ async def expire_task_agent_loop_input_requests(db: AsyncSession, *, task: Task,
 
     await lock_task_runtime_approval_boundary(db, task_id=str(task.id))
     requests = await lock_agent_loop_input_requests(db, task=task)
-    return await close_agent_loop_input_requests(db, task=task, requests=requests, reason=reason)
+    with closing_for_terminal_task():
+        return await close_agent_loop_input_requests(db, task=task, requests=requests, reason=reason)
 
 
 __all__ = [
     "APPROVAL_WAIT_KIND",
+    "CHILD_APPROVAL_TAG_VERSION",
     "DELEGATED_INPUT_WAIT_KIND",
+    "ENDED_CHILD_CARD_REASON",
     "HUMAN_NOTE_KEY",
     "HUMAN_WAIT_KINDS",
     "INPUT_WAIT_KIND",
+    "INPUT_WAIT_KINDS",
+    "ROOT_APPROVAL_TAG_VERSION",
+    "RUN_KIND_CHILD",
+    "RUN_KIND_ROOT",
+    "CLOSED_RESOLUTION",
+    "close_ended_child_cards",
+    "closing_for_terminal_task",
+    "settle_closed_park",
+    "wake_run_for_closed_request",
+    "input_parks",
+    "parked_child_human_wait",
+    "request_child_run_id",
+    "sync_task_human_wait_status",
+    "tag_run_kind",
+    "tree_waits_on_a_person",
     "TASK_AGENT_LOOP_HITL_CONTEXT_KEY",
     "TASK_AGENT_LOOP_INPUT_DISPATCH",
     "apply_task_agent_loop_input_answer",
@@ -768,14 +1444,14 @@ __all__ = [
     "close_agent_loop_input_requests",
     "expire_task_agent_loop_input_requests",
     "lock_agent_loop_input_requests",
+    "lock_live_task_children",
     "human_wait",
     "input_answer_result",
-    "is_task_agent_loop_request",
     "parked_human_wait",
+    "rebind_task_lifecycle",
     "runtime_checkpoint_digest",
     "stage_task_agent_loop_approval_resolution",
     "task_agent_loop_approval_is_current",
-    "task_agent_loop_owns_request",
     "task_agent_loop_run",
     "task_agent_loop_waiting_on_input",
     "verified_request_tag",

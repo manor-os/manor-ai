@@ -46,7 +46,7 @@ async def test_same_skill_reload_preserves_existing_workdir(monkeypatch):
     )
 
     inject.assert_awaited_once()
-    assert inject.await_args.kwargs == {"clear_existing": False}
+    assert inject.await_args.kwargs == {"slot": "pptx", "clear_existing": False}
 
 
 @pytest.mark.asyncio
@@ -63,7 +63,7 @@ async def test_different_skill_reload_clears_existing_workdir(monkeypatch):
     )
 
     inject.assert_awaited_once()
-    assert inject.await_args.kwargs == {"clear_existing": True}
+    assert inject.await_args.kwargs == {"slot": "pdf", "clear_existing": True}
 
 
 @pytest.mark.asyncio

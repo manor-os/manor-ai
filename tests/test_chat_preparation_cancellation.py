@@ -17,6 +17,7 @@ from packages.core.services import chat_service
 from packages.core.services.runtime_event_stream import parse_sse_frame
 from packages.core.services.runtime_run_service import create_runtime_run, request_runtime_run_cancel
 from packages.core.tasks import runtime_tasks
+from tests.async_waits import LIVENESS_TIMEOUT_S, wait_for_signal
 
 
 @pytest.mark.asyncio
@@ -86,11 +87,11 @@ async def test_cancel_drains_preparation_and_commits_terminal_before_publication
     monkeypatch.setattr(runtime_tasks, "append_runtime_sse_event", append)
     task = asyncio.create_task(runtime_tasks.execute_runtime_run_once(run_id=run_id, worker_id="prepare-worker"))
     try:
-        await asyncio.wait_for(started.wait(), 3)
+        await wait_for_signal(started, task)
         async with database.async_session() as db:
             await request_runtime_run_cancel(db, run_id=run_id, entity_id="prepare-entity", user_id="prepare-user")
             await db.commit()
-        result = await asyncio.wait_for(asyncio.shield(task), 2)
+        result = await asyncio.wait_for(asyncio.shield(task), LIVENESS_TIMEOUT_S)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

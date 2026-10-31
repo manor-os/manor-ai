@@ -85,7 +85,8 @@ def public_media_job_params(params: dict[str, Any] | None) -> dict[str, Any]:
     return {
         key: value
         for key, value in (params or {}).items()
-        if key != MEDIA_JOB_OUTPUT_CONTRACT_KEY
+        # The billing pin names the paying company; it is internal.
+        if key not in {MEDIA_JOB_OUTPUT_CONTRACT_KEY, "xai_credential_binding", "payer_entity_id"}
     }
 
 

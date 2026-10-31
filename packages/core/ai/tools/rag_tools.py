@@ -21,10 +21,12 @@ from __future__ import annotations
 from typing import Any
 
 from packages.core.ai.runtime import runtime_rag_action
+from packages.core.ai.runtime.rag import runtime_rag_collaborator_scope
 from packages.core.ai.runtime.tool_context import (
     runtime_tool_call_context_from_kwargs,
     runtime_tool_call_context_is_external_customer,
     runtime_tool_call_context_is_public_customer,
+    runtime_trusted_workspace_id_from_context,
 )
 
 
@@ -79,6 +81,7 @@ async def _rag(entity_id: str, user_id: str = "", **kwargs: Any) -> str:
         client_visible_only=runtime_tool_call_context_is_external_customer(kwargs),
         public_agent_visible_only=runtime_tool_call_context_is_public_customer(kwargs),
         params=params,
+        **runtime_rag_collaborator_scope(entity_id, runtime_trusted_workspace_id_from_context(context)),
     )
 
 

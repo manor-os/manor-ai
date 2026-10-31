@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from packages.core.ai.runtime.chrome_run import (
     ChromeSkillOutcome,
@@ -22,6 +25,7 @@ from packages.core.ai.runtime.skill_capability_companion import (
     trusted_skill_capability_companion,
 )
 from packages.core.ai.runtime.surfaces import ChatSurface
+from packages.core.services.skill_service import invoke_skill
 
 
 
@@ -43,6 +47,17 @@ def _envelope(metadata: dict) -> RuntimeEnvelope:
         conversation_id="conv-1",
         metadata=metadata,
     )
+
+
+def _tool_schema(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
 
 
 def test_chrome_skill_outcome_serializes_resumable_run_without_ephemeral_refs() -> None:
@@ -98,6 +113,242 @@ def test_prompt_skill_child_envelope_preserves_chrome_runtime_state() -> None:
     assert child is not None
     assert child.metadata["chrome_runtime_contract_v1"]["run_id"] == "chrome-run-1"
     assert child.metadata["chrome_runtime_contract_v1"]["latest_snapshot_id"] == "snapshot-1"
+
+
+@pytest.mark.asyncio
+async def test_second_fresh_chrome_skill_invocation_reloads_discovered_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed Chrome Skill handoff does not terminate a later invocation."""
+
+    skill = SimpleNamespace(
+        id="chrome-skill",
+        entity_id=None,
+        name="chrome",
+        slug="chrome",
+        status="active",
+        system_prompt="Use Chrome tools.",
+        tools=["search_tools", "mcp__chrome__finalize_tabs"],
+        config={"discoverable_tool_prefixes": ["mcp__chrome__"]},
+    )
+    parent = _envelope({
+        "chrome_runtime_contract_v1": {
+            "run_id": "chrome-run-invocations",
+            "group_id": "group-invocations",
+            "control_epoch": "epoch-invocations",
+            "chrome_policy_connection_id": "connection-invocations",
+            "action_receipts": {"existing": {"receipt": {"status": "verified"}}},
+        }
+    })
+    invocation = 0
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_get_skill(_db, _skill_id):
+        return skill
+
+    async def fake_eligible(*_args, **_kwargs):
+        return True, None
+
+    async def fake_release(_db):
+        return None
+
+    async def fake_skill_loop(**kwargs):
+        nonlocal invocation
+        invocation += 1
+        current_invocation = invocation
+        rounds = 0
+        child_metadata = kwargs["runtime_envelope"].metadata
+
+        async def completion(_messages, tools, **_kwargs):
+            nonlocal rounds
+            rounds += 1
+            names = [schema["function"]["name"] for schema in tools]
+            seen_tool_names.append(names)
+            if current_invocation == 1 and rounds == 1:
+                assert "mcp__chrome__finalize_tabs" in names
+                return "", [{"id": "finish", "name": "mcp__chrome__finalize_tabs", "arguments": {}}], {"total": 1}
+            if current_invocation == 2 and rounds == 1:
+                assert "mcp__chrome__finalize_tabs" in names
+                return "", [{"id": "discover", "name": "search_tools", "arguments": {"query": "read chrome page"}}], {"total": 1}
+            if current_invocation == 2 and rounds == 2:
+                assert "mcp__chrome__read_page" in names
+                return "", [{"id": "read", "name": "mcp__chrome__read_page", "arguments": {}}], {"total": 1}
+            return "done", None, {"total": 1}
+
+        async def executor(name, _arguments):
+            if name == "mcp__chrome__finalize_tabs":
+                state = child_metadata.setdefault("chrome_runtime_contract_v1", {})
+                state["finalized"] = True
+                return json.dumps({"ok": True, "status": "finalized"})
+            if name == "search_tools":
+                return json.dumps({
+                    "loaded_tools": ["mcp__chrome__read_page"],
+                    "matches": [{
+                        "name": "mcp__chrome__read_page",
+                        "available": True,
+                        "schema": _tool_schema("mcp__chrome__read_page"),
+                    }],
+                })
+            if name == "mcp__chrome__read_page":
+                return json.dumps({"ok": True, "url": "https://example.test"})
+            raise AssertionError(f"Unexpected tool: {name}")
+
+        from packages.core.ai.agentic_loop import agentic_loop
+
+        with patch(
+            "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+            completion,
+        ):
+            return await agentic_loop(
+                system_prompt=kwargs["system_prompt"],
+                user_message=kwargs["user_message"],
+                tools=kwargs["tools"],
+                tool_executor=executor,
+                tool_schema_resolver=lambda name: _tool_schema(name),
+                metadata=child_metadata,
+                max_rounds=4,
+            )
+
+    monkeypatch.setattr("packages.core.services.skill_service.get_skill", fake_get_skill)
+    monkeypatch.setattr("packages.core.ai.runtime.skills.runtime_skill_is_eligible", fake_eligible)
+    monkeypatch.setattr("packages.core.services.skill_service.release_read_transaction", fake_release)
+    monkeypatch.setattr("packages.core.services.skill_service._load_prompt_skill_extra_files", lambda *_args: [])
+    monkeypatch.setattr("packages.core.ai.runtime.runtime_execute_skill_agent_loop", fake_skill_loop)
+    # This exercises the shared nested-loop contract with a simulated provider.
+    # The exported tree deliberately has no built-in Chrome provider catalog.
+    provider_tools = {"search_tools", "mcp__chrome__finalize_tabs", "mcp__chrome__read_page"}
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.tool_registry.runtime_registered_tool_names",
+        lambda **_kwargs: provider_tools,
+    )
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.tool_registry.runtime_tool_schemas_for_names",
+        lambda names: [_tool_schema(name) for name in names if name in provider_tools],
+    )
+
+    first = await invoke_skill(
+        MagicMock(), "chrome", "entity-1", "first browser task",
+        user_id="user-1", runtime_envelope=parent,
+        allowed_tool_names={"search_tools", "mcp__chrome__finalize_tabs", "mcp__chrome__read_page"},
+    )
+    second = await invoke_skill(
+        MagicMock(), "chrome", "entity-1", "second browser task",
+        user_id="user-1", runtime_envelope=parent,
+        allowed_tool_names={"search_tools", "mcp__chrome__finalize_tabs", "mcp__chrome__read_page"},
+    )
+
+    assert "chrome_outcome" in first, first
+    assert first["chrome_outcome"]["evidence"][0]["tabs_finalized"] is True
+    assert second["chrome_outcome"]["evidence"][0]["tabs_finalized"] is False
+    assert invocation == 2
+    assert any("mcp__chrome__read_page" in names for names in seen_tool_names)
+    state = parent.metadata["chrome_runtime_contract_v1"]
+    assert state["group_id"] == "group-invocations"
+    assert state["control_epoch"] == "epoch-invocations"
+    assert state["chrome_policy_connection_id"] == "connection-invocations"
+    assert state["action_receipts"] == {"existing": {"receipt": {"status": "verified"}}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("resume_kwargs", "keeps_finalized"), [
+    pytest.param({"runtime_checkpoint": {"messages": []}}, True, id="runtime-checkpoint"),
+    pytest.param({"hitl_resume_checkpoint": True}, False, id="checkpoint-capture"),
+])
+async def test_chrome_skill_only_checkpoint_resume_keeps_finalized_state(
+    monkeypatch: pytest.MonkeyPatch,
+    resume_kwargs: dict,
+    keeps_finalized: bool,
+) -> None:
+    skill = SimpleNamespace(
+        id="chrome-resume-skill", entity_id=None, name="chrome", slug="chrome",
+        status="active", system_prompt="Use Chrome.", tools=[], config={},
+    )
+    parent = _envelope({"chrome_runtime_contract_v1": {
+        "run_id": "chrome-resume", "finalized": True, "status": "completed",
+        "control_epoch": "epoch-resume", "control_interruption": {"kind": "pause"},
+    }})
+    observed: list[dict] = []
+
+    async def fake_loop(**kwargs):
+        observed.append(dict(kwargs["runtime_envelope"].metadata["chrome_runtime_contract_v1"]))
+        return SimpleNamespace(
+            content="paused", usage={}, tool_calls_made=[], rounds=0,
+            messages=[], stop_reason="completed", error=None, control={}, tool_evidence={},
+        )
+
+    monkeypatch.setattr("packages.core.services.skill_service.get_skill", AsyncMock(return_value=skill))
+    monkeypatch.setattr("packages.core.ai.runtime.skills.runtime_skill_is_eligible", AsyncMock(return_value=(True, None)))
+    monkeypatch.setattr("packages.core.services.skill_service.release_read_transaction", AsyncMock())
+    monkeypatch.setattr("packages.core.services.skill_service._load_prompt_skill_extra_files", lambda *_args: [])
+    monkeypatch.setattr("packages.core.ai.runtime.runtime_execute_skill_agent_loop", fake_loop)
+
+    await invoke_skill(
+        MagicMock(), "chrome", "entity-1", "resume browser task", user_id="user-1",
+        runtime_envelope=parent,
+        allowed_tool_names={"mcp__chrome__read_page"},
+        **resume_kwargs,
+    )
+
+    assert ("finalized" in observed[0]) is keeps_finalized
+    assert observed[0].get("status") == ("completed" if keeps_finalized else None)
+    assert observed[0]["control_interruption"] == {"kind": "pause"}
+
+
+@pytest.mark.asyncio
+async def test_nested_chrome_skill_resume_is_not_a_fresh_task() -> None:
+    from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
+    from packages.core.ai.runtime.nested_agent import (
+        runtime_nested_checkpoint_scope,
+        runtime_nested_skill_resume_active,
+        runtime_nested_skill_scope,
+    )
+    from packages.core.ai.runtime.tool_effect_intents import runtime_tool_effect_checkpoint_scope
+
+    parent = RuntimeAgentCheckpoint(
+        messages=[], usage={}, rounds=1, tool_calls_made=[],
+        pending_tool_call={"id": "invoke-chrome", "name": "invoke_skill", "arguments": {"skill": "chrome"}},
+    ).to_dict()
+    saved: list[dict] = []
+
+    async def persist(tree, _messages):
+        saved.append(tree)
+
+    with (
+        runtime_nested_checkpoint_scope(persist),
+        runtime_tool_effect_checkpoint_scope({"parent": parent}),
+        runtime_nested_skill_scope("chrome-skill") as frame,
+    ):
+        await frame.on_round_end(1, [], {}, [], {})
+
+    with (
+        runtime_nested_checkpoint_scope(persist),
+        runtime_tool_effect_checkpoint_scope({"parent": saved[-1]}),
+    ):
+        assert runtime_nested_skill_resume_active() is True
+
+
+@pytest.mark.asyncio
+async def test_parent_failure_retains_completed_child_evidence_without_settling_effect():
+    from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
+    from packages.core.ai.runtime.nested_agent import runtime_execute_with_nested_approval_checkpoints, runtime_nested_skill_scope
+    from packages.core.ai.runtime.tool_effect_intents import runtime_tool_effect_checkpoint_scope
+
+    parent = RuntimeAgentCheckpoint(messages=[], usage={}, rounds=1, tool_calls_made=[],
+        pending_tool_call={"id": "invoke-child", "name": "invoke_skill", "arguments": {"skill": "chrome"}}).to_dict()
+
+    async def fail_after_child():
+        with runtime_tool_effect_checkpoint_scope({"parent": parent}), runtime_nested_skill_scope("chrome-skill") as frame:
+            await frame.complete({"skill": "chrome", "content": "Existing draft: draft-42",
+                "chrome_outcome": {"status": "completed", "artifacts": [{"document_id": "draft-proof"}]},
+                "stop_reason": "completed"}, [])
+        return SimpleNamespace(stop_reason="error", control={"effect_state": "unconfirmed", "do_not_replay": True})
+
+    result = await runtime_execute_with_nested_approval_checkpoints(fail_after_child)
+    assert result.control["effect_state"] == "unconfirmed" and result.control["do_not_replay"] is True
+    evidence = result.control["child_skill_results"][0]
+    assert evidence["tool_call_id"] == "invoke-child"
+    assert evidence["result"]["chrome_outcome"]["artifacts"] == [{"document_id": "draft-proof"}]
+    assert evidence["result"]["content"] == "Existing draft: draft-42"
 
 
 def test_runtime_format_invoke_skill_result_returns_typed_chrome_outcome() -> None:

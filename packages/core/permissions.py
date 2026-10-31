@@ -105,6 +105,7 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
         Permission.DOCS_UPLOAD,
         Permission.AGENTS_CREATE,
         Permission.INTEGRATIONS_CONNECT,
+        Permission.INTEGRATIONS_SHARE,  # owners share what they connected
         Permission.MCP_USE_PERSONAL,
     },
     "admin": {
@@ -124,7 +125,6 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
         Permission.ADMIN_AUDIT,
         Permission.CHAT_VIEW_ALL,
         Permission.INTEGRATIONS_MANAGE,
-        Permission.INTEGRATIONS_SHARE,
         Permission.MCP_QUICKBOOKS_USE,
         Permission.MCP_STRIPE_USE,
     },
@@ -263,6 +263,8 @@ async def user_staff_role_assignment(
     db: "AsyncSession",
     user_id: str,
     entity_id: str,
+    *,
+    membership_role: dict | None = None,
 ) -> tuple[bool, str | None, str | None, list[str]]:
     """Return the authoritative Staff assignment for one entity.
 
@@ -270,21 +272,32 @@ async def user_staff_role_assignment(
     supplies permissions; inactive or deleted Staff fails closed. Only users
     with no linked Staff history may fall back to legacy ``User.role`` during
     migration.
+
+    ``membership_role``, when given, receives ``{"role": ...}`` -- the raw
+    UserMembership role (any status) -- read in the same Staff query whenever
+    Staff rows exist; it stays empty when there are none.
     """
     from packages.core.models.staff import Staff, StaffRole
 
-    staff_rows = list(
-        (
-            await db.execute(
-                select(Staff).where(
-                    Staff.user_id == user_id,
-                    Staff.entity_id == entity_id,
-                )
-            )
-        )
-        .scalars()
-        .all()
+    statement = select(Staff).where(
+        Staff.user_id == user_id,
+        Staff.entity_id == entity_id,
     )
+    if membership_role is None:
+        staff_rows = list((await db.execute(statement)).scalars().all())
+    else:
+        from packages.core.models.user import UserMembership
+
+        raw_role = (
+            select(UserMembership.role)
+            .where(UserMembership.user_id == user_id, UserMembership.entity_id == entity_id)
+            .limit(1)
+            .scalar_subquery()
+        )
+        rows = (await db.execute(statement.add_columns(raw_role.label("membership_role")))).all()
+        staff_rows = [row[0] for row in rows]
+        if rows:
+            membership_role["role"] = rows[0][1]
 
     if not staff_rows:
         return False, None, None, []
@@ -346,12 +359,18 @@ async def resolve_effective_user_role_name(
     user_id: str | None,
     entity_id: str | None,
     legacy_role: str | None = None,
+    membership_role: dict | None = None,
 ) -> str:
     """Resolve one user's authoritative role inside a target entity.
 
     Staff is authoritative whenever any linked Staff history exists. Without
     Staff, an active entity membership wins over compatibility role values;
     legacy User.role is used only for accounts not yet represented there.
+
+    ``membership_role``, when given, also receives ``{"role": ...}``: the raw
+    UserMembership role, whatever its status and whatever Staff says (None
+    without a membership), read by the same queries -- for callers keyed on
+    the membership role rather than the authorization role.
     """
     if not user_id or not entity_id:
         return (legacy_role or "").strip().lower()
@@ -360,6 +379,7 @@ async def resolve_effective_user_role_name(
         db,
         user_id,
         entity_id,
+        membership_role=membership_role,
     )
     if has_staff_record:
         return (assigned_role or "").strip().lower()
@@ -378,10 +398,12 @@ async def resolve_effective_user_role_name(
             )
         )
     ).one_or_none()
+    if membership_role is not None:
+        membership_role["role"] = membership[0] if membership is not None else None
     if membership is not None:
-        membership_role, membership_status, membership_deleted_at = membership
+        raw_role, membership_status, membership_deleted_at = membership
         if membership_status == "active" and membership_deleted_at is None:
-            return str(membership_role or "").strip().lower()
+            return str(raw_role or "").strip().lower()
         return ""
     if legacy_role:
         return legacy_role.strip().lower()

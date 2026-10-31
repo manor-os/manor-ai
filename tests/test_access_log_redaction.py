@@ -1,5 +1,6 @@
 import logging
 import io
+import json
 import sys
 
 import httpx
@@ -16,7 +17,8 @@ from packages.core.observability.log_redaction import (
 def test_redacts_sensitive_query_values_from_text():
     text = (
         '192.0.2.1 - "WebSocket /ws?token=jwt-secret&workspace_id=ok'
-        '&access_token=oauth-secret&code=auth-code HTTP/1.1" [accepted]'
+        '&access_token=oauth-secret&code=auth-code&ticket=download-secret'
+        '&TICKET=uppercase-secret HTTP/1.1" [accepted]'
     )
 
     redacted = redact_sensitive_log_text(text)
@@ -24,10 +26,51 @@ def test_redacts_sensitive_query_values_from_text():
     assert "jwt-secret" not in redacted
     assert "oauth-secret" not in redacted
     assert "auth-code" not in redacted
+    assert "download-secret" not in redacted
+    assert "uppercase-secret" not in redacted
     assert "workspace_id=ok" in redacted
     assert "token=<redacted>" in redacted
     assert "access_token=<redacted>" in redacted
     assert "code=<redacted>" in redacted
+    assert "ticket=<redacted>" in redacted
+    assert "TICKET=<redacted>" in redacted
+
+
+def test_log_filter_redacts_headers_passwords_and_private_keys():
+    secrets = ["dummy-bearer-secret", "dummy-password-secret", "dummy-cookie-secret", "dummy-private-key-secret"]
+    text = "\n".join([
+        f"Authorization: Bearer {secrets[0]}",
+        f"password={secrets[1]}",
+        f"Cookie: session={secrets[2]}",
+        "-----BEGIN PRIVATE KEY-----",  # Dummy PEM fixture; the payload is not a real key.
+        secrets[3],
+        "-----END PRIVATE KEY-----",
+        "request_id=review-safe-request",
+    ])
+    record = logging.LogRecord("httpx", logging.WARNING, __file__, 1, "%s", (text,), None)
+    assert SensitiveQueryStringFilter().filter(record)
+    rendered = logging.Formatter().format(record)
+    assert all(value not in rendered for value in secrets)
+    assert "request_id=review-safe-request" in rendered
+
+
+@pytest.mark.parametrize("serialize", [json.dumps, repr], ids=["json", "python-repr"])
+def test_log_filter_redacts_quoted_header_values_without_losing_context(serialize):
+    text = serialize({
+        "headers": {
+            "Cookie": 'manor_refresh=TEST_REFRESH_SECRET; other="TEST_OTHER_COOKIE"',
+            "Authorization": "Basic TEST_BASIC_CREDENTIAL",
+            "Proxy-Authorization": "Bearer TEST_PROXY_CREDENTIAL",
+            "Set-Cookie": "manor_refresh=TEST_SET_COOKIE; Path=/; HttpOnly",
+        },
+        "request_id": "review-safe-request",
+    })
+    record = logging.LogRecord("httpx", logging.WARNING, __file__, 1, "%s", (text,), None)
+    assert SensitiveQueryStringFilter().filter(record)
+    rendered = logging.Formatter().format(record)
+    assert "TEST_" not in rendered
+    assert "request_id" in rendered
+    assert "review-safe-request" in rendered
 
 
 def test_redacts_sensitive_query_values_from_log_record_args():
@@ -49,7 +92,18 @@ def test_redacts_sensitive_query_values_from_log_record_args():
     assert "tab=goals" in rendered
 
 
-def test_uvicorn_access_formatter_keeps_required_arguments_after_redaction():
+@pytest.mark.parametrize(
+    ("path", "secret", "redacted_query", "context"),
+    [
+        ("/ws?token=jwt-secret&workspace_id=ok", "jwt-secret", "token=<redacted>", "workspace_id=ok"),
+        (
+            "/api/v1/chat/rooms/group/file-downloads?ticket=download-secret&archive=true",
+            "download-secret", "ticket=<redacted>", "archive=true",
+        ),
+    ],
+    ids=["websocket", "group-download"],
+)
+def test_uvicorn_access_formatter_keeps_required_arguments_after_redaction(path, secret, redacted_query, context):
     record = logging.LogRecord(
         name="uvicorn.access",
         level=logging.INFO,
@@ -59,7 +113,7 @@ def test_uvicorn_access_formatter_keeps_required_arguments_after_redaction():
         args=(
             "127.0.0.1:1234",
             "GET",
-            "/ws?token=jwt-secret&workspace_id=ok",
+            path,
             "1.1",
             200,
         ),
@@ -71,9 +125,9 @@ def test_uvicorn_access_formatter_keeps_required_arguments_after_redaction():
     rendered = AccessFormatter(
         '%(client_addr)s - "%(request_line)s" %(status_code)s'
     ).format(record)
-    assert "jwt-secret" not in rendered
-    assert "token=<redacted>" in rendered
-    assert "workspace_id=ok" in rendered
+    assert secret not in rendered
+    assert redacted_query in rendered
+    assert context in rendered
     assert "GET" in rendered
     assert "200 OK" in rendered
 
@@ -105,15 +159,17 @@ def test_filter_redacts_rendered_format_arguments(message, arguments):
 
 def test_filter_redacts_traceback_and_stack_info():
     try:
-        raise ValueError("failed https://example.test/?apikey=secret-value")
+        raise ValueError("failed https://example.test/?apikey=secret-value&ticket=exception-ticket")
     except ValueError:
         exc_info = sys.exc_info()
-    record = logging.LogRecord("httpx", logging.ERROR, __file__, 1, "request failed", (), exc_info)
-    record.stack_info = "request https://example.test/?api_key=stack-secret"
+    record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "request failed", (), exc_info)
+    record.stack_info = "request https://example.test/?api_key=stack-secret&ticket=stack-ticket"
     assert SensitiveQueryStringFilter().filter(record)
     formatted = logging.Formatter().format(record)
     assert "secret-value" not in formatted
     assert "stack-secret" not in formatted
+    assert "exception-ticket" not in formatted
+    assert "stack-ticket" not in formatted
     assert "ValueError" in formatted
 
 

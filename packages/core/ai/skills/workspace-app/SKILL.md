@@ -1,7 +1,7 @@
 ---
 name: workspace-app
 description: Configure the Workspace App layout, main action, forms and internal links to Agent Chat, Workflow or Automation.
-version: 1.0.2
+version: 1.0.8
 ---
 
 # Workspace App
@@ -12,8 +12,18 @@ Read `app_view`, `available_actions`, `workflow_options`, `agent_options`,
 do not prove an App or Workflow is missing. Unattached saved Workflows can still
 be available to connect. Do not select an unrelated Workflow merely because it exists.
 
-For titles, descriptions, visible/order settings, primary action, input forms
-and internal execution targets, create a configuration draft using `app_view.update`.
+To design or redesign the page (which entries it offers, what cards open,
+which data views and sections it shows), do not lay it out yourself: command
+the App designer with operation `design_app` and
+`brief:"<what the person wants to do from the App>"`. It reads what the
+Workspace runs, composes the page from the App module schematic and recipes,
+and returns a checked candidate as an `app_view.update` draft with its design
+notes. Review the candidate against the request, then accept it with
+`apply_draft` (the person approves the review card), send it back with
+`design_app`, `feedback` and that `draft_id`, or `discard_draft`.
+
+For small named changes (titles, descriptions, visible/order settings, primary action, input forms
+and internal execution targets), create a configuration draft using `app_view.update`.
 Use returned action keys for existing entries and catalog IDs for runner references.
 New entries do not require a Workspace Service: add
 `entries:{"action:<unique id>":{"title":"Entry name"}}`, with a typed target in
@@ -32,6 +42,165 @@ To connect an unattached Workflow, use `workflow_binding.attach` with its actual
 `workflow_id`, optional existing `action_key` (or `service_key`, never both), and
 `primary:true` when it should be the main action. The reviewed apply creates
 the binding and App action; it does not deploy or run the Workflow.
+
+Data sections use declared `data_sources` and `data_view` components in the same
+App configuration. Project sources can set `label_fields:[["title"],["edition"]]`
+to compose readable names from up to three declared string fields in the producer
+`state_schema`. Do not use internal project keys as display names. Omit
+`launch_workflows` (or use `[]`) for a selector of actual projects only; include
+launch mappings only when the Page needs attempts that have not created a project.
+Data views are not tied to campaigns or publishing. Choose a context label and
+sources for the actual tracked object (for example a delivery or inspection).
+One Workspace can have several independent components for different Workflows.
+Ordinary `workflow_projects`, `related_projects`, and typed `project_records`
+can render as `records` without platforms, publication receipts or Stats.
+Set `visibility:{block:<records block key>,when:"has_records"}` to show only
+contexts with records in that declared source. Omit visibility when the section
+should also show work in progress. Workflow completion is not a universal gate.
+
+A project that contains projects (a series and its episodes, a campaign and
+its slots) is one data view: a `workflow_projects` source for the parent, a
+`related_projects` source for its children, `project_files` for the files in
+the parent's folder and its children's folders (a documents block groups them
+by subfolder, exactly as the Workspace files show them) and `project_references`
+for what the parent pins for every child: narrator voices
+(`reference_kind:"voices"`) and named images such as a key visual or a
+character sheet (`reference_kind:"images"`). A `references` block shows each
+one, with the image itself, and which project holds it. The
+producing Flow names the folders: `workflow_project` create or claim with
+`folder:{name:"{{plan.title}}"}`, and a child with
+`folder:{name:..., under:"{{parent.state.project_root}}"}`; its `state_schema`
+declares `project_root` as a string. A voice is pinned where the parent's state
+declares an empty slot, `references:{voices:{narrator:{}}}`, and every child's
+narration reuses it. A parent that declares `references:{images:{}}` keeps every
+image made inside it under a name (`generate_file` image `workspace_asset_key`,
+saved in its `references/` folder); children pass
+`params.reference_assets:["<name>"]` to image or video generation to use exactly
+those files. Set `context:{kind:"project",source:"parents",display:"cards",
+cover:"<references block of images>",progress:"<project_rollup block with
+completion>"}` to list the parents as cards (cover, name, children done); one
+opens that parent's blocks, and a `packs` block over `project_files` with
+`results_only:true` shows each child as a cover card that opens its results.
+Give that block `plan:"<project_records source of the parent's plan list>"` to
+list every planned child in the plan's order (one not started yet is a card
+too), and `item_action:{action:"action:<entry>",input:"episode_id",
+label:"Remake"}` to open that App entry from a started child's card with the
+child chosen; the `project_rollup` that counts children takes the same
+`plan` so its total is every planned child. Give the same block
+`plan_action:{action:"action:<entry>",label:"Make this episode",
+inputs:{series_id:"parent",episode_code:"code"}}` to open an App entry from a
+planned card, its Flow inputs (one to four) filled from the card's `parent`
+project or its plan `code`. The entries the cards open are ordinary App entries
+(`entries` with a Workflow in `targets`, and `asks:{"action:<entry>":["episode_id"]}`
+for the hidden Flow inputs they ask for); list them in `hidden` so they show on
+the cards only, never as tiles of their own. A Flow that makes a child again opens it with `workflow_project`
+`production:"take"`: the run works in `<child folder>/takes/<run>`, read as
+`{{child.production_root}}`, and records it on the child when done; the card
+then shows only that take. Do not add a section per Workspace for this; configure
+these sources.
+
+Project sources may declare `stages:["scheduled","ready"]` and
+`order:{field:["due_at"],type:"datetime",direction:"asc"}`. The ordering field
+must be a declared string path in the producer schema. Use timezone-aware ISO
+timestamps; missing or invalid older values sort last. Stage filters apply to
+all dependent views, including related records. Keep a source unfiltered when
+both pending and completed results must remain visible.
+
+By default a project execution link reads the project's current `last_run_id`.
+When a later status check could replace that pointer, a project source may
+declare `execution_run_id_path:["publishing","run_id"]`. The path must be a
+string field declared by the producing Workflow's `state_schema`; the App then
+links only to that same Workspace's referenced run. For a canonical native
+retry lineage it shows the latest retry attempt; it does not fall back to
+`last_run_id` when the value is absent or invalid. This is a read projection,
+not a retry, launch, approval, or recovery control.
+
+Use a `project_rollup` block in an existing project-context data view for a
+summary across all matching projects, not just the current page:
+`{key:"schedule_summary",type:"project_rollup",source:"scheduled_items",count_by_stage:true,first:{stages:["scheduled","ready"]}}`.
+`first` requires the source's datetime order and selects the earliest matching
+item, including overdue items. Its preview contains the label, stage, ordering
+date and linked execution. Use `first.stages` to choose pending work without
+hiding completed results from other blocks that share the source.
+
+A `project_rollup` can declare
+`completion:{stages:["delivered"],label:"Delivered"}`; the App derives the
+completed count from that block's returned `total` and `counts_by_stage`.
+This is display configuration only and does not advance a Workflow Project.
+`project_rollup` and `progress` may declare
+`stage_labels:{ready:"Materials ready",leased:"Work in progress"}` to map
+stored stage values to human-readable copy. Labels do not establish that work
+was generated, published, delivered, or otherwise completed. Use an optional
+`empty_message` on any data block only for an honest configured empty state;
+it must not imply output or evidence that the configured sources do not have.
+
+A `progress` block can use the same labeled field declarations as `summary`
+below, in any context, when its source is a project source; a Workspace-level
+list of projects then shows each row's labeled fields and skips empty ones
+marked `hide_when_empty`. Legacy field-path arrays remain supported but show
+raw state keys. Business stage and current
+Workflow run status are separate. An Automation displays its enabled, disabled
+or ended state separately from its last run's result, next check and stop date.
+Do not interpret a completed check as completion of the tracked project.
+
+For publication results, use a `records` block with
+`source:<project_records source>` and `metrics_source:<publication_stats source>`.
+For publications with different applicable metrics, set the records block's
+`metrics_display` to `configured`. It shows only metrics with matching Stat
+definitions for that exact publication; configured metrics without observations
+remain visible as unavailable. A publication with no matching definitions remains
+pending tracking. Omit the option (or use `declared`) to retain placeholders for
+all declared source metric keys. This setting is editable in Page data sections
+and travels with the Blueprint.
+The Stats source must name this records source as its `parent` and a project
+ancestor as its `subject`. This keeps each publication and its observations
+together, even when several works use the same platform. A completed Workflow
+alone is not proof of publication: the records source reads durable verified
+`publication-receipt/v1` records, and missing observations remain unavailable.
+For a project section that starts at publication, set
+`visibility:{block:"published",when:"has_records"}`. It filters the selector
+and records block to verified publication receipts; missing, pending,
+unavailable, and error metrics remain
+visible. Use `when:"has_observations"` only when the section must wait for an
+active matching collector and a real observation (zero counts qualify). Both
+rules are portable App configuration and remain editable in Page.
+
+Configure display metadata with
+`record_display:{title:{source:<project owner or ancestor>,field:["title"]},fields:[{label:"Outcome",source:<project owner or ancestor>,field:["outcome"],labels:{pass:"Passed"}}]}`.
+Each field must be declared in that source's `fields` and the producer
+Workflow's `state_schema`. Keep these references in App configuration so Page
+edits and Blueprint export/install preserve them. Optional `labels` maps stored
+status values to domain copy; do not bake business status meanings into the UI.
+Add `record_display.media:[{source:<project_documents source>,label:"Evidence"}]`
+to show up to four associated documents inside each record. A media source's
+parent must be the record's declared project owner or ancestor. Its
+`document_path` must resolve to a canonical Knowledge Document ID. The App
+resolves each record's exact project reference and enforces Document access;
+never bind a campaign-wide first image, filename match, filesystem path or
+arbitrary image URL. Image previews use the shared thumbnail service; other
+files retain their viewer entry. Configured media labels describe the actual
+role, not an assumed publication status. Showing an asset does not prove it
+was externally applied. Hide a redundant standalone documents block through
+Page display settings only when those documents already appear with records.
+Preserve the main action and
+existing Page display choices. App bindings do not create collectors: the
+Workflow must configure Stats and deploy collection/reporting schedules before
+launching work that can publish.
+
+For a selected project context, add a `summary` block to the same project-scoped
+component as its related records so they share one project selector. Its source
+must exactly equal the component project source. Remove a component-level
+record visibility condition if this context should appear before publication.
+Use a separate summary component only for an independent project selection.
+Use fields such as
+`{label:"Target date",field:["timeline","target_at"],format:"date",hide_when_empty:true}`.
+Supported formats are `text`, `status`, `date`, `link`, `link_list`, and
+`document`; `status` may map stored values with `labels`. Link lists are arrays
+of `{label,url}` and only safe public HTTP(S) URLs render as links. A `document`
+field holds a stored Document ID and opens that Document in the viewer. Summary fields
+must be declared source paths backed by the producer `state_schema`; they cannot
+query another Project, Automation, or arbitrary URL. Keep an empty summary
+component out of the page rather than adding placeholder content.
 
 Use create_draft with nonempty patches, then validate_draft/preview_diff when
 needed. The returned review card owns approval; apply_draft only after approval.

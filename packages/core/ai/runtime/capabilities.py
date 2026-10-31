@@ -4,7 +4,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from packages.core.ai.runtime.channel_tools import RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME
-from packages.core.ai.runtime.profiles import RuntimeProfile
+from packages.core.ai.runtime.profiles import (
+    EXTERNAL_RUNTIME_PROFILES,
+    INTERNAL_RUNTIME_PROFILES,
+    RuntimeProfile,
+)
 
 
 RiskLevel = Literal["safe", "write", "external", "destructive", "financial", "admin"]
@@ -36,15 +40,19 @@ _INTERNAL_PROFILES = (
     RuntimeProfile.WORKFLOW_STEP,
     RuntimeProfile.BACKGROUND_WORKER,
 )
-_CUSTOMER_SAFE_PROFILES = (
-    RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
-    RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
+_CUSTOMER_SAFE_PROFILES = tuple(
+    profile for profile in RuntimeProfile if profile in EXTERNAL_RUNTIME_PROFILES
 )
 _VOICE_AND_EDITOR_PROFILES = (
     RuntimeProfile.FILE_EDITOR_PATCH,
     RuntimeProfile.VOICE_SAFE,
 )
 _ALL_RUNTIME_PROFILES = _INTERNAL_PROFILES + _CUSTOMER_SAFE_PROFILES + _VOICE_AND_EDITOR_PROFILES
+
+def _sandbox_execute_tool_names() -> tuple[str, ...]:
+    names: tuple[str, ...] = ("sandbox", "video_edit")
+    return names
+
 
 _TOOL_CAPABILITY_ALIAS_TARGETS = {
     "sandbox_create": "sandbox",
@@ -112,6 +120,12 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Invoke visible skill",
         description="Invoke a skill that is visible and allowed in this runtime surface.",
         tool_names=("invoke_skill",),
+        # Enumerated, not derived from INTERNAL_RUNTIME_PROFILES: external
+        # profiles hold it (gated per Skill by allowed_surfaces) and the
+        # workspace architect deliberately does not. The file editor holds it
+        # by product decision 2026-10-06: it invokes any Skill the caller
+        # could invoke in ordinary chat; Skill-level authorization is
+        # unchanged and Skill outputs never replace the mounted file.
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -121,6 +135,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
             RuntimeProfile.BACKGROUND_WORKER,
             RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
             RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
+            RuntimeProfile.FILE_EDITOR_PATCH,
             RuntimeProfile.VOICE_SAFE,
         ),
     ),
@@ -330,18 +345,10 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="sandbox.execute",
         name="Sandbox execution",
         description="Run isolated sandbox commands and exchange sandbox files.",
-        tool_names=(
-            "sandbox",
-            "video_edit",
-        ),
-        profiles=(
-            RuntimeProfile.OWNER_COPILOT,
-            RuntimeProfile.AGENT_DELEGATE,
-            RuntimeProfile.WORKSPACE_OPERATOR,
-            RuntimeProfile.TASK_WORKER_FEEDBACK,
-            RuntimeProfile.WORKFLOW_STEP,
-            RuntimeProfile.BACKGROUND_WORKER,
-        ),
+        tool_names=_sandbox_execute_tool_names(),
+        # Product decision 2026-10-06: every internal principal may use the
+        # Sandbox, including profiles added later; external principals never.
+        profiles=INTERNAL_RUNTIME_PROFILES,
         risk_level="write",
         required_approval=True,
     ),
@@ -458,7 +465,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
     "cli.execute": BusinessCapability(
         id="cli.execute",
         name="CLI execution",
-        description="Run local shell commands through the controlled bash tool.",
+        description="Run shell commands in the caller's sandbox through the bash tool.",
         tool_names=("bash",),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
@@ -534,6 +541,13 @@ _LEGACY_INTERNAL_PROFILES = {
     RuntimeProfile.WORKFLOW_STEP,
     RuntimeProfile.BACKGROUND_WORKER,
 }
+
+
+def capability_tool_name(name: str) -> str:
+    """Return the capability-declared tool a legacy alias stands for."""
+
+    clean = str(name or "").strip()
+    return _TOOL_CAPABILITY_ALIAS_TARGETS.get(clean, clean)
 
 
 def capabilities_for_tool_names(

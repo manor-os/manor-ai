@@ -1,0 +1,29 @@
+{
+  "id": "workspace-app-design",
+  "name": "workspace-app-design",
+  "display_name": "Workspace App design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Design a Workspace App page from what the Workspace runs: the module schematic, when to use each module, and recipes for combining them. Guides the App designer.",
+  "category": "workspace-design",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "search": {
+    "terms": [
+      "app design",
+      "page layout",
+      "app modules",
+      "series app",
+      "app recipes"
+    ],
+    "examples": [
+      "design the workspace app page",
+      "lay out a series app with episodes",
+      "choose app modules for a studio"
+    ]
+  }
+}

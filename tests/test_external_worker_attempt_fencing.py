@@ -510,10 +510,12 @@ async def test_expired_tokenized_external_action_is_never_blindly_retried(
     step = await db_session.get(ExecutionStep, seeded["step_id"])
     assert lease.status == WorkLeaseStatus.EXPIRED.value
     # Expiry proves neither that the daemon stopped nor that provider I/O did
-    # not finish. Keep the claim as the durable quiescence fence; the token is
-    # still absent from provider arguments and reconciliation evidence.
+    # not finish. Keep the claim as evidence; the token is still absent from
+    # provider arguments and the recorded effect. The Step fails rather than
+    # replaying the action.
     assert lease.execution_claim_id == attempt_token
-    assert step.step_status == "waiting_human"
+    assert step.step_status == "failed"
+    assert step.error["type"] == "ExternalEffectUnconfirmed"
     assert step.current_lease_id is None
     unknown = [
         item

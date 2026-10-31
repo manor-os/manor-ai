@@ -25,6 +25,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import WorkLease, Worker
 from packages.core.models.workspace import Workspace
+from tests.async_waits import LIVENESS_TIMEOUT_S, wait_for_signal
 
 
 async def _seed_worker_capacity_scenario(
@@ -354,7 +355,10 @@ async def test_heartbeat_commits_worker_before_workspace_checkout(
                 else:
                     await completion_db.commit()
 
-                await asyncio.wait_for(workspace_waiter, timeout=2)
+                await asyncio.wait_for(
+                    workspace_waiter,
+                    timeout=LIVENESS_TIMEOUT_S,
+                )
                 observed["worker_lock_error"] = worker_lock_error
             finally:
                 if completion_db.in_transaction():
@@ -406,23 +410,37 @@ async def test_concurrent_checkout_respects_persisted_worker_capacity(db_session
             release_checkout=release_checkout,
         )
     )
-    await asyncio.wait_for(checked_out.wait(), timeout=2)
-    second_checkout = asyncio.create_task(
-        _checkout_and_commit(
-            sessions,
-            worker_id,
-            requested=32,
-            plan_id=plan_ids[1],
-        )
-    )
-    second_waited = False
+    tasks = [first_checkout]
     try:
-        await asyncio.wait_for(asyncio.shield(second_checkout), timeout=0.1)
-    except asyncio.TimeoutError:
-        second_waited = True
+        await wait_for_signal(checked_out, first_checkout)
+        second_checkout = asyncio.create_task(
+            _checkout_and_commit(
+                sessions,
+                worker_id,
+                requested=32,
+                plan_id=plan_ids[1],
+            )
+        )
+        tasks.append(second_checkout)
+        second_waited = False
+        try:
+            # The first transaction holds the admission lane until released,
+            # so the second cannot finish inside this window on any machine.
+            await asyncio.wait_for(asyncio.shield(second_checkout), timeout=0.1)
+        except asyncio.TimeoutError:
+            second_waited = True
+        finally:
+            release_checkout.set()
+        granted = await asyncio.wait_for(
+            asyncio.gather(first_checkout, second_checkout),
+            timeout=LIVENESS_TIMEOUT_S,
+        )
     finally:
         release_checkout.set()
-    granted = await asyncio.gather(first_checkout, second_checkout)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async with sessions() as verify_db:
         active = (await verify_db.execute(

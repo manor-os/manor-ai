@@ -6,6 +6,7 @@ from typing import Any
 from packages.core.ai.runtime import runtime_invoke_skill
 from packages.core.ai.runtime.artifacts import runtime_input_with_artifact_context
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.services.skill_reference_materials import skill_context_artifact_urls
 
 from . import common
 
@@ -81,9 +82,10 @@ async def _invoke_builtin_skill(
             model=getattr(runtime_context, "llm_model", None),
             tool_profile=getattr(runtime_context, "tool_profile", None),
             allowed_tool_names=getattr(runtime_context, "allowed_tool_names", None),
-            reference_artifact_urls=(
-                list(getattr(runtime_context, "runtime_artifact_urls", None) or ())
-                + list(getattr(runtime_context, "dependency_artifact_urls", None) or ())
+            # Host-collected run context: optional references.
+            context_artifact_urls=skill_context_artifact_urls(
+                getattr(runtime_context, "runtime_artifact_urls", None),
+                getattr(runtime_context, "dependency_artifact_urls", None),
             ),
         )
 
@@ -98,6 +100,10 @@ async def _invoke_builtin_skill(
                 "skill": skill,
                 "code": result.get("code"),
                 "retryable": bool(result.get("retryable")),
+                **(
+                    {"reference": result["reference"]}
+                    if isinstance(result.get("reference"), dict) else {}
+                ),
             },
             ensure_ascii=False,
         )

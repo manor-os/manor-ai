@@ -47,6 +47,68 @@ _consumed_approval_request_ids: contextvars.ContextVar[list[str] | None] = (
 _tool_effect_result_observer: contextvars.ContextVar[Callable[..., Any] | None] = (
     contextvars.ContextVar("runtime_tool_effect_result_observer", default=None)
 )
+_tool_effect_intent_watchers: contextvars.ContextVar[tuple[Callable[..., Any], ...]] = (
+    contextvars.ContextVar("runtime_tool_effect_intent_watchers", default=())
+)
+
+
+def _no_intent_effects() -> frozenset[Any]:
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+
+    # Reads and control calls change nothing; an orchestrator call (a Skill
+    # or delegated loop) changes only what its own child calls change, and
+    # each of those reports its own intent.
+    return frozenset({RuntimeToolEffect.READ_ONLY, RuntimeToolEffect.CONTROL, RuntimeToolEffect.ORCHESTRATOR})
+
+
+def runtime_tool_call_may_cross_effect_io(tool_name: str, classification: Any) -> bool:
+    """True when this classified call may change something outside the run.
+
+    An unclassified call counts as effectful: only a classification proves
+    a call cannot have an effect.
+    """
+    from packages.core.ai.runtime.approval_classifier import runtime_call_executes_nothing
+
+    if runtime_call_executes_nothing(tool_name, classification):
+        return False
+    return getattr(classification, "effect", None) not in _no_intent_effects()
+
+
+@contextmanager
+def runtime_tool_effect_watch_scope(watcher: Callable[..., Any] | None) -> Iterator[None]:
+    """Let a host learn, before I/O, that an effectful call is about to run.
+
+    Unlike the intent observer this is no single-continuation barrier: it
+    never serializes tool batches and needs no per-call checkpoint. The
+    watcher is called as ``watcher(tool_name, classification)`` (sync or
+    async) for every call that may cross effect I/O, including calls of
+    nested Skill loops, and is awaited before the handler runs. An exception
+    it raises keeps the handler from running.
+    """
+
+    if watcher is None:
+        yield
+        return
+    token = _tool_effect_intent_watchers.set((*_tool_effect_intent_watchers.get(), watcher))
+    try:
+        yield
+    finally:
+        _tool_effect_intent_watchers.reset(token)
+
+
+async def _notify_tool_effect_watchers(tool_name: str, classification: Any) -> None:
+    watchers = _tool_effect_intent_watchers.get()
+    if not watchers or not runtime_tool_call_may_cross_effect_io(tool_name, classification):
+        return
+    for watcher in watchers:
+        try:
+            outcome = watcher(str(tool_name or ""), classification)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except RuntimeToolEffectPersistenceError:
+            raise
+        except Exception as exc:
+            raise RuntimeToolEffectPersistenceError("Tool effect intent could not be recorded") from exc
 
 
 @contextmanager
@@ -76,6 +138,15 @@ def runtime_tool_effect_durability_enabled() -> bool:
     return _tool_effect_result_observer.get() is not None
 
 
+def runtime_tool_effect_intent_barrier_active() -> bool:
+    """True when a host persists one pre-I/O intent checkpoint per call.
+
+    Such a host keeps a single pending continuation; two mutating calls in
+    flight at once would overwrite each other's crash-recovery frame.
+    """
+    return _tool_effect_intent_observer.get() is not None
+
+
 async def runtime_record_tool_effect_result(
     tool_name: str,
     arguments: dict[str, Any],
@@ -90,9 +161,9 @@ async def runtime_record_tool_effect_result(
     if observer is None:
         return
     checkpoint = runtime_current_tool_checkpoint(tool_call_id)
-    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+    from packages.core.ai.runtime.approval_classifier import runtime_call_executes_nothing
 
-    if getattr(classification, "effect", None) is RuntimeToolEffect.READ_ONLY and (
+    if runtime_call_executes_nothing(tool_name, classification) and (
         tool_call_id is None or checkpoint is None
         or checkpoint.get("pending_tool_call", {}).get("name") != tool_name
     ):
@@ -192,6 +263,7 @@ async def runtime_record_tool_effect_intent(
     barrier must prevent the handler call.
     """
 
+    await _notify_tool_effect_watchers(tool_name, classification)
     observer = _tool_effect_intent_observer.get()
     if observer is None:
         return
@@ -200,14 +272,14 @@ async def runtime_record_tool_effect_intent(
 
     checkpoint = runtime_current_tool_checkpoint(normalized_call_id) if normalized_call_id else None
     if runtime_tool_effect_durability_enabled():
-        from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+        from packages.core.ai.runtime.approval_classifier import runtime_call_executes_nothing
 
         effect = getattr(classification, "effect", None)
-        if effect is RuntimeToolEffect.READ_ONLY and (
+        if runtime_call_executes_nothing(tool_name, classification) and (
             checkpoint is None or checkpoint.get("pending_tool_call", {}).get("name") != tool_name
         ):
             return
-        if effect not in {RuntimeToolEffect.READ_ONLY, RuntimeToolEffect.CONTROL, RuntimeToolEffect.ORCHESTRATOR}:
+        if effect not in _no_intent_effects():
             if (
                 checkpoint is None
                 or checkpoint.get("pending_tool_call", {}).get("name") != tool_name
@@ -284,7 +356,10 @@ __all__ = [
     "runtime_record_consumed_approval_request_id",
     "runtime_record_tool_effect_intent",
     "runtime_record_tool_effect_result",
+    "runtime_tool_call_may_cross_effect_io",
     "runtime_tool_effect_checkpoint_scope",
+    "runtime_tool_effect_intent_barrier_active",
+    "runtime_tool_effect_watch_scope",
     "runtime_tool_effect_intent_scope",
     "runtime_tool_effect_result_scope",
 ]

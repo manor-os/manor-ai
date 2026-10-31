@@ -208,41 +208,6 @@ async def test_actorless_calls_only_use_billing_actor_in_same_entity(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_planner_and_task_supervisor_preserve_structured_contracts(monkeypatch, language_calls):
-    from packages.core.ai.runtime import planning, task_llm
-
-    monkeypatch.setattr(
-        planning, "runtime_resolve_text_completion_route",
-        AsyncMock(return_value=("test-model", None, False)),
-    )
-    complete = AsyncMock(return_value=("", [{"name": "submit_plan", "arguments": {"status": "ready"}}], {}))
-    monkeypatch.setattr("packages.core.ai.llm_client.chat_completion_with_tools", complete)
-    tools = [{"type": "function", "function": {"name": "submit_plan"}}]
-    result = await planning.runtime_execute_planner_chat_turn(
-        messages=[{"role": "user", "content": "Plan the task"}], tools=tools,
-        system_prompt="Return the plan via submit_plan only.", entity_id="entity", user_id="alice",
-    )
-    messages, sent_tools = complete.await_args.args
-    assert messages[0] == {"role": "system", "content": "Return the plan via submit_plan only."}
-    assert "Chinese (zh)" in messages[-2]["content"]
-    assert messages[-1] == {"role": "user", "content": "Plan the task"}
-    assert sent_tools == tools
-    assert result.tool_calls[0]["arguments"] == {"status": "ready"}
-
-    monkeypatch.setattr(
-        task_llm, "runtime_current_billing_context",
-        lambda: SimpleNamespace(entity_id="entity", user_id="bob"),
-    )
-    engine = SimpleNamespace(chat=AsyncMock(return_value="result"))
-    assert await task_llm.runtime_execute_task_supervisor_chat(engine=engine, prompt="Assess this task") == "result"
-    prompt = engine.chat.await_args.kwargs["system_prompt"]
-    assert "Output only valid JSON" in prompt
-    messages = engine.chat.await_args.args[0]
-    assert "French (fr)" in messages[-2].content
-    assert messages[-1].content == "Assess this task"
-
-
-@pytest.mark.asyncio
 async def test_context_compaction_keeps_language_from_active_run(monkeypatch, language_calls):
     from packages.core.ai.runtime import agentic_llm
 

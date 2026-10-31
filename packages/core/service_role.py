@@ -72,7 +72,7 @@ def telegram_polling_startup_enabled(
     """Return whether this process may own Telegram long polling.
 
     Local/OSS single-machine deployments historically ran the poller inside
-    the API process. Cloud/K8s API and chat deployments can have multiple
+    the API process. Cloud API and chat deployments can have multiple
     replicas, so polling needs a deliberately single-owned process.
     """
     normalized = normalize_service_role(role)

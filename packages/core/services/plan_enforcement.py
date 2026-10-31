@@ -63,7 +63,10 @@ async def get_entity_plan(db: AsyncSession, entity_id: str) -> dict[str, Any]:
         from packages.core.constants.plans import OSS_PLAN
         return OSS_PLAN
 
+    from packages.core.constants.plans import ensure_plans_fresh
     from packages.core.models.user import Entity
+
+    await ensure_plans_fresh(db)
     result = await db.execute(select(Entity).where(Entity.id == entity_id))
     entity = result.scalar_one_or_none()
     if not entity:
@@ -114,13 +117,18 @@ async def record_ai_cost(
             "billed": billed,
         }
 
-    # Record usage
-    settings["ai_usage_usd"] = round(new_usage, 4)
-    settings["ai_provider_cost_usd"] = round(
-        float(settings.get("ai_provider_cost_usd", 0.0)) + provider_cost_usd, 4
+    # Record usage. Increment in SQL: this row was read without a lock, and
+    # writing the whole settings dict back could erase a concurrent
+    # webhook's Stripe subscription state.
+    from packages.core.services.entity_settings import (
+        increment_entity_settings_counters,
     )
-    entity.settings = settings
-    await db.flush()
+    await increment_entity_settings_counters(
+        db,
+        entity_id,
+        {"ai_usage_usd": billed, "ai_provider_cost_usd": provider_cost_usd},
+        round_digits=4,
+    )
 
     return {
         "allowed": True,

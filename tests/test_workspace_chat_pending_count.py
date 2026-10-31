@@ -431,6 +431,53 @@ async def test_retried_workflow_and_nested_or_foreign_requests_do_not_add_action
 
 
 @pytest.mark.asyncio
+async def test_requests_whose_run_ended_or_task_was_cancelled_are_not_counted(client, db_session):
+    """The badge said 2 with "No pending messages to open": both were approvals of
+    failed Flow runs. Nothing can decide them, so they are not "needs you"."""
+    from packages.core.models.task import Task
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_runtime_approvals import expire_ended_workflow_run_approvals
+    from packages.core.workspace_chat.pending_actions import count_pending_actions_by_workspace
+
+    headers = await _register(client, "ws_ended_owner")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _workspace(client, headers)
+    run = WorkflowRun(
+        id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace_id,
+        workflow_id=generate_ulid(), status="running",
+    )
+    task = Task(id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace_id,
+                title="Prepare assets", status="in_progress")
+    run_request = HitlRequest(
+        id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace_id,
+        origin_kind="tool_call", status="pending", dedup_key=generate_ulid(),
+        context={"operation_id": f"runtime:{run.id}:call:call_1"},
+    )
+    task_request = HitlRequest(
+        id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace_id,
+        origin_kind="lease", origin_task_id=task.id, status="pending", dedup_key=generate_ulid(),
+    )
+    db_session.add_all([run, task, run_request, task_request])
+    await db_session.flush()
+
+    async def badge() -> int:
+        counts = await count_pending_actions_by_workspace(
+            db_session, entity_id=me["entity_id"], workspace_ids=[workspace_id],
+        )
+        return sum(counts[workspace_id].values())
+
+    assert await badge() == 2
+    run.status = "failed"
+    task.status = "cancelled"
+    await db_session.flush()
+    assert await badge() == 0
+
+    # The run's end also closes its approval, so no other surface shows it.
+    assert await expire_ended_workflow_run_approvals(db_session, run=run) == 1
+    assert run_request.status == "expired"
+
+
+@pytest.mark.asyncio
 async def test_pending_request_without_message_is_counted_and_deduplicates_later_mirror(client, db_session):
     """A lost chat projection cannot hide a durable human decision."""
     from packages.core.constants.execution import COORDINATOR_CHILD_PARAM_KEY
@@ -554,7 +601,9 @@ async def test_workflow_retry_count_accepts_user_variable_shapes(
 
 
 @pytest.mark.asyncio
-async def test_legacy_pending_actions_preserves_missing_task_and_step_fallback(client, db_session):
+async def test_pending_actions_is_the_badge_and_waiting_tasks_stay_a_separate_stat(client, db_session):
+    """``pending_actions`` used to add waiting Tasks with no card, so it read 2
+    while the badge and the chat both showed nothing to open."""
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.task import Task
 
@@ -578,8 +627,8 @@ async def test_legacy_pending_actions_preserves_missing_task_and_step_fallback(c
     await db_session.commit()
 
     stats = await _sidebar_stats(client, headers, workspace_id)
-    assert stats["pending_actions"] == stats["hitl_tasks"] == 2
-    assert _badge_total(stats) == 0
+    assert stats["hitl_tasks"] == 2
+    assert stats["pending_actions"] == _badge_total(stats) == 0
 
     for expected, action in enumerate((
         {"kind": "human_input", "step_id": step.id, "task_id": tasks[0].id},
@@ -590,8 +639,8 @@ async def test_legacy_pending_actions_preserves_missing_task_and_step_fallback(c
         db_session.add(card)
         await db_session.commit()
         stats = await _sidebar_stats(client, headers, workspace_id)
-        assert stats["pending_actions"] == stats["hitl_tasks"] == 2
-        assert _badge_total(stats) == expected
+        assert stats["hitl_tasks"] == 2
+        assert stats["pending_actions"] == _badge_total(stats) == expected
 
 
 @pytest.mark.asyncio
@@ -646,7 +695,12 @@ async def test_real_workflow_wait_counts_once_and_clears_after_resolution(
 
     resolved = await client.post(
         f"/api/v1/workspaces/{workspace_id}/chat/messages/{cards[0]['id']}/resolve",
-        headers=headers, json={"choice": choice, "note": "Reviewed"},
+        headers=headers, json={
+            "choice": choice,
+            "note": "Reviewed",
+            **({"payload": {"inputs": {"choice": "Reviewed"}}}
+               if wait_type == "input" and choice == "respond" else {}),
+        },
     )
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["resolved_at"]
@@ -696,3 +750,117 @@ async def test_linked_mirror_shares_resolution_without_hiding_independent_reques
     await db_session.commit()
     assert (await _page(client, headers, workspace_id))["open_action_count"] == 2
     assert _badge_total(await _sidebar_stats(client, headers, workspace_id)) == 2
+
+
+async def _stale_workflow_cards(db_session, entity_id: str, workspace_id: str, thread_id: str):
+    """Cards the badge used to count on runs that need nothing any more."""
+    from packages.core.models.workflow import WorkflowRun
+
+    runs, cards, bindings = {}, {}, {}
+
+    def run(name, status, *, flow, binding="entry", minute):
+        runs[name] = WorkflowRun(
+            id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id, workflow_id=flow,
+            binding_id=bindings.setdefault((flow, binding), generate_ulid()), status=status, current_step_id="ask",
+            created_at=BASE + timedelta(minutes=minute),
+        )
+
+    def card(name, run_name, kind):
+        message = _card(thread_id, kind, created_at=BASE)
+        message.pending_action = {"kind": kind, "workflow_run_id": runs[run_name].id, "step_id": "ask"}
+        message.meta = {"hitl_requests": [{"id": message.id, "resolved": False}]}
+        cards[name] = message
+
+    video, song, report, upload = (generate_ulid() for _ in range(4))
+    # One scheduled Flow failing again and again is one problem: its latest run.
+    for minute in range(3):
+        run(f"video{minute}", "failed", flow=video, minute=minute)
+        card(f"video{minute}", f"video{minute}", "workflow_retry")
+    # The same Flow from another entry is its own problem.
+    run("video_other_entry", "failed", flow=video, binding="other", minute=1)
+    card("video_other_entry", "video_other_entry", "workflow_retry")
+    # A failure the person already ran again is replaced, whatever the new run does.
+    run("report_failed", "failed", flow=report, minute=0)
+    run("report_again", "running", flow=report, minute=5)
+    card("report_failed", "report_failed", "workflow_retry")
+    # Nothing on a cancelled run can be answered, including a card kind added later.
+    run("song_cancelled", "cancelled", flow=song, minute=0)
+    for kind in ("workflow_starter_input", "workflow_input", "workflow_upload_request"):
+        card(f"song_{kind}", "song_cancelled", kind)
+    # That new kind on a live run is a real question.
+    run("upload_paused", "paused", flow=upload, minute=0)
+    card("upload_paused", "upload_paused", "workflow_upload_request")
+    db_session.add_all([*runs.values(), *cards.values()])
+    await db_session.commit()
+    return runs, cards
+
+
+async def _badge_and_open_cards(client, db_session, headers, workspace_id, cards):
+    page = await _page(client, headers, workspace_id)
+    stats = await _sidebar_stats(client, headers, workspace_id)
+    assert page["open_action_count"] == _badge_total(stats) == stats["pending_actions"]
+    for message in cards.values():
+        await db_session.refresh(message)
+    return stats["pending_actions"], {name for name, message in cards.items() if message.resolved_at is None}
+
+
+@pytest.mark.asyncio
+async def test_stale_workflow_cards_are_not_counted_and_the_platform_closes_them(client, db_session):
+    from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+    headers = await _register(client, "ws_stale_flow_cards")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _workspace(client, headers)
+    _, thread_id = await _seed(db_session, me["entity_id"], workspace_id)
+    runs, cards = await _stale_workflow_cards(db_session, me["entity_id"], workspace_id, thread_id)
+    live = {"video2", "video_other_entry", "upload_paused"}
+
+    count, still_open = await _badge_and_open_cards(client, db_session, headers, workspace_id, cards)
+    assert count == len(live)
+    assert still_open == set(cards)
+
+    # Each run's end closes what it leaves behind.
+    for name in ("video2", "song_cancelled", "upload_paused"):
+        await project_workflow_run_status(db_session, run=runs[name])
+    await db_session.commit()
+    count, still_open = await _badge_and_open_cards(client, db_session, headers, workspace_id, cards)
+    assert count == len(live)
+    # The report failure closes when the run that replaced it ends.
+    assert still_open == live | {"report_failed"}
+    assert {cards[name].resolution["choice"] for name in ("video0", "video1")} == {"superseded"}
+    assert cards["song_workflow_input"].resolution == {"choice": "stopped"}
+    assert cards["song_workflow_upload_request"].meta["hitl_requests"][0]["resolved"] is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_migration_closes_existing_stale_workflow_cards(client, db_session):
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from alembic.script import ScriptDirectory
+
+    headers = await _register(client, "ws_stale_flow_cleanup")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _workspace(client, headers)
+    _, thread_id = await _seed(db_session, me["entity_id"], workspace_id)
+    _, cards = await _stale_workflow_cards(db_session, me["entity_id"], workspace_id, thread_id)
+    root = Path(__file__).resolve().parents[1]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "packages/core/migrations"))
+    cleanup = ScriptDirectory.from_config(config).get_revision("20261029_10").module
+
+    def migrate(sync_connection):
+        with Operations.context(MigrationContext.configure(sync_connection)):
+            cleanup.upgrade()
+
+    for _ in range(2):  # Idempotent.
+        await (await db_session.connection()).run_sync(migrate)
+        await db_session.commit()
+    count, still_open = await _badge_and_open_cards(client, db_session, headers, workspace_id, cards)
+    assert count == 3
+    assert still_open == {"video2", "video_other_entry", "upload_paused"}
+    assert cards["report_failed"].resolution == {"choice": "superseded"}
+    assert cards["song_workflow_starter_input"].resolution == {"choice": "stopped"}
+    assert cards["video1"].meta["hitl_requests"][0]["resolved"] is True

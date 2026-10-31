@@ -217,7 +217,9 @@ async def resolve_workspace_input_message(
                                      resolution={"choice": choice, "note": text, "payload": data})
         applied = await apply_task_input_answer(
             db, task=task, user_id=user.id, user_label=user.display_name or user.email,
-            response_text=text, payload={**data, "choice": choice, "source": "workspace_chat"},
+            response_text=text, payload={**data, "choice": choice, "source": "workspace_chat",
+                                         "request_id": task_request.id},
+            request_id=str(pending.get("approval_request_id") or "") or None,
         )
         if not applied["resumed"]:
             raise WorkspaceInputResolutionError(409, "This task is no longer waiting for an answer.")
@@ -267,6 +269,3 @@ async def dispatch_workspace_input_resolution(db, result: WorkspaceInputResoluti
     if result.task_dispatch:
         from packages.core.services.task_input_resume import dispatch_task_input_resume
         dispatch_task_input_resume(*result.task_dispatch)
-    if result.plan_id:
-        from packages.core.plans.wakeup import hint_pending_plan_cycle
-        await hint_pending_plan_cycle(db, result.plan_id, reason="workspace_input_post_commit_hint")

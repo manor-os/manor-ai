@@ -314,3 +314,44 @@ async def test_published_blueprint_content_and_record_are_immutable(
     assert detail.status_code == 200, detail.text
     assert detail.json()["title"] == "Marketplace Blueprint"
     assert detail.json()["status"] == "published"
+
+
+async def test_listing_reads_in_the_viewers_language_but_its_owner_sees_what_they_wrote(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    owner_headers, owner_entity_id = await _register(client, "bp_market_lang_owner")
+    user_headers, _ = await _register(client, "bp_market_lang_user")
+    blueprint = WorkspaceBlueprint(
+        entity_id=owner_entity_id, slug="marketplace-language", title="Video Studio",
+        summary="Pick a video type and make it.", description="Seven kinds of video.", tags=[],
+        payload={"manifest": {
+            "blueprint_version": "1.1", "title": "Video Studio", "summary": "Pick a video type and make it.",
+            "description": "Seven kinds of video.",
+            "i18n": {"zh": {"title": "视频工作室", "summary": "选一种视频，直接生成。", "description": "七类视频。"}},
+        }},
+        payload_version="1.1", status="published",
+    )
+    db_session.add(blueprint)
+    await db_session.commit()
+
+    chinese = {**user_headers, "X-Language": "zh"}
+    entry = next(item for item in (await client.get("/api/v1/blueprints", headers=chinese)).json()
+                 if item["id"] == blueprint.id)
+    assert (entry["title"], entry["summary"]) == ("视频工作室", "选一种视频，直接生成。")
+    detail = (await client.get(f"/api/v1/blueprints/{blueprint.id}", headers=chinese)).json()
+    assert detail["description"] == "七类视频。"
+
+    english = (await client.get(f"/api/v1/blueprints/{blueprint.id}", headers=user_headers)).json()
+    assert (english["title"], english["description"]) == ("Video Studio", "Seven kinds of video.")
+    own = (await client.get(f"/api/v1/blueprints/{blueprint.id}", headers={**owner_headers, "X-Language": "zh"})).json()
+    assert own["title"] == "Video Studio"
+
+    # A listing edited after publishing keeps its own words.
+    blueprint.summary = "Edited listing summary."
+    await db_session.commit()
+    entry = next(item for item in (await client.get("/api/v1/blueprints", headers=chinese)).json()
+                 if item["id"] == blueprint.id)
+    assert entry["summary"] == "Edited listing summary."

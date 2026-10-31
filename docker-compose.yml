@@ -292,12 +292,6 @@ services:
       NANGO_SECRET_KEY: ${NANGO_SECRET_KEY:-}
       NANGO_PUBLIC_KEY: ${NANGO_PUBLIC_KEY:-}
       NANGO_WEBHOOK_SECRET: ${NANGO_WEBHOOK_SECRET:-}
-      # Ops alerts — comma-separated email recipients for the alert
-      # engine. Empty means "log only, don't actually email."
-      OPS_EMAIL_RECIPIENTS: ${OPS_EMAIL_RECIPIENTS:-}
-      # Where the alerter probes for /health/deep — defaults to the
-      # in-process API. Set this when running the alerter elsewhere.
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://localhost:8000/health/deep}
     env_file:
       - path: .env
         required: false
@@ -364,7 +358,6 @@ services:
       CHAT_STREAM_MAX_CONCURRENCY_PER_INSTANCE: ${CHAT_STREAM_MAX_CONCURRENCY_PER_INSTANCE:-20}
       CHAT_STREAM_QUEUE_TIMEOUT_SECONDS: ${CHAT_STREAM_QUEUE_TIMEOUT_SECONDS:-0.5}
       CHAT_STREAM_SLOT_TTL_SECONDS: ${CHAT_STREAM_SLOT_TTL_SECONDS:-900}
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
     networks:
       default:
         aliases:
@@ -391,11 +384,10 @@ services:
 
   # ── Workers ──
   #
-  # Four Celery worker roles consume the queues declared in packages/core/queues.py:
+  # Celery worker roles consume the queues declared in packages/core/queues.py:
   #   manor-worker         -Q interactive,recovery-v2 — Chat turns and
   #                          version-isolated settlement recovery
   #   manor-worker-control -Q celery — sandbox scheduler, runtime outbox, lease ticks
-  #   manor-worker-ops     -Q ops — host/container monitoring (Docker walks)
   #   manor-worker-heavy   -Q heavy,work — long work plus one-release legacy drain
   #
   # Celery beat stays in manor-beat as a single process, so scaling
@@ -416,11 +408,6 @@ services:
     privileged: true
     devices:
       - /dev/fuse
-    volumes:
-      # Ops monitoring — Celery beat tasks ops.collect_snapshot and
-      # ops.log_scan need read access to the Docker daemon to inspect
-      # peer containers + tail their stderr. Read-only.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     # Interactive turns only. The control plane (queue ``celery``: sandbox
     # scheduler, runtime outbox, lease ticks) lives in
     # manor-worker-control below — sharing one small pool let two concurrent
@@ -478,11 +465,6 @@ services:
       NANGO_SECRET_KEY: ${NANGO_SECRET_KEY:-}
       NANGO_PUBLIC_KEY: ${NANGO_PUBLIC_KEY:-}
       NANGO_WEBHOOK_SECRET: ${NANGO_WEBHOOK_SECRET:-}
-      OPS_EMAIL_RECIPIENTS: ${OPS_EMAIL_RECIPIENTS:-}
-      # The worker probes the API container's /health/deep, not its own
-      # localhost (the worker doesn't run uvicorn). Inside the docker
-      # network, the manor-api service name resolves to the API container.
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
     env_file:
       - path: .env
         required: false
@@ -519,7 +501,6 @@ services:
     environment:
       <<: *worker-env
       MANOR_SERVICE_ROLE: worker-heavy
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
 
   manor-worker-control:
     <<: *worker-runtime-service
@@ -533,21 +514,6 @@ services:
       # "worker"); only the queue set differs.
       MANOR_SERVICE_ROLE: worker
 
-  manor-worker-ops:
-    <<: *worker-runtime-service
-    container_name: manor-worker-ops
-    # Monitoring on its own pool: ops.collect_snapshot / ops.log_scan walk
-    # Docker once per running container (seconds on a busy host). On the
-    # control pool that held one of two slots and the 1-2 s scheduler and
-    # outbox ticks were discarded meanwhile. Needs the Docker socket (from the
-    # anchor) but no JuiceFS mount.
-    command: celery -A packages.core.celery_app worker --hostname manor-worker-ops@%h -l info -Q ops -c ${WORKER_OPS_CONCURRENCY:-1}
-    privileged: false
-    devices: []
-    environment:
-      <<: *worker-env
-      MANOR_SERVICE_ROLE: worker
-      MANOR_FS_ENABLED: "false"
 
   manor-beat:
     <<: *worker-runtime-service
@@ -560,7 +526,6 @@ services:
       <<: *worker-env
       MANOR_SERVICE_ROLE: beat
       MANOR_FS_ENABLED: "false"
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
     depends_on:
       postgres:
         condition: service_healthy
@@ -591,10 +556,11 @@ services:
     build: *sandbox-service-build
     container_name: manor-sandbox
     restart: unless-stopped
-    # Manages child skill containers via the host docker socket — graceful
-    # shutdown can need to wait for in-flight container creates / cleanups
-    # to settle. Default 10s sometimes wasn't enough during deploy windows.
-    stop_grace_period: 30s
+    # Manages child skill containers via the host docker socket. On stop the
+    # service drains (refuses new sandboxes, lets in-flight execs and their
+    # result reads finish, up to SANDBOX_DRAIN_TIMEOUT_SECONDS, default 240)
+    # before destroying the rest; an idle service stops within seconds.
+    stop_grace_period: 300s
     ports:
       - "127.0.0.1:8110:8000"
     volumes:
@@ -614,9 +580,13 @@ services:
       # ephemeral Chat bash runner explicitly requests `none` so code-lab
       # submissions cannot reach the network.
       SANDBOX_ALLOWED_NETWORKS: ${SANDBOX_ALLOWED_NETWORKS:-bridge,none}
-      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-512m}
+      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-1g}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-512}
       SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
       SANDBOX_MAX_SANDBOXES: ${SANDBOX_MAX_SANDBOXES:-5}
+      # Memory admission: sum of container limits <= host memory x overcommit - reserve.
+      SANDBOX_MEMORY_OVERCOMMIT: ${SANDBOX_MEMORY_OVERCOMMIT:-2.0}
+      SANDBOX_MEMORY_RESERVE: ${SANDBOX_MEMORY_RESERVE:-256m}
       SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-600}
       SANDBOX_EXEC_TIMEOUT: ${SANDBOX_EXEC_TIMEOUT:-120}
       SANDBOX_INSTANCE_MAX_EXECUTING: ${SANDBOX_INSTANCE_MAX_EXECUTING:-0}

@@ -8,7 +8,28 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 
 
 SUBAGENTS_METADATA_KEY = "runtime_subagents"
-PLAN_STEP_MAX_ROUNDS = 80
+# Every sub-agent, including a Plan step's delegated child, gets at most this
+# many rounds; the account balance and Workspace budget bound what it spends.
+SUBAGENT_MAX_ROUNDS = 200
+PLAN_STEP_MAX_ROUNDS = SUBAGENT_MAX_ROUNDS
+# Designs a Workspace App page when the Architect or Workspace chat commands it;
+# those agents only send the brief and accept or send back its candidate.
+WORKSPACE_APP_DESIGNER_SUBAGENT = "workspace_app_designer"
+WORKSPACE_APP_DESIGNER_TOOLS = ("app_read_context", "app_pattern_project_tree", "app_submit_candidate")
+
+
+def _workspace_app_designer_spec(profile: RuntimeProfile) -> SubAgentSpec:
+    return SubAgentSpec(
+        name=WORKSPACE_APP_DESIGNER_SUBAGENT,
+        purpose="Design a Workspace App page from what the Workspace runs and submit a checked candidate.",
+        profile=profile,
+        allowed_tools=WORKSPACE_APP_DESIGNER_TOOLS,
+        max_steps=SUBAGENT_MAX_ROUNDS,
+        output_contract={
+            "format": "app_view_candidate",
+            "required_fields": ("app_view", "design_notes"),
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -18,8 +39,7 @@ class SubAgentSpec:
     profile: RuntimeProfile
     allowed_tools: tuple[str, ...] = ()
     memory_mounts: tuple[str, ...] = ()
-    max_steps: int = 24
-    max_cost_credits: int | None = None
+    max_steps: int = SUBAGENT_MAX_ROUNDS
     output_contract: dict = field(default_factory=dict)
 
     def to_trace_dict(self) -> dict[str, Any]:
@@ -30,7 +50,6 @@ class SubAgentSpec:
             "allowed_tools": self.allowed_tools,
             "memory_mounts": self.memory_mounts,
             "max_steps": self.max_steps,
-            "max_cost_credits": self.max_cost_credits,
             "output_contract": dict(self.output_contract or {}),
         }
 
@@ -73,13 +92,13 @@ def subagent_specs_for_surface(
                 profile=RuntimeProfile.WORKSPACE_ARCHITECT,
                 allowed_tools=("workspace_search", "search_tools"),
                 memory_mounts=workspace_memory_mounts,
-                max_steps=8,
-                max_cost_credits=6,
+                max_steps=SUBAGENT_MAX_ROUNDS,
                 output_contract={
                     "format": "structured_review",
                     "required_fields": ("risks", "missing_capabilities", "recommendations"),
                 },
             ),
+            _workspace_app_designer_spec(RuntimeProfile.WORKSPACE_ARCHITECT),
         )
 
     if surface == ChatSurface.WORKSPACE_CHAT and workspace_id:
@@ -90,13 +109,13 @@ def subagent_specs_for_surface(
                 profile=RuntimeProfile.WORKSPACE_OPERATOR,
                 allowed_tools=("workspace_search", "web_search", "web_fetch", "search_tools"),
                 memory_mounts=workspace_memory_mounts,
-                max_steps=10,
-                max_cost_credits=8,
+                max_steps=SUBAGENT_MAX_ROUNDS,
                 output_contract={
                     "format": "strategy_brief",
                     "required_fields": ("findings", "recommendations", "open_questions"),
                 },
             ),
+            _workspace_app_designer_spec(RuntimeProfile.WORKSPACE_OPERATOR),
         )
 
     if surface in {
@@ -113,8 +132,7 @@ def subagent_specs_for_surface(
                 profile=profile,
                 allowed_tools=("workspace_search", "web_search", "web_fetch", "search_tools"),
                 memory_mounts=workspace_memory_mounts,
-                max_steps=PLAN_STEP_MAX_ROUNDS,
-                max_cost_credits=60,
+                max_steps=SUBAGENT_MAX_ROUNDS,
                 output_contract={
                     "format": "research_notes",
                     "required_fields": ("summary", "evidence", "next_actions"),
@@ -140,8 +158,7 @@ def _subagent_spec_from_trace(data: dict[str, Any]) -> SubAgentSpec | None:
             profile=profile,
             allowed_tools=tuple(str(v) for v in (data.get("allowed_tools") or ()) if str(v or "").strip()),
             memory_mounts=tuple(str(v) for v in (data.get("memory_mounts") or ()) if str(v or "").strip()),
-            max_steps=int(data.get("max_steps") or 24),
-            max_cost_credits=data.get("max_cost_credits"),
+            max_steps=int(data.get("max_steps") or SUBAGENT_MAX_ROUNDS),
             output_contract=dict(data.get("output_contract") or {}),
         )
     except Exception:

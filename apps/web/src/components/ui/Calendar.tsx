@@ -60,6 +60,7 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 function monthLabel(month: number): string {
+  // timezone-exempt: names a wall-clock date built in the device zone
   return new Intl.DateTimeFormat(getLocale(), { month: "long" }).format(new Date(2026, month, 1));
 }
 
@@ -94,6 +95,7 @@ function pillColor(ev: CalendarEvent) {
   return "#4f7d75";
 }
 function formatDayLabel(d: Date) {
+  // timezone-exempt: selected grid day, a device-local wall-clock date
   return d.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
 }
 
@@ -107,6 +109,7 @@ function eventDateKey(ev: CalendarEvent): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value.slice(0, 10);
   try {
+    // timezone-exempt: event's own zone; events without one keep the device zone the grid uses
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: ev.timezone || undefined,
       year: "numeric",
@@ -141,6 +144,7 @@ function formatEventTime(ev: CalendarEvent): string | null {
   if (ev.all_day) return "All day";
   const parsed = new Date(eventStartValue(ev));
   if (Number.isNaN(parsed.getTime())) return null;
+  // timezone-exempt: event's own zone; events without one keep the device zone the grid uses
   return parsed.toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
@@ -153,6 +157,7 @@ function formatEventEndTime(ev: CalendarEvent): string | null {
   if (ev.all_day || !ev.duration_minutes) return null;
   const parsed = new Date(eventStartValue(ev));
   if (Number.isNaN(parsed.getTime())) return null;
+  // timezone-exempt: event's own zone; events without one keep the device zone the grid uses
   return new Date(parsed.getTime() + ev.duration_minutes * 60000).toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
@@ -167,6 +172,7 @@ function formatEventDateTime(ev: CalendarEvent): string {
   const startStr = formatEventTime(ev);
   const endStr = formatEventEndTime(ev);
   if (Number.isNaN(parsed.getTime())) return startStr || eventStartValue(ev);
+  // timezone-exempt: event's own zone; events without one keep the device zone the grid uses
   const dateStr = parsed.toLocaleDateString("en-US", {
     weekday: "short",
     month: "short",
@@ -198,6 +204,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
   const dayHeaders = useMemo(
     () =>
       [1, 2, 3, 4, 5, 6, 0].map((day) =>
+        // timezone-exempt: names a wall-clock date built in the device zone
         new Intl.DateTimeFormat(getLocale(), { weekday: "short" }).format(new Date(2026, 0, 4 + day)),
       ),
     [],

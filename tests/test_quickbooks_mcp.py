@@ -98,7 +98,7 @@ async def test_quickbooks_uses_realm_from_oauth_credential_bundle(http) -> None:
     assert _last_call()["headers"]["Authorization"] == "Bearer qb-token"
 
 
-@pytest.mark.parametrize("manor_environment", ["dev", "staging", "digitalocean-test"])
+@pytest.mark.parametrize("manor_environment", ["dev", "staging", "test"])
 def test_quickbooks_defaults_to_sandbox_outside_production(monkeypatch, manor_environment: str) -> None:
     monkeypatch.delenv("QUICKBOOKS_ENVIRONMENT", raising=False)
     monkeypatch.delenv("QBO_ENVIRONMENT", raising=False)

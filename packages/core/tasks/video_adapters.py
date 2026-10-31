@@ -101,9 +101,53 @@ def catalog_video_provider(model: str) -> str:
     return (model or "").split("/", 1)[0].strip().lower() if "/" in (model or "") else ""
 
 
+def _vercel_video_wire_model(model: str, *, has_first_frame: bool) -> str:
+    """Gateway model for one video request.
+
+    Kling's gateway catalog splits text- and image-to-video into separate
+    models; the product catalog has one Kling v3.0 entry per quality tier.
+    Sending a first frame to the t2v model ignores the image.
+    """
+    if str(model).startswith("kwaivgi/kling-v3.0"):
+        return "klingai/kling-v3.0-i2v" if has_first_frame else "klingai/kling-v3.0-t2v"
+    from packages.core.services.model_provider_handlers import vercel_model_id
+
+    return vercel_model_id(model)
+
+
+def _vercel_kling_options(model: str, generate_audio: bool) -> dict[str, str]:
+    """providerOptions.klingai for a catalog Kling model (per @ai-sdk/klingai).
+
+    Std/Pro is a ``mode`` on one gateway model, and native ``sound`` exists
+    only in pro mode.
+    """
+    pro = str(model).endswith("-pro")
+    options = {"mode": "pro" if pro else "std"}
+    if pro:
+        options["sound"] = "on" if generate_audio else "off"
+    return options
+
+
 def native_video_model(model: str) -> str:
     raw = (model or "").split("/", 1)[1] if "/" in (model or "") else (model or "")
     return VIDEO_NATIVE_MODEL_MAP.get(model, raw)
+
+
+# A provider that answers a submit with these statuses turned it away before
+# accepting work, so submitting again cannot start a second paid generation.
+# 500/502/504 stay final: a relay may have forwarded the job before failing.
+SUBMIT_UNAVAILABLE_STATUSES = frozenset({429, 503})
+
+
+class ProviderSubmitUnavailable(RuntimeError):
+    """The provider refused a submit without accepting the job; it may be retried."""
+
+
+def submit_error(status_code: int, message: str) -> dict[str, Any]:
+    """Every adapter's failed submit: retryable refusals raise, the rest are final."""
+    if status_code in SUBMIT_UNAVAILABLE_STATUSES:
+        raise ProviderSubmitUnavailable(message)
+    return {"error": message}
 
 
 def provider_error_hint(status_code: int, message: str) -> str:
@@ -448,7 +492,10 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
         if resp.status_code not in (200, 201, 202):
             err = data.get("error", {})
             msg = err.get("message", "") if isinstance(err, dict) else str(err)
-            return {"error": f"Video generation failed ({resp.status_code}): {msg}{provider_error_hint(resp.status_code, msg)}"}
+            return submit_error(
+                resp.status_code,
+                f"Video generation failed ({resp.status_code}): {msg}{provider_error_hint(resp.status_code, msg)}",
+            )
 
         generation_id = (
             data.get("id")
@@ -518,6 +565,7 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
         runtime: VideoAdapterRuntime,
     ) -> dict[str, Any]:
         from packages.core.services.vercel_ai_gateway import (
+            VercelAIGatewayError,
             vercel_gateway_endpoint,
             vercel_gateway_post,
         )
@@ -541,8 +589,14 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
         # under providerOptions.<provider>. Without it Seedance adds an audio
         # track, which its copyright filter can reject.
         provider = str(model).split("/", 1)[0].strip()
-        if provider:
+        if provider == "kwaivgi":
+            payload["providerOptions"] = {"klingai": _vercel_kling_options(model, payload["generateAudio"])}
+        elif provider == "xai":
+            # Grok always adds its own audio track and has no audio switch.
+            payload.pop("generateAudio")
+        elif provider:
             payload["providerOptions"] = {provider: {"generateAudio": payload["generateAudio"]}}
+        wire_model = _vercel_video_wire_model(model, has_first_frame=bool(params.get("first_frame_url")))
         if params.get("seed") is not None:
             payload["seed"] = params["seed"]
 
@@ -595,18 +649,42 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
         if input_references:
             payload["inputReferences"] = input_references
 
+        # The v4 file lists have no audio slot. Seedance takes audio references
+        # as provider options (``referenceAudio``, URL strings, per
+        # @ai-sdk/bytedance), so they must be fetchable signed URLs.
+        audio_reference_urls = list(params.get("audio_reference_urls") or [])
+        if not audio_reference_urls and params.get("audio_reference_url"):
+            audio_reference_urls = [params["audio_reference_url"]]
+        if audio_reference_urls and provider == "bytedance":
+            from packages.core.constants.models import video_model_capabilities
+
+            limit = video_model_capabilities(model)["max_audio_references"]
+            payload["providerOptions"][provider]["referenceAudio"] = [
+                (await materialize_video_reference(
+                    str(value),
+                    job.entity_id,
+                    media_kind="audio",
+                    capability=PUBLIC_URL_MEDIA_REFERENCE,
+                    runtime=runtime,
+                    public_base_url=public_base_url,
+                )).value
+                for value in audio_reference_urls[:limit]
+            ]
+
         auth_method = str(params.get("vercel_auth_method") or "api-key")
         try:
             started = await vercel_gateway_post(
                 api_key=api_key,
                 base_url=base_url,
-                model=model,
+                model=wire_model,
                 protocol="video",
                 payload=payload,
                 auth_method=auth_method,
                 endpoint_suffix="start",
                 timeout=180.0,
             )
+        except VercelAIGatewayError as exc:
+            return submit_error(exc.status_code, str(exc))
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -630,7 +708,7 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
                 status = await vercel_gateway_post(
                     api_key=api_key,
                     base_url=base_url,
-                    model=model,
+                    model=wire_model,
                     protocol="video",
                     payload={"operation": operation},
                     auth_method=auth_method,
@@ -917,7 +995,7 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
             err = data.get("error", {})
             msg = err.get("message", "") if isinstance(err, dict) else str(err or data)
             hint = provider_error_hint(resp.status_code, msg)
-            return {"error": f"Seedance generation failed ({resp.status_code}): {msg}{hint}"}
+            return submit_error(resp.status_code, f"Seedance generation failed ({resp.status_code}): {msg}{hint}")
 
         task_id = runtime.extract_task_id(data)
         video_url = runtime.extract_video_url(data)
@@ -1011,12 +1089,10 @@ class AtlasCloudVideoAdapter(VideoGenerationAdapter):
             else:
                 msg = str(err)
             status = inner_code if isinstance(inner_code, int) and inner_code >= 400 else resp.status_code
-            return {
-                "error": (
-                    f"Atlas Cloud generation failed ({status}): {msg}"
-                    f"{provider_error_hint(status, msg)}"
-                )
-            }
+            return submit_error(
+                status,
+                f"Atlas Cloud generation failed ({status}): {msg}{provider_error_hint(status, msg)}",
+            )
 
         body = data.get("data") if isinstance(data.get("data"), dict) else data
         prediction_id = body.get("id") or body.get("prediction_id")
@@ -1101,7 +1177,10 @@ class KlingVideoAdapter(VideoGenerationAdapter):
         if resp.status_code not in (200, 201, 202):
             err = data.get("error", {})
             msg = err.get("message", "") if isinstance(err, dict) else str(err or data)
-            return {"error": f"Kling generation failed ({resp.status_code}): {msg}{provider_error_hint(resp.status_code, msg)}"}
+            return submit_error(
+                resp.status_code,
+                f"Kling generation failed ({resp.status_code}): {msg}{provider_error_hint(resp.status_code, msg)}",
+            )
 
         video_url = runtime.extract_video_url(data)
         task_id = (
@@ -1218,6 +1297,304 @@ async def build_openrouter_frame_images(
         })
     return frames
 
+_XAI_ASPECT_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
+
+
+def _xai_request_id(data: Any) -> str:
+    """Task id from an xAI-compatible create response (relays vary the key)."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("request_id", "id", "task_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("data", "video"):
+        found = _xai_request_id(data.get(key))
+        if found:
+            return found
+    return ""
+
+
+class XaiVideoAdapter(VideoGenerationAdapter):
+    """Grok Imagine video: xAI's API or an xAI-compatible relay (Sub2API).
+
+    BYOK-only (enforced in generate_video). The saved base URL decides the
+    host; the contract is the same on both:
+    POST {base}/videos/generations → {"request_id"}, GET {base}/videos/{id}
+    until status done/failed, then the MP4 from {base}/videos/{id}/content.
+    The completed payload's video URL can be relative or point upstream, so
+    the result is always downloaded from the content endpoint with the same
+    key — never by sending the key to a URL taken from a response.
+    """
+
+    adapter_name = "xai"
+    provider = "xai"
+    route = "native"
+    poll_provider = "xai"
+
+    def media_reference_capability(
+        self,
+        model: str,
+        media_kind: Literal["image", "video", "audio"],
+    ) -> MediaReferenceCapability:
+        del model
+        if media_kind == "image":
+            return OPENROUTER_IMAGE_MEDIA_REFERENCE
+        return PUBLIC_URL_MEDIA_REFERENCE
+
+    async def submit(
+        self,
+        job: _JobLike,
+        api_key: str,
+        base_url: str | None,
+        runtime: VideoAdapterRuntime,
+    ) -> dict[str, Any]:
+        model = job.model or "xai/grok-imagine-video-1.5"
+        params = job.params or {}
+        from packages.core.services.xai_video_transport import (
+            XAI_BINDING_KEY, XaiTransportError, require_xai_job_binding,
+            xai_poll_url, xai_request,
+        )
+
+        try:
+            base = require_xai_job_binding(
+                params.get(XAI_BINDING_KEY), entity_id=job.entity_id,
+                model=model, base_url=base_url or "", api_key=api_key,
+                is_byok=params.get("credential_source") == "byok",
+            )
+        except XaiTransportError as exc:
+            return {"error": str(exc)}
+        from packages.core.constants.models import video_model_capabilities
+
+        # Each Grok model takes what docs.x.ai lists for it: Lite no references or
+        # last frame, the first model up to 7 references at 720p.
+        capabilities = video_model_capabilities(model)
+        first_frame = params.get("first_frame_url")
+        last_frame = params.get("last_frame_url") if capabilities.get("last_frame") else ""
+        references = [url for url in params.get("reference_urls") or [] if url][
+            :int(capabilities.get("max_reference_images") or 0)]
+        duration = max(1, min(15, int(params.get("duration") or 5)))
+        resolution = runtime.normalize_resolution(model, params.get("resolution", "720p"))
+        if references or last_frame or native_video_model(model) == "grok-imagine-video":
+            # Reference-to-video, and the first model, render at 720p at most.
+            resolution = "720p"
+        if references and native_video_model(model) == "grok-imagine-video":
+            duration = min(duration, 10)
+
+        async def image_url(url: str) -> dict[str, str]:
+            image = await materialize_video_reference(
+                url,
+                job.entity_id,
+                media_kind="image",
+                capability=self.media_reference_capability(model, "image"),
+                runtime=runtime,
+                public_base_url=str(params.get("public_base_url") or "").strip(),
+            )
+            return {"url": image.as_data_url()}
+
+        prompt = job.prompt
+        if references and "<IMAGE_" not in prompt:
+            # A pinned first frame is <IMAGE_0>, so the references are numbered after it.
+            offset = 1 if first_frame else 0
+            names = ", ".join(f"<IMAGE_{offset + index}>" for index in range(len(references)))
+            prompt = f"{prompt}\n\nKeep the same people, faces, clothing and look as in {names}."
+        payload: dict[str, Any] = {
+            "model": native_video_model(model),
+            "prompt": prompt,
+            "duration": duration,
+            "resolution": resolution,
+        }
+        if first_frame:
+            payload["image"] = await image_url(first_frame)
+        if references:
+            payload["reference_images"] = [await image_url(url) for url in references]
+        if last_frame:
+            payload["last_frame"] = await image_url(last_frame)
+        aspect_ratio = str(params.get("aspect_ratio") or "").strip()
+        if aspect_ratio in _XAI_ASPECT_RATIOS:
+            payload["aspect_ratio"] = aspect_ratio
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        try:
+            resp = await xai_request(
+                "POST", f"{base}/videos/generations", headers=headers,
+                json_body=payload, timeout=runtime.media_api_timeout,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+        except XaiTransportError as exc:
+            return {"error": str(exc)}
+
+        logger.info("Video job %s xAI response status %d", job.id, resp.status_code)
+        request_id = _xai_request_id(data)
+        if resp.status_code not in (200, 201, 202) or not request_id:
+            return submit_error(
+                resp.status_code, f"Grok video generation failed ({resp.status_code}). Check the relay and API key.",
+            )
+
+        try:
+            poll_url = xai_poll_url(base, request_id)
+        except XaiTransportError as exc:
+            return {"error": str(exc)}
+        await runtime.remember_provider_poll(job.id, self.poll_provider, poll_url, request_id)
+        await runtime.poll_generic_video_task(poll_url, {"Authorization": f"Bearer {api_key}"}, provider="xai")
+        return await _download_adapter_result(
+            runtime,
+            job,
+            f"{poll_url}/content",
+            model,
+            duration,
+            resolution,
+            auth_headers={"Authorization": f"Bearer {api_key}"},
+        )
+
+
+GOOGLE_GENAI_BASE_URL = "https://generativelanguage.googleapis.com"
+# Google takes images inline in the request body; it cannot read Manor's signed URLs.
+GOOGLE_IMAGE_MEDIA_REFERENCE = MediaReferenceCapability(
+    (INLINE_BASE64_REFERENCE,), max_inline_bytes=7 * 1024 * 1024,
+)
+_GOOGLE_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+
+
+def normalize_google_base_url(base_url: str | None) -> str:
+    """The Gemini API origin, whether or not the saved URL carries its version path."""
+    base = str(base_url or "").strip().rstrip("/") or GOOGLE_GENAI_BASE_URL
+    for suffix in ("/v1beta", "/v1"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base
+
+
+def _google_interaction_video(data: Any) -> tuple[str, str]:
+    """The (mime type, base64 data) of the video in an interaction's model output."""
+    steps = data.get("steps") if isinstance(data, dict) else None
+    for step in steps or []:
+        if not isinstance(step, dict) or step.get("type") != "model_output":
+            continue
+        for item in step.get("content") or []:
+            if isinstance(item, dict) and item.get("type") == "video" and item.get("data"):
+                return str(item.get("mime_type") or "video/mp4"), str(item["data"])
+    return "", ""
+
+
+class GoogleInteractionsVideoAdapter(VideoGenerationAdapter):
+    """Gemini Omni video through the Gemini Interactions API, on the Account's own key.
+
+    POST {base}/v1beta/interactions answers synchronously with the clip as base64
+    in steps[].content[]. Videos are kept to 720p, the largest size Google returns
+    inline, so the key is never sent to a download URL taken from a response.
+    The API has no duration field; the requested length goes in the prompt.
+    """
+
+    adapter_name = "google_interactions"
+    provider = "google"
+    route = "native"
+    poll_provider = "google"
+
+    def media_reference_capability(
+        self,
+        model: str,
+        media_kind: Literal["image", "video", "audio"],
+    ) -> MediaReferenceCapability:
+        del model
+        if media_kind == "image":
+            return GOOGLE_IMAGE_MEDIA_REFERENCE
+        return PUBLIC_URL_MEDIA_REFERENCE
+
+    async def submit(
+        self,
+        job: _JobLike,
+        api_key: str,
+        base_url: str | None,
+        runtime: VideoAdapterRuntime,
+    ) -> dict[str, Any]:
+        from packages.core.constants.models import video_model_capabilities
+
+        model = job.model or ""
+        params = job.params or {}
+        capabilities = video_model_capabilities(model)
+        first_frame = params.get("first_frame_url") or ""
+        # A last frame only means something after a first frame (interpolation).
+        last_frame = params.get("last_frame_url") if first_frame and capabilities.get("last_frame") else ""
+        frames = [url for url in (first_frame, last_frame) if url]
+        references = [url for url in params.get("reference_urls") or [] if url][
+            :int(capabilities.get("max_reference_images") or 0)]
+        duration = max(3, min(10, int(params.get("duration") or 5)))
+
+        inputs: list[dict[str, str]] = []
+        for url in [*frames, *references]:
+            image = await materialize_video_reference(
+                url,
+                job.entity_id,
+                media_kind="image",
+                capability=GOOGLE_IMAGE_MEDIA_REFERENCE,
+                runtime=runtime,
+                public_base_url=str(params.get("public_base_url") or "").strip(),
+            )
+            inputs.append({"type": "image", "data": image.value, "mime_type": image.media_type})
+        notes: list[str] = []
+        if frames:
+            notes.append("Image 1 is the first frame of the clip.")
+        if len(frames) > 1:
+            notes.append("Image 2 is the last frame of the clip.")
+        if references:
+            first = len(frames) + 1
+            notes.append(
+                f"Images {first}-{first + len(references) - 1} are references: keep the same "
+                "people, faces, clothing and look."
+            )
+        notes.append(f"The clip is about {duration} seconds long.")
+        inputs.append({"type": "text", "text": "\n\n".join([job.prompt, " ".join(notes)])})
+
+        response_format: dict[str, str] = {"type": "video", "resolution": "720p"}
+        aspect_ratio = str(params.get("aspect_ratio") or "").strip()
+        if aspect_ratio in _GOOGLE_ASPECT_RATIOS:
+            response_format["aspect_ratio"] = aspect_ratio
+        payload = {
+            "model": native_video_model(model),
+            "input": inputs,
+            "response_format": response_format,
+            "background": False,
+            "store": False,
+            "stream": False,
+        }
+        url = f"{normalize_google_base_url(base_url)}/v1beta/interactions"
+        # Generation runs inside this one request, so its read timeout is generous.
+        timeout = httpx.Timeout(connect=30.0, read=900.0, write=180.0, pool=30.0)
+        async with runtime.http_client_cls(timeout=timeout) as client:
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        logger.info("Video job %s Google Interactions response status %d", job.id, resp.status_code)
+        if resp.status_code >= 400:
+            message = runtime.provider_error_message(data) or resp.text[:300]
+            return submit_error(
+                resp.status_code,
+                f"Gemini video generation failed ({resp.status_code}): {message}"
+                + provider_error_hint(resp.status_code, message),
+            )
+        mime_type, video = _google_interaction_video(data)
+        if not video:
+            status = str((data or {}).get("status") or "") if isinstance(data, dict) else ""
+            return {"error": f"Gemini returned no video (status {status or 'unknown'}). The prompt may have been blocked."}
+        return await _download_adapter_result(
+            runtime,
+            job,
+            f"data:{mime_type};base64,{video}",
+            model,
+            duration,
+            "720p",
+        )
+
 
 def select_video_generation_adapter(
     *,
@@ -1232,6 +1609,11 @@ def select_video_generation_adapter(
     # even when the resolved key is an OpenRouter key.
     if selected_provider == "atlascloud":
         return AtlasCloudVideoAdapter()
+    # A Grok key (own or relayed) uses the xAI API; managed Grok arrives here with provider "vercel".
+    if selected_provider == "xai":
+        return XaiVideoAdapter()
+    if selected_provider == "google":
+        return GoogleInteractionsVideoAdapter()
     if selected_provider == "vercel":
         return VercelGatewayVideoAdapter()
     if (api_key or "").startswith("sk-or-"):
@@ -1250,6 +1632,8 @@ def video_adapter_by_name(name: str) -> VideoGenerationAdapter | None:
         VolcengineSeedanceAdapter.adapter_name: VolcengineSeedanceAdapter(),
         KlingVideoAdapter.adapter_name: KlingVideoAdapter(),
         AtlasCloudVideoAdapter.adapter_name: AtlasCloudVideoAdapter(),
+        XaiVideoAdapter.adapter_name: XaiVideoAdapter(),
+        GoogleInteractionsVideoAdapter.adapter_name: GoogleInteractionsVideoAdapter(),
     }
     return adapters.get(str(name or "").strip())
 

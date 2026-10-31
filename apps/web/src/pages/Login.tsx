@@ -6,16 +6,22 @@ import { IconEye, IconEyeOff, IconInfo } from "../components/icons";
 import AuthShell, { AuthBrand } from "../components/auth/AuthShell";
 import { navigateAfterAuth, safeAuthRedirect } from "../lib/authNavigation";
 import { t } from "../lib/i18n";
+import { COLLABORATION_ENDED_REASON, collaborationEndedSignIn } from "../lib/persistentSession";
 
 type Tab = "login" | "register";
 
 export default function Login() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const safeNextPath = safeAuthRedirect(searchParams.get("next"));
-  const chatInviteToken = safeNextPath.startsWith("/chat?")
-    ? new URLSearchParams(safeNextPath.split("?", 2)[1]).get("invite") || ""
-    : "";
+  // An ended collaboration sends the person home: the customer's Workspace is
+  // no longer theirs, so no ``next`` back into it is honoured.
+  const collaborationEnded = searchParams.get("reason") === COLLABORATION_ENDED_REASON;
+  const safeNextPath = safeAuthRedirect(collaborationEnded ? null : searchParams.get("next"));
+  useEffect(() => {
+    if (collaborationEnded) collaborationEndedSignIn({ clear: true });
+  }, [collaborationEnded]);
+  const chatParams = new URLSearchParams(safeNextPath.startsWith("/chat?") ? safeNextPath.split("?", 2)[1] : "");
+  const chatInviteToken = chatParams.get("join") || chatParams.get("invite") || "";
   const teamInviteToken = searchParams.get("team_invite") || searchParams.get("invite_token") || "";
   const inviteRedirectPath = teamInviteToken
     ? `/account?team_invite=${encodeURIComponent(teamInviteToken)}`
@@ -211,6 +217,27 @@ export default function Login() {
                 : t("page.login.create_desc")}
             </p>
 
+            {collaborationEnded && !error && !pending2fa && !pendingVerificationEmail && (
+              <div
+                role="status"
+                style={{
+                  marginBottom: 20,
+                  padding: 12,
+                  borderRadius: 12,
+                  background: "var(--surface-muted, rgba(245,245,244,0.9))",
+                  border: "1px solid var(--border-subtle, rgba(120,113,108,0.2))",
+                  color: "var(--text-default, #44403c)",
+                  fontSize: 13,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <IconInfo size={16} className="shrink-0" />
+                {t("collaboration.ended_sign_in")}
+              </div>
+            )}
+
             {/* Error */}
             {error && (
               <div
@@ -375,6 +402,7 @@ export default function Login() {
             ) : (
             <>
             <form onSubmit={handleSubmit}>
+              {chatParams.get("join") && <p className="mb-4 rounded-xl bg-[var(--surface-muted)] p-3 text-sm text-[var(--text-default)]">{t("page.login.public_group_invite_hint")}</p>}
               {teamInviteToken && (
                 <div style={{
                   marginBottom: 18,

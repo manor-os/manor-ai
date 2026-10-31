@@ -22,7 +22,7 @@
   min-height: 35px;
   padding: 0 12px;
   border: 0;
-  border-radius: 11px;
+  border-radius: calc(11px * var(--app-radius-scale, 1));
   background: var(--surface-panel);
   box-shadow: var(--shadow-sm);
   color: var(--text-default);
@@ -75,34 +75,35 @@
   overflow-wrap: anywhere;
 }
 
+/* The main entry: a soft-fill card led by its type, a pill to start it. With
+   a cover image or video it fills the card under a dark wash; without one,
+   slow hairline orbits drift behind it unless the visual is plain. */
 .workspace-app-view__hero {
   position: relative;
   isolation: isolate;
   overflow: hidden;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   width: 100%;
-  min-height: 156px;
-  gap: 15px;
-  padding: 22px;
+  min-height: 0;
+  gap: 16px;
+  padding: 20px 20px 18px;
   text-align: left;
   border: 0;
-  border-radius: 22px;
-  background: color-mix(in srgb, var(--surface-panel) 90%, var(--surface-muted));
-  box-shadow: var(--shadow-sm);
+  border-radius: calc(22px * var(--app-radius-scale, 1));
+  background: var(--app-card-fill);
+  box-shadow: none;
   color: var(--text-strong);
+  font: inherit;
   cursor: pointer;
-  transition: background .24s ease, box-shadow .24s ease, transform .24s ease;
+  transition: background .2s ease;
   animation: workspace-app-reveal .55s .06s both;
 }
-.workspace-app-view__hero:hover:not(:disabled) {
-  background: var(--surface-panel);
-  box-shadow: var(--shadow-md);
-  transform: translateY(-2px);
-}
+.workspace-app-view__hero:hover:not(:disabled) { background: var(--app-card-fill-hover); }
+.workspace-app-view__hero:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .workspace-app-view__cover-image,
-.workspace-app-view__cover-video,
-.workspace-app-view__cover-layers {
+.workspace-app-view__cover-video {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -111,43 +112,61 @@
   pointer-events: none;
 }
 .workspace-app-view__cover-image { z-index: -3; }
-.workspace-app-view__cover-video,
-.workspace-app-view__cover-layers { z-index: -2; }
-.workspace-app-view__record-layer { animation: workspace-app-record-slide 7s ease-in-out infinite; }
-.workspace-app-view__parcel-layer { animation: workspace-app-parcel-lift 7s ease-in-out infinite; }
+.workspace-app-view__cover-video { z-index: -2; }
+.workspace-app-view__hero--image { min-height: 200px; justify-content: flex-end; color: white; }
 .workspace-app-view__hero--image::before {
   content: "";
   position: absolute;
   z-index: -1;
   inset: 0;
-  background: linear-gradient(90deg, rgb(24 25 23 / 80%) 0%, rgb(24 25 23 / 54%) 55%, rgb(24 25 23 / 14%) 100%);
+  background: linear-gradient(180deg, rgb(0 0 0 / 0%) 20%, rgb(0 0 0 / 62%) 100%);
 }
-.workspace-app-view__hero--image { color: white; }
-.workspace-app-view__hero--image .workspace-app-view__hero-icon { display: none; }
-.workspace-app-view__hero--image .workspace-app-view__hero-content small,
-.workspace-app-view__hero--image .workspace-app-view__hero-arrow { color: rgb(255 255 255 / 84%); }
 .workspace-app-view__hero-art {
   position: absolute;
   z-index: -1;
-  top: -82px;
-  right: -18px;
-  width: 252px;
-  height: 252px;
+  top: -96px;
+  right: -40px;
+  width: 280px;
+  height: 280px;
   pointer-events: none;
   transform: rotate(-18deg);
 }
 .workspace-app-view__hero-art span {
   position: absolute;
   display: block;
-  border: 1px solid color-mix(in srgb, var(--text-faint) 23%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-faint) 28%, transparent);
   border-radius: 38% 62% 56% 44%;
   animation: workspace-app-orbit 18s linear infinite;
 }
 .workspace-app-view__hero-art span:nth-child(1) { inset: 0; }
-.workspace-app-view__hero-art span:nth-child(2) { inset: 34px; animation-duration: 24s; animation-direction: reverse; }
-.workspace-app-view__hero-art span:nth-child(3) { inset: 67px; animation-duration: 15s; }
-.workspace-app-view__hero--plain { min-height: 145px; }
-.workspace-app-view__hero-icon,
+.workspace-app-view__hero-art span:nth-child(2) { inset: 36px; animation-duration: 24s; animation-direction: reverse; }
+.workspace-app-view__hero-art span:nth-child(3) { inset: 72px; animation-duration: 15s; }
+.workspace-app-view__hero-content { display: grid; gap: 6px; min-width: 0; max-width: 46ch; }
+.workspace-app-view__hero-kicker { color: var(--text-muted); font-size: 11px; font-weight: 500; letter-spacing: .02em; }
+.workspace-app-view__hero-content strong {
+  font-size: clamp(20px, 5cqi, 24px);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -.025em;
+  overflow-wrap: break-word;
+}
+.workspace-app-view__hero-description {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.workspace-app-view__hero-content .workspace-app-view__hero-unavailable { color: var(--app-status-attention); font-size: 12px; }
+.workspace-app-view__hero-start {
+  display: inline-flex; align-items: center; gap: 4px; padding: 7px 16px; border-radius: 999px;
+  background: var(--text-strong); color: var(--surface-panel); font-size: 13px; font-weight: 600;
+}
+.workspace-app-view__hero--image :is(.workspace-app-view__hero-kicker, .workspace-app-view__hero-description) { color: rgb(255 255 255 / 80%); }
+.workspace-app-view__hero--image .workspace-app-view__hero-start { background: white; color: #1d1d1f; }
 .workspace-app-view__action-icon {
   display: grid;
   place-items: center;
@@ -155,22 +174,6 @@
   color: var(--text-muted);
   background: transparent;
 }
-.workspace-app-view__hero-icon { width: 24px; height: 24px; }
-.workspace-app-view__hero-content { display: grid; gap: 8px; min-width: 0; flex: 1; }
-.workspace-app-view__hero-content strong {
-  font-size: clamp(16px, 3.6cqi, 20px);
-  line-height: 1.25;
-  letter-spacing: -.025em;
-  overflow-wrap: break-word;
-}
-.workspace-app-view__hero-content small {
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-.workspace-app-view__hero-arrow { align-self: flex-end; color: var(--text-muted); transition: transform .2s ease; }
-.workspace-app-view__hero:hover:not(:disabled) .workspace-app-view__hero-arrow { transform: translateX(3px); }
 .workspace-app-view__cover {
   position: relative;
   isolation: isolate;
@@ -181,7 +184,7 @@
   gap: 28px;
   overflow: hidden;
   padding: clamp(24px, 4vw, 38px);
-  border-radius: 24px;
+  border-radius: calc(24px * var(--app-radius-scale, 1));
   background: var(--surface-panel);
   box-shadow: var(--shadow-sm);
   animation: workspace-app-reveal .45s both;
@@ -208,7 +211,7 @@
   min-height: 43px;
   padding: 10px 12px 10px 17px;
   border: 0;
-  border-radius: 12px;
+  border-radius: calc(12px * var(--app-radius-scale, 1));
   background: var(--surface-panel);
   color: var(--text-strong);
   box-shadow: var(--shadow-sm);
@@ -221,19 +224,8 @@
 .workspace-app-view__cover-action span { min-width: 0; overflow-wrap: anywhere; }
 .workspace-app-view__cover-action:hover:not(:disabled) { background: var(--glass-card-hover); }
 .workspace-app-view__cover-action:disabled { opacity: .55; cursor: not-allowed; }
-.workspace-app-view--cover .workspace-app-view__actions { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-.workspace-app-view--cover .workspace-app-view__action { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto 1fr; min-height: 178px; gap: 20px 12px; padding: 20px; border-radius: var(--radius-panel); background: var(--glass-card); backdrop-filter: var(--glass-blur-sm); }
-.workspace-app-view--cover .workspace-app-view__action-icon { grid-column: 1; grid-row: 1; }
-.workspace-app-view--cover .workspace-app-view__action > svg { grid-column: 2; grid-row: 1; align-self: center; }
-.workspace-app-view--cover .workspace-app-view__action-copy { grid-column: 1 / -1; grid-row: 2; align-self: end; }
-.workspace-app-view--cover .workspace-app-view__action--spotlight { grid-column: span 2; min-height: 210px; background: color-mix(in srgb, var(--surface-muted) 78%, var(--surface-panel)); background-image: radial-gradient(circle at 88% 15%, color-mix(in srgb, var(--text-faint) 14%, transparent), transparent 42%); }
-.workspace-app-view--cover .workspace-app-view__action--spotlight .workspace-app-view__action-copy strong { font-size: 19px; letter-spacing: -.025em; }
-.workspace-app-view--cover .workspace-app-view__action--spotlight .workspace-app-view__action-copy small { max-width: 52ch; }
 .workspace-app-view--list .workspace-app-view__intro { margin-bottom: 30px; }
 .workspace-app-view--list .workspace-app-view__section { margin-top: 0; }
-.workspace-app-view--list .workspace-app-view__actions { gap: 0; }
-.workspace-app-view--list .workspace-app-view__action { min-height: 70px; border: 0; border-radius: 0; border-bottom: 1px solid color-mix(in srgb, var(--text-faint) 19%, transparent); background: transparent; box-shadow: none; }
-.workspace-app-view--list .workspace-app-view__action:hover:not(:disabled) { background: var(--surface-muted); box-shadow: none; transform: none; }
 .workspace-app-automation__runs { display: grid; gap: 7px; }
 .workspace-app-automation__description { max-width: 52ch; color: var(--text-strong) !important; font-size: 15px !important; line-height: 1.55 !important; }
 .workspace-app-automation__facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 9px; margin: 0; }
@@ -253,11 +245,12 @@
 .workspace-app-automation__actions { justify-content: space-between; }
 .workspace-app-automation__actions > a { display: inline-flex; align-items: center; gap: 5px; color: var(--text-default); font-size: 12px; text-decoration: none; }
 .workspace-app-automation__actions > a:hover { color: var(--text-strong); }
-.workspace-app-automation__runs a { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--surface-muted); color: var(--text-default); font-size: 12px; text-decoration: none; }
+.workspace-app-automation__runs a { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: calc(10px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-default); font-size: 12px; text-decoration: none; }
 .workspace-app-automation__runs a span:nth-child(2) { margin-left: auto; color: var(--text-muted); }
 .workspace-app-automation__runs a:hover { background: var(--glass-card-hover); }
 
 .workspace-app-view__section { margin-top: 27px; animation: workspace-app-reveal .55s .14s both; }
+.workspace-app-data + .workspace-app-view__section { margin-top: 28px; }
 .workspace-app-view__section-head {
   display: flex;
   align-items: center;
@@ -283,7 +276,7 @@
   gap: 8px;
   padding: 0 10px;
   border: 1px solid var(--border-subtle);
-  border-radius: 10px;
+  border-radius: calc(10px * var(--app-radius-scale, 1));
   background: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-panel));
   color: var(--text-muted);
   box-shadow: none;
@@ -322,7 +315,7 @@
   gap: 12px;
   padding: 11px 12px;
   border: 1px solid color-mix(in srgb, var(--text-faint) 14%, transparent);
-  border-radius: 12px;
+  border-radius: calc(12px * var(--app-radius-scale, 1));
   background: color-mix(in srgb, var(--surface-panel) 88%, transparent);
   box-shadow: none;
   color: var(--text-muted);
@@ -340,20 +333,12 @@
 .workspace-app-view__action-kind { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .04em; }
 .workspace-app-view__action-copy strong { color: var(--text-strong); font-size: 13px; font-weight: 680; line-height: 1.35; overflow-wrap: anywhere; }
 .workspace-app-view__action-copy small { color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
-.workspace-app-view--cover .workspace-app-view__action-copy strong { font-size: 15px; }
-.workspace-app-view--cover .workspace-app-view__action-copy small { font-size: 12px; }
 .workspace-app-view__action > svg { flex: 0 0 auto; align-self: center; }
 .workspace-app-view__action:disabled,
 .workspace-app-view__hero:disabled { opacity: .55; cursor: not-allowed; }
 .workspace-app-view__scheduled { display: grid; gap: 12px; margin-top: 22px; padding: 17px; border-radius: var(--radius-panel); background: var(--surface-muted); }
 .workspace-app-view__scheduled h4 { margin: 0; color: var(--text-strong); font-size: 12px; font-weight: 700; }
 .workspace-app-view__scheduled-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action { grid-column: auto; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-rows: auto; align-items: center; min-height: 108px; padding: 16px; background: var(--surface-panel); box-shadow: none; }
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action-icon,
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action-copy,
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action > svg { grid-column: auto; grid-row: auto; align-self: center; }
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action-copy strong { font-size: 13px; }
-.workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action-copy small { font-size: 11px; }
 
 .workspace-app-view__edit {
   display: flex;
@@ -379,13 +364,35 @@
 .workspace-app-view__state p,
 .workspace-app-view__empty p { margin: 10px 0; }
 .workspace-app-view__no-results { padding: 16px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-view__busy { margin: 4px 0 0; color: var(--text-muted); font-size: 12px; }
 
-.workspace-app-flow { display: grid; align-content: start; gap: 16px; max-width: 580px; margin: 0 auto; }
+/* An entry grows with the App: a narrow column on a small pane, a wide page on a wide one. */
+.workspace-app-flow { display: grid; align-content: start; gap: 16px; width: 100%; max-width: clamp(580px, 82cqi, 1120px); margin: 0 auto; }
+/* On a wide page short fields (toggles, choices, dates, short text) sit side by side; fields that
+   need the row (files, galleries, choice cards, long text) keep it. */
+@container workspace-app (min-width: 760px) {
+  .workspace-app-flow .workflow-starter-input-schema-fields {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    align-items: start;
+  }
+  .workspace-app-flow .workflow-starter-input-schema-fields > :is(
+    .workflow-starter-input-field--files, .workflow-starter-input-field--suggested,
+    .workflow-starter-input-field--choices, :has(textarea), :not(.workflow-starter-input-field)
+  ) { grid-column: 1 / -1; }
+}
 .workspace-app-flow__back { display: inline-flex; align-items: center; gap: 7px; justify-self: start; padding: 6px 0; border: 0; background: none; color: var(--text-muted); font-size: 12px; cursor: pointer; }
 .workspace-app-flow__back:hover { color: var(--text-strong); }
-.workspace-app-flow__mark { display: grid; place-items: center; width: 24px; height: 24px; margin-top: 16px; color: var(--text-muted); }
-.workspace-app-flow h2 { margin: 0; color: var(--text-strong); font-size: clamp(24px, 2.4vw, 34px); line-height: 1.16; letter-spacing: -.04em; }
-.workspace-app-flow__intro { max-width: 50ch; margin: 0; color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+/* The action's header: its glyph on a soft tile beside the title, the intro under both. */
+.workspace-app-flow__header {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; column-gap: 14px; row-gap: 10px;
+  margin: 8px 0 6px;
+}
+.workspace-app-flow__mark {
+  display: grid; place-items: center; width: 44px; height: 44px; border-radius: calc(12px * var(--app-radius-scale, 1));
+  background: var(--app-card-fill, var(--surface-muted)); color: var(--text-strong);
+}
+.workspace-app-flow h2 { margin: 0; color: var(--text-strong); font-size: clamp(22px, 2.2vw, 28px); font-weight: 650; line-height: 1.2; letter-spacing: -.025em; overflow-wrap: break-word; }
+.workspace-app-flow__intro { grid-column: 1 / -1; max-width: 62ch; margin: 0; color: var(--text-muted); font-size: 14px; line-height: 1.6; }
 .workspace-app-flow__steps { display: flex; gap: 8px; margin: 12px 0; color: var(--text-faint); font-size: 11px; font-weight: 650; }
 .workspace-app-flow__steps span { flex: 1; padding: 9px 6px; text-align: center; border-radius: var(--radius-control); background: var(--surface-muted); }
 .workspace-app-flow__steps .is-current { background: var(--surface-panel); box-shadow: var(--shadow-sm); color: var(--text-strong); }
@@ -394,6 +401,11 @@
 .workspace-app-flow__panel > .workflow-starter-input-schema-fields { grid-template-columns: minmax(0, 1fr); }
 .workspace-app-flow__panel h3 { margin: 0; color: var(--text-strong); font-size: 20px; letter-spacing: -.025em; }
 .workspace-app-flow__running-heading { display: flex; align-items: center; gap: 11px; }
+/* A run waiting on the person reads first: a warm tint, a larger heading and a marker. */
+.workspace-app-flow__panel--attention { background: color-mix(in srgb, var(--app-status-attention) 13%, var(--glass-card)); }
+.workspace-app-flow__panel--attention h3 { display: flex; align-items: center; gap: 12px; color: var(--app-status-attention); font-size: 28px; font-weight: 650; letter-spacing: -.03em; }
+.workspace-app-flow__panel--attention .workspace-app-flow__kicker { color: var(--app-status-attention); }
+.workspace-app-flow__attention-dot { flex: 0 0 12px; width: 12px; height: 12px; border-radius: 50%; background: var(--app-status-attention); box-shadow: 0 0 0 5px color-mix(in srgb, var(--app-status-attention) 22%, transparent); }
 .workspace-app-flow__running-indicator { position: relative; display: inline-block; flex: 0 0 12px; width: 12px; height: 12px; border-radius: 50%; background: var(--text-default); }
 .workspace-app-flow__running-indicator::after { content: ""; position: absolute; inset: -5px; border: 1px solid var(--text-muted); border-radius: 50%; animation: workspace-app-running-pulse 2.2s ease-out infinite; }
 .workspace-app-flow__run-progress { display: flex; align-items: center; gap: 12px; min-width: 0; min-height: 14px; }
@@ -411,28 +423,48 @@
 .workspace-app-flow__review div { display: grid; gap: 4px; min-width: 0; }
 .workspace-app-flow__review dt { color: var(--text-muted); font-size: 11px; }
 .workspace-app-flow__review dd { margin: 0; overflow-wrap: anywhere; color: var(--text-strong); font-size: 13px; white-space: pre-wrap; }
+/* A finished result's facts sit in a grid of short tiles, not one long column. */
+.workspace-app-flow__fields--compact > .chat-workflow-review-pairs { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 18px 24px; }
+.workspace-app-flow__fields--compact .chat-workflow-review-pairs > div { gap: 5px; }
+.workspace-app-flow__fields--compact .chat-workflow-review-pairs dd { font-size: 13px; line-height: 1.5; }
 .workspace-app-flow__output { max-height: 360px; margin: 0; padding: 15px; overflow: auto; border-radius: var(--radius-control); background: var(--surface-muted); color: var(--text-default); font: 12px/1.6 var(--font-mono, monospace); white-space: pre-wrap; overflow-wrap: anywhere; }
+.workspace-app-flow__raw > summary { width: fit-content; color: var(--text-muted); font-size: 12.5px; cursor: pointer; }
+.workspace-app-flow__raw[open] > summary { margin-bottom: 8px; }
 .workspace-app-flow__summary { margin: 0; color: var(--text-default); font-size: 13px; line-height: 1.6; }
+.workspace-app-flow__panel .workspace-app-flow__result-title { margin: 0; color: var(--text-strong); font-size: 16px; font-weight: 600; line-height: 1.45; }
+.workspace-app-flow__fields { margin-top: 10px; }
 .workspace-app-flow__timeline { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .workspace-app-flow__timeline li { display: flex; align-items: center; gap: 10px; min-width: 0; color: var(--text-default); font-size: 12px; }
 .workspace-app-flow__timeline-mark { display: inline-flex; flex: 0 0 25px; align-items: center; justify-content: center; width: 25px; height: 25px; border-radius: 50%; background: var(--surface-muted); color: var(--text-muted); font-size: 10px; font-weight: 700; }
 .workspace-app-flow__timeline li.is-completed .workspace-app-flow__timeline-mark { background: var(--accent); color: var(--on-accent, white); }
+.workspace-app-flow__timeline li.is-check-no .workspace-app-flow__timeline-mark { background: var(--surface-panel); color: var(--app-status-attention); box-shadow: inset 0 0 0 1px var(--app-status-attention); }
+.workspace-app-flow__timeline li.is-check-no small { color: var(--app-status-attention); }
 .workspace-app-flow__timeline li.is-running .workspace-app-flow__timeline-mark, .workspace-app-flow__timeline li.is-paused .workspace-app-flow__timeline-mark { background: var(--surface-panel); color: var(--text-strong); box-shadow: inset 0 0 0 1px var(--text-muted); }
 .workspace-app-flow__timeline li.is-running .workspace-app-flow__timeline-mark { position: relative; }
 .workspace-app-flow__timeline li.is-running .workspace-app-flow__timeline-mark::after { content: ""; position: absolute; inset: -4px; border: 1px solid var(--text-muted); border-radius: 50%; animation: workspace-app-running-pulse 2.2s ease-out infinite; }
 .workspace-app-flow__timeline li.is-running > span:nth-child(2) { color: var(--text-strong); font-weight: 650; }
 .workspace-app-flow__timeline li > span:nth-child(2) { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .workspace-app-flow__timeline small { color: var(--text-muted); font-size: 11px; }
-.workspace-app-flow__history { display: grid; gap: 8px; margin-top: 20px; }
-.workspace-app-flow__history h3 { margin: 0 0 3px; color: var(--text-strong); font-size: 13px; }
-.workspace-app-flow__history > button { display: grid; grid-template-columns: minmax(0, 1fr) auto 15px; align-items: center; gap: 12px; width: 100%; padding: 14px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; cursor: pointer; color: var(--text-default); font: inherit; text-align: left; }
+.workspace-app-flow__timeline li:has(> .workspace-app-flow__activity) { flex-wrap: wrap; }
+.workspace-app-flow__activity { flex: 1 0 100%; padding-left: 35px; }
+.workspace-app-flow__history { margin-top: 20px; }
+.workspace-app-flow__history > summary { display: flex; align-items: center; gap: 8px; padding: 8px 4px; color: var(--text-strong); font-size: 13px; font-weight: 600; list-style: none; cursor: pointer; }
+.workspace-app-flow__history > summary::-webkit-details-marker { display: none; }
+.workspace-app-flow__history > summary:focus-visible { outline: 2px solid var(--text-default); outline-offset: 2px; border-radius: calc(6px * var(--app-radius-scale, 1)); }
+.workspace-app-flow__history > summary svg { margin-left: auto; color: var(--text-muted); transition: transform .2s ease; }
+.workspace-app-flow__history[open] > summary svg { transform: rotate(180deg); }
+.workspace-app-flow__history-count { padding: 1px 7px; border-radius: 999px; background: var(--surface-muted); color: var(--text-muted); font-size: 11px; font-weight: 500; }
+.workspace-app-flow__history-tally { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-flow__history > button { display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: center; gap: 12px; width: 100%; padding: 10px 4px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; cursor: pointer; color: var(--text-default); font: inherit; font-size: 12px; text-align: left; }
 .workspace-app-flow__history > button:hover, .workspace-app-flow__history > button[aria-current="true"] { background: var(--glass-card-hover); }
 .workspace-app-flow__history > button:focus-visible { outline: 2px solid var(--text-default); outline-offset: 2px; }
-.workspace-app-flow__history-copy { display: grid; min-width: 0; gap: 6px; }
-.workspace-app-flow__history-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; overflow-wrap: anywhere; }
-.workspace-app-flow__history-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.workspace-app-flow__history-step { font-size: 12px; overflow-wrap: anywhere; }
-.workspace-app-flow__history-status { font-size: 12px; color: var(--text-muted); }
+.workspace-app-flow__history > button time { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+/* A run: its title, then when it ran and how long it took, then the step it stopped at. */
+.workspace-app-flow__history-copy { display: grid; min-width: 0; gap: 3px; }
+.workspace-app-flow__history-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; color: var(--text-strong); font-size: 13px; overflow-wrap: anywhere; }
+.workspace-app-flow__history-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.workspace-app-flow__history-step { min-width: 0; overflow: hidden; color: var(--text-default); text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-flow__history-status { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
 .workspace-app-flow__history-status[data-status="failed"] { color: var(--chip-danger-fg); }
 .workspace-app-flow__history-status[data-status="completed"] { color: var(--accent); }
 @media (max-width: 520px) {
@@ -442,11 +474,14 @@
 }
 .workspace-app-flow__files-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .workspace-app-flow__files-heading h4 { margin: 0; }
-.workspace-app-flow__files-heading span { display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 5px; border-radius: 7px; background: var(--surface-muted); color: var(--text-muted); font: 600 10px/1 var(--font-mono, monospace); }
+.run-media-clips__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: 12px; margin: 0; padding: 0; list-style: none; }
+.run-media-clips__grid > li { display: grid; gap: 4px; min-width: 0; padding: 8px; border-radius: var(--radius-card, 12px); background: var(--glass-card); box-shadow: var(--shadow-sm); }
+.run-media-clips__label { padding: 0 8px; font-size: 11px; color: var(--text-muted); }
+.workspace-app-flow__files-heading span { display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 5px; border-radius: calc(7px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-muted); font: 600 10px/1 var(--font-mono, monospace); }
 .workspace-app-flow__files { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
 .workspace-app-flow__files li { min-width: 0; }
 .workspace-app-flow__files a { display: flex; align-items: center; gap: 10px; min-height: 60px; padding: 9px 11px; border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); text-decoration: none; box-shadow: var(--shadow-sm); }
-.workspace-app-flow__file-icon { display: inline-grid; flex: 0 0 34px; place-items: center; width: 34px; height: 34px; border-radius: 9px; background: var(--surface-muted); color: var(--text-default); }
+.workspace-app-flow__file-icon { display: inline-grid; flex: 0 0 34px; place-items: center; width: 34px; height: 34px; border-radius: calc(9px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-default); }
 .workspace-app-flow__file-copy { display: grid; flex: 1; gap: 2px; min-width: 0; }
 .workspace-app-flow__file-copy strong { overflow-wrap: anywhere; color: var(--text-strong); font-size: 12px; font-weight: 650; line-height: 1.35; }
 .workspace-app-flow__file-copy small { color: var(--text-muted); font: 600 10px/1.2 var(--font-mono, monospace); letter-spacing: .04em; }
@@ -489,23 +524,302 @@
   box-shadow: none;
 }
 
-.workspace-app-view--preview { border-radius: 22px; overflow: hidden; box-shadow: var(--shadow-md); }
+.workspace-app-view--preview { border-radius: calc(22px * var(--app-radius-scale, 1)); overflow: hidden; box-shadow: var(--shadow-md); }
 .workspace-app-view--preview .workspace-app-view__scroll { max-height: 590px; }
 .workspace-app-view--preview :is(.workspace-app-view__hero, .workspace-app-view__action):disabled { opacity: 1; cursor: default; }
 
-@keyframes workspace-app-record-slide {
-  0%, 14%, 82%, 100% { transform: translate(0, 0); }
-  34%, 61% { transform: translate(18px, -4px); }
-}
-@keyframes workspace-app-parcel-lift {
-  0%, 43%, 77%, 100% { transform: translate(0, 0); }
-  57%, 64% { transform: translate(0, -5px); }
-}
 @keyframes workspace-app-orbit { to { transform: rotate(360deg); } }
 @keyframes workspace-app-reveal { from { opacity: 0; } to { opacity: 1; } }
 @keyframes workspace-app-running-pulse { 0% { opacity: .65; transform: scale(.7); } 70%, 100% { opacity: 0; transform: scale(1.25); } }
 @keyframes workspace-app-running-sweep { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
 @keyframes workspace-app-running-breathe { 50% { opacity: .68; } }
+
+/* Data sections: recent outputs and decisions waiting on a person. Status is a
+   coloured dot on a neutral label; only the queue carries a tinted surface. */
+/* Root-level so the metric detail drawer, mounted outside the App, shares them. */
+:root {
+  --app-status-done: #437f6b;
+  --app-status-active: #426c87;
+  --app-status-attention: #b27c34;
+  --app-status-failed: #c14a44;
+  --app-queue-bg: #f8f1e3;
+  --app-card-fill: #f5f5f7;
+  --app-card-fill-hover: #ececef;
+  --app-hairline: rgba(28, 25, 23, 0.06);
+}
+html[data-theme="dark"] {
+  --app-status-done: #7fc0a8;
+  --app-status-active: #8db4d0;
+  --app-status-attention: #e0b06a;
+  --app-status-failed: #ef8a84;
+  --app-queue-bg: rgba(224, 176, 106, 0.13);
+  --app-card-fill: #1c1c1e;
+  --app-card-fill-hover: #26262a;
+  --app-hairline: rgba(255, 255, 255, 0.1);
+}
+/* An App's own look (app_view.theme, lib/appTheme.ts). Corners scale through
+   --app-radius-scale (1 = the platform's); the shared radius tokens follow. */
+.workspace-app-view {
+  --radius-panel: calc(22px * var(--app-radius-scale, 1));
+  --radius-card: calc(14px * var(--app-radius-scale, 1));
+  --radius-control: calc(10px * var(--app-radius-scale, 1));
+}
+.workspace-app-view[data-app-surface="tinted"] {
+  background-image: linear-gradient(var(--app-surface-tint, transparent), var(--app-surface-tint, transparent));
+}
+/* A deep App is dark in either appearance: the dark tokens, scoped to the App. */
+.workspace-app-view[data-app-surface="deep"] {
+  color-scheme: dark;
+  --surface-app: #070707;
+  --surface-panel: #111111;
+  --surface-muted: #1b1b1b;
+  --surface-sunken: #0c0c0c;
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --border-default: rgba(255, 255, 255, 0.18);
+  --border-strong: rgba(255, 255, 255, 0.32);
+  --text-strong: #ffffff;
+  --text-default: #ffffff;
+  --text-muted: rgba(255, 255, 255, 0.92);
+  --text-faint: rgba(255, 255, 255, 0.68);
+  --chip-neutral-bg: rgba(255, 255, 255, 0.08);
+  --chip-neutral-fg: rgba(255, 255, 255, 0.72);
+  --chip-danger-bg: rgba(255, 143, 143, 0.12);
+  --chip-danger-fg: #ffaaa2;
+  --ink: #ffffff;
+  --ink-hover: #ffffff;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --glass-panel: rgba(17, 17, 17, 0.97);
+  --glass-card: rgba(20, 20, 20, 0.98);
+  --glass-card-hover: rgba(29, 29, 29, 0.99);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-hairline: rgba(255, 255, 255, 0.1);
+  --app-status-done: #7fc0a8;
+  --app-status-active: #8db4d0;
+  --app-status-attention: #e0b06a;
+  --app-status-failed: #ef8a84;
+  --app-queue-bg: rgba(224, 176, 106, 0.13);
+  --app-card-fill: #1c1c1e;
+  --app-card-fill-hover: #26262a;
+  --app-hairline: rgba(255, 255, 255, 0.1);
+  background: #0b0b0c;
+  color: var(--text-default);
+}
+/* The list layout drops section top margins; data sections keep their spacing. */
+.workspace-app-view--list .workspace-app-section { margin-block: 27px; }
+.workspace-app-section__detail { min-width: 0; color: var(--text-faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-section__note { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0; padding: 12px 14px; border-radius: calc(12px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-muted); font-size: 12px; }
+.workspace-app-section__skeleton { display: grid; gap: 8px; }
+.workspace-app-section__skeleton span { height: 44px; border-radius: calc(12px * var(--app-radius-scale, 1)); background: linear-gradient(90deg, var(--surface-muted), color-mix(in srgb, var(--text-faint) 12%, var(--surface-muted)), var(--surface-muted)); background-size: 200% 100%; animation: workspace-app-shimmer 1.2s linear infinite; }
+
+.workspace-app-status { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; padding: 2px 8px 2px 7px; border-radius: 999px; background: var(--chip-neutral-bg); color: var(--chip-neutral-fg); font-size: 11px; font-weight: 500; white-space: nowrap; }
+.workspace-app-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+.workspace-app-status--done::before { background: var(--app-status-done); }
+.workspace-app-status--active::before { background: var(--app-status-active); animation: workspace-app-running-breathe 1.4s ease-in-out infinite; }
+.workspace-app-status--attention::before { background: var(--app-status-attention); }
+.workspace-app-status--failed { background: var(--chip-danger-bg); color: var(--chip-danger-fg); }
+.workspace-app-status--failed::before { background: currentColor; }
+
+.workspace-app-outputs, .workspace-app-outputs__files, .workspace-app-queue, .workspace-app-gallery { margin: 0; padding: 0; list-style: none; }
+.workspace-app-outputs__run { display: grid; gap: 8px; padding: 11px 4px; border-bottom: 1px solid var(--app-hairline); }
+.workspace-app-outputs__run:last-child { border-bottom: 0; }
+.workspace-app-outputs__head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.workspace-app-outputs__head a, .workspace-app-outputs__open { display: grid; flex: 1; min-width: 0; gap: 2px; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; text-decoration: none; }
+button.workspace-app-outputs__open { cursor: pointer; }
+.workspace-app-outputs__head a:hover strong, button.workspace-app-outputs__open:hover strong { text-decoration: underline; text-underline-offset: 3px; }
+.workspace-app-outputs__head strong { overflow: hidden; color: var(--text-strong); font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-outputs__summary { display: -webkit-box; margin: 0; overflow: hidden; color: var(--text-secondary); font-size: 12px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.workspace-app-outputs__head small { color: var(--text-faint); font-size: 11.5px; }
+.workspace-app-outputs__files { display: flex; flex-wrap: wrap; gap: 6px; }
+.workspace-app-outputs__files a, .workspace-app-outputs__files li > span { display: inline-flex; align-items: center; max-width: 100%; gap: 6px; padding: 5px 9px; border-radius: calc(9px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); color: var(--text-default); font-size: 12px; text-decoration: none; }
+.workspace-app-outputs__files a:hover { box-shadow: var(--shadow-md); }
+.workspace-app-outputs__files span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-outputs__files small { color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; }
+.workspace-app-outputs__files svg { flex: 0 0 auto; color: var(--text-muted); }
+.workspace-app-outputs__progress { display: grid; gap: 5px; }
+.workspace-app-outputs__progress small { color: var(--text-muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.workspace-app-outputs__stages { display: flex; gap: 3px; }
+.workspace-app-outputs__stages i { flex: 1; height: 4px; border-radius: calc(2px * var(--app-radius-scale, 1)); background: var(--surface-muted); }
+.workspace-app-outputs__stages i.is-done { background: var(--accent); }
+.workspace-app-outputs__stages i.is-current { background: var(--app-status-active); animation: workspace-app-running-breathe 1.4s ease-in-out infinite; }
+.workspace-app-outputs__stages i.is-waiting { background: var(--app-status-attention); }
+.workspace-app-outputs__stages i.is-failed { background: var(--app-status-failed); }
+.workspace-app-outputs__published { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.workspace-app-outputs__published li { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; font-size: 12px; }
+.workspace-app-outputs__published a, .workspace-app-outputs__published span { min-width: 0; overflow: hidden; color: var(--text-default); text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-outputs__published a { text-decoration: underline; text-decoration-color: var(--app-hairline); text-underline-offset: 3px; }
+.workspace-app-outputs__published small { flex: 0 0 auto; color: var(--text-faint); font-size: 11px; }
+.workspace-app-outputs__more { align-self: center; color: var(--text-faint); font-size: 11.5px; }
+
+.workspace-app-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.workspace-app-gallery__card { position: relative; display: flex; align-items: flex-end; aspect-ratio: 3 / 4; overflow: hidden; border-radius: calc(12px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-default); text-decoration: none; transition: transform .2s ease, box-shadow .2s ease; }
+a.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.workspace-app-gallery__glyph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-faint); }
+.workspace-app-gallery__thumb { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: var(--surface-muted); }
+.workspace-app-gallery__wide { grid-column: span 2; }
+/* Two 3:4 columns side by side read as 3:2, so rows stay level. */
+.workspace-app-gallery__wide .workspace-app-gallery__card { aspect-ratio: 3 / 2; }
+.workspace-app-gallery__tall .workspace-app-gallery__card { aspect-ratio: 9 / 16; }
+/* A recording: a square with its note, a play button, and how far it has played along the bottom. */
+.workspace-app-gallery__card--audio { aspect-ratio: 1; }
+.workspace-app-gallery__card--audio .workspace-app-gallery__glyph { place-items: start center; padding-top: 22%; }
+.workspace-app-gallery__play { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: var(--text-strong); color: var(--surface-panel); cursor: pointer; transform: translate(-50%, -10%); transition: transform .15s ease; }
+.workspace-app-gallery__play:hover { transform: translate(-50%, -10%) scale(1.06); }
+.workspace-app-gallery__play[aria-busy="true"] { opacity: .6; cursor: progress; }
+.workspace-app-gallery__card--audio .workspace-app-gallery__caption a { min-width: 0; overflow: hidden; color: inherit; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-gallery__played { position: absolute; right: 0; bottom: 0; left: 0; height: 3px; background: color-mix(in srgb, var(--text-default) 8%, transparent); }
+.workspace-app-gallery__played i { display: block; height: 100%; background: var(--text-strong); transition: width .25s linear; }
+.workspace-app-gallery__thumb--page { inset: 8px 8px 30px; width: calc(100% - 16px); height: calc(100% - 38px); object-fit: contain; background: transparent; filter: drop-shadow(0 1px 3px rgb(28 25 23 / 14%)); }
+.workspace-app-gallery__badge { position: absolute; top: 7px; left: 7px; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: rgb(11 11 11 / 58%); color: #fff; }
+.workspace-app-gallery__caption { position: relative; display: flex; justify-content: space-between; gap: 6px; width: 100%; padding: 7px 8px; background: color-mix(in srgb, var(--surface-panel) 84%, transparent); font-size: 11px; }
+.workspace-app-gallery__caption span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-gallery__caption small { flex: 0 0 auto; color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; }
+/* A result without files: what it says and its state, on the same tile. */
+button.workspace-app-gallery__card { width: 100%; padding: 0; border: 0; font: inherit; text-align: left; cursor: pointer; }
+button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.workspace-app-gallery__card--result { flex-direction: column; align-items: stretch; background: var(--surface-panel); box-shadow: var(--shadow-sm); }
+.workspace-app-gallery__result { display: flex; flex: 1; flex-direction: column; gap: 6px; min-height: 0; padding: 10px 10px 0; overflow: hidden; }
+.workspace-app-gallery__result .workspace-app-status { align-self: flex-start; }
+.workspace-app-gallery__result strong { display: -webkit-box; overflow: hidden; color: var(--text-strong); font-size: 12.5px; font-weight: 600; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
+.workspace-app-gallery__detail { display: -webkit-box; overflow: hidden; color: var(--text-secondary); font-size: 11px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+/* A running result: a soft light sweeps the tile while its stages fill along the foot. */
+.workspace-app-gallery__card--result.is-running::before { content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none; background: linear-gradient(105deg, transparent 32%, color-mix(in srgb, var(--app-status-active) 9%, transparent) 44%, color-mix(in srgb, var(--surface-panel) 70%, transparent) 50%, color-mix(in srgb, var(--app-status-active) 9%, transparent) 56%, transparent 68%); background-size: 260% 100%; animation: workspace-app-gallery-sheen 2.6s ease-in-out infinite; }
+.workspace-app-gallery__card--result.is-running > * { position: relative; z-index: 1; }
+.workspace-app-gallery__progress { display: flex; align-items: center; gap: 7px; padding: 0 10px 9px; }
+.workspace-app-gallery__segments { display: flex; flex: 1; gap: 3px; min-width: 0; }
+.workspace-app-gallery__segments i { position: relative; flex: 1; height: 4px; overflow: hidden; border-radius: calc(2px * var(--app-radius-scale, 1)); background: color-mix(in srgb, var(--text-default) 9%, transparent); }
+.workspace-app-gallery__segments i.is-done { background: var(--app-status-active); }
+.workspace-app-gallery__segments i.is-current { background: color-mix(in srgb, var(--app-status-active) 24%, transparent); }
+.workspace-app-gallery__segments i.is-current::after { content: ""; position: absolute; inset: 0; width: 46%; border-radius: inherit; background: var(--app-status-active); animation: workspace-app-gallery-fill 1.5s cubic-bezier(.45, 0, .25, 1) infinite; }
+.workspace-app-gallery__segments i.is-waiting { background: var(--app-status-attention); }
+.workspace-app-gallery__progress small { flex: 0 0 auto; color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+@keyframes workspace-app-gallery-sheen { from { background-position: 130% 0; } to { background-position: -130% 0; } }
+@keyframes workspace-app-gallery-fill { from { transform: translateX(-105%); } to { transform: translateX(225%); } }
+.workspace-app-gallery__published { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 4px; }
+.workspace-app-gallery__card:not(.workspace-app-gallery__card--result) .workspace-app-gallery__published { position: absolute; top: 7px; right: 7px; justify-content: flex-end; }
+.workspace-app-gallery__published a, .workspace-app-gallery__published span { padding: 2px 6px; border-radius: 999px; background: color-mix(in srgb, var(--surface-panel) 88%, transparent); color: var(--text-default); font-size: 10.5px; text-decoration: none; }
+
+/* Tracking: a few app-style widgets, then one line for numbers still waiting. */
+.workspace-app-metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.workspace-app-metric { display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 124px; gap: 6px; padding: 14px 14px 12px; border: 0; border-radius: calc(16px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); color: inherit; font: inherit; text-align: left; text-decoration: none; cursor: pointer; transition: box-shadow .2s ease, transform .2s ease; }
+.workspace-app-metric:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+.workspace-app-metric:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-app-metric__label { display: -webkit-box; overflow: hidden; color: var(--text-muted); font-size: 12px; font-weight: 500; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.workspace-app-metric__reading { display: flex; flex-wrap: wrap; align-items: baseline; min-width: 0; column-gap: 8px; }
+.workspace-app-metric__reading .workspace-app-metric__value { flex: 0 1 auto; max-width: 100%; }
+.workspace-app-metric__value { overflow: hidden; color: var(--text-strong); font-family: var(--font-mono); font-size: 24px; font-variant-numeric: tabular-nums; font-weight: 500; letter-spacing: -.03em; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-metric__change { flex: 0 0 auto; color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.workspace-app-metric__change--up { color: var(--app-status-done); }
+.workspace-app-metric__change--down { color: var(--app-status-failed); }
+.workspace-app-metric__spark { width: 100%; height: 24px; overflow: visible; }
+.workspace-app-metric__spark polygon { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
+.workspace-app-metric__spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.workspace-app-metric__spark circle { fill: var(--accent); }
+.workspace-app-metric__goal { display: grid; gap: 5px; }
+.workspace-app-metric__goal small { color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.workspace-app-metric__track { height: 4px; overflow: hidden; border-radius: calc(2px * var(--app-radius-scale, 1)); background: var(--surface-muted); }
+.workspace-app-metric__track > span { display: block; height: 100%; border-radius: calc(2px * var(--app-radius-scale, 1)); background: var(--accent); }
+.workspace-app-metric__pace { font-family: var(--font-sans); }
+.workspace-app-metric__pace--done { color: var(--app-status-done); }
+.workspace-app-metric__pace--attention { color: var(--app-status-attention); }
+.workspace-app-metric__foot { display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: auto; overflow: hidden; color: var(--text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-metric__dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+.workspace-app-metric__dot--active { background: var(--app-status-active); }
+.workspace-app-metric__dot--attention { background: var(--app-status-attention); }
+.workspace-app-metric__dot--failed { background: var(--app-status-failed); }
+.workspace-app-metric__foot:has(.workspace-app-metric__dot--failed) { color: var(--app-status-failed); }
+.workspace-app-metric__foot:has(.workspace-app-metric__dot--attention) { color: var(--text-muted); }
+/* Numbers past the headline tiles: rows with the reading on the right; a dash until the first reading. */
+.workspace-app-metrics + .workspace-app-metric-rows { margin-top: 12px; }
+.workspace-app-metric-rows { margin: 0; padding: 0; list-style: none; }
+.workspace-app-metric-rows > li { border-top: 1px solid var(--app-hairline); }
+.workspace-app-metric-row { display: flex; align-items: center; width: 100%; min-height: 52px; gap: 10px; padding: 9px 4px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.workspace-app-metric-row:hover { background: color-mix(in srgb, var(--surface-muted) 60%, transparent); }
+.workspace-app-metric-row:focus-visible, .workspace-app-section__more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-app-metric-row__text { display: grid; flex: 1; min-width: 0; gap: 2px; }
+.workspace-app-metric-row__text strong { overflow: hidden; color: var(--text-strong); font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-metric-row .workspace-app-metric__foot { margin-top: 0; }
+.workspace-app-metric-row__value { flex: none; color: var(--text-strong); font-family: var(--font-mono); font-size: 15px; font-variant-numeric: tabular-nums; font-weight: 500; }
+.workspace-app-metric-row__value.is-waiting { color: var(--text-faint); font-weight: 400; }
+.workspace-app-metric-row > svg { flex: none; color: var(--text-faint); }
+.workspace-app-section__more { margin-left: auto; padding: 2px 4px; border: 0; background: none; color: var(--text-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-section__more:hover { color: var(--text-strong); }
+@media (prefers-reduced-motion: reduce) { .workspace-app-metric { transition: none; } .workspace-app-metric:hover { transform: none; } }
+
+.workspace-app-audience { display: grid; gap: 10px; padding: 14px; border-radius: calc(14px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); }
+.workspace-app-audience p { margin: 0; color: var(--text-muted); font-size: 12.5px; line-height: 1.55; }
+.workspace-app-audience strong { color: var(--text-strong); }
+.workspace-app-audience__choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.workspace-app-audience__choices button { padding: 5px 10px; border: 0; border-radius: 999px; background: var(--chip-neutral-bg); color: var(--chip-neutral-fg); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-audience__choices button[aria-pressed="true"] { background: var(--accent-soft); color: var(--text-strong); box-shadow: inset 0 0 0 1px var(--accent-soft-border); }
+.workspace-app-audience__choices button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-app-audience > :last-child { justify-self: start; }
+
+/* Connections the Workspace's Blueprint needs, set up in place. */
+.workspace-app-connections { display: grid; gap: 10px; margin-bottom: 18px; }
+.workspace-app-connections__required { display: grid; gap: 10px; padding: 14px; border-radius: calc(14px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); }
+.workspace-app-connections__lead { margin: 0; color: var(--text-muted); font-size: 12.5px; line-height: 1.55; }
+.workspace-app-connections__lead strong { margin-right: 4px; color: var(--text-strong); }
+.workspace-app-connections__lead strong::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--app-status-attention); vertical-align: 1px; }
+.workspace-app-connections ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.workspace-app-connections__row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 0; }
+.workspace-app-connections__row + .workspace-app-connections__row { border-top: 1px solid rgba(28, 25, 23, 0.06); }
+.workspace-app-connections__row > button { flex: none; }
+.workspace-app-connections__name { display: flex; min-width: 0; flex: 1 1 0; align-items: center; gap: 10px; }
+.workspace-app-connections__name > span { display: grid; min-width: 0; }
+.workspace-app-connections__name strong { color: var(--text-strong); font-size: 13px; font-weight: 600; }
+.workspace-app-connections__name small { color: var(--text-muted); font-size: 11.5px; line-height: 1.4; }
+.workspace-app-connections__steps { flex: 1 0 100%; padding: 4px 0 2px 28px; font-size: 12.5px; }
+.workspace-app-connections__steps .text-sm { font-size: 12.5px; line-height: 1.55; }
+.workspace-app-connections__optional { padding: 0 2px; }
+.workspace-app-connections__optional summary { width: fit-content; color: var(--text-muted); font-size: 12px; cursor: pointer; }
+.workspace-app-connections__optional summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: calc(4px * var(--app-radius-scale, 1)); }
+.workspace-app-connections__optional ul { margin-top: 6px; }
+
+/* Metric detail drawer body. */
+.workspace-app-metric-detail__value { color: var(--text-strong); font-family: var(--font-mono); font-size: 20px; font-variant-numeric: tabular-nums; }
+.workspace-app-metric-detail { display: grid; gap: 22px; }
+.workspace-app-metric-detail section { display: grid; gap: 8px; }
+.workspace-app-metric-detail h4 { margin: 0; color: var(--text-strong); font-size: 12px; font-weight: 700; letter-spacing: .02em; }
+.workspace-app-metric-detail p { margin: 0; font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.workspace-app-metric-detail__muted { color: var(--text-muted); }
+.workspace-app-metric-detail__goal-title { color: var(--text-strong); font-weight: 600; }
+.workspace-app-metric-detail__link { color: var(--text-default); font-size: 12.5px; text-decoration: underline; text-underline-offset: 3px; }
+.workspace-app-metric-detail__chart { margin: 0; }
+.workspace-app-metric-detail__chart svg { display: block; width: 100%; height: 120px; overflow: visible; }
+.workspace-app-metric-detail__chart line { stroke: var(--app-hairline); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.workspace-app-metric-detail__chart polygon { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
+.workspace-app-metric-detail__chart polyline { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.workspace-app-metric-detail__chart figcaption { display: flex; justify-content: space-between; margin-top: 4px; color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; }
+.workspace-app-metric-detail__gaps, .workspace-app-metric-detail__readings, .workspace-app-metric-detail__refs { margin: 0; padding: 0; list-style: none; }
+.workspace-app-metric-detail__gaps li { padding: 8px 10px; border-radius: calc(10px * var(--app-radius-scale, 1)); background: var(--app-queue-bg); color: var(--text-default); font-size: 12.5px; }
+.workspace-app-metric-detail__gaps li + li { margin-top: 6px; }
+.workspace-app-metric-detail__readings > li { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--app-hairline); }
+.workspace-app-metric-detail__readings > li:last-child { border-bottom: 0; }
+.workspace-app-metric-detail__readings > li > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.workspace-app-metric-detail__readings strong { color: var(--text-strong); font-family: var(--font-mono); font-size: 14px; font-variant-numeric: tabular-nums; }
+.workspace-app-metric-detail__readings small { color: var(--text-faint); font-size: 11px; white-space: nowrap; }
+.workspace-app-metric-detail__refs { display: flex; flex-wrap: wrap; gap: 6px; }
+.workspace-app-metric-detail__refs a { display: inline-block; padding: 3px 8px; border-radius: calc(8px * var(--app-radius-scale, 1)); background: var(--chip-neutral-bg); color: var(--chip-neutral-fg); font-size: 11.5px; text-decoration: none; }
+.workspace-app-metric-detail__record { display: grid; gap: 6px; }
+.workspace-app-metric-detail__record label { color: var(--text-strong); font-size: 12px; font-weight: 700; }
+.workspace-app-metric-detail__record > div { display: flex; gap: 8px; }
+.workspace-app-metric-detail__record [role="alert"] { color: var(--app-status-failed); }
+
+.workspace-app-queue { padding: 2px 12px; border-radius: calc(14px * var(--app-radius-scale, 1)); background: var(--app-queue-bg); }
+.workspace-app-queue li + li { border-top: 1px solid color-mix(in srgb, var(--app-status-attention) 18%, transparent); }
+.workspace-app-queue button { display: flex; align-items: center; width: 100%; gap: 11px; padding: 11px 0; border: 0; background: transparent; color: var(--text-default); font: inherit; text-align: left; cursor: pointer; }
+.workspace-app-queue button > svg { flex: 0 0 auto; color: var(--app-status-attention); }
+.workspace-app-queue__copy { display: grid; flex: 1; min-width: 0; gap: 2px; }
+.workspace-app-queue__copy strong { color: var(--text-strong); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.workspace-app-queue__copy small { color: var(--text-faint); font-size: 11.5px; }
+.workspace-app-queue__open { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; color: var(--text-muted); font-size: 11.5px; }
+.workspace-app-queue button:hover .workspace-app-queue__open { color: var(--text-strong); }
+.workspace-app-queue button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: calc(8px * var(--app-radius-scale, 1)); }
+@keyframes workspace-app-shimmer { to { background-position: -200% 0; } }
+
+@container workspace-app (min-width: 720px) {
+  .workspace-app-gallery { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+}
 
 @container chat-workbench (max-width: 720px) {
   .workspace-app-view { max-height: min(48vh, 430px); }
@@ -514,27 +828,303 @@
   .workspace-app-view__intro { margin-bottom: 14px; }
   .workspace-app-view__intro h2 { font-size: 22px; }
   .workspace-app-view__intro p { font-size: 12px; }
-  .workspace-app-view__hero { min-height: 136px; padding: 16px; border-radius: 16px; }
-  .workspace-app-view__hero-content strong { font-size: 16px; }
+  .workspace-app-view__hero { padding: 16px 16px 14px; border-radius: calc(18px * var(--app-radius-scale, 1)); }
+  .workspace-app-view__hero-content strong { font-size: 18px; }
   .workspace-app-view__section { margin-top: 20px; }
-  .workspace-app-view__cover { min-height: 220px; gap: 20px; padding: 20px; border-radius: 18px; }
-}
-
-@container workspace-app (max-width: 760px) {
-  .workspace-app-view--cover .workspace-app-view__actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
-@container workspace-app (max-width: 520px) {
-  .workspace-app-view--cover .workspace-app-view__actions { grid-template-columns: 1fr; }
-  .workspace-app-view--cover .workspace-app-view__action--spotlight { grid-column: auto; }
-  .workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action { grid-template-columns: auto minmax(0, 1fr); }
-  .workspace-app-view--cover .workspace-app-view__scheduled .workspace-app-view__action > svg { display: none; }
+  .workspace-app-view__cover { min-height: 220px; gap: 20px; padding: 20px; border-radius: calc(18px * var(--app-radius-scale, 1)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .workspace-app-view :is(.workspace-app-view__hero, .workspace-app-view__action, .workspace-app-view__cover-image, .workspace-app-view__hero-arrow, .workspace-app-view__hero-art span, .workspace-app-view__record-layer, .workspace-app-view__parcel-layer),
+  .workspace-app-view :is(.workspace-app-view__hero, .workspace-app-view__action, .workspace-app-view__cover-image, .workspace-app-view__hero-art span),
   .workspace-app-view__intro, .workspace-app-view__section, .workspace-app-flow__files-toggle svg,
   .workspace-app-flow__running-indicator::after, .workspace-app-flow__run-progress-track > span,
+  .workspace-app-section__skeleton span, .workspace-app-status--active::before, .workspace-app-gallery__card, .workspace-app-gallery__card--result.is-running::before, .workspace-app-gallery__segments i.is-current::after,
   .workspace-app-flow__timeline li.is-running .workspace-app-flow__timeline-mark::after { animation: none; transition: none; }
   .workspace-app-flow__run-progress:not(.is-determinate) .workspace-app-flow__run-progress-track > span { width: 34%; }
+}
+
+/* ── App modules ──────────────────────────────────────────────────────────
+   One grammar for every block of the contract, in the spirit of iOS inset
+   groups: a quiet canvas, white grouped surfaces, a short title above each
+   module, rows with a 30px icon tile, one line of detail and a hairline that
+   starts after the icon. No borders, no card shadows; hierarchy from type. */
+/* The App shares the chat's canvas, so the two panes read as one surface. */
+.workspace-app-view { background: var(--surface-panel); }
+/* A module before the main action keeps the same rhythm as modules after it. */
+.workspace-app-view__section + :is(.workspace-app-view__hero, .workspace-app-view__cover, .workspace-app-view__empty) { margin-top: 30px; }
+.workspace-app-view__section { margin-top: 30px; }
+.workspace-app-view__section-head { margin: 0 4px 10px; }
+.workspace-app-view__section-head h3 { font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
+.workspace-app-view__section-head .workspace-app-section__detail,
+.workspace-app-view__section-head .workspace-app-section__more { font-size: 13px; }
+
+/* Grouped surfaces. */
+.workspace-app-group, .workspace-app-view__actions, .workspace-app-view__scheduled-actions, .workspace-app-queue, .workspace-app-outputs {
+  display: block; margin: 0; padding: 0; overflow: hidden; border-radius: calc(16px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); list-style: none;
+}
+.workspace-app-group__row, .workspace-app-view__action, .workspace-app-queue button, .workspace-app-outputs__run { position: relative; }
+:is(.workspace-app-group__row, .workspace-app-view__action) + :is(.workspace-app-group__row, .workspace-app-view__action)::before,
+.workspace-app-queue li + li::before, .workspace-app-outputs__run + .workspace-app-outputs__run::before {
+  content: ""; position: absolute; top: 0; right: 0; left: 56px; height: 1px; background: var(--app-hairline);
+}
+.workspace-app-queue li { position: relative; }
+.workspace-app-outputs__run + .workspace-app-outputs__run::before { left: 14px; }
+.workspace-app-group__row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-height: 56px; padding: 10px 14px; }
+.workspace-app-group__icon, .workspace-app-view__action-icon {
+  display: grid; flex: none; place-items: center; width: 30px; height: 30px; border-radius: calc(8px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-default);
+}
+.workspace-app-group__icon--attention { background: color-mix(in srgb, var(--app-status-attention) 16%, transparent); color: var(--app-status-attention); }
+.workspace-app-group__text { display: grid; flex: 1 1 0; min-width: 0; gap: 2px; }
+.workspace-app-group__text strong { overflow: hidden; color: var(--text-strong); font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-group__text small { overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-group__row > button { flex: none; }
+
+/* Entries: every layout lists them the same way; layout only shapes the top. */
+.workspace-app-view__action {
+  display: flex; align-items: center; width: 100%; min-height: 56px; gap: 12px; padding: 10px 14px;
+  border: 0; border-radius: 0; background: transparent; box-shadow: none; color: var(--text-faint); text-align: left; transform: none;
+}
+.workspace-app-view__action:hover:not(:disabled) { border: 0; background: color-mix(in srgb, var(--surface-muted) 55%, var(--surface-panel)); box-shadow: none; transform: none; }
+.workspace-app-view__action:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.workspace-app-view__action-copy { gap: 2px; }
+.workspace-app-view__action-copy strong { color: var(--text-strong); font-size: 14px; font-weight: 600; line-height: 1.3; }
+.workspace-app-view__action-copy small { overflow: hidden; color: var(--text-muted); font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-view__action-kind { color: var(--app-status-attention); font-size: 11px; font-weight: 600; letter-spacing: 0; }
+.workspace-app-view__scheduled { gap: 10px; margin-top: 24px; padding: 0; background: none; }
+.workspace-app-view__scheduled h4 { margin: 0 4px; color: var(--text-muted); font-size: 13px; font-weight: 600; }
+
+/* Waiting for you: the same rows, an amber tile marks a decision. */
+.workspace-app-queue button { display: flex; align-items: center; width: 100%; min-height: 60px; gap: 12px; padding: 10px 14px; }
+.workspace-app-queue button:hover { background: color-mix(in srgb, var(--surface-muted) 55%, var(--surface-panel)); }
+.workspace-app-queue__copy strong { display: -webkit-box; overflow: hidden; font-size: 14px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.workspace-app-queue__copy small { font-size: 12px; }
+.workspace-app-queue__open { font-size: 12px; }
+
+/* Outputs list rows. */
+.workspace-app-outputs__run { padding: 12px 14px; border-bottom: 0; }
+.workspace-app-outputs__head strong { font-size: 14px; }
+
+/* Connections. */
+.workspace-app-connections { display: grid; gap: 8px; margin-bottom: 0; }
+.workspace-app-connections__lead { margin: 0 4px; color: var(--text-muted); font-size: 12.5px; line-height: 1.5; }
+.workspace-app-connections__lead strong::before { content: none; }
+.workspace-app-connections__optional summary { margin: 2px 4px 0; font-size: 12.5px; }
+.workspace-app-connections__optional .workspace-app-group { margin-top: 8px; }
+.workspace-app-connections__steps { padding: 0 0 4px 42px; }
+
+/* Tracking widgets sit on the canvas like the other groups. */
+.workspace-app-metric { border-radius: calc(18px * var(--app-radius-scale, 1)); box-shadow: var(--shadow-sm); }
+.workspace-app-metric:hover { box-shadow: var(--shadow-md); transform: none; }
+.workspace-app-section__note { border-radius: calc(16px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: var(--shadow-sm); }
+
+/* The closing link. */
+.workspace-app-view__edit { justify-content: center; margin-top: 32px; background: none; box-shadow: none; color: var(--text-muted); }
+.workspace-app-view__edit span { flex: 0 0 auto; }
+.workspace-app-view__edit:hover { color: var(--text-strong); }
+
+/* ── Zones: ① notices ② functions ③ data ④ outputs, always in this order.
+   Each zone has its own shape so it reads without its title: a tinted card,
+   soft-fill cards to press, then flat rows to read under a hairline. No
+   shadows or outlines: one quiet fill, type and space carry the page. */
+.workspace-app-zone--notices { margin-top: 0; }
+.workspace-app-zone--functions { margin-top: 22px; }
+.workspace-app-zone--functions:empty, .workspace-app-zone--records:empty { display: none; }
+.workspace-app-zone--notices + .workspace-app-zone--functions { margin-top: 18px; }
+.workspace-app-zone--functions > .workspace-app-view__empty { margin: 0; }
+
+/* ③④ Records: flat rows on the page, separated by hairlines, under muted list headings. */
+.workspace-app-zone--records { margin-top: 28px; border-top: 1px solid var(--app-hairline); }
+.workspace-app-zone--records > :first-child { margin-top: 22px; }
+.workspace-app-zone--records > :is(.workspace-app-data, .workspace-app-calendar):first-child { padding-top: 0; border-top: 0; }
+.workspace-app-zone--records .workspace-app-view__section-head h3 { color: var(--text-muted); font-size: 13px; font-weight: 600; letter-spacing: 0; }
+.workspace-app-zone--records :is(.workspace-app-group, .workspace-app-outputs, .workspace-app-queue, .workspace-app-section__note) {
+  border-top: 1px solid var(--app-hairline); border-radius: 0; background: none; box-shadow: none;
+}
+.workspace-app-zone--records > :is(.workspace-app-data, .workspace-app-calendar) { border-top-color: var(--app-hairline); }
+.workspace-app-zone--records .workspace-app-section__note { padding-inline: 4px; }
+.workspace-app-zone--records :is(.workspace-app-group__row, .workspace-app-outputs__run, .workspace-app-queue button) { padding-inline: 4px; }
+.workspace-app-zone--records :is(.workspace-app-group__row + .workspace-app-group__row, .workspace-app-queue li + li)::before { left: 46px; }
+.workspace-app-zone--records .workspace-app-outputs__run + .workspace-app-outputs__run::before { left: 4px; }
+.workspace-app-zone--records .workspace-app-queue button:hover { background: none; }
+.workspace-app-zone--records .workspace-app-metric { border-radius: calc(18px * var(--app-radius-scale, 1)); background: var(--app-card-fill); box-shadow: none; }
+.workspace-app-zone--records .workspace-app-metric:hover { background: var(--app-card-fill-hover); box-shadow: none; }
+.workspace-app-zone--records .workspace-app-metric__spark polygon { fill: none; }
+.workspace-app-zone--records .workspace-app-metric__spark polyline { stroke: var(--text-muted); }
+.workspace-app-zone--records .workspace-app-metric__spark circle { fill: var(--text-strong); }
+.workspace-app-zone--records .workspace-app-metric__track > span { background: var(--text-strong); }
+
+/* ① One tinted card for everything that needs the person. */
+.workspace-app-notices { padding: 4px 0 8px; border-radius: calc(16px * var(--app-radius-scale, 1)); background: var(--app-queue-bg); }
+.workspace-app-notices__head { display: flex; align-items: center; gap: 8px; padding: 10px 14px 4px; color: var(--app-status-attention); }
+.workspace-app-notices__head h3 { flex: 1; margin: 0; color: var(--text-strong); font-size: 14px; font-weight: 700; }
+.workspace-app-notices__list { margin: 0; padding: 0; list-style: none; }
+.workspace-app-notices__list > li { position: relative; }
+.workspace-app-notices__list > li + li::before { content: ""; position: absolute; top: 0; right: 14px; left: 56px; height: 1px; background: color-mix(in srgb, var(--app-status-attention) 18%, transparent); }
+.workspace-app-notices__row > button { display: flex; align-items: center; width: 100%; gap: 12px; padding: 8px 14px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.workspace-app-notices__list .workspace-app-group__row { min-height: 52px; padding: 8px 14px; }
+.workspace-app-notices__list .workspace-app-group__row::before { display: none; }
+.workspace-app-notices .workspace-app-group__icon { background: var(--surface-panel); }
+.workspace-app-notices__open { display: inline-flex; flex: none; align-items: center; gap: 4px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-notices__row > button:hover .workspace-app-notices__open { color: var(--text-strong); }
+.workspace-app-notices__optional { display: block; margin: 2px 0 0; padding: 6px 14px 0; border: 0; background: none; color: var(--text-muted); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.workspace-app-zone--notices > .workspace-app-notices__optional { padding: 0 4px; }
+.workspace-app-notices__optional:hover { color: var(--text-strong); }
+.workspace-app-notices__optional-list { margin-top: 8px; }
+/* A workflow review: a glimpse of the output, accepted here or opened in full. */
+.workspace-app-notices__row--review { display: flex; align-items: center; gap: 10px; padding-right: 14px; }
+.workspace-app-notices__row--review > .workspace-app-notices__review-main { display: flex; flex: 1; align-items: center; min-width: 0; gap: 12px; padding: 8px 0 8px 14px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.workspace-app-notices__previews { display: flex; flex: none; gap: 4px; }
+.workspace-app-notices__preview { position: relative; width: 28px; height: 44px; overflow: hidden; border-radius: calc(6px * var(--app-radius-scale, 1)); background: var(--surface-muted); }
+.workspace-app-notices__actions { display: inline-flex; flex: none; gap: 6px; }
+@container (max-width: 420px) { .workspace-app-notices__row--review { flex-wrap: wrap; } .workspace-app-notices__actions { padding: 0 0 8px 14px; } }
+
+/* ② Functions: the main one, then the rest as tiles with a glyph at the top
+   and a name at the bottom, then what runs on a schedule. Two columns; a last
+   tile left alone fills its row. */
+.workspace-app-view__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+@container workspace-app (min-width: 560px) { .workspace-app-view__grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.workspace-app-zone--functions > .workspace-app-view__grid:first-child { margin-top: 0; }
+.workspace-app-view__tile {
+  display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; min-width: 0; min-height: 84px; gap: 14px; padding: 14px;
+  border: 0; border-radius: calc(18px * var(--app-radius-scale, 1)); background: var(--app-card-fill); box-shadow: none;
+  color: var(--text-strong); font: inherit; text-align: left; cursor: pointer; transition: background .2s ease;
+}
+.workspace-app-view__tile:last-child:nth-child(odd) { grid-column: 1 / -1; flex-direction: row; align-items: center; justify-content: flex-start; min-height: 0; }
+@container workspace-app (min-width: 560px) {
+  .workspace-app-view__tile:last-child:nth-child(odd) { grid-column: auto; flex-direction: column; align-items: flex-start; justify-content: space-between; min-height: 84px; }
+  .workspace-app-view__tile:last-child:nth-child(3n+1) { grid-column: 1 / -1; flex-direction: row; align-items: center; justify-content: flex-start; min-height: 0; }
+}
+.workspace-app-view__tile:hover:not(:disabled) { background: var(--app-card-fill-hover); }
+.workspace-app-view__tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-app-view__tile:disabled { opacity: .55; cursor: not-allowed; }
+.workspace-app-view__tile-icon { display: grid; flex: none; place-items: center; width: 22px; height: 22px; color: var(--text-strong); }
+/* A word longer than the tile is hyphenated ("Announce-ment"), never chopped mid-word without one. */
+.workspace-app-view__tile-name { display: -webkit-box; overflow: hidden; font-size: 14px; font-weight: 600; letter-spacing: -.01em; line-height: 1.3; overflow-wrap: break-word; hyphens: auto; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.workspace-app-view__tile small { color: var(--app-status-attention); font-size: 11px; }
+.workspace-app-zone--functions > .workspace-app-view__search { width: 100%; margin-top: 14px; }
+.workspace-app-view__automations { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-view__automations-label { display: inline-flex; align-items: center; gap: 5px; margin: 0 2px 0 4px; }
+.workspace-app-view__automation { padding: 5px 12px; border: 0; border-radius: 999px; background: var(--app-card-fill); color: var(--text-default); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-view__automation:hover:not(:disabled) { color: var(--text-strong); background: var(--app-card-fill-hover); }
+.workspace-app-view__automation:disabled { opacity: .55; cursor: not-allowed; }
+.workspace-app-view__automation small { color: var(--app-status-attention); font-size: 11px; }
+@media (prefers-reduced-motion: reduce) { .workspace-app-view__tile { transition: none; } }
+.workspace-app-view--cover .workspace-app-zone--notices { margin-bottom: 18px; }
+
+/* A gallery card with no picture: its kind (a track, a file) or, while it is made, a quiet stripe. */
+.workspace-app-data__gallery-tile { display: grid; place-items: center; width: 100%; height: 100%; background: var(--surface-muted); color: var(--text-muted); }
+.workspace-app-data__gallery-tile[data-kind="pending"] { background: repeating-linear-gradient(135deg, var(--surface-muted) 0 8px, transparent 8px 16px); }
+.workspace-app-data__pack-cover { position: relative; }
+.workspace-app-data__gallery-play { position: absolute; left: 8px; bottom: 8px; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--surface-panel); color: var(--text-strong); box-shadow: var(--shadow-sm); }
+
+/* A track is a record: a square sleeve with its disc tucked behind. On hover
+   the disc slides out and turns; the sleeve art repeats on the disc label. */
+.workspace-app-data__gallery--records { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 22px 18px; }
+.workspace-app-data__record-card {
+  display: grid; gap: 10px; min-width: 0; padding: 0; border: 0; background: none;
+  color: var(--text-strong); font: inherit; text-align: left; cursor: pointer;
+}
+.workspace-app-data__record-card:disabled { cursor: default; }
+.workspace-app-data__record-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: calc(12px * var(--app-radius-scale, 1)); }
+.workspace-app-data__record-stage { position: relative; display: block; width: 60%; aspect-ratio: 1; }
+.workspace-app-data__record-sleeve,
+.workspace-app-data__record-disc { position: absolute; inset: 0; display: block; }
+.workspace-app-data__record-sleeve {
+  z-index: 1; overflow: hidden; border-radius: calc(6px * var(--app-radius-scale, 1));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%), 0 10px 24px -12px rgb(0 0 0 / 45%);
+}
+.workspace-app-data__record-sleeve > *, .workspace-app-data__record-label > * { display: block; width: 100%; height: 100%; object-fit: cover; }
+.workspace-app-data__record-disc {
+  inset: 3%; border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 0 31%, rgb(255 255 255 / 6%) 31.5% 32%, transparent 32.5%),
+    repeating-radial-gradient(circle, #141416 0 1.1px, #1d1d20 1.1px 2.2px),
+    #111;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 7%), 0 6px 18px -8px rgb(0 0 0 / 60%);
+  transform: translateX(24%);
+  transition: transform .6s cubic-bezier(.2, .8, .2, 1);
+}
+/* The sheen sits still while the grooves turn under it. */
+.workspace-app-data__record-disc::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(from 30deg, transparent 0 8%, rgb(255 255 255 / 9%) 12%, transparent 18% 50%, rgb(255 255 255 / 7%) 62%, transparent 68%);
+}
+.workspace-app-data__record-label {
+  position: absolute; inset: 33%; overflow: hidden; border-radius: 50%;
+  animation: workspace-app-record-spin 3.2s linear infinite paused;
+}
+.workspace-app-data__record-label::after {
+  content: ""; position: absolute; top: 50%; left: 50%; width: 9%; height: 9%; border-radius: 50%;
+  background: #0d0d0e; transform: translate(-50%, -50%);
+}
+.workspace-app-data__record-art {
+  background:
+    radial-gradient(120% 90% at 18% 12%, hsl(var(--record-accent) 85% 72% / 90%), transparent 58%),
+    radial-gradient(110% 100% at 92% 96%, hsl(var(--record-hue) 70% 38%), transparent 70%),
+    linear-gradient(150deg, hsl(var(--record-hue) 55% 52%), hsl(var(--record-accent) 45% 22%));
+}
+.workspace-app-data__record-card:is(:hover, :focus-visible):not(:disabled) .workspace-app-data__record-disc { transform: translateX(60%); }
+.workspace-app-data__record-card:is(:hover, :focus-visible):not(:disabled) .workspace-app-data__record-label { animation-play-state: running; }
+.workspace-app-data__record-caption { display: grid; gap: 2px; min-width: 0; }
+.workspace-app-data__record-caption strong { overflow: hidden; font-size: 13.5px; font-weight: 600; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-data__record-caption small { overflow: hidden; color: var(--text-muted); font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+/* A record still being made sits half out of its sleeve and keeps turning. */
+.workspace-app-data__record-card[data-making] .workspace-app-data__record-disc { transform: translateX(46%); }
+.workspace-app-data__record-card[data-making] .workspace-app-data__record-label { animation-play-state: running; }
+@keyframes workspace-app-record-spin { to { transform: rotate(360deg); } }
+/* A picture or video still being made: a slow colour field in the result's own hues, a light passing
+   over it and a pulse, so the card reads as working rather than empty. */
+.workspace-app-data__gallery-tile[data-making] {
+  position: relative; overflow: hidden;
+  background:
+    radial-gradient(60% 70% at 20% 25%, hsl(var(--making-accent) 70% 58% / 55%), transparent 70%),
+    radial-gradient(70% 80% at 85% 80%, hsl(var(--making-hue) 65% 45% / 60%), transparent 72%),
+    linear-gradient(140deg, hsl(var(--making-hue) 35% 22%), hsl(var(--making-accent) 30% 14%));
+  background-size: 180% 180%, 180% 180%, 100% 100%;
+  animation: workspace-app-making-drift 7s ease-in-out infinite alternate;
+}
+.workspace-app-data__gallery-tile[data-making]::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(105deg, transparent 35%, rgb(255 255 255 / 14%) 50%, transparent 65%);
+  transform: translateX(-100%);
+  animation: workspace-app-making-sweep 2.4s ease-in-out infinite;
+}
+.workspace-app-data__making-dot {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: rgb(255 255 255 / 85%);
+  box-shadow: 0 0 0 0 rgb(255 255 255 / 45%);
+  animation: workspace-app-making-pulse 1.6s ease-out infinite;
+}
+/* How far it is: a ring that fills with the run, the figure inside it. */
+.workspace-app-data__making-percent {
+  position: relative; isolation: isolate; display: grid; place-items: center;
+  width: 64px; height: 64px; border-radius: 50%;
+  background: conic-gradient(rgb(255 255 255 / 92%) var(--making-progress, 0deg), rgb(255 255 255 / 22%) 0);
+  color: #fff; font-size: 14px; font-weight: 600; letter-spacing: -0.01em;
+  transition: background .6s ease;
+}
+.workspace-app-data__making-percent::before {
+  content: ""; position: absolute; inset: 4px; z-index: -1; border-radius: 50%;
+  background: rgb(0 0 0 / 38%); backdrop-filter: blur(6px);
+}
+.workspace-app-data__record-card { position: relative; }
+.workspace-app-data__record-progress {
+  position: absolute; top: 0; left: 0; z-index: 3; display: grid; place-items: center;
+  width: 60%; aspect-ratio: 1; pointer-events: none;
+}
+@keyframes workspace-app-making-drift {
+  from { background-position: 0% 0%, 100% 100%, 0 0; }
+  to { background-position: 100% 60%, 0% 30%, 0 0; }
+}
+@keyframes workspace-app-making-sweep { 55%, 100% { transform: translateX(100%); } }
+@keyframes workspace-app-making-pulse {
+  70% { box-shadow: 0 0 0 16px rgb(255 255 255 / 0%); }
+  100% { box-shadow: 0 0 0 0 rgb(255 255 255 / 0%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-app-data__record-disc { transition: none; }
+  .workspace-app-data__record-label { animation: none; }
+  .workspace-app-data__gallery-tile[data-making],
+  .workspace-app-data__gallery-tile[data-making]::after,
+  .workspace-app-data__making-dot { animation: none; }
 }

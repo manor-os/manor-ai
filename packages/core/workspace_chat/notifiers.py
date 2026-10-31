@@ -19,19 +19,13 @@ import re
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.execution import ExecutionPlanStatus
 from packages.core.constants.pending_actions import PendingActionKind
-from packages.core.constants.task import TaskStatus
 from packages.core.contracts.envelope import step_result_output_text
 from packages.core.database import async_session
 from packages.core.i18n import t
-from packages.core.services.chat_feedback import (
-    ChatFeedbackTargetKind,
-    lock_completion_feedback_subject,
-)
+from packages.core.services.chat_feedback import ChatFeedbackTargetKind
 from packages.core.services.generated_file_refs import (
     ArtifactReferenceFactory,
     canonical_document_id,
@@ -45,194 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 # ── Plan lifecycle ────────────────────────────────────────────────────
-
-def _plan_refs(plan_id: str, task_id: Optional[str] = None) -> list[dict]:
-    refs = [{"type": "plan", "id": plan_id}]
-    if task_id:
-        refs.append({"type": "task", "id": task_id})
-    return refs
-
-
-async def notify_plan_started(
-    *,
-    entity_id: str,
-    workspace_id: Optional[str],
-    plan_id: str,
-    task_id: Optional[str] = None,
-    task_title: Optional[str],
-    step_count: int,
-    execution_mode: str,
-    steps: Optional[list[dict]] = None,
-    locale: str | None = None,
-) -> None:
-    if not workspace_id:
-        return
-    headline = t("task.execution.plan_started", locale=locale or "en", step_count=step_count)
-    if task_title:
-        headline += " " + t("task.execution.plan_for_task", locale=locale or "en", task_title=task_title)
-    if execution_mode != "live":
-        headline += f"  `[{execution_mode}]`"
-
-    body = headline
-    if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
-
-    metadata = {"step_count": step_count, "task_title": task_title}
-
-    # Plan thread (full DAG)
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=body, message_kind="agent_update", author_kind="agent",
-        thread_ref_kind="plan", thread_ref_id=plan_id,
-        refs=_plan_refs(plan_id, task_id),
-        meta=metadata,
-    )
-
-    # Main workspace chat (headline only)
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=headline, message_kind="agent_update", author_kind="agent",
-        refs=_plan_refs(plan_id, task_id),
-        meta=metadata,
-    )
-
-
-async def notify_plan_completed(
-    *,
-    entity_id: str,
-    workspace_id: Optional[str],
-    plan_id: str,
-    task_id: Optional[str] = None,
-    duration_seconds: Optional[float],
-    cost_usd: Optional[float],
-    task_title: Optional[str] = None,
-    steps: Optional[list[dict]] = None,
-    locale: str | None = None,
-) -> None:
-    if not workspace_id:
-        return
-    body = _render_plan_completion_summary(
-        plan_id=plan_id,
-        task_title=task_title,
-        duration_seconds=duration_seconds,
-        cost_usd=cost_usd,
-        steps=steps or [],
-        entity_id=entity_id,
-        locale=locale,
-    )
-    completion_artifacts = _unique_artifacts(
-        artifact
-        for step in (steps or [])
-        if isinstance(step, dict)
-        for artifact in (step.get("artifacts") or [])
-        if isinstance(artifact, dict)
-    )
-    attachments = _artifacts_as_attachments(completion_artifacts, entity_id=entity_id)
-    headline = body
-    if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
-
-    # Plan thread (full DAG)
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=body, message_kind="agent_update", author_kind="agent",
-        thread_ref_kind="plan", thread_ref_id=plan_id,
-        refs=_plan_refs(plan_id, task_id),
-        attachments=attachments or None,
-        meta={
-            # The full-DAG thread row is a projection of the same Plan. Only
-            # the main Chat receipt is the canonical feedback entry point.
-            "feedback_target_kind": ChatFeedbackTargetKind.NONE.value
-        },
-    )
-
-    # Main workspace chat
-    await _safe_post_completion(
-        entity_id=entity_id, workspace_id=workspace_id,
-        plan_id=plan_id, task_id=task_id,
-        body=headline, message_kind="agent_update", author_kind="agent",
-        refs=_plan_refs(plan_id, task_id),
-        attachments=attachments or None,
-        meta={
-            "feedback_target_kind": (
-                ChatFeedbackTargetKind.TASK_COMPLETION.value
-                if task_id
-                else ChatFeedbackTargetKind.PLAN_COMPLETION.value
-            )
-        },
-    )
-
-
-async def notify_plan_needs_attention(
-    *,
-    entity_id: str,
-    workspace_id: Optional[str],
-    plan_id: str,
-    task_id: Optional[str] = None,
-    task_title: Optional[str] = None,
-    issue: Optional[str] = None,
-    steps: Optional[list[dict]] = None,
-    locale: str | None = None,
-) -> None:
-    """Announce a mechanically finished plan whose task was not accepted."""
-    if not workspace_id:
-        return
-    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
-    headline = t("task.execution.plan_needs_attention", locale=locale or "en", subject=subject)
-    if issue:
-        headline += f"\n\n{issue}"
-    body = headline
-    if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
-
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=body, message_kind="agent_update", author_kind="agent",
-        thread_ref_kind="plan", thread_ref_id=plan_id,
-        refs=_plan_refs(plan_id, task_id),
-    )
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=headline, message_kind="agent_update", author_kind="agent",
-        refs=_plan_refs(plan_id, task_id),
-    )
-
-
-async def notify_plan_failed(
-    *,
-    entity_id: str,
-    workspace_id: Optional[str],
-    plan_id: str,
-    task_id: Optional[str] = None,
-    error: Optional[dict],
-    task_title: Optional[str] = None,
-    steps: Optional[list[dict]] = None,
-    locale: str | None = None,
-) -> None:
-    if not workspace_id:
-        return
-    msg = (error or {}).get("message") or t("task.execution.unknown_error", locale=locale or "en")
-    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
-    headline = t("task.execution.plan_failed", locale=locale or "en", subject=subject, error=msg)
-    body = headline
-    if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
-
-    # Plan thread (full DAG)
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=body, message_kind="agent_update", author_kind="agent",
-        thread_ref_kind="plan", thread_ref_id=plan_id,
-        refs=_plan_refs(plan_id, task_id),
-    )
-
-    # Main workspace chat
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=headline, message_kind="agent_update", author_kind="agent",
-        refs=_plan_refs(plan_id, task_id),
-    )
-
 
 # ── Step lifecycle ────────────────────────────────────────────────────
 
@@ -441,6 +247,66 @@ async def notify_step_needs_human(
         ],
         pending_action=merged_action,
     )
+
+
+# ── Task lifecycle ────────────────────────────────────────────────────
+
+async def notify_task_completed(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    task_id: str,
+    task_title: Optional[str],
+    summary: Optional[str],
+    files: list[dict],
+    subscription_id: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    locale: str | None = None,
+) -> None:
+    """Announce a completed Task in the Workspace chat, in the caller's transaction.
+
+    One bubble from the agent carries the delivered files and the user's
+    feedback on the result; one event row after it says who finished what.
+    Both share a timestamp, so they are written in the order every client
+    shows them.
+    """
+    subject = formatted_task_subject(task_title, task_id)
+    headline = (
+        t("task.execution.task_completed_by", locale=locale or "en", agent_name=agent_name, subject=subject)
+        if agent_name
+        else t("task.execution.task_completed", locale=locale or "en", subject=subject)
+    )
+    task_ref = {"type": "task", "id": task_id, **({"title": task_title} if task_title else {})}
+    artifacts = [
+        {"kind": "document", "value": ref["document_id"], "name": ref.get("name"), "fs_path": ref.get("fs_path")}
+        if ref.get("document_id")
+        else {"kind": "file", "value": ref.get("fs_path"), "name": ref.get("name")}
+        for ref in files
+        if isinstance(ref, dict) and (ref.get("document_id") or ref.get("fs_path"))
+    ]
+    attachments = _artifacts_as_attachments(artifacts, entity_id=entity_id)
+    body = _clip_text(summary, 1600)
+    if body or attachments:
+        await _safe_post(
+            db=db,
+            entity_id=entity_id, workspace_id=workspace_id,
+            body=body, message_kind="agent_update", author_kind="agent",
+            author_subscription_id=subscription_id,
+            refs=[task_ref],
+            attachments=attachments or None,
+            meta={"feedback_target_kind": ChatFeedbackTargetKind.TASK_COMPLETION.value},
+        )
+    await _safe_post(
+        db=db,
+        entity_id=entity_id, workspace_id=workspace_id,
+        body=headline, message_kind="system", author_kind="system",
+        refs=[task_ref],
+    )
+
+
+def formatted_task_subject(title: Optional[str], task_id: str) -> str:
+    return _as_text(title) or f"#{task_id[-6:]}"
 
 
 # ── Goal lifecycle ────────────────────────────────────────────────────
@@ -661,72 +527,6 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
     parsed = _parse_json_if_string(result)
     walk(parsed)
     return _unique_artifacts(artifacts)[:8]
-
-
-def _render_plan_completion_summary(
-    *,
-    plan_id: str,
-    task_title: Optional[str],
-    duration_seconds: Optional[float],
-    cost_usd: Optional[float],
-    steps: list[dict],
-    entity_id: str = "",
-    locale: str | None = None,
-) -> str:
-    done_steps = [s for s in steps if s.get("status") == "done"]
-    failed_steps = [s for s in steps if s.get("status") in {"failed", "skipped", "cancelled"}]
-    total = len(steps)
-    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
-
-    meta: list[str] = []
-    if total:
-        meta.append(t("task.execution.completed_step_count", locale=locale or "en", done=len(done_steps), total=total))
-    if duration_seconds is not None:
-        meta.append(t("task.execution.completed_duration", locale=locale or "en", duration=_fmt_duration(duration_seconds)))
-    if cost_usd is not None:
-        meta.append(t("task.execution.completed_cost", locale=locale or "en", cost=cost_usd))
-
-    lines = [t("task.execution.plan_completed", locale=locale or "en", subject=subject)]
-    if meta:
-        lines.append("")
-        lines.append(t("task.execution.completed_meta", locale=locale or "en", details=", ".join(meta)))
-
-    if done_steps:
-        lines.append("")
-        lines.append(t("task.execution.what_completed", locale=locale or "en"))
-        for step in done_steps[:8]:
-            label = _step_label(step, locale=locale)
-            summary = _clip_text(_as_text(step.get("result_summary")), 360)
-            if summary:
-                lines.append(f"- **{label}:** {summary}")
-            else:
-                lines.append(f"- **{label}**")
-
-    artifacts = _unique_artifacts(
-        artifact
-        for step in done_steps
-        for artifact in (step.get("artifacts") or [])
-        if isinstance(artifact, dict)
-    )
-    if artifacts:
-        lines.append("")
-        lines.append(t("task.execution.files_saved", locale=locale or "en"))
-        lines.extend(
-            f"- {_format_artifact(artifact, entity_id=entity_id, locale=locale)}"
-            for artifact in artifacts[:8]
-        )
-
-    if failed_steps:
-        lines.append("")
-        lines.append(t("task.execution.needs_attention", locale=locale or "en"))
-        for step in failed_steps[:5]:
-            err = step.get("error") if isinstance(step.get("error"), dict) else {}
-            status = str(step.get("status"))
-            status_key = "task.execution.step_skipped" if status == "skipped" else f"task.status.{status}"
-            msg = _as_text((err or {}).get("message") or (err or {}).get("type")) or t(status_key, locale=locale or "en")
-            lines.append(f"- **{_step_label(step, locale=locale)}:** {msg}")
-
-    return "\n".join(lines)
 
 
 def _render_step_completion_summary(
@@ -953,13 +753,6 @@ def _unique_artifacts(artifacts: Any) -> list[dict]:
     return out
 
 
-def _step_label(step: dict, *, locale: str | None = None) -> str:
-    return (
-        _as_text(step.get("description")) or _as_text(step.get("key")).replace("_", " ").title()
-        or t("task.execution.completed_step", locale=locale or "en")
-    )
-
-
 def _as_text(value: Any) -> str:
     if value is None:
         return ""
@@ -979,87 +772,6 @@ def _clip_text(text: Optional[str], max_chars: int) -> str:
 
 def _is_markdown_rule(line: str) -> bool:
     return set(line) <= {"-", "_", "*"} and len(line) >= 3
-
-
-def _render_dag(steps: list[dict], *, entity_id: str = "", locale: str | None = None) -> str:
-    """Render a plan DAG as markdown for chat / task comments.
-
-    Input: list of step dicts with keys:
-      key, kind, service_key, description, depends_on, status, error
-    """
-    STATUS_ICONS = {
-        "done": "✅", "failed": "❌", "running": "🔄",
-        "pending": "⬜", "waiting_human": "⏸️",
-        "skipped": "⏭️", "cancelled": "🚫",
-    }
-
-    lines: list[str] = []
-    keys_seen: set[str] = set()
-
-    # Group steps into layers (parallel steps at same depth)
-    layers: list[list[dict]] = []
-    remaining = list(steps)
-    while remaining:
-        layer = [s for s in remaining if all(d in keys_seen for d in (s.get("depends_on") or []))]
-        if not layer:
-            layer = remaining[:]  # break infinite loop
-        for s in layer:
-            remaining.remove(s)
-            keys_seen.add(s["key"])
-        layers.append(layer)
-
-    for i, layer in enumerate(layers):
-        if len(layer) > 1:
-            # Parallel steps
-            lines.append(t("task.execution.parallel_layer", locale=locale or "en", layer=i + 1))
-            for s in layer:
-                lines.append(_render_step(s, STATUS_ICONS, indent="  ", entity_id=entity_id, locale=locale))
-        else:
-            s = layer[0]
-            lines.append(_render_step(s, STATUS_ICONS, indent="", entity_id=entity_id, locale=locale))
-
-        # Arrow to next layer
-        if i < len(layers) - 1:
-            lines.append("  ↓")
-
-    return "\n".join(lines)
-
-
-def _render_step(
-    s: dict, icons: dict, indent: str = "", *, entity_id: str = "", locale: str | None = None,
-) -> str:
-    status = s.get("status") or "pending"
-    icon = icons.get(status, "⬜")
-    key = s.get("key", "?")
-    desc = s.get("description") or key.replace("_", " ").title()
-    service = s.get("service_key")
-    agent = s.get("agent_name")
-
-    # Step name + agent
-    line = f"{indent}{icon} **{desc}**"
-    if agent:
-        line += f" — _{agent}_"
-    elif service:
-        line += f" — _{service.replace('_', ' ')}_"
-
-    # Show error for failed steps
-    if status == "failed" and s.get("error"):
-        err = s["error"]
-        err_msg = err.get("message", err.get("type", ""))[:150]
-        line += f"\n{indent}  ↳ _{err_msg}_"
-
-    # Show result preview for completed steps
-    if status == "done" and s.get("result_summary"):
-        preview = _clip_text(s["result_summary"], 600)
-        line += f"\n{indent}  ↳ {preview}"
-
-    artifacts = _unique_artifacts(s.get("artifacts") or [])
-    if status == "done" and artifacts:
-        for artifact in artifacts[:3]:
-            if isinstance(artifact, dict):
-                line += f"\n{indent}  ↳ {_format_artifact(artifact, entity_id=entity_id, locale=locale)}"
-
-    return line
 
 
 async def _safe_post(
@@ -1101,73 +813,6 @@ async def _post_step_event(
     """
 
     await _safe_post(db=db, **kwargs)
-
-
-async def _safe_post_completion(
-    *,
-    entity_id: str,
-    workspace_id: str,
-    plan_id: str,
-    task_id: Optional[str],
-    **post_kwargs,
-) -> None:
-    """Post a canonical completion receipt only for live completed lineage.
-
-    Task deletion and completion feedback mutations take the same subject lock.
-    Revalidating the Plan and Task after that lock prevents a delayed worker
-    from recreating a rateable receipt after its Task was deleted.
-    """
-    from packages.core.models.execution import ExecutionPlan
-    from packages.core.models.task import Task
-
-    try:
-        async with async_session() as db:
-            await lock_completion_feedback_subject(
-                db,
-                task_id=task_id,
-                plan_id=plan_id,
-            )
-            plan = (
-                await db.execute(
-                    select(ExecutionPlan)
-                    .where(
-                        ExecutionPlan.id == plan_id,
-                        ExecutionPlan.entity_id == entity_id,
-                        ExecutionPlan.workspace_id == workspace_id,
-                        ExecutionPlan.status
-                        == ExecutionPlanStatus.COMPLETED.value,
-                    )
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if plan is None or plan.task_id != task_id:
-                return
-
-            if task_id:
-                task = (
-                    await db.execute(
-                        select(Task.id)
-                        .where(
-                            Task.id == task_id,
-                            Task.entity_id == entity_id,
-                            Task.workspace_id == workspace_id,
-                            Task.status == TaskStatus.COMPLETED.value,
-                        )
-                        .with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if task is None:
-                    return
-
-            await chat.post_message(
-                db,
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                **post_kwargs,
-            )
-            await db.commit()
-    except Exception:
-        logger.warning("workspace_chat completion post failed", exc_info=True)
 
 
 def _fmt_duration(seconds: float) -> str:

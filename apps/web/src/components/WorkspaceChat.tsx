@@ -7,7 +7,7 @@ import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
  * @mention: type "@" to open agent picker dropdown, routes message to that agent.
  * Also displays workspace events: proposals, agent updates, step events, goal alerts.
  */
-import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
+import { Fragment, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -17,11 +17,13 @@ import {
   type WorkspaceAgentMapping,
   type WorkspaceChatEntrypoint,
   type WorkspaceAppAction,
+  type WorkspaceAppDisplayMode,
   type WorkspaceLedgerOverview,
 } from "../lib/api";
 import { invalidateAgentInitiativeQueries } from "../lib/agentInitiativeInvalidation";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
 import { uploadPendingInputFiles } from "../lib/pendingInputUploads";
+import type { WorkflowDocumentRef } from "../lib/workflowRunInputs";
 import {
   createKeyedTrailingScheduler,
   workspaceRealtimeRefreshPlan,
@@ -41,7 +43,7 @@ import { useDisplayPreferences } from "../stores/displayPreferences";
 import { useToastStore } from "../stores/toast";
 import { t } from "../lib/i18n";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
-import { usePendingActionNotice } from "../lib/usePendingActionNotice";
+import { usePendingActionHighlight } from "../lib/usePendingActionHighlight";
 import { useWorkspaceAttentionSeen } from "../lib/useWorkspaceAttentionSeen";
 import { openDetail, closeDetail, useDetailStore } from "../stores/detail";
 import { openAgentEditModal } from "../stores/agentEditModal";
@@ -78,7 +80,7 @@ import ChatMessageActions, {
 } from "./chat/ChatMessageActions";
 import useChatMessageFeedback from "./chat/useChatMessageFeedback";
 import { chatFeedbackSubjectKey } from "../lib/chat-feedback-queue.mjs";
-import ChatTimestamp from "./chat/ChatTimestamp";
+import ChatTimestamp, { chatDayKey, formatChatDayLabel, formatChatTime } from "./chat/ChatTimestamp";
 import ConversationInitiativesButton from "./agents/ConversationInitiativesButton";
 import ChatScrollRail, {
   type ChatScrollRailMarker,
@@ -140,14 +142,14 @@ import WorkspaceWorkflowRunHost, {
 } from "./workflows/WorkspaceWorkflowRunHost";
 import {
   workflowRunStatusPresentation,
+  type WorkflowRunAction,
   type WorkflowRunStatus,
 } from "./workflows/workflowRunDisplay";
+import WorkflowReviewChatCard from "./workflows/WorkflowReviewChatCard";
 import {
-  IconBrain,
   IconChatBubble,
   IconCheck,
   IconClose,
-  IconDocument,
   IconEdit,
   IconFlow,
   IconHelp,
@@ -157,9 +159,6 @@ import {
   IconPlay,
   IconPlus,
   IconRefresh,
-  IconSearch,
-  IconSparkles,
-  IconTimeline,
   IconTrash,
   IconUsers,
   IconWarning,
@@ -206,6 +205,7 @@ import { relativeTime } from "../lib/format";
 import { hasActiveWorkspaceChatStream } from "../lib/workspaceChatStream";
 import Chip from "./ui/Chip";
 import StatusBadge from "./ui/StatusBadge";
+import type { WorkspaceMessageKind } from "../lib/workspaceMessageKinds";
 import {
   proposalApprovalView,
   proposalApprovedRowIds,
@@ -234,7 +234,7 @@ interface WsMessage {
   body: string | null;
   tool_calls?: any;
   assistant_blocks?: any[] | null;
-  message_kind: string;
+  message_kind: WorkspaceMessageKind;
   author_kind: string;
   author_user_id?: string | null;
   author_user_name?: string | null;
@@ -307,6 +307,8 @@ interface WorkspaceChatProps {
   threadRef?: { kind: "task" | "plan" | "goal"; id: string };
   agentMappings?: WorkspaceAgentMapping[];
   taskSession?: TaskSessionPresentation;
+  /** Opens with this layout instead of the remembered one (the trial frame's Chat opens the composer). */
+  initialAppDisplay?: WorkspaceAppDisplayMode;
 }
 
 interface WorkspaceAutonomyGoal {
@@ -325,17 +327,36 @@ type WorkspaceAutonomyGoalEditorOrigin =
 
 /* ── Helpers ── */
 
-type WorkspaceAppDisplayMode = "split" | "app" | "chat";
 const WORKSPACE_APP_DISPLAY_KEY = "workspace-chat-app-display";
+const workspaceAppDisplayKey = (workspaceId: string) => `${WORKSPACE_APP_DISPLAY_KEY}:${workspaceId}`;
 
-function readWorkspaceAppDisplay(): WorkspaceAppDisplayMode {
+function asAppDisplay(value: unknown): WorkspaceAppDisplayMode | null {
+  return value === "app" || value === "chat" || value === "split" ? value : null;
+}
+
+/** The viewer's own choice for this Workspace, then the view its App opens as, then the last choice anywhere. */
+function readWorkspaceAppDisplay(workspaceId: string, openAs: unknown): WorkspaceAppDisplayMode {
   try {
-    const saved = window.localStorage.getItem(WORKSPACE_APP_DISPLAY_KEY);
-    if (saved === "app" || saved === "chat" || saved === "split") return saved;
+    const chosen = asAppDisplay(window.localStorage.getItem(workspaceAppDisplayKey(workspaceId)));
+    if (chosen) return chosen;
   } catch {
-    // The first visit uses the split view when browser storage is unavailable.
+    // Without browser storage the Workspace opens the way its App is set to open.
   }
-  return "split";
+  const configured = asAppDisplay(openAs);
+  if (configured) return configured;
+  try {
+    return asAppDisplay(window.localStorage.getItem(WORKSPACE_APP_DISPLAY_KEY)) ?? "split";
+  } catch {
+    return "split";
+  }
+}
+
+function hasChosenWorkspaceAppDisplay(workspaceId: string): boolean {
+  try {
+    return Boolean(asAppDisplay(window.localStorage.getItem(workspaceAppDisplayKey(workspaceId))));
+  } catch {
+    return false;
+  }
 }
 
 const AGENT_COLORS = [
@@ -401,16 +422,6 @@ function systemSenderName(msg: WsMessage) {
     return t("component.workspace_chat.workspace_rules");
   }
   return MANOR_AGENT_NAME;
-}
-function formatTime(iso: string) {
-  try {
-    return new Date(iso).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return "";
-  }
 }
 
 const WORKSPACE_CHAT_DRAFT_PREFIX = "manor_workspace_chat_draft:";
@@ -591,7 +602,11 @@ function mergeWorkspaceMessages(existing: WsMessage[], incoming: WsMessage[]) {
       });
       return;
     }
-    byId.set(message.id, nextMessage);
+    // An answered card stays answered: a copy fetched before the answer (the
+    // attention lookup, a page read racing the resolve) must not reopen it.
+    byId.set(message.id, current?.resolved_at && !nextMessage.resolved_at
+      ? { ...nextMessage, resolved_at: current.resolved_at, resolution: current.resolution }
+      : nextMessage);
   });
   return Array.from(byId.values());
 }
@@ -772,11 +787,52 @@ export function workspaceMessageOwnsStream(
   return message === active || Boolean(message.id && message.id === active.id);
 }
 
-function isDuplicatePersistedUserMessage(
+/**
+ * The question and answer of a `request_input`, mirrored locally when the
+ * person answers, are the same messages the server saves: match them by the
+ * request and role, so the saved copies replace them in their place.
+ */
+function runtimeInputMirror(persisted: WsMessage, local: WorkspaceLocalMsg): boolean | null {
+  const requestId = local.meta?.runtime_input_request_id;
+  const role = local.meta?.runtime_input_role;
+  if (!requestId || !role) return null;
+  return persisted.meta?.runtime_input_request_id === requestId
+    && persisted.meta?.runtime_input_role === role;
+}
+
+/** Files an open review card already shows are not listed again under the message. */
+export function withoutFilesUnderReview(
+  artifacts: OutputArtifact[],
+  reviewFiles: Array<{ document_id: string; fs_path?: string }> | undefined,
+): OutputArtifact[] {
+  if (!reviewFiles?.length) return artifacts;
+  const shown = new Set(reviewFiles.flatMap((file) => [file.document_id, file.fs_path].filter(Boolean)));
+  return artifacts.filter((artifact) => {
+    const data = artifact.data || {};
+    const keys = [
+      data.document_id, data.documentId, data.fs_path, data.fsPath,
+      artifact.href?.match(/\/viewer\/([^/?#]+)/)?.[1],
+    ];
+    return !keys.some((key) => typeof key === "string" && shown.has(key));
+  });
+}
+
+/** A saved request_input question whose live card is still asking it. */
+export function isLiveRuntimeQuestion(message: WsMessage, liveRequestId: string | undefined): boolean {
+  return Boolean(
+    liveRequestId
+      && message.meta?.runtime_input_role === "question"
+      && message.meta?.runtime_input_request_id === liveRequestId,
+  );
+}
+
+export function isDuplicatePersistedUserMessage(
   persisted: WsMessage,
   local: WorkspaceLocalMsg,
 ) {
   if (persisted.author_kind !== "user" || local.role !== "user") return false;
+  const mirrored = runtimeInputMirror(persisted, local);
+  if (mirrored !== null) return mirrored;
 
   if (local.conversation_id && persisted.conversation_id
     && local.conversation_id !== persisted.conversation_id) return false;
@@ -824,6 +880,8 @@ export function isDuplicatePersistedAssistantMessage(
   local: WorkspaceLocalMsg,
 ) {
   if (persisted.author_kind === "user" || local.role !== "assistant") return false;
+  const mirrored = runtimeInputMirror(persisted, local);
+  if (mirrored !== null) return mirrored;
   if (local.conversation_id && persisted.conversation_id
     && local.conversation_id !== persisted.conversation_id) return false;
   if (local.id && persisted.id === local.id) return !isRunningStreamPlaceholder(persisted);
@@ -1094,16 +1152,120 @@ function completionFeedbackSubjectKey(msg: WsMessage): string | null {
   return chatFeedbackSubjectKey(targetKind, targetId);
 }
 
-// Per-step / plan-lifecycle status updates ("▶ Plan started", "✗ Step … failed",
-// step receipts). These are machine status, not conversation, so they render as
-// quiet centered system lines rather than chat bubbles. Task-completion receipts
-// are excluded — they carry user feedback and stay conversational.
+// Workspace chat has two elements. Someone speaking is a bubble; everything
+// the system reports — progress, notices, dates — is a centered event row.
+//
+// Event rows: per-step / plan-lifecycle status updates ("▶ Plan started",
+// "✗ Step … failed", step receipts), Strategist progress, Workflow status, Goal
+// and budget alerts, and short system notices. Task-completion receipts are
+// excluded — they carry user feedback and stay conversational — and so is
+// anything that asks the user to decide.
 function isActivityMessage(msg: WsMessage): boolean {
   if (isCompletionFeedbackMessage(msg)) return false;
   if (msg.message_kind === "strategist_activity") return true;
   if (msg.message_kind === "step_event") return true;
+  if (isWorkspaceNotice(msg)) return true;
   return msg.message_kind === "agent_update" && Boolean(planRefId(msg));
 }
+
+/** A system status note with nothing to answer, open or attach. */
+function isWorkspaceNotice(msg: WsMessage): boolean {
+  if (msg.author_kind === "user" || isExternalCustomerMessage(msg)) return false;
+  if (msg.pending_action?.kind || msg.resolved_at) return false;
+  if ((msg.hitl_requests || []).length > 0 || (msg.attachments || []).length > 0) return false;
+  if ((parseToolCalls(msg.tool_calls) || []).length > 0) return false;
+  if (Array.isArray(msg.assistant_blocks) && msg.assistant_blocks.length > 0) return false;
+  if (msg.meta?.workflow_result || Array.isArray(msg.meta?.simulation_artifacts)) return false;
+  if (msg.message_kind === "goal_alert" || msg.message_kind === "workflow_activity") return true;
+  if (msg.author_kind !== "system" || msg.message_kind !== "system") return false;
+  const body = String(msg.body || "").trim();
+  return body.length <= 200 && !body.includes("\n\n");
+}
+
+/** A standalone "✓ Approved" receipt that points back at a card, or the saved
+ *  reply to an approval click that resumed a Task or Workflow. The card
+ *  collapses into its own "You chose" line, so the receipt is never shown. */
+function isResolutionReceipt(msg: WsMessage): boolean {
+  if (msg.meta?.approval_receipt === true) return true;
+  return msg.author_kind === "system"
+    && msg.message_kind === "system"
+    && (msg.refs || []).some((ref) => ref?.type === "message" && Boolean(ref.id));
+}
+
+type EventTone = "running" | "done" | "attention" | "neutral";
+
+/** Event rows carry no buttons; a small glyph says whether the system is still
+ *  working, finished, needs a look (amber) or is handling something (grey). */
+function EventRowGlyph({ tone }: { tone: EventTone }) {
+  if (tone === "running") {
+    return (
+      <span className="ws-event-glyph ws-event-glyph--running" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+          <path d="M12 3a9 9 0 1 0 9 9" />
+        </svg>
+      </span>
+    );
+  }
+  if (tone === "done") {
+    return (
+      <span className="ws-event-glyph ws-event-glyph--done" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M5 12.5l4.5 4.5L19 7.5" />
+        </svg>
+      </span>
+    );
+  }
+  return <span className={`ws-event-glyph ws-event-dot ws-event-dot--${tone}`} aria-hidden="true" />;
+}
+
+const WORKFLOW_ACTIVITY_RUNNING = new Set(["queued", "pending", "running", "waiting", "paused", "waiting_for_input", "waiting_for_approval"]);
+const WORKFLOW_ACTIVITY_DONE = new Set(["completed", "succeeded", "success"]);
+
+function workflowActivityEventTone(msg: WsMessage): EventTone {
+  const status = String(msg.meta?.workflow_status || "queued").toLowerCase();
+  if (WORKFLOW_ACTIVITY_DONE.has(status)) return "done";
+  if (WORKFLOW_ACTIVITY_RUNNING.has(status)) return "running";
+  return "attention";
+}
+
+/** One line per Workflow run, updated in place: "Weekly report · step 3/6". */
+function workflowActivityLineText(msg: WsMessage): string {
+  const meta = msg.meta || {};
+  const title = formatUserFacingText(String(meta.workflow_title || t("component.workspace_chat.workflow")));
+  const status = String(meta.workflow_status || "queued").toLowerCase();
+  const steps = Array.isArray(meta.workflow_steps)
+    ? meta.workflow_steps.filter((step: unknown) => step && typeof step === "object")
+    : [];
+  if (WORKFLOW_ACTIVITY_RUNNING.has(status) && steps.length > 0) {
+    const completed = steps.filter(
+      (step: Record<string, unknown>) => String(step.status || "") === "completed",
+    ).length;
+    return t("component.workspace_chat.workflow_step_progress", {
+      title,
+      current: Math.min(steps.length, completed + 1),
+      total: steps.length,
+    });
+  }
+  const presentation = workflowRunStatusPresentation({
+    status: status as WorkflowRunStatus,
+    businessOutcome: String(meta.workflow_business_outcome || "in_progress").toLowerCase(),
+  });
+  const label = t(presentation.stateKey);
+  return `${title} · ${label}`;
+}
+
+/** Who is speaking in a bubble: consecutive bubbles of one speaker share a
+ *  single avatar and name. */
+function persistedSpeakerKey(msg: WsMessage, subToAgent: Map<string, AgentInfo>): string {
+  if (isExternalCustomerMessage(msg)) return `external:${externalCustomerName(msg)}`;
+  if (msg.author_kind === "user") return `user:${workspaceMessageAuthorUserId(msg) || "unknown"}`;
+  const agent = msg.author_subscription_id ? subToAgent.get(msg.author_subscription_id) : null;
+  if (agent) return `agent:${agent.name}`;
+  return `agent:${msg.author_kind === "system" ? systemSenderName(msg) : MANOR_AGENT_NAME}`;
+}
+
+/** A merged bubble after this long a pause shows its own time (not the name). */
+const BUBBLE_CONTINUATION_TIME_GAP_MS = 5 * 60 * 1000;
 
 function workspaceLifecycleActivityTranslationKey(msg: WsMessage): string | null {
   if (msg.meta?.workspace_lifecycle !== true) return null;
@@ -1128,6 +1290,7 @@ function workspaceLifecycleActivityTranslationKey(msg: WsMessage): string | null
 }
 
 function activityLineText(msg: WsMessage): string {
+  if (msg.message_kind === "workflow_activity") return workflowActivityLineText(msg);
   const body = msg.body || "";
   const willRetry = /will retry/i.test(body);
   const workspaceLifecycleActivity = msg.meta?.workspace_lifecycle === true;
@@ -1137,7 +1300,7 @@ function activityLineText(msg: WsMessage): string {
   let firstLine = (body.split(/\r?\n/)[0] || "")
     .replace(/\*\*/g, "")
     .replace(/`/g, "")
-    .replace(/[✅✔️❌⚠️🎉🚀🟢🔴🟡🧭]/g, "")
+    .replace(/[✅✔️❌⚠️🎉🚀🟢🔴🟡🧭📊🛑🔌]/gu, "")
     .replace(/^\s*[▶✓✗•·]\s*/, "")
     .trim();
   // Drop the internal error / traceback after "failed:" — never surface code,
@@ -1159,53 +1322,6 @@ function isOpenPendingAction(msg: WsMessage) {
   return Boolean(msg.pending_action?.kind && !msg.resolved_at);
 }
 
-function compactPendingActionSubject(value: unknown) {
-  if (typeof value !== "string") return "";
-  const text = formatUserFacingText(value).replace(/\s+/g, " ").trim();
-  if (text.length <= 72) return text;
-  return `${text.slice(0, 69).trimEnd()}…`;
-}
-
-function pendingActionLabel(msg: WsMessage) {
-  const action = msg.pending_action;
-  const kind = action?.kind || "unknown";
-  if (kind === PendingActionKind.APPROVE_PROPOSALS) {
-    return t("component.workspace_chat.pending_action_approve_proposals");
-  }
-
-  const taskRef = taskRefs(msg)[0];
-  const taskTitle = taskRef?.title || taskRef?.name || action?.task_titles?.[0];
-  const payload = action?.payload && typeof action.payload === "object"
-    ? action.payload
-    : null;
-  const subject = [
-    action?.review_title,
-    taskTitle,
-    action?.title,
-    payload?.action_description,
-    payload?.question,
-    payload?.headline,
-    action?.prompt,
-  ].map(compactPendingActionSubject).find(Boolean) || "";
-  const isRetry =
-    kind === PendingActionKind.TASK_RECOVERY
-    || kind === PendingActionKind.WORKFLOW_RETRY
-    || kind === PendingActionKind.RETRY_STRATEGIST_REVIEW
-    || action?.hitl_type === "error";
-  if (isRetry && subject) {
-    return t("component.workspace_chat.pending_action_retry_named").replace(
-      "{title}",
-      subject,
-    );
-  }
-  if (subject) return subject;
-
-  const translated = t(`component.workspace_chat.pending_action_${kind}`);
-  return translated === `component.workspace_chat.pending_action_${kind}`
-    ? t("component.workspace_chat.pending_action_review_requested")
-    : translated;
-}
-
 function workflowStarterAction(msg: WsMessage): WsMessage["pending_action"] {
   const action = msg.pending_action;
   if (!action || action.kind !== PendingActionKind.WORKFLOW_STARTER_INPUT || action.title) {
@@ -1218,11 +1334,6 @@ function workflowStarterAction(msg: WsMessage): WsMessage["pending_action"] {
     ...action,
     title: workflowRef?.title || metadataTitle,
   };
-}
-
-function pendingActionsLabel(count: number) {
-  if (count === 1) return t("component.workspace_chat.pending_action_one");
-  return t("component.workspace_chat.pending_action_many").replace("{count}", String(count));
 }
 
 function isExternalCustomerMessage(msg: WsMessage) {
@@ -1274,6 +1385,7 @@ export default function WorkspaceChat({
   threadRef,
   agentMappings,
   taskSession,
+  initialAppDisplay,
 }: WorkspaceChatProps) {
   const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const isTaskSession = Boolean(taskSession);
@@ -1345,19 +1457,31 @@ export default function WorkspaceChat({
     initialContractIds: string[];
   } | null>(null);
   const [outputOpen, setOutputOpen] = useState(false);
-  const [appDisplayMode, setAppDisplayMode] = useState(readWorkspaceAppDisplay);
+  const configuredAppDisplay = workspace?.operating_model?.app_view?.open_as;
+  const [appDisplayMode, setAppDisplayMode] = useState(
+    () => initialAppDisplay ?? readWorkspaceAppDisplay(workspaceId, configuredAppDisplay),
+  );
+  // The Workspace record can arrive after the first render; its App's opening view applies until the viewer picks one.
+  useEffect(() => {
+    if (initialAppDisplay || attentionTargetKey || hasChosenWorkspaceAppDisplay(workspaceId)) return;
+    const configured = asAppDisplay(configuredAppDisplay);
+    if (configured) setAppDisplayMode(configured);
+  }, [attentionTargetKey, configuredAppDisplay, initialAppDisplay, workspaceId]);
   useEffect(() => {
     if (attentionTargetKey) setAppDisplayMode("chat");
   }, [attentionTargetKey]);
   const appOpen = !threadRef && !isTaskSession && appDisplayMode !== "chat";
+  // The App beside the chat shows runs itself (Needs you, the run when opened).
+  const appPanelShown = appOpen && !outputOpen;
   const changeAppDisplay = useCallback((mode: WorkspaceAppDisplayMode) => {
     setAppDisplayMode(mode);
     try {
+      window.localStorage.setItem(workspaceAppDisplayKey(workspaceId), mode);
       window.localStorage.setItem(WORKSPACE_APP_DISPLAY_KEY, mode);
     } catch {
       // Keep the selection for this session when browser storage is unavailable.
     }
-  }, []);
+  }, [workspaceId]);
   const [selectedArtifact, setSelectedArtifact] =
     useState<OutputArtifact | null>(null);
   const [selectedArtifactAnchor, setSelectedArtifactAnchor] =
@@ -1927,6 +2051,17 @@ export default function WorkspaceChat({
     fetchedMappingsLoading;
 
   const [wsMessages, setWsMessages] = useState<WsMessage[]>([]);
+  // A request an App entry sent to an Agent is listed in Recent outputs, and
+  // its questions in Needs you: refresh them when one arrives, when its Agent
+  // asks something, and when a turn starts or ends.
+  const appRequestIds = useMemo(
+    () => wsMessages.filter((message) => message.meta?.workspace_app_action).map((message) => message.id).join(","),
+    [wsMessages],
+  );
+  useEffect(() => {
+    if (!appRequestIds && !runtimeHumanInput) return;
+    void queryClient.invalidateQueries({ queryKey: ["workspace-app-section", workspaceId] });
+  }, [appRequestIds, runtimeHumanInput?.requestId, streaming, queryClient, workspaceId]);
   const [voiceConversationId, setVoiceConversationId] = useState<string | null>(null);
   const {
     hydrateConversation: hydrateMessageFeedback,
@@ -2045,16 +2180,12 @@ export default function WorkspaceChat({
     workspaceId,
   ]);
 
-  // The conversation other members type into is the one their messages live
-  // in; fall back to our own stream conversation before any message exists.
-  const wsConversationId = useMemo(() => {
-    for (const m of wsMessages as WsMessage[]) {
-      if (m.conversation_id) return m.conversation_id;
-    }
-    return conversationId || null;
-  }, [wsMessages, conversationId]);
+  // The page identifies this Workspace/thread's conversation. Pinned action
+  // cards can belong to other threads and must never redirect new messages.
+  // Before the first history refresh, the stream receipt owns the new ID.
+  const wsConversationId = workspaceMessagesPage?.conversation_id || conversationId || null;
   const voiceScopeConversationId = voiceConversationId || wsConversationId;
-  const activeConversationId = conversationId || wsConversationId || undefined;
+  const activeConversationId = wsConversationId || undefined;
   const remoteRunInFlight = !streaming && hasActiveWorkspaceChatStream(
     workspaceMessagesPage?.items || [],
     workspaceMessagesPage?.conversation_id,
@@ -2483,6 +2614,25 @@ export default function WorkspaceChat({
               );
             }
           }
+          if (data.action_resolved && data.resolved_message_id) {
+            // Answered from the run bar, the App page or another tab: the card
+            // may be older than the refetched page, so close the loaded copy.
+            const resolvedId = String(data.resolved_message_id);
+            setWsMessages((current) =>
+              current.map((message) =>
+                message.id === resolvedId && !message.resolved_at
+                  ? {
+                      ...message,
+                      resolved_at:
+                        typeof data.resolved_at === "string"
+                          ? data.resolved_at
+                          : new Date().toISOString(),
+                      resolution: data.resolution ?? message.resolution,
+                    }
+                  : message,
+              ),
+            );
+          }
           const loadedMessage = (wsMessages as WsMessage[]).find(
             (message) => message.id === data.message_id,
           );
@@ -2516,6 +2666,24 @@ export default function WorkspaceChat({
         workflowRunInvalidationScheduler,
         wsMessages,
       ],
+    ),
+    onTaskUpdate: useCallback(
+      (data: Record<string, any>) => {
+        const taskId = String(data.task_id || data.id || "");
+        const status = typeof data.status === "string" ? data.status : "";
+        if (!taskId || !status) return;
+        // A Task this conversation shows changed state: its label re-reads
+        // the live status instead of waiting for a page refresh.
+        const stale = wsMessages.some((msg) =>
+          taskRefs(msg).some((ref) => ref.id === taskId && ref.status !== status),
+        );
+        if (stale) {
+          void queryClient.invalidateQueries({
+            queryKey: ["workspace-chat", workspaceId],
+          });
+        }
+      },
+      [queryClient, workspaceId, wsMessages],
     ),
     onTyping: handleTyping,
   });
@@ -2989,7 +3157,8 @@ export default function WorkspaceChat({
       && !responseSurfaceSubmissionFailureMessageIds.has(msg.id)
     ))
       .filter((msg) =>
-        !isRedundantApprovalResolutionReceipt({
+        !isResolutionReceipt(msg)
+        && !isRedundantApprovalResolutionReceipt({
           role: msg.author_kind,
           content: msg.body,
           message_kind: msg.message_kind,
@@ -3125,6 +3294,8 @@ export default function WorkspaceChat({
       // realtime action-resolved events can arrive before the commit.
       queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId], exact: true });
       queryClient.invalidateQueries({ queryKey: ["workspace-app-view", workspaceId] });
+      // Recent outputs and Needs-you follow the answer at once, not on their next poll.
+      queryClient.invalidateQueries({ queryKey: ["workspace-app-section", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-setup-status", workspaceId], exact: true });
       queryClient.invalidateQueries({
         queryKey: ["workspace-connection-status", currentUser?.entity_id, currentUser?.id, workspaceId],
@@ -3405,6 +3576,7 @@ export default function WorkspaceChat({
       sendOptions: {
         responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
         appAgentId?: string;
+        appAction?: string;
       } = {},
     ) => {
       if (streamingRef.current || remoteRunInFlight) {
@@ -3583,6 +3755,7 @@ export default function WorkspaceChat({
                 workspaceId,
                 workspaceContext: true,
                 agentId: targetAgent?.id,
+                workspaceAppAction: sendOptions.appAction,
                 localWorkerId: sendContext?.localWorkerId,
                 threadRef,
                 files: localFiles.length > 0 ? localFiles : undefined,
@@ -3728,15 +3901,7 @@ export default function WorkspaceChat({
     wsConversationId,
   ]);
 
-  // The COUNT comes from the server, never from `pendingActions.length`. This
-  // list is whatever the client has accumulated, and it drifts above the truth
-  // the moment a card is answered: the answered card leaves the pinned set, so
-  // no later page hands it back for merge-by-id to overwrite. The sidebar badge
-  // re-counts in the DB and drops — which is how one answer produced two
-  // numbers. Fall back to the local length only before the first page lands.
-  const openActionCount =
-    workspaceMessagesPage?.open_action_count ?? pendingActions.length;
-  const pendingActionNotice = usePendingActionNotice(
+  const pendingActionHighlight = usePendingActionHighlight(
     `${currentUser?.id || ""}:${streamSessionKey}`,
     pendingActions.map((message) => message.id),
   );
@@ -3760,40 +3925,14 @@ export default function WorkspaceChat({
         card.tabIndex = -1;
         card.focus({ preventScroll: true });
         scrollToMessage(card, "auto");
-        pendingActionNotice.highlight(attentionTargetMessageId);
+        pendingActionHighlight.highlight(attentionTargetMessageId);
       });
     };
     const observer = new MutationObserver(locate);
     if (workspaceChatHistoryStageRef.current) observer.observe(workspaceChatHistoryStageRef.current, { childList: true, subtree: true, attributes: true });
     locate();
     return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
-  }, [workspaceId, location.key, attentionTargetKey, attentionTargetMessageId, workspaceMessagesPage, pendingActionNotice.highlight, pauseAutoFollow, scrollToMessage]);
-
-  const showPendingActionsBanner =
-    autonomousRunning && openActionCount > 0 && pendingActions.length > 0 && !pendingActionNotice.hidden;
-  // Jump to the OLDEST open action, not the newest. `sorted` is ascending, so
-  // the newest sits nearest the bottom where the reader already is, while the
-  // one that has waited longest is buried far above — the only one that
-  // genuinely needs a shortcut. (Background plans file their cards in their
-  // own thread; those get merged into this view by created_at, so a card that
-  // has been blocked for days lands above days of newer chat.)
-  const oldestPendingAction = pendingActions[0];
-  // How long the longest-blocked item has waited. Silence is the failure mode
-  // here — work sat blocked for days behind a badge that only said "13".
-  const oldestPendingWaitLabel = useMemo(
-    () => (oldestPendingAction ? relativeTime(oldestPendingAction.created_at, "") : ""),
-    [oldestPendingAction],
-  );
-  const jumpToOldestPendingAction = useCallback(() => {
-    if (!oldestPendingAction) return;
-    const el = document.getElementById(
-      `workspace-chat-message-${oldestPendingAction.id}`,
-    );
-    if (!el) return;
-    el.focus({ preventScroll: true });
-    scrollToMessage(el);
-    pendingActionNotice.highlight(oldestPendingAction.id);
-  }, [oldestPendingAction, pendingActionNotice.highlight, scrollToMessage]);
+  }, [workspaceId, location.key, attentionTargetKey, attentionTargetMessageId, workspaceMessagesPage, pendingActionHighlight.highlight, pauseAutoFollow, scrollToMessage]);
 
   const visibleLocalMsgs = useMemo(
     () =>
@@ -3830,17 +3969,27 @@ export default function WorkspaceChat({
   const hasVisibleLocalAssistant = visibleLocalMsgs.some(
     (msg) => msg.role === "assistant",
   );
+  const liveQuestionRequestId = runtimeHumanInput?.requestId;
   const timelinePersistedMessages = useMemo(
     () =>
       presentedVisibleSortedMessages.filter((msg) => {
         if (hasVisibleLocalAssistant && isRunningStreamPlaceholder(msg)) return false;
+        // While its live card asks the question, the saved copy of the same question
+        // would say it twice; the copy is the record once the card is answered.
+        if (isLiveRuntimeQuestion(msg, liveQuestionRequestId)) return false;
         const persisted = msg.meta?.strategist_activity?.state;
         const state = isStrategistActivityTerminalState(persisted)
           ? persisted
           : realtimeStrategistActivityById.get(msg.id)?.state || persisted;
         return state !== "completed" && state !== "skipped";
       }),
-    [hasVisibleLocalAssistant, presentedVisibleSortedMessages, realtimeStrategistActivityById],
+    [hasVisibleLocalAssistant, liveQuestionRequestId, presentedVisibleSortedMessages, realtimeStrategistActivityById],
+  );
+  // A turn restored after a reload starts without the name of the Agent answering it;
+  // its saved message knows that Agent.
+  const persistedById = useMemo(
+    () => new Map((wsMessages as WsMessage[]).map((message) => [message.id, message])),
+    [wsMessages],
   );
 
   const timelineItems = useMemo(() => {
@@ -3917,6 +4066,42 @@ export default function WorkspaceChat({
     }
     return out;
   }, [timelineItems]);
+
+  // A date divider opens each calendar day; consecutive bubbles of one speaker
+  // share one avatar and name for the rest of that day. After a pause, a merged
+  // bubble still shows its own time.
+  const timelineDecorations = useMemo(() => {
+    let previousDay = "";
+    let previousSpeaker = "";
+    let previousTime = Number.NaN;
+    return renderTimeline.map((item) => {
+      const timestamp = item.kind === "activity-run"
+        ? item.msgs[0]?.created_at
+        : item.kind === "persisted"
+          ? item.msg.created_at
+          : item.msg.timestamp;
+      const day = chatDayKey(timestamp);
+      const divider = day && day !== previousDay ? formatChatDayLabel(timestamp) : "";
+      if (day) previousDay = day;
+      const speaker = item.kind === "local"
+        ? item.msg.role === "user"
+          ? `user:${currentUser?.id || "self"}`
+          : `agent:${item.msg.agentName || MANOR_AGENT_NAME}`
+        : item.kind === "persisted" && !isActivityMessage(item.msg)
+          ? persistedSpeakerKey(item.msg, subToAgent)
+          : "";
+      const time = messageTimestampMs(timestamp || "");
+      const continuation = Boolean(speaker && !divider && speaker === previousSpeaker);
+      const continuationTime = continuation && (
+        !Number.isFinite(time) ||
+        !Number.isFinite(previousTime) ||
+        time - previousTime >= BUBBLE_CONTINUATION_TIME_GAP_MS
+      );
+      previousSpeaker = speaker;
+      previousTime = speaker ? time : Number.NaN;
+      return { divider, continuation, continuationTime };
+    });
+  }, [currentUser?.id, renderTimeline, subToAgent]);
 
   const activeOutputArtifact = useMemo(() => {
     if (!selectedArtifact || !selectedArtifactAnchor) return selectedArtifact;
@@ -4721,44 +4906,6 @@ export default function WorkspaceChat({
           }`}
         >
         <div ref={chatContentRef} className="chat-scroll-content">
-        {showPendingActionsBanner && (
-          <div className="workspace-pending-actions-banner">
-            <div className="workspace-pending-actions-content">
-              <div className="workspace-pending-actions-title">
-                {pendingActionsLabel(openActionCount)}
-              </div>
-              <div className="workspace-pending-actions-copy">
-                {/* Lead with what has waited longest — the oldest is what the
-                    jump targets, and how long it has been stuck is the part
-                    worth reacting to. */}
-                {pendingActions
-                  .slice(0, 3)
-                  .map((msg) => pendingActionLabel(msg))
-                  .join(" · ")}
-                {oldestPendingWaitLabel ? ` · ${oldestPendingWaitLabel}` : ""}
-              </div>
-            </div>
-            <Button
-              variant="outline"
-              size="sm"
-              className="workspace-pending-actions-jump"
-              onClick={jumpToOldestPendingAction}
-            >
-              {t("component.workspace_chat.jump_to_oldest_action")}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="workspace-pending-actions-dismiss"
-              style={{ width: 32, height: 32, padding: 0 }}
-              ariaLabel={t("component.workspace_chat.dismiss_pending_notice")}
-              title={t("component.workspace_chat.dismiss_pending_notice")}
-              onClick={pendingActionNotice.dismiss}
-            >
-              <IconClose size={14} />
-            </Button>
-          </div>
-        )}
         {workspaceThreadLoading ? (
           <ChatMessagesSkeleton rows={5} />
         ) : timelineItems.length === 0 &&
@@ -4823,15 +4970,19 @@ export default function WorkspaceChat({
           </div>
         )}
 
-        {renderTimeline.map((item) => {
+        {renderTimeline.map((item, itemIndex) => {
+          const { divider, continuation, continuationTime } = timelineDecorations[itemIndex] || {
+            divider: "",
+            continuation: false,
+            continuationTime: false,
+          };
+          const rendered = (() => {
           if (item.kind === "activity-run") {
             return (
               <WsActivityRun
                 key={item.key}
                 markerId={item.key}
                 msgs={item.msgs}
-                subToAgent={subToAgent}
-                simple={isSimple}
               />
             );
           }
@@ -4884,7 +5035,7 @@ export default function WorkspaceChat({
                 key={item.key}
                 markerId={item.key}
                 workspaceId={workspaceId}
-                highlighted={pendingActionNotice.highlightedMessageId === item.msg.id}
+                highlighted={pendingActionHighlight.highlightedMessageId === item.msg.id}
                 msg={item.msg}
                 attentionKeys={workspaceMessagesPage?.unseen_action_keys?.[item.msg.id]}
                 workflowHistoryContext={hostOwnedWorkflowMessageIds.has(item.msg.id)}
@@ -4911,11 +5062,23 @@ export default function WorkspaceChat({
                     ? openLedgerConfiguration
                     : undefined
                 }
+                continuation={continuation}
+                continuationTime={continuationTime}
               />
             );
           }
 
-          const msg = item.msg;
+          const restoredAgent = item.msg.role === "assistant" && !item.msg.agentName && item.msg.id
+            ? subToAgent.get(persistedById.get(item.msg.id)?.author_subscription_id || "")
+            : undefined;
+          const msg = restoredAgent
+            ? { ...item.msg, agentName: restoredAgent.name, agentColor: agentColor(restoredAgent.name) }
+            : item.msg;
+          // The live reply and its saved copy must draw the same avatar: both
+          // come from the agent record, never from a name-seeded placeholder.
+          const liveAgent = restoredAgent
+            || (item.msg.id ? subToAgent.get(persistedById.get(item.msg.id)?.author_subscription_id || "") : undefined)
+            || agentList.find((agent) => agent.name === msg.agentName);
           const delegatedRuns =
             msg.role === "assistant" ? msg.sub_agent_events || [] : [];
           const localTools =
@@ -4960,24 +5123,26 @@ export default function WorkspaceChat({
                   chatMessageActionText(msg, bubbleContent, isStreamingAssistant),
                 );
           const visibleMessageFileReferences = messageDisplay.references;
-          const showMessageBubble = !showFallbackProcess || Boolean(
-            renderedBubbleContent ||
-              visibleMessageFileReferences.length > 0 ||
-              (isStreamingAssistant && (runtimeQueueStatus || runtimeHumanInput)),
+          // A reply always has its bubble: speaker, text, then its process.
+          const showMessageBubble = msg.role !== "user" || Boolean(
+            renderedBubbleContent || visibleMessageFileReferences.length > 0,
           );
           const messageArtifacts =
             msg.role === "assistant"
-              ? filterMessageArtifactsAlreadyRepresented(
-                  { ...msg, tool_calls: localTools },
-                  workspaceFileArtifacts(
+              ? withoutFilesUnderReview(
+                  filterMessageArtifactsAlreadyRepresented(
                     { ...msg, tool_calls: localTools },
-                    isStreamingAssistant,
+                    workspaceFileArtifacts(
+                      { ...msg, tool_calls: localTools },
+                      isStreamingAssistant,
+                    ),
+                    true,
+                    {
+                      renderedContent: renderedBubbleContent,
+                      streaming: isStreamingAssistant,
+                    },
                   ),
-                  true,
-                  {
-                    renderedContent: renderedBubbleContent,
-                    streaming: isStreamingAssistant,
-                  },
+                  isStreamingAssistant ? runtimeHumanInput?.reviewFiles : undefined,
                 )
               : [];
           const canRateLocalMessage = Boolean(
@@ -5002,9 +5167,11 @@ export default function WorkspaceChat({
               key={item.key}
               id={messageAnchorId}
               data-chat-scroll-marker-id={item.key}
-              className={`chat-message-row chat-message-shell ${msg.role === "user" ? "chat-message-row--user" : ""}`}
+              className={`chat-message-row chat-message-shell ${msg.role === "user" ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""}`}
             >
-              {msg.role === "user" ? (
+              {continuation ? (
+                <span className="chat-avatar-spacer" aria-hidden="true" />
+              ) : msg.role === "user" ? (
                 <UserAvatar
                   name={currentUserName}
                   avatarUrl={currentUserAvatar}
@@ -5014,32 +5181,17 @@ export default function WorkspaceChat({
               ) : msg.agentName === MANOR_AGENT_NAME || !msg.agentName ? (
                 <ManorAvatar size={32} />
               ) : (
-                <UserAvatar name={msg.agentName} type="agent" seed={msg.agentName} size={32} />
+                <UserAvatar
+                  name={msg.agentName}
+                  avatarUrl={liveAgent?.avatar_url}
+                  type="agent"
+                  seed={liveAgent ? agentAvatarSeed(liveAgent) : msg.agentName}
+                  size={32}
+                />
               )}
               <div
                 className={`chat-message-col ${msg.role === "user" ? "chat-message-col--user" : ""}`}
               >
-                <span
-                  className={`chat-sender-name ${msg.role === "user" ? "chat-sender-name--user" : "chat-sender-name--agent"}`}
-                  style={
-                    msg.role !== "user" && msg.agentColor
-                      ? ({ "--chat-agent-name-color": msg.agentColor } as CSSProperties)
-                      : undefined
-                  }
-                >
-                  {msg.role === "user"
-                    ? t("page.chat_history.you")
-                    : msg.agentName || MANOR_AGENT_NAME}
-                </span>
-                {showFallbackProcess && (
-                  <ToolCallList
-                    tools={localTools}
-                    hideDetails={isSimple}
-                    keyPrefix={item.key}
-                    subAgentRuns={delegatedRuns}
-                    streaming={isStreamingAssistant}
-                  />
-                )}
                 {showMessageBubble && (
                   <div
                   className={`chat-bubble ${msg.role === "user" ? "chat-bubble--user" : "chat-bubble--bot"} ${
@@ -5048,11 +5200,56 @@ export default function WorkspaceChat({
                       : ""
                   }`}
                 >
+                  {msg.role !== "user" && (!continuation || continuationTime) && (
+                    <div className="chat-bubble-header">
+                      {!continuation && (
+                        <span
+                          className="chat-sender-name chat-sender-name--agent"
+                          style={
+                            msg.agentColor
+                              ? ({ "--chat-agent-name-color": msg.agentColor } as CSSProperties)
+                              : undefined
+                          }
+                        >
+                          {msg.agentName || MANOR_AGENT_NAME}
+                        </span>
+                      )}
+                      <ChatTimestamp timestamp={msg.timestamp} className="chat-timestamp chat-bubble-time" />
+                    </div>
+                  )}
+                  {/* The work behind the reply opens the bubble, live or finished. */}
+                  {localAssistantBlocks && (
+                    <AssistantMessageBlocks
+                      blocks={msg.assistant_blocks}
+                      content={renderedBubbleContent}
+                      keyPrefix={item.key}
+                      streaming={isStreamingAssistant}
+                      hideProcess={isSimple}
+                      minimal
+                      part="process"
+                      queueStatus={messageQueueStatus}
+                      subAgentRuns={delegatedRuns}
+                      sourceMessageId={msg.id || ""}
+                      pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                      hitlRequests={msg.hitl_requests}
+                    />
+                  )}
+                  {showFallbackProcess && (
+                    <ToolCallList
+                      tools={localTools}
+                      hideDetails={isSimple}
+                      keyPrefix={item.key}
+                      subAgentRuns={delegatedRuns}
+                      streaming={isStreamingAssistant}
+                      stepsSummary
+                    />
+                  )}
                   {isStreamingAssistant && runtimeHumanInput && (
                     <RuntimeHumanInputCard
                       input={runtimeHumanInput}
                       onSubmit={submitRuntimeHumanInput}
                       busy={runtimeInputBusy}
+                      workspaceId={workspaceId}
                     />
                   )}
                   {localAssistantBlocks ? (
@@ -5063,6 +5260,7 @@ export default function WorkspaceChat({
                       streaming={isStreamingAssistant}
                       hideProcess={isSimple}
                       minimal
+                      part="content"
                       collapseLongFinal
                       queueStatus={messageQueueStatus}
                       subAgentRuns={delegatedRuns}
@@ -5096,23 +5294,23 @@ export default function WorkspaceChat({
                     inlineFileCards
                     returnTo={messageReturnTo}
                   />
+                  {msg.role === "assistant" && (
+                    <ArtifactSummaryCards
+                      artifacts={messageArtifacts}
+                      onOpen={(artifact) =>
+                        openWorkspaceArtifact(artifact, messageAnchorId)
+                      }
+                    />
+                  )}
                   </div>
                 )}
-                {msg.role === "assistant" && (
-                  <ArtifactSummaryCards
-                    artifacts={messageArtifacts}
-                    onOpen={(artifact) =>
-                      openWorkspaceArtifact(artifact, messageAnchorId)
-                    }
-                  />
-                )}
-                {showLocalMessageMeta && (
+                {showLocalMessageMeta && (msg.role === "user" || showLocalMessageActions) && (
                   <div
                     className={`chat-message-meta-row ${
                       msg.role === "user" ? "chat-message-meta-row--user" : ""
                     } ${showLocalMessageActions ? "chat-message-meta-row--actions" : ""}`}
                   >
-                    <ChatTimestamp timestamp={msg.timestamp} />
+                    {msg.role === "user" ? <ChatTimestamp timestamp={msg.timestamp} /> : <span aria-hidden="true" />}
                     {showLocalMessageActions && (
                       <span className="chat-message-meta-actions">
                         <ChatMessageActions
@@ -5147,6 +5345,16 @@ export default function WorkspaceChat({
                 )}
               </div>
             </div>
+          );
+          })();
+          if (!divider) return rendered;
+          return (
+            <Fragment key={`day-${item.key}`}>
+              <div className="ws-activity-line-row ws-date-divider" role="separator" aria-label={divider}>
+                <span className="ws-activity-line">{divider}</span>
+              </div>
+              {rendered}
+            </Fragment>
           );
         })}
 
@@ -5266,7 +5474,9 @@ export default function WorkspaceChat({
               />
             </div>}
 
-            <WorkspaceWorkflowRunHost
+            {/* With the App open beside it the pinned run card would repeat what the
+                App shows; opening a run from the App switches to chat, which shows it. */}
+            {!appPanelShown && <WorkspaceWorkflowRunHost
               workspaceId={workspaceId}
               groups={workflowRunGroups}
               attentionKeys={workspaceMessagesPage?.unseen_action_keys}
@@ -5275,7 +5485,7 @@ export default function WorkspaceChat({
               resolveError={resolveMutation.error}
               resolveMessageId={resolveMutation.variables?.msgId || null}
               onRunChange={resolveMutation.reset}
-            />
+            />}
           </div>
         )}
       </div>
@@ -5390,10 +5600,15 @@ export default function WorkspaceChat({
     changeAppDisplay("chat");
     window.requestAnimationFrame(() => composerEditorRef.current?.focus());
   };
-  const launchAppAction = async (action: WorkspaceAppAction, request: string, files: File[] = []) => {
+  const launchAppAction = async (action: WorkspaceAppAction, request: string, documents: WorkflowDocumentRef[] = []) => {
     const prompt = [action.prompt || action.title, request].filter(Boolean).join("\n\n");
-    const attachments: AttachedItem[] = files.map((file) => ({ name: file.name, type: "file", file, mimeType: file.type }));
-    const completed = await handleSend(prompt, attachments, [], null, undefined, { appAgentId: action.agent_id });
+    // The form already put these files in Knowledge; the Agent reads them as attached documents.
+    const attachments: AttachedItem[] = documents.map((document) => ({
+      name: document.name || document.document_id, type: "knowledge", id: document.document_id, fsPath: document.fs_path || undefined,
+    }));
+    const completed = await handleSend(prompt, attachments, [], null, undefined, { appAgentId: action.agent_id, appAction: action.key });
+    // The request and its reply are listed under this entry in Recent outputs.
+    void queryClient.invalidateQueries({ queryKey: ["workspace-app-section", workspaceId] });
     if (completed !== true) throw new Error(t("component.workspace_app_view.start_error"));
     const session = useChatStreamStore.getState().sessions[streamSessionKey];
     const assistant = [...(session?.messages || [])].reverse().find((message) => message.role === "assistant");
@@ -5557,6 +5772,8 @@ export function WsMessageRow({
   onResponseSurfaceSubmit,
   responseSurfaceSubmissionReceipts = [],
   onConfigureLedgers,
+  continuation = false,
+  continuationTime = false,
 }: {
   markerId?: string;
   workspaceId: string;
@@ -5602,6 +5819,10 @@ export function WsMessageRow({
     | Promise<void | boolean | ResponseSurfaceSubmissionResult>;
   responseSurfaceSubmissionReceipts?: ResponseSurfaceSubmissionReceipt[];
   onConfigureLedgers?: (overview: WorkspaceLedgerOverview) => void;
+  /** Same speaker as the bubble just above: avatar and name are not repeated. */
+  continuation?: boolean;
+  /** A merged bubble after a pause keeps its own time. */
+  continuationTime?: boolean;
 }) {
   const location = useLocation();
   const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
@@ -5745,13 +5966,22 @@ export function WsMessageRow({
   const inputQuestion = displayPendingAction?.kind === PendingActionKind.HUMAN_INPUT
     ? String(displayPendingAction.payload?.question || displayPendingAction.prompt || "").trim()
     : "";
-  const inputBody = renderedBodyContent.trim().replace(
-    /^🙋\s*[^:\n]+? needs a human input:\s*/i,
-    "",
+  // The body is the text-only rendering (notifications, email) of the card:
+  // a lead line naming the asker, the question, and its options. The card
+  // shows all of it — the task chip names the task — open or answered.
+  const inputBody = renderedBodyContent.trim()
+    .replace(/^🙋\s*[^:\n]+? needs a human input:\s*/i, "")
+    .replace(/^(?:Question from the agent working on|Asked by [^\n]+?, an agent working on) “[^\n]*”:\s*/i, "")
+    .replace(/\n+Options: [^\n]*$/, "");
+  // An answered card restates its question unless it carries its own title.
+  const answeredCardShowsQuestion = Boolean(
+    displayPendingAction?.payload?.question &&
+    !["title", "review_title", "action_summary", "context_summary", "description"]
+      .some((key) => String(displayPendingAction?.[key] || "").trim()),
   );
   const redundantInputBody = Boolean(
-    !msg.resolved_at &&
     inputQuestion &&
+    (!msg.resolved_at || answeredCardShowsQuestion) &&
     inputBody.replace(/\s+/g, " ") === inputQuestion.replace(/\s+/g, " "),
   );
   const structuredProposalPayload = structuredProposal(msg);
@@ -5824,20 +6054,17 @@ export function WsMessageRow({
       hitl.id &&
       !(pendingReviewToken && String(hitl.id) === pendingReviewToken),
   );
+  // A Workflow review is answered on its message; its metadata copy is not updated.
+  const hitlResolved = (hitl: { resolved?: unknown; action?: unknown }) => Boolean(hitl.resolved)
+    || (hitl.action === "workflow.review" && Boolean(msg.resolved_at));
+  // The review card carries the instructions; the body would repeat them.
+  const showsWorkflowReviewCard = !msg.resolved_at
+    && msg.pending_action?.kind === PendingActionKind.WORKFLOW_APPROVAL
+    && hitlCards.some((hitl) => hitl.action === "workflow.review" && !hitl.resolved);
   const showFallbackProcess = !retryableAssistant && !hasAssistantBlocks && visibleTools.length > 0;
-  const hasNonProcessBubbleContent = Boolean(
-    renderedBodyContent ||
-      msg.message_kind === "workflow_activity" ||
-      presentingAgentGreeting ||
-      visibleFileReferences.length > 0 ||
-      msg.meta?.workflow_result ||
-      Array.isArray(msg.meta?.simulation_artifacts) ||
-      hitlCards.length > 0 ||
-      (!inlineProposalDecision && (msg.pending_action?.kind || (msg.resolved_at && msg.resolution))) ||
-      showCompletionTaskLink ||
-      visibleTaskRefs.length > 0,
-  );
-  const showMessageBubble = !showFallbackProcess || hasNonProcessBubbleContent;
+  // Bubble layer 1: speaker · time. Your own bubbles need neither; a
+  // continuation of the same speaker does not repeat them.
+  const showBubbleHeader = !isCurrentUser && !continuation;
 
   return (
     <div
@@ -5845,9 +6072,11 @@ export function WsMessageRow({
       data-workspace-attention-key={workflowHistoryContext ? pendingAttentionKey : undefined}
       data-chat-scroll-marker-id={markerId || msg.id}
       tabIndex={-1}
-      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""} ${highlighted ? "workspace-chat-message--highlighted" : ""}`}
+      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""} ${highlighted ? "workspace-chat-message--highlighted" : ""}`}
     >
-      {isUser ? (
+      {continuation ? (
+        <span className="chat-avatar-spacer" aria-hidden="true" />
+      ) : isUser ? (
         <UserAvatar
           name={isCurrentUser ? currentUserName : userSenderName}
           avatarUrl={isCurrentUser ? currentUserAvatar : msg.author_user_avatar_url}
@@ -5881,63 +6110,24 @@ export function WsMessageRow({
       <div
         className={`chat-message-col ${isCurrentUser ? "chat-message-col--user" : ""}`}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span
-            className={`chat-sender-name ${isCurrentUser ? "chat-sender-name--user" : "chat-sender-name--agent"}`}
-            style={
-              (!isUser || !isCurrentUser) && color
-                ? ({ "--chat-agent-name-color": color } as CSSProperties)
-                : undefined
-            }
-          >
-            {senderName}
-          </span>
-          {!isUser &&
-            msg.message_kind !== "text" &&
-            msg.message_kind !== "agent_update" &&
-            msg.message_kind !== "external_message" &&
-            (msg.message_kind !== "hitl_request" ||
-              Boolean(msg.pending_action?.kind && !msg.resolved_at) ||
-              (msg.hitl_requests || []).some((request) => !request.resolved)) && (
-              <KindBadge kind={msg.message_kind} />
-            )}
-          {isExternalCustomer && (
-            <KindBadge kind="external_message" />
-          )}
-        </div>
-        {showFallbackProcess && (
-          <ToolCallList
-            tools={visibleTools}
-            hideDetails={isSimple}
-            keyPrefix={`ws-${msg.id}`}
-            subAgentRuns={delegatedRuns}
-            streaming={Boolean(streaming)}
-          />
-        )}
-        {showMessageBubble && (
-          <div
-          className={`chat-bubble ${isCurrentUser ? "chat-bubble--user" : "chat-bubble--bot"} ${!isUser && msg.message_kind === "proposal" ? "chat-bubble--proposal" : ""}`}
+        <div
+          className={`chat-bubble ${isCurrentUser ? "chat-bubble--user" : "chat-bubble--bot"}`}
           aria-busy={presentingAgentGreeting || undefined}
-          style={
-            !isUser && msg.message_kind === "goal_alert"
-                ? {
-                    background: "rgba(255,250,239,0.94)",
-                    border: "1px solid rgba(207,155,68,0.2)",
-                  }
-                : !isUser && msg.message_kind === "step_event"
-                  ? {
-                      background: "rgba(250,249,247,0.95)",
-                      border: "1px solid rgba(28,25,23,0.085)",
-                      fontSize: 12,
-                    }
-                  : isExternalCustomer
-                    ? {
-                        background: "rgba(242,248,246,0.95)",
-                        border: "1px solid rgba(79,113,105,0.2)",
-                      }
-                  : undefined
-          }
         >
+          {(showBubbleHeader || (!isCurrentUser && continuationTime)) && (
+            <div className="chat-bubble-header">
+              {showBubbleHeader && (
+                <span
+                  className={`chat-sender-name ${isUser ? "chat-sender-name--user" : "chat-sender-name--agent"}`}
+                  style={color ? ({ "--chat-agent-name-color": color } as CSSProperties) : undefined}
+                >
+                  {senderName}
+                </span>
+              )}
+              <ChatTimestamp timestamp={msg.created_at} className="chat-timestamp chat-bubble-time" />
+            </div>
+          )}
+          {/* The work behind the reply opens the bubble, live or finished. */}
           {hasAssistantBlocks && (
             <AssistantMessageBlocks
               blocks={msg.assistant_blocks}
@@ -5946,6 +6136,32 @@ export function WsMessageRow({
               streaming={Boolean(streaming)}
               hideProcess={isSimple}
               minimal
+              part="process"
+              subAgentRuns={delegatedRuns}
+              sourceMessageId={msg.id}
+              pendingActionKind={assistantPendingActionKindForMessage(msg)}
+              hitlRequests={msg.hitl_requests}
+            />
+          )}
+          {showFallbackProcess && (
+            <ToolCallList
+              tools={visibleTools}
+              hideDetails={isSimple}
+              keyPrefix={`ws-${msg.id}`}
+              subAgentRuns={delegatedRuns}
+              streaming={Boolean(streaming)}
+              stepsSummary
+            />
+          )}
+          {hasAssistantBlocks && (
+            <AssistantMessageBlocks
+              blocks={msg.assistant_blocks}
+              content={renderedBodyContent}
+              keyPrefix={`ws-${msg.id}`}
+              streaming={Boolean(streaming)}
+              hideProcess={isSimple}
+              minimal
+              part="content"
               collapseLongFinal={collapseBody}
               subAgentRuns={delegatedRuns}
               onResponseSurfaceSubmit={onResponseSurfaceSubmit}
@@ -5965,6 +6181,7 @@ export function WsMessageRow({
             msg.message_kind !== "workflow_activity" &&
             renderedBodyContent &&
             !redundantInputBody &&
+            !showsWorkflowReviewCard &&
             // An open approval renders a clean action card below; suppress the
             // raw governance body so internal keys/payloads never leak. Proposal
             // approvals are the exception: ProposalMessageContent reads their
@@ -6024,6 +6241,16 @@ export function WsMessageRow({
             <SimulationArtifactGallery artifacts={msg.meta.simulation_artifacts} />
           )}
 
+          {!isUser && (
+            <ArtifactSummaryCards
+              artifacts={messageArtifacts}
+              onOpen={(artifact) =>
+                onArtifactOpen(artifact, `workspace-chat-message-${msg.id}`)
+              }
+            />
+          )}
+
+
           {/* Tool-call HITL cards. Unlike FloatingChat/EmbeddedChat — which
               park the buttons in a sticky <ApprovalActionBar> because their
               panel can scroll the card out of reach — workspace chat renders
@@ -6040,6 +6267,18 @@ export function WsMessageRow({
                   data-workspace-attention-key={attentionKeys?.[String(hitl.id)]}
                   className={`chat-hitl-card ${hitl.type === "approval" ? "chat-hitl-card--approval" : ""}`}
                 >
+                  {hitl.action === "workflow.review"
+                    && msg.pending_action?.kind === PendingActionKind.WORKFLOW_APPROVAL
+                    && !hitl.resolved && !msg.resolved_at ? (
+                    // The deliverables and a change request that keeps its note.
+                    <WorkflowReviewChatCard
+                      workspaceId={workspaceId}
+                      action={msg.pending_action as WorkflowRunAction}
+                      currentUserName={currentUserName}
+                      disabled={Boolean(streaming)}
+                      onResolve={(choice, note, payload) => onResolve(msg.id, choice, note, payload)}
+                    />
+                  ) : <>
                   {hitl.type === "approval" ? (
                     <ApprovalSummary
                       prompt={hitl.prompt}
@@ -6065,18 +6304,19 @@ export function WsMessageRow({
                         hitl.type === "approval" ? "approve" : "human_input",
                       options: hitl.options || ["approve", "reject"],
                     }}
-                    resolved={Boolean(hitl.resolved)}
+                    resolved={hitlResolved(hitl)}
                     resolution={
                       hitl.resolved
                         ? { choice: hitl.resolution || "approved" }
-                        : null
+                        : hitlResolved(hitl) ? msg.resolution ?? null : null
                     }
                     currentUserName={currentUserName}
-                    disabled={Boolean(streaming) || Boolean(hitl.resolved)}
+                    disabled={Boolean(streaming) || hitlResolved(hitl)}
                     onResolve={(choice) =>
                       onHitlAction?.(String(hitl.id), choice)
                     }
                   />
+                  </>}
                 </div>
               ))}
             </div>
@@ -6156,22 +6396,14 @@ export function WsMessageRow({
               </div>
             </div>
           )}
-          </div>
-        )}
-        {!isUser && (
-          <ArtifactSummaryCards
-            artifacts={messageArtifacts}
-            onOpen={(artifact) =>
-              onArtifactOpen(artifact, `workspace-chat-message-${msg.id}`)
-            }
-          />
-        )}
+        </div>
+        {(isCurrentUser || showMessageActions) && (
         <div
           className={`chat-message-meta-row ${
             isCurrentUser ? "chat-message-meta-row--user" : ""
           } ${showMessageActions ? "chat-message-meta-row--actions" : ""}`}
         >
-          <ChatTimestamp timestamp={msg.created_at} />
+          {isCurrentUser ? <ChatTimestamp timestamp={msg.created_at} /> : <span aria-hidden="true" />}
           {showMessageActions && (
             <span className="chat-message-meta-actions">
               <ChatMessageActions
@@ -6204,6 +6436,7 @@ export function WsMessageRow({
             </span>
           )}
         </div>
+        )}
       </div>
     </div>
   );
@@ -6246,9 +6479,7 @@ function WorkflowActivityContent({
         <strong>{String(meta.workflow_title || t("component.workspace_chat.workflow"))}</strong>
         <span className="workspace-workflow-activity-status">
           <span aria-hidden="true" />
-          {statusPresentation.labelKey === status
-            ? formatUserFacingText(status)
-            : t(`component.workflow_run.status.${statusPresentation.labelKey}`)}
+          {t(statusPresentation.stateKey)}
         </span>
       </div>
 
@@ -6325,33 +6556,6 @@ function activityRunTitle(msgs: WsMessage[]): string {
   return t("component.workspace_chat.activity_default_title");
 }
 
-function msgAgent(
-  msg: WsMessage,
-  subToAgent: Map<string, AgentInfo>,
-): AgentInfo | null {
-  const sid = msg.author_subscription_id;
-  return sid ? subToAgent.get(sid) || null : null;
-}
-
-// All distinct agents that ran a step in this run, in order of first
-// appearance. A run can span several agents — one per step is common — so the
-// summary shows the whole cast, not just the busiest one.
-function activityRunAgents(
-  msgs: WsMessage[],
-  subToAgent: Map<string, AgentInfo>,
-): AgentInfo[] {
-  const seen = new Set<string>();
-  const agents: AgentInfo[] = [];
-  for (const m of msgs) {
-    const agent = msgAgent(m, subToAgent);
-    if (agent && !seen.has(agent.id)) {
-      seen.add(agent.id);
-      agents.push(agent);
-    }
-  }
-  return agents;
-}
-
 function activityRunTaskId(msgs: WsMessage[]): string | null {
   for (const m of msgs) {
     const id = messageRefId(m, "task");
@@ -6380,22 +6584,17 @@ function AgentMiniAvatar({
   );
 }
 
-// Collapses all step/plan status messages of one plan into a single quiet
-// expandable line — attributed to every agent that ran a step and linking to
-// the task — so a burst of step receipts and retries reads as one background
-// activity rather than a wall of bubbles.
+// Collapses all step/plan status messages of one plan into a single event
+// row, linking to the task, so a burst of step receipts and retries reads as
+// one background activity rather than a wall of bubbles. The row updates in
+// place as later steps arrive.
 function WsActivityRun({
   markerId,
   msgs,
-  subToAgent,
-  simple = false,
 }: {
   markerId?: string;
   msgs: WsMessage[];
-  subToAgent: Map<string, AgentInfo>;
-  simple?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const stepMsgs = msgs.filter((m) => m.message_kind === "step_event");
   const failed = stepMsgs.filter((m) => /failed|✗/i.test(m.body || "")).length;
   // New receipts carry the count independently of their display language.
@@ -6412,23 +6611,18 @@ function WsActivityRun({
   }
   const title = activityRunTitle(msgs);
   const last = msgs[msgs.length - 1];
-  const detailMsgs = stepMsgs.length > 0 ? stepMsgs : msgs;
-  const agents = activityRunAgents(msgs, subToAgent);
   const taskId = activityRunTaskId(msgs);
-  const stackAgents: (AgentInfo | null)[] =
-    agents.length > 0 ? agents.slice(0, 3) : [null];
-  const nameLabel =
-    agents.length > 1
-      ? t("component.workspace_chat.activity_agents", { count: agents.length })
-      : agents[0]?.name || MANOR_AGENT_NAME;
   const summary = (
     <>
-      <span className="ws-activity-run-agent">{nameLabel}</span>
-      {" · "}
       <span className="ws-activity-run-title">{title}</span>
       <span className="ws-activity-run-meta">
         {" · "}
-        {t("component.workspace_chat.activity_steps", { count: total })}
+        {t(
+          total === 1
+            ? "component.workspace_chat.activity_steps_one"
+            : "component.workspace_chat.activity_steps",
+          { count: total },
+        )}
         {failed > 0 &&
           ` · ${t("component.workspace_chat.activity_failed", { count: failed })}`}
       </span>
@@ -6439,78 +6633,23 @@ function WsActivityRun({
       className="ws-activity-line-row"
       data-chat-scroll-marker-id={markerId || last?.id || title}
     >
-      <div className="ws-activity-run">
-        <div className="ws-activity-line ws-activity-run-bar">
-          {!simple && <button
-            type="button"
-            className="ws-activity-run-chevron"
-            onClick={() => setExpanded((v) => !v)}
-            aria-expanded={expanded}
-            aria-label={expanded ? t("chat.show_less") : t("chat.show_more")}
+      <span className="ws-activity-line ws-activity-run-bar" data-tone={failed > 0 ? "attention" : "neutral"}>
+        <EventRowGlyph tone={failed > 0 ? "attention" : "neutral"} />
+        {taskId ? (
+          <Link
+            to={`/tasks/${taskId}`}
+            className="ws-activity-line-text ws-activity-run-main--link"
+            title={title}
           >
-            <span aria-hidden>{expanded ? "▾" : "▸"}</span>
-          </button>}
-          <span className="ws-activity-run-avatars">
-            {stackAgents.map((a, i) => (
-              <span className="ws-activity-run-avatar" key={a?.id || i}>
-                <AgentMiniAvatar agent={a} size={16} />
-              </span>
-            ))}
-            {agents.length > 3 && (
-              <span className="ws-activity-run-avatar-more">
-                +{agents.length - 3}
-              </span>
-            )}
-          </span>
-          {taskId ? (
-            <Link
-              to={`/tasks/${taskId}`}
-              className="ws-activity-run-main ws-activity-run-main--link"
-              title={title}
-            >
-              {summary}
-            </Link>
-          ) : (
-            <span className="ws-activity-run-main">{summary}</span>
-          )}
-          <span className="ws-activity-line-time mono">
-            {formatTime(last.created_at)}
-          </span>
-        </div>
-        {!simple && expanded && (
-          <div className="ws-activity-run-detail">
-            {detailMsgs.map((m, idx) => {
-              const stepAgent = msgAgent(m, subToAgent);
-              const prevAgent =
-                idx > 0 ? msgAgent(detailMsgs[idx - 1], subToAgent) : undefined;
-              const showName =
-                idx === 0 ||
-                (stepAgent?.id || null) !== (prevAgent?.id || null);
-              return (
-                <div className="ws-activity-run-step" key={m.id || idx}>
-                  <span className="ws-activity-line-glyph" aria-hidden>
-                    {/failed|✗/i.test(m.body || "") ? "✗" : "·"}
-                  </span>
-                  <span className="ws-activity-run-step-avatar">
-                    <AgentMiniAvatar agent={stepAgent} size={14} />
-                  </span>
-                  <span className="ws-activity-run-step-text">
-                    {showName && (
-                      <span className="ws-activity-run-step-agent">
-                        {stepAgent?.name || MANOR_AGENT_NAME} ·{" "}
-                      </span>
-                    )}
-                    {activityLineText(m)}
-                  </span>
-                  <span className="ws-activity-line-time mono">
-                    {formatTime(m.created_at)}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+            {summary}
+          </Link>
+        ) : (
+          <span className="ws-activity-line-text" title={title}>{summary}</span>
         )}
-      </div>
+        <span className="ws-activity-line-time mono">
+          {formatChatTime(last.created_at)}
+        </span>
+      </span>
     </div>
   );
 }
@@ -6553,15 +6692,6 @@ function WsActivityLine({
   const strategistStage = typeof strategistActivity?.stage === "string"
     ? strategistActivity.stage
     : "";
-  const StrategistStageIcon = strategistStage === "collecting_feedback"
-    ? IconSearch
-    : strategistStage === "analyzing_context"
-      ? IconBrain
-      : strategistStage === "generating_plan"
-        ? IconSparkles
-        : strategistStage === "finalizing_plan"
-          ? IconDocument
-          : IconTimeline;
   const workspaceLifecycleActivity = msg.meta?.workspace_lifecycle === true;
   const lifecyclePhase = typeof msg.meta?.workspace_lifecycle_phase === "string"
     ? msg.meta.workspace_lifecycle_phase
@@ -6569,17 +6699,25 @@ function WsActivityLine({
   const failed =
     lifecyclePhase === "failed" ||
     strategistState === "failed" ||
-    /failed|✗/i.test(msg.body || "");
+    (msg.message_kind === "workflow_activity"
+      ? workflowActivityEventTone(msg) === "attention"
+      : /failed|✗/i.test(msg.body || ""));
   const lifecycleAction: WorkspaceLifecycleAction = msg.meta?.workspace_lifecycle_action === "pause"
     ? "pause"
     : "start";
-  const lifecycleGlyph = workspaceLifecycleActivity
-    ? lifecyclePhase === "failed"
-      ? "!"
-      : lifecycleAction === "pause"
-        ? "⏸"
-        : "▶"
-    : null;
+  const tone: EventTone = failed || msg.message_kind === "goal_alert"
+    ? "attention"
+    : msg.message_kind === "workflow_activity"
+      ? workflowActivityEventTone(msg)
+      // A Strategist row spins only while its review is still being followed;
+      // one whose worker is gone settles instead of spinning forever.
+      : (isStrategistActivity && processing)
+        || lifecyclePhase === "starting"
+        || lifecyclePhase === "pausing"
+        ? "running"
+        : workspaceLifecycleActivity
+          ? "done"
+          : "neutral";
 
   useLayoutEffect(() => {
     const streamStarted = stream && !previousStreamRef.current;
@@ -6656,16 +6794,11 @@ function WsActivityLine({
       data-streaming={activelyStreaming || undefined}
       aria-live={workspaceLifecycleActivity ? "polite" : undefined}
     >
-      <span className="ws-activity-line">
-        <span className="ws-activity-line-glyph" aria-hidden>
-          {failed
-            ? "✗"
-            : lifecycleGlyph || (isStrategistActivity
-              ? <StrategistStageIcon size={14} />
-              : "▸")}
-        </span>
+      <span className="ws-activity-line" data-tone={tone}>
+        <EventRowGlyph tone={tone} />
         <span
           className="ws-activity-line-text"
+          title={displayText}
           aria-hidden={
             (isStrategistActivity && (stream || shouldAnnounceStrategistStatus)) ||
             undefined
@@ -6682,7 +6815,7 @@ function WsActivityLine({
           </span>
         )}
         <span className="ws-activity-line-time mono">
-          {formatTime(msg.created_at)}
+          {formatChatTime(msg.created_at)}
         </span>
       </span>
     </div>
@@ -6860,17 +6993,17 @@ function ProposalMessageContent({
       .map((line) => formatUserFacingText(String(line)))
       .filter((line) => line && line !== approvalView?.reason)
     : [];
-  const structuredEmpty =
+  // Nothing to decide: the card is just Manor AI's reply, so show it as one.
+  const structuredReplyOnly =
     Boolean(structured) &&
-    !proposal?.summary &&
     !structuredTasks.length &&
     !structuredItems.length &&
     !(proposal?.notes.length || 0) &&
     !approvalView;
-  if (!proposal || structuredEmpty) {
+  if (!proposal || structuredReplyOnly) {
     return (
       <ExpandableWorkspaceMarkdown
-        content={content.replace(/~~/g, "")}
+        content={(proposal?.summary || content).replace(/~~/g, "")}
         isUser={false}
         collapsible={false}
       />
@@ -7130,59 +7263,5 @@ function ExpandableWorkspaceMarkdown({
     <CollapsibleSentMessage text={content} enabled={collapsible && !streaming} tone={isUser ? "user" : "assistant"}>
       <ChatMarkdown content={content} isUser={isUser} streaming={streaming} />
     </CollapsibleSentMessage>
-  );
-}
-
-function KindBadge({ kind }: { kind: string }) {
-  const config: Record<string, { label: string; color: string; bg: string }> = {
-    proposal: {
-      label: t("component.workspace_chat.proposal"),
-      color: "var(--message-kind-proposal-fg)",
-      bg: "var(--message-kind-proposal-bg)",
-    },
-    step_event: {
-      label: t("component.workspace_chat.step"),
-      color: "#5f574f",
-      bg: "rgba(120,113,108,0.11)",
-    },
-    workflow_activity: {
-      label: t("component.workspace_chat.workflow"),
-      color: "#5f574f",
-      bg: "rgba(120,113,108,0.11)",
-    },
-    goal_alert: { label: t("component.embedded_chat.goal"), color: "#8c5e25", bg: "rgba(207,155,68,0.14)" },
-    hitl_request: {
-      label: t("component.workspace_chat.input_needed"),
-      color: "#af3f3a",
-      bg: "rgba(214,95,89,0.12)",
-    },
-    external_message: {
-      label: t("component.workspace_chat.customer"),
-      color: "#3f665e",
-      bg: "rgba(79,113,105,0.13)",
-    },
-    system: { label: t("page.team_roles.system_2"), color: "#5f574f", bg: "rgba(120,113,108,0.11)" },
-  };
-  const c = config[kind] || {
-    label: kind,
-    color: "#78716c",
-    bg: "rgba(120,113,108,0.08)",
-  };
-  return (
-    <span
-      style={{
-        display: "inline-block",
-        fontSize: 9,
-        fontWeight: 800,
-        padding: "2px 7px",
-        borderRadius: 4,
-        color: c.color,
-        background: c.bg,
-        textTransform: "uppercase",
-        letterSpacing: "0.04em",
-      }}
-    >
-      {c.label}
-    </span>
   );
 }

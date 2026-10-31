@@ -143,3 +143,17 @@ async def test_preflight_checks_all_spellings_before_merging_requirements(
     assert requirement.provider == canonical_slug
     assert requirement.required is True
     assert requirement.config_fields_to_set == ("project", "region")
+
+
+async def test_preflight_omits_internal_mcp_providers(db_session: AsyncSession):
+    result = await BlueprintSetupPreflightFactory.from_contract(
+        db_session,
+        contract={"requires": {"mcp_servers": [{
+            "slug": "chrome_knowledge_local",
+            "required": True,
+        }]}},
+        entity_id=generate_ulid(),
+        user_id=generate_ulid(),
+    )
+
+    assert result.requirements == ()

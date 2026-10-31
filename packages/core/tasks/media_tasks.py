@@ -11,7 +11,8 @@ import mimetypes
 import os
 import shutil
 import subprocess
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from contextlib import AsyncExitStack
+from urllib.parse import quote, unquote, urlsplit
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -56,7 +57,6 @@ MEDIA_API_TIMEOUT = httpx.Timeout(connect=30.0, read=300.0, write=180.0, pool=30
 MEDIA_JOB_STALE_SECONDS = int(os.getenv("MEDIA_JOB_STALE_SECONDS", "120"))
 MEDIA_JOB_MAX_PROCESSING_SECONDS = int(os.getenv("MEDIA_JOB_MAX_PROCESSING_SECONDS", "1800"))
 MEDIA_JOB_ORPHAN_GRACE_SECONDS = int(os.getenv("MEDIA_JOB_ORPHAN_GRACE_SECONDS", "600"))
-SUNO_WORKER_LEASE_SECONDS = int(os.getenv("SUNO_WORKER_LEASE_SECONDS", "300"))
 # One delivery of media.process_video_job owns a job at a time. Longer than the
 # task's own time limit, so a live worker never loses its lease mid-poll.
 VIDEO_WORKER_LEASE_SECONDS = int(os.getenv("VIDEO_WORKER_LEASE_SECONDS", "1260"))
@@ -89,14 +89,20 @@ MEDIA_REFERENCE_URL_PREFLIGHT_RETRY_DELAY_SECONDS = max(
     float(os.getenv("MEDIA_REFERENCE_URL_PREFLIGHT_RETRY_DELAY_SECONDS", "1")),
 )
 _MEDIA_REFERENCE_URL_TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+# A refused video submit (rate limit, provider unavailable) is retried in the
+# worker with backoff (5s, 15s by default), then the job waits as pending for
+# the recovery sweep, which resubmits it each minute. It fails only once the
+# provider has refused it for the whole window.
+VIDEO_SUBMIT_ATTEMPTS = max(1, int(os.getenv("VIDEO_SUBMIT_ATTEMPTS", "3")))
+VIDEO_SUBMIT_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("VIDEO_SUBMIT_RETRY_DELAY_SECONDS", "5")))
+VIDEO_SUBMIT_REFUSAL_WINDOW_SECONDS = max(0, int(os.getenv("VIDEO_SUBMIT_REFUSAL_WINDOW_SECONDS", "900")))
+# A relay may acknowledge a video before its poll endpoint can find the task.
+# Retrying these GETs preserves the submitted job; never repeat the paid POST.
+_XAI_POLL_PENDING_HTTP_STATUSES = {404, 408, 425, 429, 500, 502, 503, 504}
 
 
 class ProviderPollTimeout(TimeoutError):
     """Provider job is still pending after this worker's active poll window."""
-
-
-class SunoSubmissionReconciliationRequired(RuntimeError):
-    """A paid Suno submit may have succeeded, so automatic retry is unsafe."""
 
 
 def parse_video_duration(value: Any) -> int | None:
@@ -201,37 +207,46 @@ async def process_video_job(job_id: str) -> None:
         logger.error("Video job %s failed: %s", job_id, error_message, exc_info=True)
         result = {"error": error_message}
 
+    if result.get("submit_refused") and await _defer_refused_video_submit(job_id, str(result.get("error") or "")):
+        return
+    result.pop("submit_refused", None)
     await _finalize_video_job(job_id, result)
 
 
-async def process_suno_audio_job(job_id: str) -> None:
-    """Submit once, poll, project, and settle one Catalog Suno audio job."""
-    from packages.core.services.room_generated_files import room_media_job_approved_for_execution
+async def _defer_refused_video_submit(job_id: str, message: str) -> bool:
+    """Return a job the provider refused to pending, within its refusal window.
 
-    if not await room_media_job_approved_for_execution(job_id):
-        return
-    if not await _mark_suno_audio_job_processing(job_id):
-        return
-    try:
-        result = await _call_suno_audio_api(job_id)
-    except ProviderPollTimeout as exc:
-        logger.info("Suno audio job %s remains pending: %s", job_id, exc)
-        await _release_suno_worker_lease(job_id)
-        return
-    except SunoSubmissionReconciliationRequired as exc:
-        # Keep the reservation active: a timed-out paid POST may have been
-        # accepted, and releasing it would understate Manor's exposure.
-        await _finalize_suno_audio_failure(job_id, str(exc), release_reservation=False)
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Suno audio job %s failed: %s", job_id, exc, exc_info=True)
-        await _finalize_suno_audio_failure(
-            job_id,
-            _provider_exception_message(exc),
-            release_reservation=True,
-        )
-        return
-    await _finalize_suno_audio_success(job_id, result)
+    The provider accepted nothing, so the recovery sweep may submit it again.
+    Returns False once the window is spent; the job then fails with the
+    provider's last refusal.
+    """
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+    from sqlalchemy import select
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return False
+        params = dict(job.params or {})
+        try:
+            since = datetime.fromisoformat(str(params.get("submit_refused_since")))
+        except ValueError:
+            since = now
+        if (now - since).total_seconds() >= VIDEO_SUBMIT_REFUSAL_WINDOW_SECONDS:
+            return False
+        params["submit_refused_since"] = since.isoformat()
+        params["submit_refusals"] = int(params.get("submit_refusals") or 0) + 1
+        params["last_submit_refusal"] = message[:300]
+        params.pop("worker_lease_at", None)
+        job.params = params
+        job.status = MediaJobStatus.PENDING.value
+        await db.commit()
+    logger.warning("Video job %s submit refused; waiting for the recovery sweep: %s", job_id, message)
+    return True
 
 
 @celery_app.task(
@@ -251,22 +266,6 @@ def process_video_job_task(job_id: str) -> dict:
             _run_async(_finalize_video_job(job_id, {"error": _provider_exception_message(exc)}))
         except Exception:
             logger.exception("Failed to mark crashed video job %s as failed", job_id)
-        return {"ok": False, "job_id": job_id, "error": _provider_exception_message(exc)}
-
-
-@celery_app.task(
-    name="media.process_suno_audio_job",
-    max_retries=0,
-    soft_time_limit=600,
-    time_limit=720,
-)
-def process_suno_audio_job_task(job_id: str) -> dict:
-    """Run a durable Suno Catalog job without Celery-level retries."""
-    try:
-        _run_async(process_suno_audio_job(job_id))
-        return {"ok": True, "job_id": job_id}
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("media.process_suno_audio_job crashed for %s: %s", job_id, exc)
         return {"ok": False, "job_id": job_id, "error": _provider_exception_message(exc)}
 
 
@@ -355,7 +354,6 @@ def recover_stale_jobs_task() -> dict:
             return {
                 "ok": True,
                 "video": await recover_stale_video_jobs(),
-                "suno_audio": await recover_stale_suno_audio_jobs(),
                 "room_files": await reconcile_completed_room_media_jobs(),
             }
 
@@ -449,90 +447,7 @@ def schedule_video_job(job_id: str) -> None:
     threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
 
 
-def schedule_suno_audio_job(job_id: str) -> None:
-    """Schedule Suno work with no automatic retry of the paid submit."""
-    async def _run():
-        try:
-            await process_suno_audio_job(job_id)
-        except Exception:
-            logger.error("Suno audio job %s crashed", job_id, exc_info=True)
-
-    def _schedule_in_current_loop() -> bool:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return False
-        task = loop.create_task(_run())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-        return True
-
-    detached = _media_jobs_detached()
-    if (
-        not detached
-        and os.getenv("MANOR_SERVICE_ROLE", "").strip().lower() == "worker-heavy"
-        and _schedule_in_current_loop()
-    ):
-        return
-    try:
-        process_suno_audio_job_task.delay(job_id)
-        return
-    except Exception:
-        if detached:
-            _leave_pending_for_sweeper("Suno audio", job_id)
-            return
-        logger.warning(
-            "Celery dispatch failed for Suno audio job %s; falling back in-process",
-            job_id,
-            exc_info=True,
-        )
-    if _schedule_in_current_loop():
-        return
-
-    import threading
-    threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
-
-
 # ── Internal helpers ─────────────────────────────────────────────────────────
-
-
-async def _mark_suno_audio_job_processing(job_id: str) -> bool:
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job or job.kind != "audio" or job.model != "suno/music":
-            logger.error("Suno audio job %s was not found", job_id)
-            return False
-        if job.status in MEDIA_JOB_TERMINAL_STATUSES:
-            return False
-        params = dict(job.params or {})
-        lease_at_raw = str(params.get("worker_lease_at") or "").strip()
-        if job.status == MediaJobStatus.PROCESSING.value and lease_at_raw:
-            try:
-                lease_at = _aware_utc(datetime.fromisoformat(lease_at_raw))
-            except ValueError:
-                lease_at = None
-            if lease_at and (
-                datetime.now(timezone.utc) - lease_at
-            ).total_seconds() < SUNO_WORKER_LEASE_SECONDS:
-                return False
-        job.status = MediaJobStatus.PROCESSING.value
-        if not job.started_at:
-            job.started_at = datetime.now(timezone.utc)
-        params["worker_lease_at"] = datetime.now(timezone.utc).isoformat()
-        job.params = params
-        await db.commit()
-        return True
-
-
-async def _release_suno_worker_lease(job_id: str) -> None:
-    await _release_media_worker_lease(job_id)
 
 
 async def _release_media_worker_lease(job_id: str) -> None:
@@ -554,297 +469,6 @@ async def _release_media_worker_lease(job_id: str) -> None:
         await db.commit()
 
 
-async def _claim_suno_submit(job_id: str) -> bool:
-    """Atomically claim the one allowed paid submit for this job."""
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
-            return False
-        params = dict(job.params or {})
-        if params.get("provider_job_id"):
-            return False
-        submit_state = params.get("provider_submit_state")
-        if submit_state == "submitting":
-            raise ProviderPollTimeout("Another worker is already submitting this Suno job")
-        if submit_state != "not_started":
-            raise SunoSubmissionReconciliationRequired(
-                "Suno submission has no durable provider job id and may already have been charged; "
-                "automatic resubmission is disabled. Reconcile the job in Suno Platform."
-            )
-        params["provider_submit_state"] = "submitting"
-        params["provider_submit_started_at"] = datetime.now(timezone.utc).isoformat()
-        job.params = params
-        await db.commit()
-        return True
-
-
-async def _persist_suno_provider_job_id(job_id: str, provider_job_id: str) -> None:
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job:
-            raise RuntimeError("Suno audio job disappeared after provider submission")
-        params = dict(job.params or {})
-        params["provider_job_id"] = provider_job_id
-        params["provider_submit_state"] = "accepted"
-        params["provider_submit_completed_at"] = datetime.now(timezone.utc).isoformat()
-        job.params = params
-        await db.commit()
-
-
-async def _persist_suno_artifact_result(job_id: str, result: dict[str, Any]) -> None:
-    """Save the durable artifact receipt before strict billing settlement."""
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job:
-            raise RuntimeError("Suno audio job disappeared after artifact projection")
-        params = dict(job.params or {})
-        params["artifact_result"] = dict(result)
-        params["artifact_projected_at"] = datetime.now(timezone.utc).isoformat()
-        job.params = params
-        await db.commit()
-
-
-async def _load_suno_audio_job(job_id: str):
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    async with async_session() as db:
-        return (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id)
-        )).scalar_one_or_none()
-
-
-async def _call_suno_audio_api(job_id: str) -> dict[str, Any]:
-    from packages.core.ai.mcp import suno
-    from packages.core.ai.runtime import runtime_resolve_suno_audio_credentials
-
-    job = await _load_suno_audio_job(job_id)
-    if not job:
-        raise RuntimeError("Suno audio job not found")
-    credentials = await runtime_resolve_suno_audio_credentials(
-        user_id=job.user_id or "",
-        entity_id=job.entity_id,
-        byok=bool(job.byok),
-    )
-    if not credentials.api_key:
-        raise RuntimeError("No Suno API key is available for this stored job route")
-    if bool(credentials.is_byok) != bool(job.byok):
-        raise RuntimeError("The stored Suno billing route no longer has its matching credential")
-
-    params = dict(job.params or {})
-    artifact_result = params.get("artifact_result")
-    if isinstance(artifact_result, dict) and artifact_result.get("document_id"):
-        return dict(artifact_result)
-    provider_job_id = str(params.get("provider_job_id") or "").strip()
-    if not provider_job_id:
-        claimed = await _claim_suno_submit(job_id)
-        if not claimed:
-            job = await _load_suno_audio_job(job_id)
-            provider_job_id = str((job.params or {}).get("provider_job_id") or "").strip() if job else ""
-        if not provider_job_id:
-            try:
-                response = await suno.submit_music_generation(
-                    api_key=credentials.api_key,
-                    description=None if params.get("lyrics") or params.get("style") else job.prompt,
-                    lyrics=params.get("lyrics") or None,
-                    style=params.get("style") or None,
-                    title=params.get("title") or None,
-                    instrumental=bool(params.get("instrumental")),
-                )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500 and exc.response.status_code != 429:
-                    raise
-                raise SunoSubmissionReconciliationRequired(
-                    "Suno submission returned an uncertain provider error without a durable "
-                    "job id; automatic resubmission is disabled. Reconcile it in Suno Platform."
-                ) from exc
-            except httpx.RequestError as exc:
-                raise SunoSubmissionReconciliationRequired(
-                    "Suno submission ended without a durable provider job id and may already "
-                    "have been charged; automatic resubmission is disabled. Reconcile it in Suno Platform."
-                ) from exc
-            provider_job_id = suno.generation_id(response)
-            if not provider_job_id:
-                raise SunoSubmissionReconciliationRequired(
-                    "Suno accepted the submission response without a usable provider job id; "
-                    "automatic resubmission is disabled. Reconcile it in Suno Platform."
-                )
-            await _persist_suno_provider_job_id(job_id, provider_job_id)
-
-    deadline = time.monotonic() + 210.0
-    while time.monotonic() < deadline:
-        try:
-            response = await suno.fetch_generation(
-                api_key=credentials.api_key,
-                generation_id=provider_job_id,
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderPollTimeout("Suno status check is temporarily unavailable") from exc
-        status = suno.generation_status(response)
-        if status == "failed":
-            raise RuntimeError(suno.generation_error(response))
-        audio_url = suno.generation_audio_url(response)
-        if status == "completed" and audio_url:
-            try:
-                audio_bytes, audio_format = await _download_suno_audio(audio_url)
-                if job.room_agent_run_id:
-                    from packages.core.ai.tools.extended_tools import (
-                        _audio_format_to_ext, _audio_format_to_mime,
-                    )
-                    from packages.core.services.room_generated_files import store_room_media_bytes
-
-                    document_id = await store_room_media_bytes(
-                        job_id=job.id, content=audio_bytes,
-                        extension=_audio_format_to_ext(audio_format),
-                        mime_type=_audio_format_to_mime(audio_format),
-                    )
-                    result_url = f"group-document:{document_id}"
-                else:
-                    from packages.core.ai.tools.extended_tools import (
-                        _fs_path_from_result_url,
-                        _save_generated_audio_bytes,
-                    )
-
-                    result_url = await _save_generated_audio_bytes(
-                        entity_id=job.entity_id,
-                        user_id=job.user_id or "",
-                        prompt=job.prompt,
-                        model=job.model or "suno/music",
-                        purpose="music",
-                        audio_bytes=audio_bytes,
-                        audio_format=audio_format,
-                        is_byok=bool(job.byok),
-                        output_name=str(params.get("output_name") or ""),
-                        workspace_id=params.get("workspace_id") or None,
-                        task_id=params.get("task_id") or None,
-                        agent_id=job.agent_id,
-                        conversation_id=job.conversation_id,
-                        bill_media=False,
-                    )
-                    fs_path = _fs_path_from_result_url(result_url, job.entity_id)
-                    document_id = await _suno_result_document_id(job.entity_id, fs_path)
-                if not document_id:
-                    raise RuntimeError("Knowledge projection did not return a document id")
-                result = {
-                    "result_url": result_url,
-                    "source_url": audio_url,
-                    "file_size": len(audio_bytes),
-                    "document_id": document_id,
-                }
-                await _persist_suno_artifact_result(job_id, result)
-                return result
-            except ProviderPollTimeout:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise ProviderPollTimeout(
-                    "Suno completed, but durable audio projection must be retried"
-                ) from exc
-        await asyncio.sleep(5.0)
-    raise ProviderPollTimeout("Suno generation is still pending after the active poll window")
-
-
-async def _download_suno_audio(audio_url: str) -> tuple[bytes, str]:
-    """Download a bounded public HTTPS audio result with DNS pinning."""
-    from packages.core.services.dashboard_http import (
-        create_public_https_transport,
-        resolve_public_https_target,
-    )
-
-    current_url = audio_url
-    max_bytes = 100 * 1024 * 1024
-    for redirect_index in range(4):
-        target = await resolve_public_https_target(current_url)
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=15.0),
-            follow_redirects=False,
-            trust_env=False,
-            transport=create_public_https_transport(target),
-            headers={"Accept": "audio/*,application/octet-stream"},
-        ) as client:
-            async with client.stream("GET", target.url) as response:
-                if response.is_redirect:
-                    if redirect_index >= 3 or not response.headers.get("location"):
-                        raise RuntimeError("Suno audio URL redirected too many times")
-                    current_url = urljoin(current_url, response.headers["location"])
-                    continue
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                if content_type and not (
-                    content_type.startswith("audio/")
-                    or content_type == "application/octet-stream"
-                ):
-                    raise RuntimeError("Suno result did not return audio content")
-                declared_size = int(response.headers.get("content-length") or 0)
-                if declared_size > max_bytes:
-                    raise RuntimeError("Suno audio result exceeds 100 MB")
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes(256 * 1024):
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise RuntimeError("Suno audio result exceeds 100 MB")
-                    chunks.append(chunk)
-                if total <= 0:
-                    raise RuntimeError("Suno returned an empty audio result")
-                suffix = os.path.splitext(urlsplit(current_url).path)[1].lower().lstrip(".")
-                by_mime = {
-                    "audio/mpeg": "mp3",
-                    "audio/mp3": "mp3",
-                    "audio/wav": "wav",
-                    "audio/x-wav": "wav",
-                    "audio/flac": "flac",
-                    "audio/ogg": "ogg",
-                    "audio/aac": "aac",
-                    "audio/opus": "opus",
-                }
-                audio_format = by_mime.get(content_type) or (
-                    suffix if suffix in {"mp3", "wav", "flac", "ogg", "aac", "opus"} else "mp3"
-                )
-                return b"".join(chunks), audio_format
-    raise RuntimeError("Suno audio URL could not be resolved")
-
-
-async def _suno_result_document_id(entity_id: str, fs_path: str | None) -> str | None:
-    if not fs_path:
-        return None
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.document import Document
-
-    async with async_session() as db:
-        return (await db.execute(
-            select(Document.id).where(
-                Document.entity_id == entity_id,
-                Document.fs_path == fs_path,
-                Document.is_trashed == False,  # noqa: E712
-            ).limit(1)
-        )).scalar_one_or_none()
-
-
 async def _wake_parked_task(db, job) -> None:
     """Wake a Task agent loop parked on this job, in the job's own transaction.
 
@@ -862,94 +486,37 @@ async def _wake_parked_task(db, job) -> None:
         logger.warning("Media job %s could not wake its parked Task", job.id, exc_info=True)
 
 
-async def _finalize_suno_audio_failure(
-    job_id: str,
-    error: str,
-    *,
-    release_reservation: bool,
-) -> None:
-    from sqlalchemy import select
+def _job_key_scope(job):
+    """Resolve a media job's keys and models as the run that started it did.
 
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
+    The tool picked them under its run's billing context: during a client
+    delivery trial, the provider's. The worker runs outside that context, so
+    it binds one for the job's Workspace and pinned payer, which the model
+    resolver reads.
+    """
+    from packages.core.ai.runtime import runtime_llm_billing_context
 
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
-            return
-        job.status = MediaJobStatus.FAILED.value
-        job.error = error[:1000]
-        job.completed_at = datetime.now(timezone.utc)
-        params = dict(job.params or {})
-        params["provider_poll_status"] = (
-            "reconciliation_required" if not release_reservation else "failed"
-        )
-        job.params = params
-        if release_reservation and not job.byok:
-            from packages.core.services.credit_reservations import release_reservation_by_source
-
-            await release_reservation_by_source(
-                db,
-                source_kind="media_job",
-                source_id=job.id,
-                reason=job.error,
-            )
-        await _wake_parked_task(db, job)
-        await db.commit()
+    params = job.params or {}
+    return runtime_llm_billing_context(
+        job.entity_id,
+        user_id=job.user_id,
+        workspace_id=str(params.get("workspace_id") or "") or None,
+        payer_entity_id=str(params.get("payer_entity_id") or "") or None,
+    )
 
 
-async def _finalize_suno_audio_success(job_id: str, result: dict[str, Any]) -> None:
-    from sqlalchemy import select
+async def _media_job_payer(db, job) -> str | None:
+    """The entity a media job's charge goes to: the one its credits are held against.
 
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
+    The payer is pinned when the job is reserved (a trial's provider pays for
+    a job started during the trial even if it finishes after delivery).
+    ``params.payer_entity_id`` keeps that pin when the reservation row is
+    gone; with neither, the ledger resolves the Workspace's current payer.
+    """
+    from packages.core.services.credit_reservations import reservation_payer_by_source
 
-    async with async_session() as db:
-        job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
-        )).scalar_one_or_none()
-        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
-            return
-        if not job.byok:
-            from packages.core.services.credit_reservations import consume_reservation_by_source
-            from packages.core.services.usage_service import record_direct_credit_usage
-
-            credits = int(job.credits or 0)
-            await record_direct_credit_usage(
-                db,
-                job.entity_id,
-                credits=credits,
-                kind="audio",
-                model=job.model or "suno/music",
-                operation_id=job.id,
-                workspace_id=str((job.params or {}).get("workspace_id") or "") or None,
-                user_id=job.user_id,
-                agent_id=job.agent_id,
-                conversation_id=job.conversation_id,
-                cost_usd=float(job.cost_usd or 0),
-            )
-            reservation = await consume_reservation_by_source(
-                db,
-                source_kind="media_job",
-                source_id=job.id,
-                consumed_credits=credits,
-            )
-            if reservation is None:
-                raise RuntimeError("Suno credit reservation is missing")
-        job.status = MediaJobStatus.COMPLETED.value
-        job.result_url = str(result.get("result_url") or "")
-        job.source_url = str(result.get("source_url") or "")
-        job.file_size = int(result.get("file_size") or 0)
-        job.completed_at = datetime.now(timezone.utc)
-        params = dict(job.params or {})
-        params["provider_poll_status"] = "completed"
-        params["result_document_id"] = result.get("document_id")
-        job.params = params
-        await _wake_parked_task(db, job)
-        await db.commit()
-    await _project_group_media_if_ready(job_id)
+    payer = await reservation_payer_by_source(db, source_kind="media_job", source_id=job.id)
+    return payer or str((job.params or {}).get("payer_entity_id") or "") or None
 
 
 async def _project_group_media_if_ready(job_id: str) -> None:
@@ -977,6 +544,63 @@ def _video_worker_lease_live(params: dict | None, now: datetime | None = None) -
     if lease_at is None:
         return False
     return ((now or datetime.now(timezone.utc)) - lease_at).total_seconds() < VIDEO_WORKER_LEASE_SECONDS
+
+
+def _video_progress(phase: str) -> dict[str, str]:
+    """The ``params.progress`` value for a video job phase.
+
+    Phases run submitting → generating → saving → done (or failed); a job
+    with no progress yet is queued. Viewers show them as the job's steps.
+    """
+    return {"phase": phase, "at": datetime.now(timezone.utc).isoformat()}
+
+
+async def _broadcast_video_progress(
+    job_id: str, entity_id: str, workspace_id: str | None, phase: str,
+) -> None:
+    """Tell open viewers a video job moved to another phase. Best effort."""
+    from packages.core.services.realtime import broadcast_media_job_update
+
+    try:
+        await broadcast_media_job_update(
+            entity_id,
+            {"id": job_id, "job_id": job_id, "status": "processing", "progress": _video_progress(phase)},
+            workspace_id=workspace_id,
+        )
+    except Exception:
+        logger.debug("Video job %s progress broadcast failed", job_id, exc_info=True)
+
+
+async def _record_video_progress(job_id: str, phase: str) -> None:
+    """Merge one phase into a video job's params without rewriting the rest."""
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+    from sqlalchemy import func, literal, update
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    try:
+        async with async_session() as db:
+            row = (await db.execute(
+                update(MediaJob)
+                .where(MediaJob.id == job_id)
+                .values(params=func.coalesce(MediaJob.params, literal({}, JSONB)).op("||")(
+                    literal({"progress": _video_progress(phase)}, JSONB)
+                ))
+                .returning(MediaJob.entity_id, MediaJob.params["workspace_id"].astext)
+            )).first()
+            await db.commit()
+    except Exception:
+        logger.warning("Failed to record %s progress for video job %s", phase, job_id, exc_info=True)
+        return
+    if row:
+        await _broadcast_video_progress(job_id, row[0], row[1] or None, phase)
+
+
+async def _download_and_save_with_progress(
+    video_url: str, prompt: str, model: str, job_id: str, *args: Any, **kwargs: Any,
+) -> dict:
+    await _record_video_progress(job_id, "saving")
+    return await _download_and_save(video_url, prompt, model, job_id, *args, **kwargs)
 
 
 async def _mark_video_job_processing(job_id: str) -> bool:
@@ -1009,8 +633,16 @@ async def _mark_video_job_processing(job_id: str) -> bool:
         if not job.started_at:
             job.started_at = datetime.now(timezone.utc)
         params["worker_lease_at"] = datetime.now(timezone.utc).isoformat()
+        # A recovery delivery resumes polling; keep the phase it reached.
+        submitting = not params.get("provider_poll")
+        if submitting:
+            params["progress"] = _video_progress("submitting")
         job.params = params
         await db.commit()
+        if submitting:
+            await _broadcast_video_progress(
+                job.id, job.entity_id, params.get("workspace_id"), "submitting",
+            )
         return True
 
 
@@ -1038,6 +670,7 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
             params["provider_poll_status"] = "failed"
         else:
             job.status = MediaJobStatus.COMPLETED.value
+            job.error = None
             job.result_url = result.get("result_url")
             job.source_url = result.get("source_url")
             job.file_size = result.get("file_size")
@@ -1064,6 +697,9 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
             logger.warning("Video job %s reservation settlement failed", job.id, exc_info=True)
 
         params["provider_poll_completed_at"] = datetime.now(timezone.utc).isoformat()
+        params["progress"] = _video_progress(
+            "done" if job.status == MediaJobStatus.COMPLETED.value else "failed"
+        )
         job.params = params
         job.completed_at = datetime.now(timezone.utc)
         await _wake_parked_task(db, job)
@@ -1115,10 +751,14 @@ async def _remember_provider_poll(
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
             params["provider_poll_status"] = "pending"
+            params["progress"] = _video_progress("generating")
             job.params = params
             await db.commit()
+            entity_id, workspace_id = job.entity_id, params.get("workspace_id")
     except Exception:
         logger.warning("Failed to persist provider poll state for video job %s", job_id, exc_info=True)
+        return
+    await _broadcast_video_progress(job_id, entity_id, workspace_id, "generating")
 
 
 def _aware_utc(value: datetime | None) -> datetime | None:
@@ -1290,80 +930,6 @@ async def recover_stale_video_jobs(
     return stats
 
 
-async def recover_stale_suno_audio_jobs(
-    *,
-    stale_after_seconds: int = MEDIA_JOB_STALE_SECONDS,
-    max_processing_seconds: int = MEDIA_JOB_MAX_PROCESSING_SECONDS,
-    orphan_grace_seconds: int = MEDIA_JOB_ORPHAN_GRACE_SECONDS,
-    limit: int = 20,
-) -> dict[str, Any]:
-    """Requeue safe Suno polling while refusing ambiguous paid resubmits."""
-    from sqlalchemy import or_, select
-
-    from packages.core.database import async_session
-    from packages.core.models.media_job import MediaJob
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(seconds=stale_after_seconds)
-    stats = {
-        "checked": 0,
-        "requeued": 0,
-        "reconciliation_required": 0,
-    }
-    async with async_session() as db:
-        jobs = (await db.execute(
-            select(MediaJob)
-            .where(
-                MediaJob.kind == "audio",
-                MediaJob.model == "suno/music",
-                MediaJob.status.in_([
-                    MediaJobStatus.PENDING.value,
-                    MediaJobStatus.PROCESSING.value,
-                ]),
-                or_(MediaJob.started_at.is_(None), MediaJob.started_at <= cutoff),
-            )
-            .order_by(MediaJob.created_at.asc())
-            .limit(limit)
-        )).scalars().all()
-
-    for job in jobs:
-        stats["checked"] += 1
-        params = dict(job.params or {})
-        provider_job_id = str(params.get("provider_job_id") or "").strip()
-        submit_state = str(params.get("provider_submit_state") or "not_started")
-        age_seconds = _job_age_seconds(job)
-        if provider_job_id and age_seconds >= max_processing_seconds:
-            await _finalize_suno_audio_failure(
-                job.id,
-                (
-                    f"Suno generation remained unresolved for {int(age_seconds)}s after "
-                    "submission. The provider job was not replayed; reconcile it in Suno Platform."
-                ),
-                release_reservation=False,
-            )
-            stats["reconciliation_required"] += 1
-            continue
-        if provider_job_id or submit_state == "not_started":
-            try:
-                process_suno_audio_job_task.delay(job.id)
-                stats["requeued"] += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not requeue Suno audio job %s: %s", job.id, exc)
-            continue
-        if submit_state == "submitting" and age_seconds >= orphan_grace_seconds:
-            await _finalize_suno_audio_failure(
-                job.id,
-                (
-                    "Suno submission stopped before a provider job id was saved and may "
-                    "already have been charged; automatic resubmission is disabled. "
-                    "Reconcile it in Suno Platform."
-                ),
-                release_reservation=False,
-            )
-            stats["reconciliation_required"] += 1
-    return stats
-
-
 async def _resume_video_job_from_provider(job) -> dict[str, Any]:
     """Poll a stranded provider job once and download the result if complete."""
     from packages.core.contracts.media_job_output import media_job_output_kwargs
@@ -1380,13 +946,28 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
     )
 
     stored_provider = str(poll_state.get("provider") or "").lower()
-    credentials = await runtime_resolve_video_recovery_credentials(
-        user_id=job.user_id or "",
-        entity_id=job.entity_id,
-        model=model,
-        stored_provider=stored_provider,
-    )
+    async with _job_key_scope(job):
+        credentials = await runtime_resolve_video_recovery_credentials(
+            user_id=job.user_id or "",
+            entity_id=job.entity_id,
+            model=model,
+            stored_provider=stored_provider,
+        )
     api_key = credentials.api_key
+    if model.startswith("xai/") or stored_provider == "xai":
+        from packages.core.services.xai_video_transport import (
+            XAI_BINDING_KEY, XaiTransportError, require_xai_job_binding, xai_poll_url,
+        )
+
+        try:
+            bound_base = require_xai_job_binding(
+                params.get(XAI_BINDING_KEY), entity_id=job.entity_id, model=model,
+                base_url=credentials.base_url_override, api_key=api_key, is_byok=credentials.is_byok,
+            )
+            if stored_provider != "xai" or poll_url != xai_poll_url(bound_base, str(poll_state.get("generation_id") or "")):
+                raise XaiTransportError("Grok recovery target does not match the saved job. Create a new video job.")
+        except XaiTransportError as exc:
+            return {"error": str(exc)}
     if not api_key:
         return {"error": "No API key configured to recover video generation"}
 
@@ -1416,7 +997,9 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
     else:
         provider = credentials.provider
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        download_headers = None
+        # xAI-compatible APIs serve the MP4 from an authenticated content
+        # endpoint on the same host (see XaiVideoAdapter).
+        download_headers = {"Authorization": headers["Authorization"]} if provider == "xai" else None
 
     poll_result = await _check_provider_poll_once(
         poll_url,
@@ -1487,7 +1070,7 @@ def _video_adapter_runtime(
         ),
         poll_volcengine_task=_poll_volcengine_task,
         poll_generic_video_task=_poll_generic_video_task,
-        download_and_save=_download_and_save,
+        download_and_save=_download_and_save_with_progress,
         extract_video_url=_extract_video_url,
         extract_task_id=_extract_task_id,
         provider_error_message=_provider_error_message,
@@ -1508,29 +1091,54 @@ async def _check_provider_poll_once(
     """Read one provider poll endpoint and normalize pending/success/failure."""
     request_url = _openrouter_api_url(poll_url, base_url) if provider == "openrouter" else poll_url
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            if provider == "vercel":
-                try:
-                    operation = json.loads(generation_id)
-                except (TypeError, ValueError):
-                    return {"error": "Vercel video recovery state is invalid"}
-                resp = await client.post(
-                    request_url,
-                    headers=headers,
-                    json={"operation": operation},
-                )
-            else:
-                resp = await client.get(request_url, headers=headers)
+        if provider == "xai":
+            from packages.core.services.xai_video_transport import xai_request
+
+            resp = await xai_request("GET", request_url, headers=headers)
+        else:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if provider == "vercel":
+                    try:
+                        operation = json.loads(generation_id)
+                    except (TypeError, ValueError):
+                        return {"error": "Vercel video recovery state is invalid"}
+                    resp = await client.post(
+                        request_url,
+                        headers=headers,
+                        json={"operation": operation},
+                    )
+                else:
+                    resp = await client.get(request_url, headers=headers)
         try:
             data = resp.json()
         except Exception:
-            data = {"message": resp.text[:500]}
+            data = {} if provider == "xai" else {"message": resp.text[:500]}
     except Exception as exc:
+        if provider == "xai":
+            return {"error": "Grok recovery request failed or its target is not allowed. Create a new video job."}
         logger.debug("Video provider poll failed once: %s", exc)
         return {"status": "pending"}
 
+    if provider == "xai" and resp.status_code in _XAI_POLL_PENDING_HTTP_STATUSES:
+        return {"status": "pending"}
+
+    if provider == "xai" and (resp.status_code >= 400 or not isinstance(data, dict)):
+        return {"error": "Grok provider poll failed. Check the relay and API key."}
+
     if resp.status_code >= 400:
         return {"error": f"Provider poll failed ({resp.status_code}): {_provider_error_message(data)}"}
+
+    if provider == "xai":
+        nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        provider_status = coerce_provider_media_status(data.get("status") or nested.get("status") or result.get("status"))
+        if provider_status == MediaJobStatus.COMPLETED:
+            return {"video_url": request_url.rstrip("/") + "/content"}
+        if provider_status == MediaJobStatus.FAILED:
+            return {"error": "Grok video generation failed."}
+        # A missing status (even with a URL) is not completion. Never pass a
+        # response URL to the credential-bearing content downloader.
+        return {"status": "pending"}
 
     video_url = (
         video_adapters._vercel_video_result_url(data)
@@ -1581,6 +1189,7 @@ async def _bill_usage(job) -> bool:
                 source="tool:video",
                 byok=job.byok,
                 strict=True,
+                payer_entity_id=await _media_job_payer(db, job),
             )
             await db.commit()
             return bool(recorded)
@@ -1625,6 +1234,11 @@ async def _release_video_reservation(job_id: str, reason: str) -> None:
 
 async def _push_notification(job) -> None:
     """Notify user of video job completion via unified dispatcher."""
+    if job.status == MediaJobStatus.COMPLETED and (job.params or {}).get("workflow_run_id"):
+        # A Workflow run reports its own outcome. Each clip finishing quietly
+        # keeps mid-run progress out of the user's notifications; failures
+        # still notify, since a stuck run may have no other signal.
+        return
     from packages.core.services.notify import notify
 
     prompt_preview = job.prompt[:50] if job.prompt else "Video"
@@ -1685,17 +1299,30 @@ async def _call_video_api(job_id: str) -> dict:
     from packages.core.ai.runtime import (
         runtime_resolve_video_generation_credentials,
     )
-    credentials = await runtime_resolve_video_generation_credentials(
-        user_id=job.user_id or "",
-        entity_id=job.entity_id,
-        model=model,
-        stored_adapter_name=stored_adapter_name,
-        openrouter_adapter_name=video_adapters.OpenRouterVideoAdapter.adapter_name,
-        vercel_adapter_name=video_adapters.VercelGatewayVideoAdapter.adapter_name,
-    )
+    async with _job_key_scope(job):
+        credentials = await runtime_resolve_video_generation_credentials(
+            user_id=job.user_id or "",
+            entity_id=job.entity_id,
+            model=model,
+            stored_adapter_name=stored_adapter_name,
+            openrouter_adapter_name=video_adapters.OpenRouterVideoAdapter.adapter_name,
+            vercel_adapter_name=video_adapters.VercelGatewayVideoAdapter.adapter_name,
+        )
     provider = credentials.provider
     api_key = credentials.api_key
     base_url_override = credentials.base_url_override
+    if model.startswith("xai/") or stored_adapter_name == "xai":
+        from packages.core.services.xai_video_transport import XAI_BINDING_KEY, XaiTransportError, require_xai_job_binding
+
+        try:
+            require_xai_job_binding(
+                params.get(XAI_BINDING_KEY), entity_id=job.entity_id, model=model,
+                base_url=base_url_override, api_key=api_key, is_byok=credentials.is_byok,
+            )
+            if stored_adapter_name != "xai":
+                raise XaiTransportError("Grok video requires the saved BYOK adapter. Create a new video job.")
+        except XaiTransportError as exc:
+            return {"error": str(exc)}
     if not api_key:
         return {"error": "No API key configured for video generation"}
 
@@ -1740,14 +1367,21 @@ async def _call_video_api(job_id: str) -> dict:
         and api_key.startswith("sk-or-")
     ):
         return {"error": f"Stored {adapter.adapter_name} video route requires a native provider API key."}
-    return await adapter.submit(
-        job,
-        api_key,
-        base_url_override,
-        _video_adapter_runtime(
-            openrouter_base_url=base_url_override if provider == "openrouter" else None,
-        ),
+    runtime = _video_adapter_runtime(
+        openrouter_base_url=base_url_override if provider == "openrouter" else None,
     )
+    for attempt in range(VIDEO_SUBMIT_ATTEMPTS):
+        try:
+            return await adapter.submit(job, api_key, base_url_override, runtime)
+        except video_adapters.ProviderSubmitUnavailable as exc:
+            # The provider turned the job away without accepting it; a short
+            # outage or rate limit should not end the job (or the run using it).
+            if attempt + 1 >= VIDEO_SUBMIT_ATTEMPTS:
+                return {"error": str(exc), "submit_refused": True}
+            delay = VIDEO_SUBMIT_RETRY_DELAY_SECONDS * (3 ** attempt)
+            logger.info("Video job %s submit refused (%s); retrying in %.0fs", job.id, exc, delay)
+            await asyncio.sleep(delay)
+    return {"error": "Video provider did not accept the job."}
 
 
 def _media_provider_model(model: str) -> str:
@@ -1984,17 +1618,29 @@ async def _poll_volcengine_task(poll_url: str, headers: dict, *, timeout: float 
     raise ProviderPollTimeout(f"Seedance generation still pending after {timeout}s")
 
 
-async def _poll_generic_video_task(poll_url: str, headers: dict, *, timeout: float = 420.0) -> str:
+async def _poll_generic_video_task(poll_url: str, headers: dict, *, timeout: float = 420.0, provider: str = "") -> str:
     deadline = time.monotonic() + timeout
     interval = 5.0
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with AsyncExitStack() as stack:
+        client = None if provider == "xai" else await stack.enter_async_context(httpx.AsyncClient(timeout=30.0))
         while time.monotonic() < deadline:
             await asyncio.sleep(interval)
             interval = min(interval * 1.2, 15.0)
             try:
-                resp = await client.get(poll_url, headers=headers)
+                if provider == "xai":
+                    from packages.core.services.xai_video_transport import xai_request
+
+                    resp = await xai_request("GET", poll_url, headers=headers)
+                    if resp.status_code in _XAI_POLL_PENDING_HTTP_STATUSES:
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError("Grok video polling failed. Check the relay and API key.")
+                else:
+                    resp = await client.get(poll_url, headers=headers)
                 data = resp.json()
             except Exception as exc:
+                if provider == "xai":
+                    raise RuntimeError("Grok video polling failed or its target is not allowed.") from None
                 logger.debug("Video poll error: %s", exc)
                 continue
             status = str(data.get("status") or (data.get("data") or {}).get("status") or "").lower()
@@ -2002,6 +1648,8 @@ async def _poll_generic_video_task(poll_url: str, headers: dict, *, timeout: flo
             if provider_status == MediaJobStatus.COMPLETED:
                 return _extract_video_url(data)
             if provider_status == MediaJobStatus.FAILED:
+                if provider == "xai":
+                    raise RuntimeError("Grok video generation failed.")
                 raise RuntimeError(f"Video generation failed: {_provider_error_message(data)}")
     raise ProviderPollTimeout(f"Video generation still pending after {timeout}s")
 
@@ -2057,11 +1705,20 @@ async def _download_and_save(
             raise RuntimeError("Provider returned invalid base64 video data") from exc
     else:
         dl_headers = auth_headers or {}
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            resp = await client.get(video_url, headers=dl_headers)
-            resp.raise_for_status()
+        if str(model).startswith("xai/"):
+            from packages.core.services.xai_video_transport import XAI_MAX_VIDEO_BYTES, xai_request
+
+            resp = await xai_request("GET", video_url, headers=dl_headers, timeout=120.0, max_bytes=XAI_MAX_VIDEO_BYTES)
+            if resp.status_code >= 400:
+                raise RuntimeError("Grok video download failed. Check the relay and API key.")
             video_bytes = resp.content
             content_type = resp.headers.get("content-type", "")
+        else:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+                resp = await client.get(video_url, headers=dl_headers)
+                resp.raise_for_status()
+                video_bytes = resp.content
+                content_type = resp.headers.get("content-type", "")
     if not video_bytes:
         raise RuntimeError("Provider returned an empty video file")
 
@@ -2097,6 +1754,7 @@ async def _download_and_save(
         resolve_workspace_artifact_base_dir,
         scope_workspace_artifact_path,
         workspace_artifact_default_dir,
+        workspace_storage_root,
         workspace_task_artifact_dir,
     )
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
@@ -2109,15 +1767,20 @@ async def _download_and_save(
         from packages.core.ai.runtime.authorization_receipts import RuntimeToolAuthorizationWriteError
 
         plan = prepared_output.plan
+        # A heavy worker runs this job in its own loop, inside the Workflow's
+        # artifact scope, so the resolved base may be that run's archive. The
+        # plan is checked against the Workspace home and its archives instead.
+        home_dir = workspace_storage_root(workspace_base_dir) or workspace_base_dir
         allowed_bases = {
             workspace_base_dir,
-            workspace_task_artifact_dir(workspace_base_dir, task_id),
+            home_dir,
+            workspace_task_artifact_dir(home_dir, task_id),
         }
-        archive_suffix = plan.artifact_base_dir.removeprefix(f"{workspace_base_dir}/")
+        archive_suffix = plan.artifact_base_dir.removeprefix(f"{home_dir}/")
         archive_parts = archive_suffix.split("/")
         if (
-            workspace_base_dir
-            and plan.artifact_base_dir.startswith(f"{workspace_base_dir}/")
+            home_dir
+            and plan.artifact_base_dir.startswith(f"{home_dir}/")
             and len(archive_parts) == 2
             and archive_parts[0] in {"workflow", "runs"}
             and archive_parts[1] not in {"", ".", ".."}

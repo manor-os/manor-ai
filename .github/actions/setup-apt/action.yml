@@ -1,0 +1,17 @@
+name: Configure CI package downloads
+description: Avoid the stalled Azure Ubuntu mirror and bound package download retries.
+runs:
+  using: composite
+  steps:
+    - name: Configure Ubuntu mirror and download timeouts
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Hosted images also reference Azure through mirror+file lists.
+        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt /etc/apt/apt-security-mirrors.txt; do
+          if [ -f "$source" ]; then
+            sudo sed -i -E 's#https?://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$source"
+          fi
+        done
+        printf '%s\n' 'Acquire::Retries "3";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+          | sudo tee /etc/apt/apt.conf.d/80-ci-network >/dev/null

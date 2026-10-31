@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,18 @@ from packages.core.database_runtime import (
     AdmissionPolicy, DatabaseAdmission, DatabaseBusyError, DatabaseEngineKind, DatabaseFailureKind,
     configure_database_runtime, database_request_id, release_read_transaction,
 )
+
+
+def _another_request(factory, value=3):
+    """Read as an unrelated caller: a task outside the current permit holder.
+
+    A Session opened by the holder itself (or a task it starts) is reentrant.
+    """
+    async def read():
+        async with factory() as db:
+            return await db.scalar(select(literal(value)))
+
+    return asyncio.create_task(read(), context=contextvars.Context())
 
 
 def runtime_settings(url, **overrides):
@@ -160,9 +173,12 @@ async def test_default_direct_worker_allows_nested_sessions(_test_database_guard
             async with inner_factory() as inner:
                 assert await inner.scalar(select(literal(2))) == 2
                 assert outer.in_transaction()
-                assert outer_runtime.snapshot()["active_transactions"] == 2
-                assert inner_runtime.snapshot()["active_transactions"] == 2
+                # The caller counts once; its own nested Session is reentrant.
+                for runtime in (outer_runtime, inner_runtime):
+                    assert runtime.snapshot()["active_transactions"] == 1
+                    assert runtime.snapshot()["active_nested_transactions"] == 1
             assert outer_runtime.snapshot()["active_transactions"] == 1
+            assert outer_runtime.snapshot()["active_nested_transactions"] == 0
         snapshot = outer_runtime.snapshot()
         assert snapshot["active_transactions"] == snapshot["waiting"] == 0
         assert snapshot["wait_timeouts"] == 0
@@ -271,7 +287,9 @@ async def test_thousand_waiting_clients_do_not_pin_connections_and_burst_is_boun
     runtime = engine.sync_engine._manor_database_runtime
     paused = asyncio.Event()
     ready = asyncio.Event()
-    initial_reads = asyncio.Semaphore(8)
+    # Warm-up must not queue behind slow connection startup; overload is
+    # exercised only after all clients reach the external-work barrier.
+    initial_reads = asyncio.Semaphore(runtime.policy.limit)
     readers = peak_checkout = 0
 
     def observe_checkout(*_args):
@@ -542,9 +560,8 @@ async def test_disabled_worker_does_not_consume_or_disable_application_admission
     async with worker_factory() as worker, app_factory() as app:
         assert await worker.scalar(select(literal(1))) == 1
         assert await app.scalar(select(literal(2))) == 2
-        async with app_factory() as rejected:
-            with pytest.raises(DatabaseBusyError):
-                await rejected.scalar(select(literal(3)))
+        with pytest.raises(DatabaseBusyError):
+            await _another_request(app_factory)
         assert runtime.snapshot()["active_transactions"] == 1
         assert runtime.snapshot()["wait_timeouts"] == 1
     assert runtime.snapshot()["active_transactions"] == 0
@@ -829,16 +846,10 @@ async def test_unmodified_dirty_assignment_releases_worker_heavy_admission_slot(
         row.value = "intake_release_identity"
         assert outer.sync_session.dirty
         assert not outer.sync_session.is_modified(row)
-        nested_busy = False
-        try:
-            async with factory() as nested:
-                await nested.scalar(select(literal(1)))
-        except DatabaseBusyError:
-            nested_busy = True
-        assert nested_busy
+        with pytest.raises(DatabaseBusyError):
+            await _another_request(factory, 1)
         assert await release_read_transaction(outer)
-        async with factory() as preflight:
-            assert await preflight.scalar(select(literal(2))) == 2
+        assert await _another_request(factory, 2) == 2
         await outer.scalar(select(literal(3)))
         row.value = "other_step"
         assert outer.sync_session.is_modified(row)
@@ -864,9 +875,8 @@ async def test_busy_queries_leave_probe_slot_and_recover(managed_db):
     engine, factory = managed_db
     async with factory() as holding:
         await holding.scalar(select(literal(1)))
-        async with factory() as waiting:
-            with pytest.raises(DatabaseBusyError):
-                await waiting.scalar(select(literal(2)))
+        with pytest.raises(DatabaseBusyError):
+            await _another_request(factory, 2)
         async with factory(info={"database_probe": True}) as probe:
             assert await probe.scalar(select(literal(3))) == 3
         assert engine.pool.checkedout() == 1
@@ -926,7 +936,8 @@ async def test_cancelled_queued_session_does_not_leak_admission(managed_db):
 
     async with factory() as holding:
         await holding.scalar(select(literal(1)))
-        waiting = asyncio.create_task(wait_for_connection())
+        # Another request's task, not one started by the permit holder.
+        waiting = asyncio.create_task(wait_for_connection(), context=contextvars.Context())
         try:
             async with asyncio.timeout(0.5):
                 while runtime.snapshot()["waiting"] == 0:
@@ -1009,9 +1020,8 @@ async def test_worker_factories_share_admission_within_loop(managed_db):
         assert isinstance(worker.pool, NullPool)
         async with factory() as holding:
             await holding.scalar(select(literal(1)))
-            async with database.create_session_factory(worker)() as waiting:
-                with pytest.raises(DatabaseBusyError):
-                    await waiting.scalar(select(literal(2)))
+            with pytest.raises(DatabaseBusyError):
+                await _another_request(database.create_session_factory(worker), 2)
             assert worker.sync_engine._manor_database_runtime.checkout_count == 0
         async with database.create_session_factory(worker)() as recovered:
             assert await recovered.scalar(select(literal(3))) == 3
@@ -1388,22 +1398,275 @@ async def test_a_member_opening_a_second_session_does_not_wait_on_its_own_permit
     assert not group.holders
 
 
+# -- A permit holder's own independent Sessions --------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nesting", ["same_task", "awaited_child_task", "worker_factory"])
+async def test_a_permit_holder_never_waits_on_its_own_permit(tight_engine, nesting):
+    """The workspace-draft shape: a turn holds the only permit (its draft row
+    lock) while the credit preflight or a locale cache fill opens its own
+    Session. That Session must not queue behind the caller's own permit, while
+    unrelated callers stay bounded by the gate."""
+    from conftest import TEST_DATABASE_URL
+
+    factory = tight_engine()
+    runtime = factory.kw["bind"].sync_engine._manor_database_runtime
+    inner_factory, worker = factory, None
+    if nesting == "worker_factory":
+        # create_worker_session() on the chat loop: same policy, same gate.
+        worker = database.create_database_engine(runtime_settings(TEST_DATABASE_URL, **{
+            "DATABASE_ADMISSION_LIMIT": 1, "DATABASE_MAX_WAITERS": 3,
+            "DATABASE_ADMISSION_TIMEOUT": 0.3,
+        }), kind=DatabaseEngineKind.WORKER)
+        inner_factory = database.create_session_factory(worker)
+
+    async def independent_read():
+        async with inner_factory() as db:
+            return await db.scalar(select(literal(2)))
+
+    holding = asyncio.Event()
+
+    async def unrelated_request():
+        await holding.wait()
+        async with factory() as db:
+            return await db.scalar(select(literal(3)))
+
+    # Created before the permit is taken, so it is not part of the holder.
+    other = asyncio.create_task(unrelated_request())
+    try:
+        async with factory() as outer:
+            await outer.scalar(select(literal(1)))
+            holding.set()
+            if nesting == "awaited_child_task":
+                assert await asyncio.create_task(independent_read()) == 2
+            else:
+                assert await independent_read() == 2
+            assert outer.in_transaction()
+            with pytest.raises(DatabaseBusyError):
+                await other
+            snapshot = runtime.snapshot()
+            assert snapshot["active_transactions"] == 1
+            assert snapshot["nested_admissions"] == 1
+            assert snapshot["wait_timeouts"] == 1  # only the unrelated request
+        snapshot = runtime.snapshot()
+        assert snapshot["active_transactions"] == snapshot["active_nested_transactions"] == 0
+        async with factory() as recovered:
+            assert await recovered.scalar(select(literal(4))) == 4
+    finally:
+        other.cancel()
+        await asyncio.gather(other, return_exceptions=True)
+        if worker is not None:
+            await worker.dispose()
+
+
+@pytest.mark.asyncio
+async def test_credit_preflight_inside_the_permit_holders_transaction(db_session, tight_engine, monkeypatch, caplog):
+    """Regression: staging chat (admission limit 1) failed every workspace
+    draft with credit_check_unavailable after the 2s admission wait."""
+    from decimal import Decimal
+
+    from packages.core.ai import llm_client
+    from packages.core.constants import plans
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity
+    from packages.core.models.workspace import Workspace
+
+    entity_id, workspace_id = generate_ulid(), generate_ulid()
+    db_session.add_all([
+        Entity(id=entity_id, name="Admission credit regression"),
+        Workspace(id=workspace_id, entity_id=entity_id, name="Admission credit regression",
+                  monthly_budget_usd=Decimal("1"), monthly_spent_usd=Decimal("0")),
+    ])
+    await db_session.commit()
+    factory = tight_engine()
+    monkeypatch.setattr(plans, "ai_credit_limits_enabled", lambda: False)
+    token = llm_client._billing_ctx_var.set(
+        llm_client.LLMBillingContext(entity_id=entity_id, workspace_id=workspace_id),
+    )
+    try:
+        async with factory() as turn:
+            # The draft turn's row lock keeps the only permit for the whole turn.
+            await turn.scalar(select(Workspace.id).where(Workspace.id == workspace_id).with_for_update())
+            await llm_client._preflight_credit_check(session_factory=factory)
+            await turn.commit()
+
+        # Genuine overload still fails closed, and is logged as such.
+        holding, done = asyncio.Event(), asyncio.Event()
+
+        async def other_request():
+            async with factory() as db:
+                await db.scalar(select(literal(1)))
+                holding.set()
+                await done.wait()
+
+        other = asyncio.create_task(other_request())
+        try:
+            await holding.wait()
+            with pytest.raises(llm_client.CreditCheckUnavailableError, match="credit_check_unavailable"):
+                await llm_client._preflight_credit_check(session_factory=factory)
+        finally:
+            done.set()
+            await other
+        assert "credit_check_database_busy" in caplog.text
+    finally:
+        llm_client._billing_ctx_var.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_session_permit_taken_in_a_child_task_still_belongs_to_its_caller(tight_engine):
+    """A tool run by agentic_loop in a child task may commit and re-lock the
+    caller's Session; the caller's next independent Session must still be
+    admitted as its own, not wait on the permit now held by that Session."""
+    factory = tight_engine()
+    runtime = factory.kw["bind"].sync_engine._manor_database_runtime
+    async with factory() as turn:
+        await turn.scalar(select(literal(1)))
+
+        async def tool_commits_and_relocks():
+            await turn.commit()
+            await turn.scalar(select(literal(2)))
+
+        await asyncio.ensure_future(tool_commits_and_relocks())
+        assert turn.in_transaction()
+        async with factory() as preflight:
+            assert await preflight.scalar(select(literal(3))) == 3
+        assert runtime.snapshot()["wait_timeouts"] == 0
+    assert runtime.snapshot()["active_transactions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_draft_turn_runs_model_rounds_without_holding_admission(
+    db_session, tight_engine, monkeypatch,
+):
+    """The staging draft turn: several model rounds, each preceded by the real
+    credit preflight, with tools between them that run in agentic_loop child
+    tasks. One tool (like ws_search_capabilities) commits and re-locks the
+    draft. With one chat permit, no round may wait on the turn's own draft
+    transaction, and the turn must persist its fields, messages and status."""
+    from decimal import Decimal
+    import json
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.ai import agentic_loop, llm_client
+    from packages.core.ai.tools import workspace_arch_tools
+    from packages.core.constants import plans
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity
+    from packages.core.models.workspace import Workspace
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_architect
+    from packages.core.services import workspace_draft_service as drafts
+
+    entity_id, user_id, workspace_id = generate_ulid(), generate_ulid(), generate_ulid()
+    db_session.add_all([
+        Entity(id=entity_id, name="Draft turn admission"),
+        Workspace(id=workspace_id, entity_id=entity_id, name="Budget probe",
+                  monthly_budget_usd=Decimal("1"), monthly_spent_usd=Decimal("0")),
+    ])
+    await db_session.commit()
+    factory = tight_engine()
+    runtime = factory.kw["bind"].sync_engine._manor_database_runtime
+    async with factory() as db:
+        draft_id = (await drafts.create_draft_shell(
+            db, entity_id=entity_id, user_id=user_id, initial_brief="A bakery workspace",
+        )).id
+        await db.commit()
+
+    async def capability_matcher_like(db, *, entity_id, user_id, draft_id, **_):
+        # ws_search_capabilities: release the draft during provider work,
+        # then re-lock it in the same Session (inside the tool's child task).
+        await db.commit()
+        draft = (await db.execute(
+            select(WorkspaceDraft).where(WorkspaceDraft.id == draft_id).with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one()
+        draft.fields = {**draft.fields, "capability_plan": "matched"}
+        flag_modified(draft, "fields")
+        await db.flush()
+        return json.dumps({"ok": True})
+
+    monkeypatch.setitem(workspace_arch_tools.HANDLERS, "ws_search_capabilities", capability_matcher_like)
+    held_during_rounds = []
+
+    async def model_round():
+        held_during_rounds.append(runtime.snapshot()["active_transactions"])
+        await llm_client._preflight_credit_check()  # real, DB-backed (Workspace budget)
+
+    async def loop(*, tool_executor, **_):
+        async def not_cancelled():
+            return False
+
+        for name, args in [
+            ("ws_commit_basics", {"name": "Bakery", "kind": "operations"}),
+            ("ws_search_capabilities", {}),
+            ("ws_commit_basics", {"primary_work": "Daily orders"}),
+        ]:
+            await model_round()
+            result = await agentic_loop._await_cancellable(tool_executor(name, args), not_cancelled)
+            assert json.loads(result).get("ok"), result
+        await model_round()
+        return SimpleNamespace(content="Your bakery workspace is drafted.", usage={}, rounds=4,
+                               tool_calls_made=[{}, {}, {}])
+
+    monkeypatch.setattr(workspace_architect, "runtime_execute_workspace_architect_loop", loop)
+    monkeypatch.setattr(database, "async_session", factory)
+    monkeypatch.setattr(plans, "ai_credit_limits_enabled", lambda: False)
+    token = llm_client._billing_ctx_var.set(
+        llm_client.LLMBillingContext(entity_id=entity_id, workspace_id=workspace_id),
+    )
+    try:
+        async def runner():  # workspace_drafts._stream_turn.runner
+            async with factory() as db:
+                reply, _ = await drafts.process_draft_message(
+                    db, draft_id=draft_id, entity_id=entity_id, user_id=user_id,
+                    user_message="begin", dedupe_opening=True,
+                )
+                await db.commit()
+                return reply
+
+        assert await asyncio.create_task(runner()) == "Your bakery workspace is drafted."
+    finally:
+        llm_client._billing_ctx_var.reset(token)
+    assert held_during_rounds == [0, 0, 0, 0]
+    assert runtime.snapshot()["wait_timeouts"] == 0
+    assert runtime.snapshot()["active_transactions"] == 0
+    async with factory() as db:
+        draft = await db.get(WorkspaceDraft, draft_id)
+        assert draft.fields["name"] == "Bakery"
+        assert draft.fields["primary_work"] == "Daily orders"
+        assert draft.fields["capability_plan"] == "matched"
+        assert [m["role"] for m in draft.messages] == ["assistant"]
+        assert not any(key.startswith("_architect_turn") for key in draft.fields)
+
+
 @pytest.mark.asyncio
 async def test_a_member_that_times_out_at_the_process_gate_frees_the_group(tight_engine):
     from packages.core.database_runtime import DatabaseAdmissionGroup, database_admission_group
 
     factory = tight_engine(DATABASE_ADMISSION_TIMEOUT=0.1)
     group = DatabaseAdmissionGroup(limit=1, timeout=0.3)
-    async with factory() as other_request:
-        assert await other_request.scalar(select(literal(1))) == 1  # holds the only slot
-        token = database_admission_group.set(group)
-        try:
-            with pytest.raises(DatabaseBusyError):
-                async with factory() as db:
-                    await db.scalar(select(literal(2)))
-        finally:
-            database_admission_group.reset(token)
-        await other_request.commit()
+    holding, done = asyncio.Event(), asyncio.Event()
+
+    async def other_request():
+        async with factory() as db:
+            assert await db.scalar(select(literal(1))) == 1  # holds the only slot
+            holding.set()
+            await done.wait()
+            await db.commit()
+
+    other = asyncio.create_task(other_request(), context=contextvars.Context())
+    await holding.wait()
+    token = database_admission_group.set(group)
+    try:
+        with pytest.raises(DatabaseBusyError):
+            async with factory() as db:
+                await db.scalar(select(literal(2)))
+    finally:
+        database_admission_group.reset(token)
+        done.set()
+        await other
     assert not group.holders
     token = database_admission_group.set(group)
     try:

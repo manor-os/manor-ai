@@ -61,16 +61,6 @@ def task_has_manual_execution(task: Any) -> bool:
     )
 
 
-def plan_has_manual_execution(plan: Any, task: Any = None) -> bool:
-    return _manual_receipt(getattr(plan, "dispatcher_state", None)) or bool(
-        task is not None
-        and task.id == plan.task_id
-        and task.entity_id == plan.entity_id
-        and task.workspace_id == plan.workspace_id
-        and task_has_manual_execution(task)
-    )
-
-
 def _receipt(*, user_id: str, action: str) -> dict[str, str]:
     if not user_id.strip() or not action.strip():
         raise ValueError("Manual execution requires a user and action")

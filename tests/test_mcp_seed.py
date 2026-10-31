@@ -64,11 +64,12 @@ async def test_mcp_catalog_seed_refreshes_existing_remote_endpoint(client):
     )
 
 
-async def test_mcp_catalog_seed_replaces_legacy_google_scopes(client):
+async def test_mcp_catalog_seed_replaces_legacy_reviewed_scopes(client):
     """Existing installs must display only the currently reviewed scopes."""
     import packages.core.database as db_module
 
     legacy = {
+        "tiktok": "user.info.basic,user.info.profile,user.info.stats,video.list,video.publish,video.upload",
         "gmail": "https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send",
         "google_calendar": "https://www.googleapis.com/auth/calendar",
         "google_drive": "https://www.googleapis.com/auth/drive",
@@ -91,11 +92,12 @@ async def test_mcp_catalog_seed_replaces_legacy_google_scopes(client):
         rows = (await conn.execute(text("""
             SELECT server_key, scopes
             FROM mcp_servers
-            WHERE server_key IN ('gmail', 'google_calendar', 'google_drive', 'youtube')
+            WHERE server_key IN ('gmail', 'google_calendar', 'google_drive', 'youtube', 'tiktok')
         """))).all()
 
     actual = {row.server_key: set((row.scopes or "").split(",")) for row in rows}
     assert actual == {
+        "tiktok": {"user.info.basic", "user.info.profile", "user.info.stats", "video.list", "video.publish"},
         "gmail": {"https://www.googleapis.com/auth/gmail.modify"},
         "google_calendar": {
             "https://www.googleapis.com/auth/calendar.events",

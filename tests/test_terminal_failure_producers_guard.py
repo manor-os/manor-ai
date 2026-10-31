@@ -21,8 +21,6 @@ REVIEWED_PRODUCERS = {
     "ai/runtime/skills.py": 4,
     # A nested Skill must keep an uncertain effect terminal after a crash.
     "ai/runtime/nested_agent.py": 1,
-    # A delegated child with an unsettled effect requires reconciliation.
-    "workers/coordinator_tools.py": 1,
     # Chrome local-browser paths (pairing, session, sequence, relay): the local
     # browser is the only path for these calls, so there is no alternative to offer
     "ai/runtime/chrome_sequence.py": 2,

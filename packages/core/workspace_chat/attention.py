@@ -29,7 +29,7 @@ async def workspace_attention(db, *, user: User, workspace_ids: list[str]):
 
 def _attention_payload(decisions: dict, seen: set[str]):
     # Outstanding decisions without a chat card still belong to the pending
-    # action count, but cannot be a viewable reminder in the sidebar.
+    # action count, but cannot have a personal chat read receipt.
     unseen = [decision for decision in decisions.values() if decision["messages"] and decision["key"] not in seen]
     messages = {}
     for decision in unseen:
@@ -57,14 +57,14 @@ async def mark_workspace_attention_seen(db, *, user: User, workspace_id: str, ke
     return _attention_payload(decisions[workspace_id], _seen_keys(user.preferences, workspace_id))
 
 
-async def unread_workspace_attention(db, *, user: User, workspace_id: str):
-    """List one chat reminder per canonical unread decision, without a receipt."""
+async def list_workspace_attention(db, *, user: User, workspace_id: str, unread_only: bool = True):
+    """List one chat card per canonical open decision, optionally filtering read receipts."""
     decisions = (await pending_actions_by_workspace(
         db, entity_id=user.entity_id, workspace_ids=[workspace_id],
     ))[workspace_id]
     seen = _seen_keys(user.preferences, workspace_id)
-    unseen = [d for d in decisions.values() if d['messages'] and d['key'] not in seen]
-    ids = {mid for d in unseen for mid in d['messages']}
+    visible = [d for d in decisions.values() if d['messages'] and (not unread_only or d['key'] not in seen)]
+    ids = {mid for d in visible for mid in d['messages']}
     if not ids:
         return {'items': []}
     messages = (await db.execute(select(Message).options(load_only(
@@ -75,17 +75,19 @@ async def unread_workspace_attention(db, *, user: User, workspace_id: str):
         Conversation.entity_id == user.entity_id,
     ).order_by(Message.created_at.desc(), Message.id.desc()))).scalars().all()
     items = []
-    for decision in unseen:
+    for decision in visible:
         message = next((m for m in messages if m.id in decision['messages']), None)
         if message is None:
             continue
         sources = decision['messages'][message.id]
         action, source_id = next(
             ((action, rid or message.id) for action, rid in _sources(message)
-             if (rid or message.id) in sources), ({}, message.id),
+             if (rid or message.id) in sources),
+            # A message standing in for a decision (an Agent's saved question) has no card fields.
+            (decision.get('action') or {}, next(iter(sources), message.id)),
         )
         summary = next((value.strip() for field in (
-            'title', 'prompt', 'task_title', 'summary', 'observed_problem', 'business_outcome',
+            'title', 'review_title', 'prompt', 'task_title', 'summary', 'observed_problem', 'business_outcome',
         ) if isinstance(value := action.get(field), str) and value.strip()), message.content or '')
         if summary.lstrip().startswith('{'):
             try:

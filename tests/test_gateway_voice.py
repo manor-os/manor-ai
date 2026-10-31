@@ -1633,7 +1633,7 @@ async def test_revocation_before_turn_prevents_all_provider_work():
 @pytest.mark.parametrize("role", ["voice", "stt"])
 async def test_non_openai_role_byok_wins_over_platform_realtime(monkeypatch, role):
     async def metadata(requested, **kwargs):
-        assert kwargs == {"entity_id": "entity", "user_id": "owner"}
+        assert kwargs == {"entity_id": "entity", "user_id": "owner", "workspace_id": None}
         return {"llm_api_key": "private"} if requested == role else None
 
     monkeypatch.setattr(
@@ -1663,7 +1663,7 @@ async def test_native_openai_audio_byok_does_not_expand_to_full_realtime(
     role,
 ):
     async def metadata(requested, **kwargs):
-        assert kwargs == {"entity_id": "entity", "user_id": "owner"}
+        assert kwargs == {"entity_id": "entity", "user_id": "owner", "workspace_id": None}
         return {"llm_api_key": "sk-private", "llm_base_url": "https://api.openai.com/v1"} if requested == role else None
 
     monkeypatch.setattr(
@@ -2081,6 +2081,7 @@ async def test_browser_realtime_uses_shared_provider_transport(monkeypatch, prov
     chat_voice.resolve_realtime_route.assert_awaited_once_with(
         "entity",
         user_id="owner",
+        workspace_id=None,
         required=False,
         allow_managed=deployment_mode == "cloud",
         respect_audio_role_overrides=False,

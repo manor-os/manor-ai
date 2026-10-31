@@ -20,6 +20,7 @@ Operational notes:
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -253,9 +254,17 @@ class VaultKeyProvider:
                 context=_ctx_b64(context),
                 mount_point=self._mount,
             )
-        except self._hvac_exceptions["VaultError"] as exc:
-            raise CredentialDecryptError(str(exc)) from exc
-        return base64.b64decode(resp["data"]["plaintext"])
+        except self._hvac_exceptions["VaultError"]:
+            # Provider diagnostics may contain submitted material. Keep the
+            # public failure typed and generic instead of returning that text.
+            raise CredentialDecryptError("vault transit decryption failed") from None
+        try:
+            plaintext = resp["data"]["plaintext"]
+            if not isinstance(plaintext, str):
+                raise ValueError("plaintext must be a base64 string")
+            return base64.b64decode(plaintext, validate=True)
+        except (KeyError, TypeError, ValueError, binascii.Error):
+            raise CredentialDecryptError("vault returned an invalid decryption response") from None
 
     def rotate(self) -> None:
         self._ensure_transit_key()

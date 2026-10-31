@@ -126,21 +126,27 @@ async def test_apply_reloads_a_draft_changed_while_waiting(db_session):
 
 
 @pytest.mark.asyncio
-async def test_apply_checks_review_fingerprint_after_waiting(db_session):
+@pytest.mark.parametrize("precondition", ["fingerprint", "published_operations"])
+async def test_apply_checks_review_preconditions_after_waiting(db_session, precondition):
     entity_id, workspace_id, draft_id = await _seed(db_session, [_remove("slack")])
     sessions = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
     async with sessions() as first, sessions() as second:
         stale = await _preload(second, entity_id, workspace_id, draft_id)
         reviewed = operations.operation_draft_review_fingerprint(stale[1])
-        await operations.patch_operation_draft(first, draft_id, entity_id, workspace_id, [_remove("github")])
+        addition = (_remove("github") if precondition == "fingerprint"
+                    else {"op": "rule.add", "payload": {"description": "A later configuration change"}})
+        await operations.patch_operation_draft(first, draft_id, entity_id, workspace_id, [addition])
 
         async def apply():
             return await operations.apply_operation_draft(
                 second, draft_id, entity_id, workspace_id,
-                user_confirmation=True, expected_review_fingerprint=reviewed,
+                user_confirmation=True,
+                **({"expected_review_fingerprint": reviewed} if precondition == "fingerprint"
+                   else {"allowed_patch_operations": ["integration.remove"]}),
             )
 
-        with pytest.raises(operations.OperationConflictError, match="changed; review"):
+        expected = "changed; review" if precondition == "fingerprint" else "not exposed"
+        with pytest.raises(operations.OperationConflictError, match=expected):
             await _finish_waiting_write(first, second, db_session, apply)
         assert stale[1].status == "open"
         assert stale[0].operation_revision == 0

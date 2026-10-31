@@ -32,6 +32,13 @@ class LedgerStorage:
     event_directory: str = "events"
 
 
+# Which Task or Workflow run wrote a record is provenance, not part of the
+# request an idempotency key names. A replay from another run must match the
+# first record and keep its provenance, so contracts exclude these fields when
+# comparing a replay with the stored record.
+LEDGER_PROVENANCE_FIELDS = frozenset({"source_task_id", "source_workflow_run_id"})
+
+
 class WorkspaceLedgerError(ValueError):
     """Stable storage/integrity error raised by the shared ledger layer."""
 

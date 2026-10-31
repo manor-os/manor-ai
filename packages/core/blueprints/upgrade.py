@@ -44,6 +44,7 @@ from typing import Any, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.blueprints.knowledge_templates import INITIAL_BODY_KEY
 from packages.core.blueprints.freshness import (
     BLUEPRINT_ID_KEY,
     BLUEPRINT_SETTINGS_KEY,
@@ -60,6 +61,7 @@ from packages.core.blueprints.freshness import (
     installed_blueprint_record,
     normalize_blueprint_upgrade_unsupported_fingerprint,
 )
+from packages.core.blueprints.registry import sync_installed_package
 from packages.core.blueprints.workflow_dependencies import (
     WorkflowDependencyError,
     WorkflowDependencyFactory,
@@ -1413,6 +1415,10 @@ async def plan(
                             )
                         )
                         and existing_metadata.get("blueprint_template") == template
+                        and (
+                            template["mode"] != "initial_file"
+                            or existing_metadata.get(INITIAL_BODY_KEY) == body
+                        )
                     )
                 )
             )
@@ -1422,8 +1428,15 @@ async def plan(
                 new_content = {"body_md": body}
             elif not template_binding_current:
                 action = UpgradeAction.UPDATE.value
-                changes = ["updates live Knowledge template binding"]
-                new_content = {"template": template}
+                changes = [
+                    "updates initial-file Knowledge template configuration"
+                    if template and template["mode"] == "initial_file"
+                    else "updates live Knowledge template binding"
+                ]
+                new_content = {
+                    "template": template,
+                    **({"body_md": body} if template and template["mode"] == "initial_file" else {}),
+                }
             else:
                 action = UpgradeAction.UNCHANGED.value
                 changes = []
@@ -2586,7 +2599,46 @@ async def apply(
         setup_changed = bool(setup_before) and (
             (empty_setup | setup_before) != (empty_setup | setup_after)
         )
-    restore_settings = personalization_changed or variable_declarations_changed or setup_changed
+    from packages.core.blueprints.reconfigure import installed_runtime_contract
+
+    previous_runtime_contract = await installed_runtime_contract(
+        db, workspace=workspace
+    )
+    previous_runtime_contract_present = previous_runtime_contract is not None
+    applied_runtime_contract: dict[str, Any] | None = None
+    runtime_contract_changed = False
+    if fully_synchronized and isinstance(payload, dict):
+        from packages.core.blueprints.reconfigure import runtime_contract
+
+        candidate_runtime_contract = runtime_contract(payload)
+        candidate_mcp_requirements = (
+            ((candidate_runtime_contract.get("contract") or {}).get("requires") or {})
+            .get("mcp_servers") or []
+        )
+        previous_mcp_requirements = (
+            (((previous_runtime_contract or {}).get("contract") or {})
+             .get("requires") or {}).get("mcp_servers") or []
+        )
+        if candidate_mcp_requirements or previous_mcp_requirements:
+            applied_runtime_contract = candidate_runtime_contract
+            # A baseline-backed policy change is reversible even when it does
+            # not alter a component row. Unknown legacy state is recorded for
+            # future exports but cannot safely manufacture an undo target.
+            runtime_contract_changed = previous_runtime_contract is not None and (
+                previous_runtime_contract != applied_runtime_contract
+            )
+    elif previous_runtime_contract is not None and not isinstance(
+        record.get("upgrade_runtime_contract"), dict
+    ):
+        # A partial legacy upgrade can invalidate its baseline. Materialize the
+        # already-applied contract first so later exports retain its policy.
+        applied_runtime_contract = previous_runtime_contract
+    restore_settings = (
+        personalization_changed
+        or variable_declarations_changed
+        or runtime_contract_changed
+        or setup_changed
+    )
     if updated or restore_settings:
         restore_point = {
             "upgraded_at": datetime.now(timezone.utc).isoformat(),
@@ -2635,6 +2687,11 @@ async def apply(
             restore_point["variable_declarations"] = (
                 previous_variable_declarations
             )
+        if runtime_contract_changed:
+            restore_point["upgrade_runtime_contract_present"] = (
+                previous_runtime_contract_present
+            )
+            restore_point["upgrade_runtime_contract"] = previous_runtime_contract
         if fully_synchronized:
             restore_point["setup_before"] = setup_before
             restore_point["setup_after"] = setup_after
@@ -2674,6 +2731,8 @@ async def apply(
             settings.pop(PERSONALIZATION_SETTINGS_KEY, None)
     if variable_declarations is not None:
         record[VARIABLE_DECLARATIONS_KEY] = variable_declarations
+    if applied_runtime_contract is not None:
+        record["upgrade_runtime_contract"] = applied_runtime_contract
     if canonical_source_id:
         from packages.core.services.marketplace_resource_links import (
             RELATIONSHIP_INSTALLED_COMPONENT,
@@ -2736,6 +2795,7 @@ async def apply(
             )
     if current_version and fully_synchronized:
         record[BLUEPRINT_VERSION_KEY] = current_version
+    await sync_installed_package(db, record)
     settings[BLUEPRINT_SETTINGS_KEY] = record
     workspace.settings = settings
     await db.flush()
@@ -2805,6 +2865,7 @@ async def revert(
     has_settings_restore = isinstance(point, dict) and (
         "personalization_present" in point
         or "variable_declarations_present" in point
+        or "upgrade_runtime_contract_present" in point
         or "setup_before" in point
     )
     if not isinstance(point, dict) or (
@@ -3330,6 +3391,13 @@ async def revert(
             )
         else:
             record.pop(VARIABLE_DECLARATIONS_KEY, None)
+    if "upgrade_runtime_contract_present" in point:
+        if point.get("upgrade_runtime_contract_present"):
+            record["upgrade_runtime_contract"] = copy.deepcopy(
+                point.get("upgrade_runtime_contract")
+            )
+        else:
+            record.pop("upgrade_runtime_contract", None)
     if "setup_before" in point:
         for key in LIVE_SETUP_STATE_KEYS:
             if key in point["setup_before"]:
@@ -3337,6 +3405,7 @@ async def revert(
             else:
                 record.pop(key, None)
     record.pop(RESTORE_POINT_KEY, None)
+    await sync_installed_package(db, record)
     settings[BLUEPRINT_SETTINGS_KEY] = record
     workspace.settings = settings
     await db.flush()

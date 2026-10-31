@@ -214,6 +214,7 @@ async def runtime_search_documents_action(
     workspace_id: str | None = None,
     params: dict[str, Any] | None = None,
     db: Any = None,
+    user_wording: str | None = None,
 ) -> str:
     from packages.core.database import async_session
     from packages.core.services.document_access import list_visible_documents
@@ -244,15 +245,16 @@ async def runtime_search_documents_action(
         "offset": offset,
         "detail": detail,
         "user_id": user_id,
+        "user_wording": user_wording or None,
         **filters,
     }
     cached = await _runtime_get_cached_document_action("search_documents", entity_id, cache_params)
     if cached is not None:
         return cached
 
-    if db is not None:
+    async def search(session: Any) -> tuple[list[Any], int, dict[str, Any] | None]:
         docs, total = await list_visible_documents(
-            db,
+            session,
             entity_id,
             user_id=user_id,
             **filters,
@@ -261,20 +263,25 @@ async def runtime_search_documents_action(
             limit=limit,
             offset=offset,
         )
+        content = None
+        if query and offset == 0:
+            # The text, not just the name: indexing is paused, so content is
+            # read at query time (knowledge_content_search).
+            from packages.core.services.knowledge_content_search import search_knowledge_content
+
+            content = await search_knowledge_content(
+                session, entity_id=entity_id, user_id=user_id, query=query,
+                limit=limit, filters=filters, user_wording=user_wording,
+            )
+        return docs, total, content
+
+    if db is not None:
+        docs, total, content = await search(db)
     else:
         async with async_session() as session:
-            docs, total = await list_visible_documents(
-                session,
-                entity_id,
-                user_id=user_id,
-                **filters,
-                actor_type="agent",
-                name_search=query or None,
-                limit=limit,
-                offset=offset,
-            )
+            docs, total, content = await search(session)
 
-    result = json.dumps({
+    payload: dict[str, Any] = {
         "total": total,
         "count": len(docs),
         "limit": limit,
@@ -282,7 +289,15 @@ async def runtime_search_documents_action(
         "next_offset": offset + len(docs) if offset + len(docs) < total else None,
         "has_more": offset + len(docs) < total,
         "documents": [runtime_document_to_dict(doc, detail=detail) for doc in docs],
-    })
+    }
+    if content is not None:
+        payload["content_matches"] = [
+            {**runtime_document_to_dict(match["doc"], detail=detail),
+             "match_score": match["score"], "snippet": match["snippet"]}
+            for match in content["matches"]
+        ]
+        payload["content_search"] = {"scanned": content["scanned"], "partial": content["partial"]}
+    result = json.dumps(payload)
     await _runtime_set_cached_document_action("search_documents", entity_id, cache_params, result)
     return result
 

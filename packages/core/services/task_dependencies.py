@@ -70,23 +70,6 @@ async def dependency_status(
         )
     )).all())
     statuses = {task_id: status for task_id, status in rows}
-    if rows:
-        # A completed retry plan can race with or predate the task status
-        # projection. Reconcile each found predecessor before applying the
-        # dependency gate so dependents do not remain blocked by stale status.
-        from packages.core.services.task_execution_reconcile import (
-            reconcile_task_from_latest_completed_plan,
-        )
-
-        tasks = list((await db.execute(
-            select(Task).where(
-                Task.entity_id == entity_id,
-                Task.id.in_(statuses),
-            )
-        )).scalars().all())
-        for task in tasks:
-            await reconcile_task_from_latest_completed_plan(db, task)
-        statuses = {task.id: task.status for task in tasks}
     if any(dep_id not in statuses for dep_id in dep_ids):
         return "blocked", statuses
     if any(statuses.get(dep_id) in {"failed", "cancelled"} for dep_id in dep_ids):
@@ -120,12 +103,6 @@ async def build_dependency_outputs(
         if dep is None:
             outputs.append({"task_id": dep_id, "status": "missing"})
             continue
-        try:
-            from packages.core.services.task_execution_reconcile import reconcile_task_from_latest_completed_plan
-
-            await reconcile_task_from_latest_completed_plan(db, dep)
-        except Exception:
-            logger.debug("Dependency output reconciliation skipped for task %s", dep_id, exc_info=True)
         actual = _as_dict(dep.actual_output)
         entry: dict[str, Any] = {
             "task_id": dep.id,

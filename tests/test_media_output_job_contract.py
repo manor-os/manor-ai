@@ -173,6 +173,28 @@ async def test_video_worker_preserves_frozen_target_without_runtime_lease(media_
 
 
 @pytest.mark.asyncio
+async def test_in_loop_video_job_keeps_explicit_workspace_destination(media_storage, monkeypatch):
+    """A heavy worker runs the job in its loop, inheriting the Workflow's artifact scope.
+
+    Prod 2026-10-28: a series episode's clips were approved for the Workspace
+    home (projects/<series>/<episode>/...), but the in-loop job resolved the
+    run archive and rejected every clip as "Video output Workspace changed
+    after authorization".
+    """
+    name = "projects/series/e02/clips/clip-01"
+    contract = _contract(media_storage, name=name, base=BASE)
+
+    async def run_archive(*, entity_id, workspace_id, task_id=None):
+        return f"{BASE}/workflow/runmediaoutput"
+
+    monkeypatch.setattr(generated_media_naming, "resolve_workspace_artifact_base_dir", run_archive)
+    result = await _save_video(contract, output_name=name)
+    path = f"{BASE}/{name}.mp4"
+    assert result["result_url"] == f"/api/v1/fs/{ENTITY}/{path}"
+    assert (media_storage / path).read_bytes() == VIDEO
+
+
+@pytest.mark.asyncio
 async def test_video_worker_selects_prepared_webm_encoding(media_storage):
     result = await _save_video(
         _contract(media_storage), video_url=VIDEO_URL.replace("video/mp4", "video/webm"),

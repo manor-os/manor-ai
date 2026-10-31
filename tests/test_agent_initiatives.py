@@ -502,10 +502,7 @@ async def test_personal_agent_initiative_crud_and_driver_boundary(
         _session_factory,
         claimed_task_id,
         _agent_id,
-        *,
-        runtime_hitl_delivery_identity=None,
     ):
-        assert runtime_hitl_delivery_identity is None
         runner_calls.append(claimed_task_id)
         return True, completed_result
 

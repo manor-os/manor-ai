@@ -1,8 +1,10 @@
 import { getFilePreviewKind, type FilePreviewReference } from "./filePreviewKind";
+import { fetchFileBlob } from "./fileTransfer";
 
 export interface FilePreviewSourceInput {
   blob?: Blob | null;
   url?: string;
+  /** Authorized downloaders own their inactivity timeout, including cache reads. */
   fetchBinary?: (signal: AbortSignal) => Promise<Blob>;
 }
 
@@ -24,7 +26,6 @@ export function createFilePreviewSource(input: FilePreviewSourceInput) {
     const controller = new AbortController();
     const abort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error("File loading timed out. Please retry.")), 30_000);
     let rejectAbort: () => void = () => {};
     try {
       const aborted = new Promise<never>((_, reject) => {
@@ -35,9 +36,7 @@ export function createFilePreviewSource(input: FilePreviewSourceInput) {
         if (input.blob) return input.blob;
         if (input.fetchBinary) return input.fetchBinary(controller.signal);
         if (!input.url) throw new Error("File preview source is unavailable");
-        const response = await fetch(input.url, { signal: controller.signal });
-        if (!response.ok) throw new Error(`File loading failed (HTTP ${response.status})`);
-        return response.blob();
+        return (await fetchFileBlob(input.url, { signal: controller.signal })).blob;
       };
       const blob = await Promise.race([download(), aborted]);
       controller.signal.throwIfAborted();
@@ -45,7 +44,6 @@ export function createFilePreviewSource(input: FilePreviewSourceInput) {
       loaded = blob;
       return blob;
     } finally {
-      clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       controller.signal.removeEventListener("abort", rejectAbort);
     }

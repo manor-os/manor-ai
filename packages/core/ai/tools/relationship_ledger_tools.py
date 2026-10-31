@@ -216,7 +216,15 @@ async def _read_relationship_ledger(entity_id: str = "", **kwargs: Any) -> str:
             directory=str(config["directory"]),
             recent_limit=kwargs.get("recent_limit", 100),
         )
-        if context.user_id and not runtime_tool_call_context_is_external_customer(kwargs):
+        from packages.core.services.collaborator_steering import collaborators_acting_now
+
+        # CRM enrichment reads the company CRM, outside any Workspace a
+        # collaborator-involved call may reach.
+        if (
+            context.user_id
+            and not runtime_tool_call_context_is_external_customer(kwargs)
+            and not collaborators_acting_now(entity_id)
+        ):
             from packages.core.database import async_session
             from packages.core.ai.runtime.crm_actions import crm_actor
             from packages.core.services.crm_relationships import enrich_relationships

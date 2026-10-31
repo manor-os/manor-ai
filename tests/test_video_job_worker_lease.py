@@ -44,12 +44,20 @@ async def test_an_expired_lease_lets_recovery_take_over(db_session):
 
 
 @pytest.mark.asyncio
-async def test_a_finished_job_is_never_claimed_again(db_session):
+async def test_a_finished_job_is_never_claimed_again(db_session, monkeypatch):
     job_id = await _job(db_session)
     job = (await db_session.execute(select(MediaJob).where(MediaJob.id == job_id))).scalar_one()
-    job.status = "completed"
+    job.status, job.error, job.byok = "failed", "Temporary provider poll failure", True
     await db_session.commit()
 
+    async def no_external_notification(*_args):
+        pass
+
+    monkeypatch.setattr(media_tasks, "_push_notification", no_external_notification)
+    monkeypatch.setattr(media_tasks, "_project_group_media_if_ready", no_external_notification)
+    assert await media_tasks._finalize_video_job(job_id, {"result_url": "/recovered.mp4"}, force=True)
+    await db_session.refresh(job)
+    assert job.status == "completed" and job.error is None
     assert await media_tasks._mark_video_job_processing(job_id) is False
 
 

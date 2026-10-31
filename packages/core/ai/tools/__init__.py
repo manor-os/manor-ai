@@ -20,6 +20,8 @@ def register_all_tools(pool) -> None:
         relationship_ledger_tools,
         ledger_query_tools,
         youtube_tools,
+        integration_route_tools,
+        stats_tools,
         system_tools,
         bash_tool,
         file_tools,
@@ -34,7 +36,6 @@ def register_all_tools(pool) -> None:
         code_project_tool,
         browser_tools,
         agent_file_tools,
-        sandbox_file_tools,
         workspace_arch_tools,
         agent_provisioning_tools,
         agent_initiative_tools,
@@ -93,6 +94,8 @@ def register_all_tools(pool) -> None:
         relationship_ledger_tools,
         ledger_query_tools,
         youtube_tools,
+        integration_route_tools,
+        stats_tools,
         system_tools,
         bash_tool,
         file_tools,
@@ -107,7 +110,6 @@ def register_all_tools(pool) -> None:
         code_project_tool,
         browser_tools,
         agent_file_tools,
-        sandbox_file_tools,
         workspace_arch_tools,
         agent_provisioning_tools,
         agent_initiative_tools,
@@ -181,6 +183,7 @@ def register_all_tools(pool) -> None:
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("Sandbox tools not loaded: %s", e)
+
 
     # Built-in MCP tool catalog — 8 seeded servers, ~33 curated tools.
     # All registered as deferred so `search_tools` discovers them on demand

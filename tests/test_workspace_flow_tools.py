@@ -37,6 +37,10 @@ class _RowsResult:
     def all(self):
         return list(self._rows)
 
+    def first(self):
+        # No collaborator membership: the user is an ordinary member.
+        return None
+
 
 class _ScalarResult:
     def __init__(self, value):

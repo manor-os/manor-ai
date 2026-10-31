@@ -9,18 +9,34 @@ Usage (async):
 """
 from __future__ import annotations
 
-import httpx
-from typing import Optional
+import base64
 
+import httpx
+from typing import Awaitable, Callable, Optional
+
+
+from .capabilities import (
+    REQUEST_GATES,
+    ROUTE_GATES,
+    UNKNOWN,
+    RunnerCapabilities,
+    describe,
+    gate_request,
+    outdated_message,
+)
 from .exceptions import (
     SandboxCapacityError,
     SandboxConnectionError,
     SandboxError,
     SandboxNotFoundError,
+    SandboxRequestError,
+    SandboxRunnerOutdatedError,
     SandboxRuntimeError,
     SandboxSecurityError,
+    SandboxTimeoutError,
 )
 from .models import (
+    RUNNER_OWNED_CONTAINER_FIELDS,
     CancelExecutionResult,
     ContainerConfig,
     CreateSandboxResult,
@@ -31,6 +47,7 @@ from .models import (
     FileReadBase64Result,
     FileReadResult,
     FileWriteResult,
+    TailFileResult,
     LoadSkillResult,
     SandboxInfo,
     SkillContext,
@@ -38,10 +55,19 @@ from .models import (
 )
 
 
+
+
 def _config_payload(config: Optional[ContainerConfig | dict]) -> dict | None:
     if not config:
         return None
     if isinstance(config, dict):
+        owned = sorted(name for name in config if name in RUNNER_OWNED_CONTAINER_FIELDS)
+        if owned:
+            raise ValueError(
+                "Container setting(s) " + ", ".join(owned) + " are the runner's own config "
+                "(SANDBOX_IMAGE, SANDBOX_WORKDIR, ...) and cannot be requested by a caller; "
+                "route the work to a runner pool configured for it instead."
+            )
         return {k: v for k, v in config.items() if v is not None}
     return config.to_dict()
 
@@ -66,20 +92,66 @@ def _parse_skill(data: dict) -> SkillManifest:
 def _raise_for_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
+    body: dict = {}
     try:
-        detail = resp.json().get("detail", resp.text)
+        parsed = resp.json()
+        if isinstance(parsed, dict):
+            body = parsed
+        detail = body.get("detail", resp.text) if body else resp.text
     except Exception:
         detail = resp.text
+    if not isinstance(detail, str):
+        detail = str(detail)
+    code = body.get("code") if isinstance(body.get("code"), str) else None
 
-    if resp.status_code == 404:
-        raise SandboxNotFoundError(detail, status_code=404)
-    if resp.status_code == 403:
-        raise SandboxSecurityError(detail, status_code=403)
-    if resp.status_code == 429:
-        raise SandboxCapacityError(detail, status_code=429)
-    if resp.status_code >= 500:
-        raise SandboxRuntimeError(detail, status_code=resp.status_code)
-    raise SandboxError(detail, status_code=resp.status_code)
+    status = resp.status_code
+    kwargs = {"status_code": status, "code": code, "body": body}
+    if status == 404:
+        raise SandboxNotFoundError(detail, **kwargs)
+    if status == 403:
+        raise SandboxSecurityError(detail, **kwargs)
+    if status == 429:
+        raise SandboxCapacityError(detail, **kwargs)
+    if status in (400, 413, 422):
+        raise SandboxRequestError(detail, **kwargs)
+    if status == 504:
+        raise SandboxTimeoutError(detail, **kwargs)
+    if status >= 500:
+        raise SandboxRuntimeError(detail, **kwargs)
+    raise SandboxError(detail, **kwargs)
+
+
+def _skill_field(skill: str | None) -> dict:
+    """The Skill view of a file operation (omitted: the runner's most recent Skill)."""
+    return {} if skill is None else {"skill": skill}
+
+
+def _exec_body(
+    command: str,
+    timeout: int,
+    workdir: str | None,
+    execution_id: str | None,
+    skill_env: bool | None,
+    skill: str | None,
+    fair_key: str | None,
+    queue_timeout: float | None,
+) -> dict:
+    body: dict = {"command": command, "timeout": timeout}
+    if workdir:
+        body["workdir"] = workdir
+    if execution_id is not None:
+        body["execution_id"] = execution_id
+    if skill_env is not None:
+        # False: run without the Skill's env (an agent sharing the sandbox
+        # that did not invoke that Skill).
+        body["skill_env"] = bool(skill_env)
+    if skill is not None:
+        body["skill"] = skill
+    if fair_key:
+        body["fair_key"] = str(fair_key)[:255]
+    if queue_timeout:
+        body["queue_timeout"] = float(queue_timeout)
+    return body
 
 
 def _parse_sandbox_info(d: dict) -> SandboxInfo:
@@ -97,6 +169,10 @@ def _parse_sandbox_info(d: dict) -> SandboxInfo:
         active_command=d.get("active_command"),
         active_execution_id=d.get("active_execution_id"),
         expires_at=d.get("expires_at"),
+        active_execution_ids=list(d.get("active_execution_ids") or []),
+        max_concurrent_executions=d.get("max_concurrent_executions"),
+        queued_execution_ids=list(d.get("queued_execution_ids") or []),
+        skills=list(d.get("skills") or []),
     )
 
 
@@ -121,6 +197,47 @@ class SandboxClient:
             headers=headers,
             transport=transport,
         )
+        # What the runner can do (``sandbox_sdk.capabilities``): set directly,
+        # or read on the first gated request through ``capability_loader``
+        # (the control plane's cached /health read per runner). Neither set:
+        # requests go out unchanged.
+        self.capabilities: RunnerCapabilities | None = None
+        self.capability_loader: Callable[[], Awaitable[RunnerCapabilities]] | None = None
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    async def runner_capabilities(self) -> RunnerCapabilities:
+        if self.capabilities is None and self.capability_loader is not None:
+            try:
+                self.capabilities = await self.capability_loader()
+            except Exception:  # noqa: BLE001 - unknown, never "outdated"
+                return UNKNOWN
+        return self.capabilities or UNKNOWN
+
+    async def _gate(self, method: str, route: str, body: dict | None = None) -> dict | None:
+        """The body this runner may receive; refuses what it would silently get wrong."""
+
+        if (method, route) not in REQUEST_GATES and (method, route) not in ROUTE_GATES:
+            return body
+        capabilities = await self.runner_capabilities()
+        sent, missing = gate_request(capabilities, method, route, body)
+        if missing and not capabilities.reported:
+            needs = ", ".join(describe(name) for name in missing)
+            raise SandboxRunnerOutdatedError(
+                f"The sandbox runner's capabilities could not be read, and this needs proof that "
+                f"it supports {needs}. Nothing was run; retry once the runner answers /health.",
+                missing=missing,
+                reported=False,
+            )
+        if missing:
+            raise SandboxRunnerOutdatedError(
+                outdated_message(missing, build_version=capabilities.build_version),
+                missing=missing,
+                build_version=capabilities.build_version,
+            )
+        return sent
 
     async def __aenter__(self) -> "SandboxClient":
         return self
@@ -174,6 +291,7 @@ class SandboxClient:
             body["config_overrides"] = config_payload
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
+        body = await self._gate("POST", "/api/v1/sandbox/create-from-files", body)
         resp = await self._http.post(
             "/api/v1/sandbox/create-from-files", json=body, timeout=self._provision_timeout()
         )
@@ -187,6 +305,9 @@ class SandboxClient:
             workdir=data["workdir"],
             env_blocked=data.get("env_blocked", []),
             env_injection=str(data.get("env_injection") or "create"),
+            config=dict(data.get("config") or {}),
+            warnings=[str(item) for item in data.get("warnings") or []],
+            skill_dir=data.get("skill_dir"),
         )
 
     async def create_from_builtin(
@@ -198,8 +319,16 @@ class SandboxClient:
         config: Optional[ContainerConfig | dict] = None,
         auto_install: bool = True,
         idempotency_key: str | None = None,
+        baked_skill: dict[str, str] | None = None,
     ) -> CreateSandboxResult:
-        """Create a sandbox for a built-in (codebase) skill."""
+        """Create a sandbox for a built-in (codebase) skill.
+
+        ``baked_skill={"name", "digest"}`` asks the runner to use its image's
+        copy instead of ``files``; only send it when the runner's
+        ``health()["baked_skills"]`` holds that exact digest (see
+        ``packages.core.services.sandbox_baked_skills``, which also falls back
+        to the files on ``baked_skill_unavailable``).
+        """
         body: dict = {
             "skill_name": skill_name,
             "files": files,
@@ -208,11 +337,14 @@ class SandboxClient:
             "auto_install": auto_install,
             "source": "builtin",
         }
+        if baked_skill is not None:
+            body["baked_skill"] = {"name": baked_skill["name"], "digest": baked_skill["digest"]}
         config_payload = _config_payload(config)
         if config_payload:
             body["config_overrides"] = config_payload
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
+        body = await self._gate("POST", "/api/v1/sandbox/create-from-builtin", body)
         resp = await self._http.post(
             "/api/v1/sandbox/create-from-builtin", json=body, timeout=self._provision_timeout()
         )
@@ -226,6 +358,9 @@ class SandboxClient:
             workdir=data["workdir"],
             env_blocked=data.get("env_blocked", []),
             env_injection=str(data.get("env_injection") or "create"),
+            config=dict(data.get("config") or {}),
+            warnings=[str(item) for item in data.get("warnings") or []],
+            skill_dir=data.get("skill_dir"),
         )
 
     async def load_skill(
@@ -238,11 +373,14 @@ class SandboxClient:
         source: str = "workspace",
         env: dict[str, str] | None = None,
         allowed_sensitive_keys: list[str] | None = None,
+        baked_skill: dict[str, str] | None = None,
     ) -> LoadSkillResult:
         """Load a new skill into an existing idle sandbox (reuse mode).
 
         ``env`` replaces the skill env later exec calls receive (an empty
         mapping clears the previous skill's credentials).
+        ``baked_skill`` loads the image's copy of a built-in Skill instead of
+        ``files`` (same contract as ``create_from_builtin``).
         Raises SandboxError(status_code=409) if the sandbox is busy.
         """
         body: dict = {
@@ -254,6 +392,9 @@ class SandboxClient:
             "env": env or {},
             "allowed_sensitive_keys": list(allowed_sensitive_keys or []),
         }
+        if baked_skill is not None:
+            body["baked_skill"] = {"name": baked_skill["name"], "digest": baked_skill["digest"]}
+        body = await self._gate("POST", "/api/v1/sandbox/{sandbox_id}/load-skill", body)
         resp = await self._http.post(
             f"/api/v1/sandbox/{sandbox_id}/load-skill", json=body, timeout=self._provision_timeout()
         )
@@ -264,25 +405,14 @@ class SandboxClient:
             skill=_parse_skill(data["skill"]),
             reused=data.get("reused", True),
             env_blocked=list(data.get("env_blocked") or []),
+            skill_dir=data.get("skill_dir"),
         )
 
     async def list(self) -> list[SandboxInfo]:
         resp = await self._http.get("/api/v1/sandbox")
         _raise_for_status(resp)
         return [
-            SandboxInfo(
-                sandbox_id=d["sandbox_id"],
-                container_name=d["container_name"],
-                status=d["status"],
-                skill_name=d["skill_name"],
-                workdir=d["workdir"],
-                created_at=d["created_at"],
-                last_used_at=d["last_used_at"],
-                config=d.get("config", {}),
-                active_command=d.get("active_command"),
-                active_execution_id=d.get("active_execution_id"),
-                expires_at=d.get("expires_at"),
-            )
+            _parse_sandbox_info(d)
             for d in resp.json()
         ]
 
@@ -309,13 +439,36 @@ class SandboxClient:
         timeout: int = 60,
         workdir: str | None = None,
         execution_id: str | None = None,
+        skill_env: bool | None = None,
+        skill: str | None = None,
+        fair_key: str | None = None,
+        queue_timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        side_channel: bool = False,
     ) -> ExecResult:
-        body: dict = {"command": command, "timeout": timeout}
-        if workdir:
-            body["workdir"] = workdir
-        if execution_id is not None:
-            body["execution_id"] = execution_id
-        http_timeout = float(timeout) + 30.0
+        """Run a command and wait for it.
+
+        ``queue_timeout``: seconds it may wait in the sandbox's fair FIFO for
+        a free slot (a typed ``sandbox_queue_timeout`` 409 when none freed;
+        it never started). ``skill``: the loaded Skill it sees as /skill
+        ("" for none). ``fair_key``: its work area, for fair dispatch.
+        ``env`` reaches this one command only (layered over the skill env);
+        it is how short-lived per-command credentials travel. Never logged.
+        ``side_channel``: a short bookkeeping command of the platform's own
+        (bash's working-copy scripts) that runs next to the command slots,
+        like a file read or write -- it never waits in the slot queue, takes
+        no Skill env and no per-exec env.
+        """
+        body = _exec_body(
+            command, timeout, workdir, execution_id, skill_env, skill, fair_key, queue_timeout,
+        )
+        if env:
+            body["env"] = dict(env)
+        if side_channel:
+            body["side_channel"] = True
+        body = await self._gate("POST", "/api/v1/sandbox/{sandbox_id}/exec", body)
+        queue_timeout = body.get("queue_timeout")
+        http_timeout = float(timeout) + float(queue_timeout or 0) + 30.0
         resp = await self._http.post(
             f"/api/v1/sandbox/{sandbox_id}/exec",
             json=body,
@@ -328,6 +481,8 @@ class SandboxClient:
             stderr=d["stderr"],
             exit_code=d["exit_code"],
             execution_id=d.get("execution_id"),
+            outcome=d.get("outcome"),
+            outcome_detail=d.get("outcome_detail"),
         )
 
     async def cancel_execution(
@@ -375,6 +530,9 @@ class SandboxClient:
             events=events,
             next_sequence=int(data.get("next_sequence") or 0),
             waiting_for_response=bool(data.get("waiting_for_response", False)),
+            outcome=data.get("outcome"),
+            outcome_detail=data.get("outcome_detail"),
+            queue_position=data.get("queue_position"),
         )
 
     async def start_exec(
@@ -384,12 +542,25 @@ class SandboxClient:
         timeout: int = 60,
         workdir: str | None = None,
         execution_id: str | None = None,
+        skill_env: bool | None = None,
+        skill: str | None = None,
+        fair_key: str | None = None,
+        queue_timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecutionStatusResult:
-        body: dict = {"command": command, "timeout": timeout}
-        if workdir:
-            body["workdir"] = workdir
-        if execution_id is not None:
-            body["execution_id"] = execution_id
+        """Start a command without waiting for it (see ``exec`` for the options).
+
+        With ``queue_timeout`` a full sandbox answers ``queued`` (with its
+        ``queue_position``) instead of busy. ``env`` reaches this one command
+        only and lives no longer than it (the runner never stores it); the
+        caller collects the command and revokes any credential in it.
+        """
+        body = _exec_body(
+            command, timeout, workdir, execution_id, skill_env, skill, fair_key, queue_timeout,
+        )
+        if env:
+            body["env"] = dict(env)
+        body = await self._gate("POST", "/api/v1/sandbox/{sandbox_id}/exec/start", body)
         resp = await self._http.post(
             f"/api/v1/sandbox/{sandbox_id}/exec/start",
             json=body,
@@ -402,11 +573,20 @@ class SandboxClient:
         sandbox_id: str,
         execution_id: str,
         after_sequence: int = 0,
+        wait_seconds: float = 0,
     ) -> ExecutionStatusResult:
-        params = {"after_sequence": max(0, int(after_sequence))} if after_sequence else None
+        """An execution's state; ``wait_seconds`` (<= 60) long-polls until it ends."""
+        params: dict | None = {"after_sequence": max(0, int(after_sequence))} if after_sequence else None
+        timeout = None
+        if wait_seconds and wait_seconds > 0:
+            wait = min(60.0, float(wait_seconds))
+            params = {**(params or {}), "wait_seconds": wait}
+            timeout = wait + 30.0
+        await self._gate("GET", "/api/v1/sandbox/{sandbox_id}/executions/{execution_id}")
         resp = await self._http.get(
             f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}",
             params=params,
+            **({"timeout": timeout} if timeout else {}),
         )
         _raise_for_status(resp)
         return self._parse_execution_status(resp.json())
@@ -420,6 +600,7 @@ class SandboxClient:
         payload: dict | None = None,
         message: str = "",
     ) -> ExecutionResponseResult:
+        await self._gate("POST", "/api/v1/sandbox/{sandbox_id}/executions/{execution_id}/responses")
         resp = await self._http.post(
             f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}/responses",
             json={
@@ -443,11 +624,13 @@ class SandboxClient:
         sandbox_id: str,
         path: str,
         max_size: int = 65536,
+        skill: str | None = None,
     ) -> FileReadResult:
-        resp = await self._http.post(
-            f"/api/v1/sandbox/{sandbox_id}/files/read",
-            json={"path": path, "max_size": max_size},
+        body = await self._gate(
+            "POST", "/api/v1/sandbox/{sandbox_id}/files/read",
+            {"path": path, "max_size": max_size, **_skill_field(skill)},
         )
+        resp = await self._http.post(f"/api/v1/sandbox/{sandbox_id}/files/read", json=body)
         _raise_for_status(resp)
         d = resp.json()
         return FileReadResult(
@@ -460,16 +643,39 @@ class SandboxClient:
         sandbox_id: str,
         path: str,
         max_size: int = 50 * 1024 * 1024,
+        skill: str | None = None,
     ) -> FileReadBase64Result:
+        body = await self._gate(
+            "POST", "/api/v1/sandbox/{sandbox_id}/files/read-base64",
+            {"path": path, "max_size": max_size, **_skill_field(skill)},
+        )
         resp = await self._http.post(
-            f"/api/v1/sandbox/{sandbox_id}/files/read-base64",
-            json={"path": path, "max_size": max_size},
-            timeout=120.0,
+            f"/api/v1/sandbox/{sandbox_id}/files/read-base64", json=body, timeout=120.0,
         )
         _raise_for_status(resp)
         d = resp.json()
         return FileReadBase64Result(
             path=d["path"], content_base64=d["content_base64"], size=d["size"],
+        )
+
+    async def tail_file(
+        self,
+        sandbox_id: str,
+        path: str,
+        offset: int = 0,
+        limit: int = 256 * 1024,
+    ) -> TailFileResult:
+        await self._gate("POST", "/api/v1/sandbox/{sandbox_id}/files/tail")
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/files/tail",
+            json={"path": path, "offset": max(0, int(offset)), "limit": int(limit)},
+            timeout=45.0,
+        )
+        _raise_for_status(resp)
+        d = resp.json()
+        return TailFileResult(
+            path=d["path"], data=base64.b64decode(d["data_base64"]),
+            next_offset=int(d["next_offset"]), size=int(d["size"]), eof=bool(d["eof"]),
         )
 
     async def write_file(
@@ -478,11 +684,13 @@ class SandboxClient:
         path: str,
         content: str,
         mkdir: bool = True,
+        skill: str | None = None,
     ) -> FileWriteResult:
-        resp = await self._http.post(
-            f"/api/v1/sandbox/{sandbox_id}/files/write",
-            json={"path": path, "content": content, "mkdir": mkdir},
+        body = await self._gate(
+            "POST", "/api/v1/sandbox/{sandbox_id}/files/write",
+            {"path": path, "content": content, "mkdir": mkdir, **_skill_field(skill)},
         )
+        resp = await self._http.post(f"/api/v1/sandbox/{sandbox_id}/files/write", json=body)
         _raise_for_status(resp)
         d = resp.json()
         return FileWriteResult(path=d["path"], written=d["written"])
@@ -493,16 +701,18 @@ class SandboxClient:
         path: str,
         content_base64: str,
         mkdir: bool = True,
+        skill: str | None = None,
     ) -> FileWriteResult:
         """Write a binary file into the sandbox from base64-encoded content.
 
         Delivers generated binary assets (e.g. images) straight into the sandbox
         without a text/utf-8 round-trip that would corrupt them.
         """
-        resp = await self._http.post(
-            f"/api/v1/sandbox/{sandbox_id}/files/write-base64",
-            json={"path": path, "content_base64": content_base64, "mkdir": mkdir},
+        body = await self._gate(
+            "POST", "/api/v1/sandbox/{sandbox_id}/files/write-base64",
+            {"path": path, "content_base64": content_base64, "mkdir": mkdir, **_skill_field(skill)},
         )
+        resp = await self._http.post(f"/api/v1/sandbox/{sandbox_id}/files/write-base64", json=body)
         _raise_for_status(resp)
         d = resp.json()
         return FileWriteResult(path=d["path"], written=d["written"])

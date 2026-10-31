@@ -89,6 +89,7 @@ def _player(**overrides) -> dict:
     [
         ("https://www.youtube.com/watch?v=tsJff6wc2XQ", "tsJff6wc2XQ"),
         ("https://youtu.be/tsJff6wc2XQ", "tsJff6wc2XQ"),
+        ("https://www.youtube.com/shorts/tsJff6wc2XQ", "tsJff6wc2XQ"),
     ],
 )
 def test_canonicalizes_supported_public_youtube_urls(
@@ -149,6 +150,12 @@ def test_parses_zero_metrics_without_fabricating_missing_comments() -> None:
     assert result.likes == 0
     assert result.comments is None
     assert result.unavailable_fields == ("comments", "subscribers")
+    assert result.metric_precision == {
+        "views": "exact",
+        "likes": "exact",
+        "comments": "exact",
+        "subscribers": "exact",
+    }
 
 
 def test_parses_numeric_comment_count_when_structured_data_exposes_it() -> None:
@@ -174,6 +181,7 @@ def test_parses_numeric_comment_count_when_structured_data_exposes_it() -> None:
     assert result.comments == 12
     assert result.subscribers == 1230
     assert result.unavailable_fields == ()
+    assert result.metric_precision["subscribers"] == "rounded"
 
 
 def test_parses_zero_public_subscribers() -> None:

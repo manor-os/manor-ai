@@ -35,11 +35,11 @@ def test_cleanup_exception_does_not_relax_execution_or_user_deletions():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["sandbox_id", "entity_id", "user_id", "agent_id"])
+@pytest.mark.parametrize("changed", ["sandbox_id", "entity_id", "user_id"])
 async def test_cleanup_rejects_foreign_owner_before_runner_io(monkeypatch, changed):
     context = {"sandbox_id": "owned", "entity_id": "entity", "user_id": "user", "agent_id": "agent"}
     context[changed] = "foreign"
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", AsyncMock(return_value=context))
+    monkeypatch.setattr(sandbox_tools, "_load_binding", AsyncMock(return_value=context))
     client = AsyncMock(side_effect=AssertionError("Foreign cleanup reached runner"))
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", client)
     release = AsyncMock(side_effect=AssertionError("Foreign cleanup reached the session service"))
@@ -53,10 +53,30 @@ async def test_cleanup_rejects_foreign_owner_before_runner_io(monkeypatch, chang
 
 
 @pytest.mark.asyncio
+async def test_cleanup_by_another_agent_of_the_conversation_releases_only_its_use(monkeypatch):
+    """The sandbox is the user x conversation's: a delegate may release its own
+    use of a sandbox another agent created; the session service keeps it warm."""
+    context = {"sandbox_id": "owned", "entity_id": "entity", "user_id": "user", "created_by_agent": "agent"}
+    monkeypatch.setattr(sandbox_tools, "_load_binding", AsyncMock(return_value=context))
+    release = AsyncMock(return_value="kept")
+    monkeypatch.setattr(sandbox_tools, "release_sandbox_session", release)
+    result = await sandbox_tools._sandbox_destroy(
+        entity_id="entity", user_id="user", conversation_id="conversation", sandbox_id="owned",
+        _agent_id_from_context="delegate",
+    )
+    assert "released for reuse" in result
+    assert release.await_args.kwargs["agent_id"] == "delegate"
+
+
+@pytest.mark.asyncio
 async def test_cleanup_without_a_binding_is_an_idempotent_release(monkeypatch):
-    """No binding for this scope means the sandbox was already released:
-    releasing twice is benign and still never reaches the runner."""
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", AsyncMock(return_value=None))
+    """A release tombstone for this scope means the sandbox was already
+    released: releasing twice is benign and still never reaches the runner."""
+    monkeypatch.setattr(
+        sandbox_tools,
+        "_load_binding",
+        AsyncMock(return_value={"released_sandbox_id": "owned", "entity_id": "entity", "user_id": "user"}),
+    )
     client = AsyncMock(side_effect=AssertionError("Cleanup without a binding reached runner"))
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", client)
     release = AsyncMock(side_effect=AssertionError("Cleanup without a binding reached the session service"))
@@ -75,7 +95,7 @@ async def test_cleanup_releases_owned_runtime_resources(monkeypatch):
     binding is dropped and the container stays warm for the same owner (the
     session service, not the tool, decides whether to destroy it)."""
     context = {"sandbox_id": "owned", "entity_id": "entity", "user_id": "user", "agent_id": "agent"}
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", AsyncMock(return_value=context))
+    monkeypatch.setattr(sandbox_tools, "_load_binding", AsyncMock(return_value=context))
     client = AsyncMock(side_effect=AssertionError("The tool must not talk to the runner directly"))
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", client)
     release = AsyncMock(return_value="kept")
@@ -88,7 +108,8 @@ async def test_cleanup_releases_owned_runtime_resources(monkeypatch):
     release.assert_awaited_once()
     kwargs = release.await_args.kwargs
     assert kwargs["sandbox_id"] == "owned"
-    assert kwargs["conversation_id"] == "conversation"
+    assert kwargs["scope"].binding_key == "conversation"
+    assert kwargs["agent_id"] == "agent"
     assert kwargs["owner"].entity_id == "entity" and kwargs["owner"].user_id == "user"
 
 

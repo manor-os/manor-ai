@@ -190,7 +190,6 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
         _route("nango", "platform-productivity", "mcp_nango", "nango apps"),
         _route("replicate", "platform-media-research", "mcp_replicate", chrome_fallback=True),
         _route("elevenlabs", "platform-media-research", "mcp_elevenlabs", "eleven labs", chrome_fallback=True),
-        _route("suno", "platform-media-research", "mcp_suno", "suno music", chrome_fallback=True),
         _route("tavily", "platform-media-research", "mcp_tavily", chrome_fallback=True),
         _route("apify", "platform-social", "mcp_apify", "instagram collection", "ig collection"),
         _route(

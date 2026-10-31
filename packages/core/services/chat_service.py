@@ -29,6 +29,7 @@ from packages.core.ai.runtime.skill_forcing import (
     runtime_forced_tool_calls_for_turn,
     runtime_message_text_for_intent,
 )
+from packages.core.ai.runtime.control import RuntimeContextWriterFenced
 from packages.core.ai.runtime.turn_policy import runtime_turn_max_rounds
 from packages.core.ai.runtime.output_policy import (
     BYOK_PROVIDER_ERROR_CODE,
@@ -103,6 +104,7 @@ from packages.core.services.usage_service import record_chat_llm_usage  # noqa: 
 from packages.core.services.usage_service import (
     build_durable_llm_billing_callbacks,
 )
+from packages.core.services.billing_payer import resolve_run_payer
 
 from packages.core.services.conversation_transcript import TRANSCRIPT_TOOL_RESULT_MAX_CHARS  # noqa: E402
 
@@ -157,6 +159,56 @@ async def _await_chat_preparation(awaitable: Awaitable, is_cancelled: Callable[[
             pending.cancel()
         # Drain the preparation task and its DB context before terminal writes.
         await asyncio.gather(pending, return_exceptions=True)
+
+
+async def _runtime_run_started_at_ms(runtime_run_id: str) -> int | None:
+    """When a durable chat turn began (its run's creation), in epoch ms."""
+
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.runtime_run import RuntimeRun
+
+    try:
+        async with async_session() as db:
+            created_at = await db.scalar(select(RuntimeRun.created_at).where(RuntimeRun.id == runtime_run_id))
+    except Exception:  # noqa: BLE001 - the clock is display-only; fall back to this wake
+        logger.debug("runtime run start lookup failed for %s", runtime_run_id, exc_info=True)
+        return None
+    if created_at is None:
+        return None
+    return min(int(created_at.timestamp() * 1000), int(time.time() * 1000))
+
+
+_FINAL_SAVE_RETRY_DELAY_SECONDS = 0.25
+_FINAL_SAVE_OPTIONAL_META = ("assistant_blocks", "assistant_blocks_schema", "sub_agent_events")
+
+
+async def _save_final_assistant_message(**fields: Any) -> str | None:
+    """Save the answer the user already has, shedding optional detail if needed.
+
+    A failed final save used to replace a correct answer with a failure. Retry
+    instead: first without raw tool results, then also without the process
+    record, so the answer, its attachments and approvals still reach history.
+    """
+    saved_id = await save_or_update_assistant_stream_message(**fields)
+    if saved_id:
+        return saved_id
+    meta = fields.get("meta") or {}
+    lean_meta = {key: value for key, value in meta.items() if key not in _FINAL_SAVE_OPTIONAL_META}
+    for detail, overrides in (
+        ("tool_results", {"tool_calls": None}),
+        ("tool_results+process", {"tool_calls": None, "meta": lean_meta or None}),
+    ):
+        await asyncio.sleep(_FINAL_SAVE_RETRY_DELAY_SECONDS)
+        saved_id = await save_or_update_assistant_stream_message(**{**fields, **overrides})
+        if saved_id:
+            logger.warning(
+                "final assistant message saved without %s conversation=%s message=%s",
+                detail, fields.get("conversation_id"), saved_id,
+            )
+            return saved_id
+    return None
 
 
 async def _append_turn_transcript(ctx: Any, result: Any, *, run_id: str | None, assistant_message_id: str) -> None:
@@ -220,6 +272,7 @@ def _chat_llm_billing_callbacks(
     conversation_id: str | None,
     fallback_model: str | None,
     byok: bool = False,
+    payer_entity_id: str | None = None,
 ):
     """Build per-turn durable billing callbacks for the agentic loop."""
     return build_durable_llm_billing_callbacks(
@@ -231,6 +284,7 @@ def _chat_llm_billing_callbacks(
         conversation_id=conversation_id,
         fallback_model=fallback_model,
         byok=byok,
+        payer_entity_id=payer_entity_id,
     )
 
 
@@ -675,6 +729,11 @@ async def stream_chat_response(
                 RuntimeRunStatus.CANCELLED.value,
             }
         ))
+
+    if runtime_run_id and runtime_checkpoint:
+        # A durable turn resumes here after every park (a sandbox, an approval):
+        # its process clock counts from when the turn started, not this wake.
+        turn_started_at_ms = await _runtime_run_started_at_ms(runtime_run_id) or turn_started_at_ms
 
     yield scoped_sse("stream_start", {
         "ephemeral": not persist_messages,
@@ -1340,9 +1399,17 @@ async def stream_chat_response(
         loop_result = [None]
         loop_error = [None]
         loop_cancelled = [False]
+        # Another worker took over this run: it owns the row and the stream.
+        loop_fenced = [False]
         error_saved_id: list[str | None] = [None]
         resolved_model = resolve_model_from_context(ctx)
         manual_skill_ids = runtime_manual_skill_ids_from_refs(manual_skill_refs)
+        # One payer for the whole turn: the durable callbacks charge it and
+        # the bound billing context gates it. Own short session, so no
+        # transaction stays open across the loop.
+        turn_payer_entity_id = await resolve_run_payer(
+            None, entity_id=entity_id, workspace_id=ctx.workspace_id,
+        )
         reserve_llm_call, settle_llm_call = _chat_llm_billing_callbacks(
             trace=trace,
             entity_id=entity_id,
@@ -1352,6 +1419,7 @@ async def stream_chat_response(
             conversation_id=conversation_id if persist_messages else None,
             fallback_model=resolved_model,
             byok=bool(getattr(ctx, "byok", False)),
+            payer_entity_id=turn_payer_entity_id,
         )
         _reserve_llm_call = reserve_llm_call
 
@@ -1371,6 +1439,7 @@ async def stream_chat_response(
                 user_id=user_id,
                 conversation_id=conversation_id if persist_messages else None,
                 durable_per_call=True,
+                payer_entity_id=turn_payer_entity_id,
             )
             try:
                 result = await runtime_execute_chat_agent_loop(
@@ -1664,7 +1733,7 @@ async def stream_chat_response(
                                 assistant_meta["sub_agent_events"] = sub_agent_events
                             if attachments:
                                 assistant_meta["attachments"] = attachments
-                            saved_id = await save_or_update_assistant_stream_message(
+                            saved_id = await _save_final_assistant_message(
                                 conversation_id=conversation_id,
                                 entity_id=entity_id,
                                 workspace_id=ctx.workspace_id,
@@ -1698,25 +1767,21 @@ async def stream_chat_response(
                                     trace_id=trace.trace_id,
                                 )
                             else:
-                                persistence_error = RuntimeError(
-                                    "Assistant response could not be saved"
+                                # Every save attempt failed, so the database
+                                # itself is unreachable. The user already has
+                                # the answer: keep it on screen rather than
+                                # replacing it with a failure. Stale-stream
+                                # repair settles the placeholder row later.
+                                logger.error(
+                                    "final assistant message not saved after retries "
+                                    "conversation=%s message=%s",
+                                    conversation_id, persisted_message_id[0],
                                 )
-                                error_saved_id[0] = (
-                                    await save_assistant_stream_error_message(
-                                        conversation_id=conversation_id,
-                                        entity_id=entity_id,
-                                        workspace_id=ctx.workspace_id,
-                                        agent_id=agent_id,
-                                        error_message=str(persistence_error),
-                                        message_id=persisted_message_id[0],
-                                        meta=assistant_blocks.meta() or None,
-                                    )
+                                publish_stream_snapshot(
+                                    "error" if terminal_result_failed else "done",
+                                    force=True,
+                                    content=visible_content,
                                 )
-                                if error_saved_id[0]:
-                                    persisted_message_id[0] = error_saved_id[0]
-                                    loop_saved[0] = True
-                                loop_error[0] = persistence_error
-                                loop_result[0] = None
                         except Exception as save_err:
                             logger.error("Failed to save assistant message: %s", save_err)
                     else:
@@ -1746,6 +1811,7 @@ async def stream_chat_response(
                                 if (
                                     persist_messages
                                     and conversation_id
+                                    and loop_saved[0]
                                     and not loop_error[0]
                                 )
                                 else []
@@ -1775,6 +1841,15 @@ async def stream_chat_response(
                 loop_cancelled[0] = True
                 assistant_blocks.finish("cancelled")
                 raise
+            except RuntimeContextWriterFenced:
+                # Not a failure: the new owner continues the turn. Write
+                # nothing, or this stale copy overwrites its answer.
+                loop_fenced[0] = True
+                assistant_blocks.finish("cancelled")
+                logger.warning(
+                    "chat turn stopped: run taken over by another worker conversation=%s",
+                    conversation_id,
+                )
             except Exception as exc:
                 loop_error[0] = exc
                 assistant_blocks.finish("failed")
@@ -1811,7 +1886,7 @@ async def stream_chat_response(
                 # not cover. No-op once a "done" snapshot already went out.
                 # Deliberately not awaited: this block also runs under
                 # cancellation, where an await re-raises.
-                if not loop_cancelled[0] and not (
+                if not loop_cancelled[0] and not loop_fenced[0] and not (
                     result and result.stop_reason == "cancelled"
                 ):
                     publish_stream_snapshot(
@@ -1888,6 +1963,10 @@ async def stream_chat_response(
 
         # Normal-exit path: task is already done, this is a fast no-op.
         await task
+        if loop_fenced[0]:
+            # The owning worker emits this turn's terminal events.
+            stream_completed = True
+            return
 
         terminal_error_id: str | None = None
         if loop_error[0]:
@@ -1982,6 +2061,7 @@ async def stream_chat_response(
                     "final_response_validation_failed",
                     "llm_configuration_missing",
                     "llm_call_failed",
+                    "llm_provider_unavailable",
                     BYOK_PROVIDER_ERROR_CODE,
                 }:
                     end_payload["error_code"] = result.error

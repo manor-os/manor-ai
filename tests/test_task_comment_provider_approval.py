@@ -80,7 +80,6 @@ async def test_foreground_provider_confirmation_and_retry_are_exactly_once(db_se
     assert row.status == "consumed"
     assert task.status == "in_progress"
     assert task.conversation_id == original_conversation
-    assert not (task.details or {}).get("_runtime_tool_hitl_v1")
 
 
 @pytest.mark.asyncio
@@ -165,9 +164,7 @@ async def test_chat_provider_adapter_does_not_mint_an_orphan_origin(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_foreground_provider_never_claims_a_ready_worker_approval(db_session, monkeypatch):
-    import packages.core.services.task_runtime_approvals as worker_approvals
-
+async def test_foreground_provider_never_claims_a_ready_worker_approval(db_session):
     task, _, envelope = await _scope(db_session, canonical_thread=True)
     request = _chrome_approval_request(approval_id=f"worker-{task.id}")
     card = await register_provider_runtime_approval(
@@ -177,13 +174,6 @@ async def test_foreground_provider_never_claims_a_ready_worker_approval(db_sessi
     row = await db_session.get(HitlRequest, card["hitl"]["id"])
     row.status = "granted"
     await db_session.commit()
-    claims = []
-
-    async def valid_worker_claim(*args, **kwargs):
-        claims.append(kwargs)
-        return True
-
-    monkeypatch.setattr(worker_approvals, "claim_task_runtime_approval_execution", valid_worker_claim)
     preflight = await prepare_provider_runtime_approval_execution(
         db_session, entity_id=envelope.entity_id, conversation_id=envelope.conversation_id,
         task_id=task.id, runtime_envelope=envelope,
@@ -194,5 +184,4 @@ async def test_foreground_provider_never_claims_a_ready_worker_approval(db_sessi
         tool_name=request["confirmation_tool"], arguments=request["confirmation_arguments"],
     )
     assert json.loads(preflight.result)["status"] == "invalid"
-    assert claims == []
     assert row.status == "granted"

@@ -33,6 +33,25 @@ def test_real_knowledge_folder_wins_over_prefix_stripping(tmp_path):
     assert _file_reference_arg("ent1", str(tmp_path), "Knowledge/b.md") == ("Knowledge/b.md", "", False)
 
 
+async def test_runtime_resolves_file_addresses_before_the_approval_receipt(tmp_path, monkeypatch):
+    """The receipt must name the path the handler writes, not the raw address."""
+    from packages.core.ai.runtime import tool_execution
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity: str(tmp_path))
+    patched = await tool_execution._runtime_canonical_file_arguments(
+        "patch_file", {"path": "/api/v1/fs/ent1/Workspaces/a.csv", "operations": []}, entity_id="ent1",
+    )
+    assert patched == {"path": "Workspaces/a.csv", "operations": []}
+    replaced = await tool_execution._runtime_canonical_file_arguments(
+        "replace_file", {"source_path": "/workspace/new.csv", "target_path": "Knowledge/a.csv"}, entity_id="ent1",
+    )
+    assert replaced == {"source_path": "new.csv", "target_path": "a.csv"}
+    foreign = {"path": "/api/v1/fs/ent2/a.csv"}
+    assert await tool_execution._runtime_canonical_file_arguments("patch_file", foreign, entity_id="ent1") == foreign
+    other = {"path": "/api/v1/fs/ent1/a.csv"}
+    assert await tool_execution._runtime_canonical_file_arguments("read_file", other, entity_id="ent1") == other
+
+
 def test_plain_and_unsafe_paths_pass_through_unchanged(tmp_path):
     assert _file_reference_arg("ent1", str(tmp_path), "a/./b.md") == ("a/./b.md", "", False)
     assert _file_reference_arg("ent1", str(tmp_path), "../etc/passwd") == ("../etc/passwd", "", False)

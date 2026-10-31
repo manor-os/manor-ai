@@ -14,7 +14,7 @@ from packages.core.services.workspace_artifacts import (
     workspace_artifact_storage_base,
 )
 from packages.core.services.workspace_layout import (
-    TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, WORKSPACE_LEDGER_DIRECTORIES,
+    TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, WORKSPACE_RESERVED_DIRECTORIES,
 )
 
 
@@ -53,6 +53,17 @@ def current_workspace_artifact_scope(
     if scope is not None and scope.entity_id == entity_id and scope.workspace_id == workspace_id:
         return scope
     return None
+
+# A voice pinned to one of these scopes is the only voice there, so its takes
+# need no voice-name folder; a random per-Task or per-Conversation voice does.
+PINNED_VOICE_SCOPES = frozenset({"project", "workspace"})
+
+
+def voice_folder_applies(voice_reference: object) -> bool:
+    """Whether narration in this voice is grouped under a voice-name folder."""
+    scope = voice_reference.get("scope") if isinstance(voice_reference, dict) else None
+    return scope not in PINNED_VOICE_SCOPES
+
 
 def narrator_audio_output_name(output_name: str, voice: str) -> str:
     """Keep an explicitly requested parent while grouping narration by voice.
@@ -384,7 +395,8 @@ def scope_workspace_artifact_path(
             rel = "runs/" + rel.removeprefix("workflow/")
         if rel == f"runs/{lineage}" or rel.startswith(f"runs/{lineage}/"):
             return f"{home}/{rel}"
-    if home and rel.split("/", 1)[0] in WORKSPACE_LEDGER_DIRECTORIES | {TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT}:
+    if home and rel.split("/", 1)[0] in WORKSPACE_RESERVED_DIRECTORIES:
+        # Ledgers, execution archives and project folders live at the home.
         return f"{home}/{rel}"
     if rel == WORKSPACE_ARTIFACT_ROOT:
         return workspace_base_dir

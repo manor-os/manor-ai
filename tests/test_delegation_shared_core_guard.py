@@ -33,12 +33,6 @@ _CORE_BUILDERS = {
 # Reviewed "delegated": True literals outside the core, as
 # (file, function, shape): count. None of them is a delegated child-run result.
 _LEGACY_SITES = {
-    # The V2 Plan coordinator (plan_dag engine) stores and replays its own
-    # materialized child steps. It is retired with plan_dag; delete these
-    # entries together with that code.
-    ("packages/core/workers/coordinator_tools.py", "_stored_child_response", "delegated_payload"): 2,
-    ("packages/core/workers/coordinator_tools.py", "_delegation_contract_failure_payload", "delegated_payload"): 1,
-    ("packages/core/workers/coordinator_tools.py", "_insert_or_resume_child_step", "delegated_payload"): 4,
     # A workflow wait step approved by a delegate: another meaning of
     # "delegated" (who approved), not a delegated agent's result.
     ("packages/core/ai/workflow_runner.py", "_execute_wait_step", "delegated_payload"): 1,

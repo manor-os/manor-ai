@@ -60,6 +60,9 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     # Roles: owner, admin, member, viewer, client
     llm_model: Mapped[Optional[str]] = mapped_column(String(100))
     timezone: Mapped[str] = mapped_column(String(50), default="UTC")
+    # False: the zone is a default or detected one that clients may replace with
+    # the device's zone. True: the user chose it, so only the user changes it.
+    timezone_user_set: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     locale: Mapped[str] = mapped_column(String(10), default="en")
     preferences: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")

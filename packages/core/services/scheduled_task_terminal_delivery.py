@@ -9,8 +9,7 @@ The transition itself cannot settle the run: callers write
 ``task.actual_output`` *after* ``apply_task_status_transition``, so the result
 (``response``, error text) does not exist yet. Instead this stages, in the
 caller's transaction, one runtime-outbox delivery of the exact gateway envelope
-(``run_agent_task``, the same event type and payload shape that
-``fail_task_runtime_approval_origin`` used). After commit the gateway sees a
+(``run_agent_task``). After commit the gateway sees a
 terminal Task, builds the real ``_task_terminal_result`` and settles/projects
 the occurrence through its normal path, which only touches a RUNNING run whose
 admitted child is this Task.

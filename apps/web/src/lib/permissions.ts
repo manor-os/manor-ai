@@ -21,7 +21,7 @@ const _ROLE_PERMISSIONS: Record<string, string[]> = {
   member: [
     "tasks.create", "tasks.update", "tasks.assign",
     "docs.upload", "agents.create",
-    "integrations.connect", "mcp.use_personal",
+    "integrations.connect", "integrations.share", "mcp.use_personal",
   ],
   admin: [
     "entity.update", "users.read", "users.invite",

@@ -282,3 +282,29 @@ def validate_container_path(path: str) -> None:
             raise SecurityError(
                 f"Container path '{path}' targets reserved path '{r}'."
             )
+
+
+_MAX_SKILL_NAME_LENGTH = 128
+
+
+def validate_skill_name(name: str) -> None:
+    """Reject skill names that could address a path instead of naming a skill.
+
+    A skill name is an identifier: it ends up in temp-dir prefixes, container
+    names and logs. Path separators, ``..`` and control characters are a
+    caller error, never something to normalise silently.
+    """
+    from .errors import InvalidRequest
+
+    if not isinstance(name, str) or not name.strip():
+        raise InvalidRequest("skill_name must not be empty")
+    if len(name) > _MAX_SKILL_NAME_LENGTH:
+        raise InvalidRequest(
+            f"skill_name must be at most {_MAX_SKILL_NAME_LENGTH} characters"
+        )
+    if "/" in name or "\\" in name or ".." in name:
+        raise InvalidRequest(
+            f"Invalid skill_name {name!r}: path separators and '..' are not allowed"
+        )
+    if any(not character.isprintable() for character in name):
+        raise InvalidRequest("skill_name must not contain control characters")

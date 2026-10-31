@@ -123,7 +123,7 @@ def test_readiness_report_documents_part_roles_and_checks() -> None:
     assert goals.missing_setup_key == ""
 
 
-def test_readiness_requires_every_declared_service_and_worker_binding() -> None:
+def test_readiness_requires_every_declared_service() -> None:
     report = build_workspace_readiness_report(
         operating_model={
             "services": [
@@ -142,14 +142,12 @@ def test_readiness_requires_every_declared_service_and_worker_binding() -> None:
         knowledge_nets=[],
         governance_policy=None,
         operating_memory="",
-        runtime_bound_subscription_ids=set(),
     )
 
     agents = next(part for part in report.parts if part.key == "agents")
     assert agents.status == "partial"
     assert agents.missing_setup_key == "no_agents"
     assert agents.details["missing_service_keys"] == ["publishing"]
-    assert agents.details["unbound_subscription_ids"] == ["sub_research"]
 
 
 def test_readiness_accepts_legacy_service_key_field_without_losing_blocker() -> None:

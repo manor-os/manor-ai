@@ -262,7 +262,7 @@ test("failed upload remains retryable and cancellation settles", async ({ page }
   await expect.poll(() => pending.length).toBe(1);
   await pending.shift()!.fulfill({ status: 503, json: { detail: "Upload service unavailable" } });
   await expect(page.getByRole("status")).toHaveText("failed");
-  await expect(page.getByRole("alert")).toContainText("Backend unavailable");
+  await expect(page.getByRole("alert")).toContainText("Upload service unavailable");
 
   await page.getByRole("button", { name: "Retry" }).click();
   await expect.poll(() => pending.length).toBe(1);

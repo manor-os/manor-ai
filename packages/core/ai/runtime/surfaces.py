@@ -81,11 +81,13 @@ def surface_for_channel_context(
         return ChatSurface.PUBLIC_CUSTOMER_CHAT
 
     clean_role = str(role or "").strip().lower()
+    # An external Workspace collaborator is not internal to the company: an
+    # internal surface would run company-wide tools for their channel contact.
     verified_internal_user = bool(
         is_verified
         and user_id
         and clean_role
-        and clean_role != "external"
+        and clean_role not in {"external", "collaborator"}
     )
     if not verified_internal_user:
         return ChatSurface.EXTERNAL_CHANNEL_CHAT

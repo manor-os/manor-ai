@@ -59,7 +59,7 @@ Treat `description` as the discovery contract. State:
 - adjacent or implicit requests for which it remains useful;
 - important near-misses when confusion with another capability is likely.
 
-Use natural semantic guidance rather than a literal keyword list. Keep the description concise enough to remain useful in the always-visible Skill catalog.
+Use natural semantic guidance rather than a literal keyword list. Keep the description at most 1024 characters: callers read only the description before invoking the Skill. When callers must pass `params` (for example a mode), say when, in the description's first sentences.
 
 ### Main instructions
 

@@ -12,6 +12,7 @@ import ShareOtpGate from "../components/permissions/ShareOtpGate";
 import ReadOnlyFilePreview from "../components/file-preview/ReadOnlyFilePreview";
 import { IconDocument, IconDownload } from "../components/icons";
 import { t } from "../lib/i18n";
+import { getPreferredTimeZone } from "../lib/format";
 
 interface SharedDocResponse {
   document_id: string;
@@ -163,7 +164,7 @@ export default function SharedDocument() {
                 </span>
                 {data.expires_at && (
                   <span style={{ fontSize: 12, color: "#a8a29e" }}>
-                    · {t("page.shared_doc.expires_on", { date: new Date(data.expires_at).toLocaleDateString() })}
+                    · {t("page.shared_doc.expires_on", { date: new Date(data.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) })}
                   </span>
                 )}
                 {canDownload && token && (

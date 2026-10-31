@@ -1,4 +1,13 @@
-import { accessTokenExpired, getReadyAuthToken, restorePersistentSession } from "./persistentSession";
+import {
+  accessTokenExpired,
+  getReadyAuthToken,
+  markCollaborationEndedSignIn,
+  restorePersistentSession,
+  signInPath,
+} from "./persistentSession";
+import { EMBED } from "../embed/embedContext";
+import { endEmbeddedSession } from "../embed/embeddedSession";
+import type { KnowledgeContentSearchResponse } from "./knowledgeLayout";
 import { approvalResourcePath, type ApprovalScope, type ApprovalSnapshot, type ApprovalWrite, type ApprovalPreview, type ApprovalOverrides, type ApprovalCommandProjection, type ApprovalSaveRuleCommand, type ApprovalCommandResult } from "./approvalTypes";
 import type {
   User,
@@ -31,10 +40,6 @@ import type {
   PublicBookingLink,
   PublicBookingRequest,
   BookingConfirmation,
-  ExecutionPlan,
-  ExecutionStep,
-  PlanRetryResponse,
-  StepRetryResponse,
   Order,
   OrderItem,
   OrderStats,
@@ -99,14 +104,54 @@ import {
 } from "./manualSkillRefs";
 import {
   authPrincipalKey,
+  decodeAuthTokenClaims,
   isSameAuthIdentity,
   getAuthToken,
   clearAuthBrowserState,
   notifyAuthTokenChanged,
 } from "./authToken";
 import { captureClientError } from "./clientErrors";
+import { downloadRoomFile } from "./roomFileDownload";
+import { fetchCachedFile, invalidateCachedFiles } from "./persistentFileCache";
 
 const API_BASE = "/api/v1";
+
+export type ConnectionKind = "integration" | "oauth_account";
+/** A coding agent (public OAuth client) signed in as the current user. */
+export interface OAuthConnection {
+  id: string;
+  client_id: string;
+  name: string;
+  verified: boolean;
+  entity_id: string;
+  connected_at: string;
+  last_used_at: string;
+  expires_at: string;
+}
+export interface ConnectionShareMember {
+  user_id: string;
+  display_name: string | null;
+  email: string | null;
+  avatar_url: string | null;
+}
+export interface ConnectionShareState {
+  entity_grant_id: string | null;
+  users: Array<ConnectionShareMember & { grant_id: string }>;
+  candidates: ConnectionShareMember[];
+}
+export interface ConnectionShareSummary {
+  entity: boolean;
+  user_count: number;
+  /** The first few named recipients, for an avatar stack. */
+  people: Array<{ user_id: string; display_name: string | null; avatar_url: string | null }>;
+}
+export interface ConnectionUse {
+  actor_user_id: string;
+  actor_display_name: string | null;
+  server_key: string;
+  tool_name: string;
+  created_at: string;
+}
 
 
 export enum ConversationSurfaceKind {
@@ -208,6 +253,9 @@ export type WorkspaceAppActionInput = WorkspaceChatEntrypoint["inputs"][number] 
   description?: string;
   hidden?: boolean;
   schema?: import("../components/workflows/workflowSchema").WorkflowInputSchema;
+  /** The form page this input is on; inputs sharing a step are asked together. */
+  step?: string;
+  step_label?: string;
 };
 
 export type WorkspaceAppFormField = {
@@ -219,6 +267,290 @@ export type WorkspaceAppFormField = {
   options: string[];
 };
 
+export type WorkspaceAppDataContextKind = "project" | "launch_run" | "workspace";
+export type WorkspaceAppDataBlockType = "progress" | "records" | "documents" | "metrics" | "summary" | "project_rollup" | "references" | "packs" | "gallery";
+
+export type WorkspaceAppSummaryField = {
+  label: string;
+  field: string[];
+  format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+  hide_when_empty?: boolean;
+  labels?: Record<string, string>;
+  /** Fallback paths shown beside the value, e.g. the account of a provider. */
+  secondary?: string[][];
+};
+
+/**
+ * A read-only source declared by a Workspace App configuration.  The server
+ * owns the adapter, ACL check, joins, and field projection; the browser never
+ * sends a source name or path when it asks for data.
+ */
+export type WorkspaceAppDataSource = {
+  type: string;
+  workflow?: string;
+  project_type?: string;
+  label_fields?: string[][];
+  /** Optional state path that pins App execution links to a substantive Workflow run. */
+  execution_run_id_path?: string[];
+  stages?: string[];
+  order?: { field: string[]; type: "datetime"; direction: "asc" | "desc" };
+  [key: string]: unknown;
+};
+
+export type WorkspaceAppDataBlock = {
+  key: string;
+  type: WorkspaceAppDataBlockType;
+  source: string;
+  metrics_source?: string;
+  metrics_display?: "declared" | "configured";
+  record_display?: {
+    title?: { source: string; field: string[] };
+    fields?: Array<{ label: string; source: string; field: string[]; labels?: Record<string, string>; format?: "text" | "provider"; secondary?: string[][] }>;
+    media?: Array<{ source: string; label?: string }>;
+  };
+  title?: string | null;
+  fields?: string[][] | WorkspaceAppSummaryField[];
+  metric_keys?: string[];
+  count_by_stage?: boolean;
+  first?: { stages: string[] };
+  /** Presentation copy retained for an explicitly configured empty block. */
+  empty_message?: string;
+  /** Completion is derived from the rollup stages; it never changes project state. */
+  completion?: { stages: string[]; label: string };
+  /** Presentation-only mapping from stored stages to display labels. */
+  stage_labels?: Record<string, string>;
+  /** A packs block's plan: its cards follow the plan's order, a planned child a card before it starts. */
+  plan?: string;
+  /** One App action per pack, opened with the pack's project filling ``input``; only in ``stages`` when given. */
+  item_action?: { action: string; label: string; input: string; stages?: string[] };
+  /** A planned card's App action, its inputs filled from the card's parent project or plan code. */
+  plan_action?: { action: string; label: string; inputs: Record<string, "parent" | "code"> };
+  limit?: number;
+};
+
+export type WorkspaceAppDataDisplay = {
+  layout?: "stack" | "tabs";
+  groups?: Array<{ key: string; title: string; blocks: string[] }>;
+  hidden?: boolean;
+  hidden_blocks?: string[];
+  /** Opt-in projection for date-based project collections such as schedules. */
+  calendar?: {
+    block: string;
+    date_field: string[];
+    rollup_block: string;
+    context_block: string;
+    attention_stages: string[];
+    collection_title: string;
+  };
+};
+
+export type WorkspaceAppDataComponent = {
+  type: "data_view";
+  schema_version: 1;
+  key: string;
+  title?: string | null;
+  description?: string | null;
+  context: {
+    kind: WorkspaceAppDataContextKind;
+    source?: string;
+    label?: string | null;
+    /** Pick projects from cards instead of a list; ``cover`` and ``progress`` name the blocks a card shows. */
+    display?: "select" | "cards";
+    cover?: string;
+    progress?: string;
+  };
+  blocks: WorkspaceAppDataBlock[];
+  display?: WorkspaceAppDataDisplay;
+  visibility?: { block: string; when: "has_records" | "has_observations" };
+};
+
+export type WorkspaceAppDataContext = {
+  kind: WorkspaceAppDataContextKind;
+  id: string;
+  label: string;
+  href?: string | null;
+  status?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  project_type?: string | null;
+  execution?: WorkspaceAppDataItem["execution"];
+  summary?: WorkspaceAppDataContextSummary;
+  /** On a card: the project's first image reference and how many of its children are done. */
+  cover?: { document_id: string; title?: string | null };
+  progress?: { done: number; total: number; label: string };
+};
+
+export type WorkspaceAppDataContextSummary = {
+  fields: Array<{
+    label: string;
+    value?: string | number | boolean | null;
+    format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+    href?: string | null;
+    links?: Array<{ label: string; href: string }>;
+    provider?: string | null;
+    secondary?: string | null;
+  }>;
+  total: number;
+  counts_by_stage: Record<string, number>;
+  /** Unfinished items are already counted by their run (failed, cancelled, paused, pending). */
+  counts_include_execution?: boolean;
+  next?: {
+    id: string;
+    label: string;
+    status?: string | null;
+    detail?: string | null;
+    updated_at?: string | null;
+    fields: Array<{
+      label: string;
+      value?: string | number | boolean | null;
+      format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+      href?: string | null;
+      links?: Array<{ label: string; href: string }>;
+    }>;
+    execution?: WorkspaceAppDataItem["execution"];
+    calendar_at?: string | null;
+  };
+};
+
+export type WorkspaceAppDataMetric = {
+  id: string;
+  metric_key?: string | null;
+  label?: string | null;
+  value?: number | string | null;
+  unit?: string | null;
+  value_type?: "number" | "percent" | "currency" | "duration" | null;
+  status?: string | null;
+  freshness?: string | null;
+  collection_error?: string | null;
+  delta_reason?: string | null;
+  change?: number | null;
+  previous_value?: number | null;
+  trend?: Array<{ value: number | null; observed_at?: string | null }>;
+  updated_at?: string | null;
+  detail?: string | null;
+  title?: string | null;
+  subtitle?: string | null;
+  href?: string | null;
+  viewer_url?: string | null;
+  document_id?: string | null;
+};
+
+export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
+  calendar_at?: string | null;
+  /** A gallery card's result: the run that made the version shown, which opens it. */
+  run_id?: string | null;
+  /** How far a result still being made is, 1–99. */
+  progress_percent?: number;
+  workflow_id?: string | null;
+  binding_id?: string | null;
+  platform?: string | null;
+  /** A project file's folder below the project's own folder ("" for the folder itself). */
+  folder?: string;
+  /** The child project (an episode) whose results this file is, and which version folder it is in. */
+  pack?: {
+    id: string; root: string; label: string; stage?: string | null; version?: string; code?: string; synopsis?: string; parent_id?: string;
+    /** The child project's latest run: how its making is going, and whether it waits for a person. */
+    run?: { id: string; workflow_id: string; binding_id?: string | null; status: string; needs_you?: boolean };
+  };
+  /** Verified as a result of its production, not a file a newer version is still writing. */
+  delivered?: boolean;
+  /** A reference a project keeps for everything made in it, e.g. role narrator → voice Puck. */
+  role?: string;
+  kind?: string;
+  reference?: { voice?: string; provider?: string; model?: string; pinned_at?: string };
+  /** Held by an ancestor project (the series an episode belongs to), not the selected one. */
+  inherited?: boolean;
+  holder_project_id?: string | null;
+  holder_label?: string | null;
+  execution?: {
+    run_id: string;
+    status: string;
+    current_step_id?: string | null;
+    error?: string | null;
+    href?: string | null;
+  } | null;
+  total?: number;
+  counts_by_stage?: Record<string, number>;
+  /** Unfinished items are already counted by their run (failed, cancelled, paused, pending). */
+  counts_include_execution?: boolean;
+  next?: {
+    id: string;
+    label: string;
+    stage: string;
+    fields: Array<{
+      label: string;
+      value?: string | number | boolean | null;
+      format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+      href?: string | null;
+      links?: Array<{ label: string; href: string }>;
+    }>;
+    execution?: WorkspaceAppDataItem["execution"];
+  } | null;
+  enabled?: boolean;
+  state?: "enabled" | "ended" | string;
+  last_status?: string | null;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  stop_after?: string | null;
+  fields?: Array<{
+    label: string;
+    value?: string | number | boolean | null;
+    format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+    href?: string | null;
+    links?: Array<{ label: string; href: string }>;
+    /** Raw provider key of a `provider` field; the value is its display label. */
+    provider?: string | null;
+    secondary?: string | null;
+  }>;
+  metrics?: WorkspaceAppDataMetric[];
+  published_at?: string | null;
+  tracking_status?: "pending" | "partial" | "configured" | null;
+  conflict?: string | null;
+  media?: Array<{
+    document_id: string;
+    title: string;
+    mime_type?: string | null;
+    file_size?: number | null;
+    updated_at?: string | null;
+    viewer_url?: string | null;
+    label?: string | null;
+  }>;
+};
+
+export type WorkspaceAppDataBlockResult = {
+  key: string;
+  type: WorkspaceAppDataBlockType;
+  source: string;
+  title?: string | null;
+  status: "ready" | "empty" | "waiting" | "stale" | "error" | string;
+  items: WorkspaceAppDataItem[];
+  summary?: string | null;
+  next_cursor?: string | null;
+  error?: { code?: string; message?: string } | null;
+};
+
+export type WorkspaceAppDataContextsResponse = {
+  component: { key: string; title?: string | null; context: WorkspaceAppDataComponent["context"] };
+  items: WorkspaceAppDataContext[];
+  /** Runs of the producing Flow still making their project (a campaign being prepared), newest first. */
+  making?: Array<{
+    run_id: string; workflow_id: string; binding_id?: string | null; status: string;
+    step?: string | null; started_at?: string | null; progress_percent?: number;
+  }>;
+  next_cursor?: string | null;
+  status: "ready" | "empty" | "waiting" | string;
+  errors?: Array<{ code?: string; message?: string; source?: string }>;
+};
+
+export type WorkspaceAppDataResponse = {
+  component_key: string;
+  visible?: boolean;
+  context: { kind: WorkspaceAppDataContextKind; id: string };
+  status: "ready" | "empty" | "waiting" | "stale" | "error" | string;
+  blocks: WorkspaceAppDataBlockResult[];
+  errors?: Array<{ code?: string; message?: string; source?: string }>;
+};
+
 export type WorkspaceAppAction = {
   key: string;
   kind: "workflow" | "chat" | "automation";
@@ -227,6 +559,8 @@ export type WorkspaceAppAction = {
   source_description?: string;
   available?: boolean;
   description: string;
+  /** The glyph the page config chose for this entry; null lets its name suggest one. */
+  icon?: WorkspaceAppEntryIcon | null;
   binding_id?: string;
   workflow_id?: string;
   job_id?: string;
@@ -247,6 +581,8 @@ export type WorkspaceAppAction = {
   target_workflow_id?: string | null;
   placeholder?: string;
   prompt?: string;
+  /** Rules across the Flow's inputs (choose at least one platform), checked before it starts. */
+  input_rules?: import("../components/workflows/workflowSchema").WorkflowInputSchema[];
   inputs?: WorkspaceAppActionInput[] | WorkspaceAppFormField[];
 };
 
@@ -264,11 +600,178 @@ export type WorkspaceAppViewConfig = {
   targets: Record<string, string>;
   entries?: Record<string, { title: string }>;
   prompts?: Record<string, string>;
+  /** Prefilled Flow inputs per entry, so one Flow can appear as several entries. */
+  presets?: Record<string, Record<string, string>>;
+  /** Hidden Flow inputs an entry asks for, e.g. the series a "next episode" entry continues. */
+  asks?: Record<string, string[]>;
+  /** A glyph per entry; absent when the page sets none. */
+  icons?: Record<string, WorkspaceAppEntryIcon>;
+  /** The Workspace's own templates for an entry's free-text inputs, by action key then input key. */
+  choices?: Record<string, Record<string, Array<{
+    value: string; label?: string; description?: string; image?: string; presets?: Record<string, string>;
+  }>>>;
   visual: "auto" | "image" | "motion" | "plain";
   layout: "feature" | "cover" | "list";
+  /** What opens first for someone who has not picked a view of this Workspace; absent = App beside the chat. */
+  open_as?: WorkspaceAppDisplayMode;
+  /** The App's own cover, shown when the Workspace has none; it travels with the Blueprint. */
+  cover_image_url?: string | null;
+  /** The App's own look; absent = the platform's (lib/appTheme.ts). */
+  theme?: { accent?: string; surface?: "neutral" | "tinted" | "deep"; radius?: "sharp" | "soft" | "round" } | null;
   motion_cover_url: string | null;
   motion_cover_source_url: string | null;
+  data_sources?: Record<string, WorkspaceAppDataSource>;
+  components?: WorkspaceAppDataComponent[];
+  sections?: WorkspaceAppSectionConfig[] | null;
 };
+
+/** Must equal the server's APP_OPEN_AS. */
+export type WorkspaceAppDisplayMode = "split" | "app" | "chat";
+
+/** Must equal the server's APP_SECTION_BLOCKS keys (guarded by a test). */
+export type WorkspaceAppSectionBlock = "connections" | "actions" | "queue" | "metrics" | "outputs";
+
+/** Must equal the server's APP_ENTRY_ICONS (guarded by a test). */
+export type WorkspaceAppEntryIcon =
+  | "flow" | "chat" | "clock" | "play" | "music" | "audio" | "microphone" | "image" | "palette" | "sparkles"
+  | "document" | "report" | "presentation" | "checklist" | "clipboard" | "search" | "megaphone" | "send"
+  | "comment" | "mail" | "globe" | "calendar" | "trending" | "rocket" | "academic" | "box" | "cart"
+  | "refresh" | "bolt" | "bookmark" | "scale" | "code" | "users" | "dollar" | "heart" | "star";
+
+/** The page's zones, always in this order: notices, functions, data, outputs. */
+export type WorkspaceAppZone = "notices" | "functions" | "data" | "outputs";
+
+/** One block's contract as published by the server; clients never hard-code it. */
+export type WorkspaceAppBlockSpec = {
+  block: WorkspaceAppSectionBlock;
+  zone: WorkspaceAppZone;
+  /** The first view is the default. */
+  views: string[];
+  default_source: string | null;
+  /** "workflow" means a section may read one flow's runs ("workflow:<binding_id>"). */
+  source_kinds: string[];
+  multiple: boolean;
+  removable: boolean;
+  /** How many items the block shows at once. */
+  limit: { default: number; max: number } | null;
+};
+
+export type WorkspaceAppSectionConfig = {
+  id: string;
+  block: WorkspaceAppSectionBlock;
+  source: string | null;
+  view: string;
+  limit: number | null;
+  /** A metrics section's chosen numbers (stat:<key>, goal:<key>), in order; absent shows them all. */
+  items?: string[];
+  /** The section's heading instead of its source's name; absent uses the source's. */
+  title?: string;
+};
+
+export type WorkspaceAppSection = WorkspaceAppSectionConfig & {
+  /** True when the page uses the default sections instead of a saved list. */
+  implicit: boolean;
+  available: boolean;
+  source_title: string | null;
+};
+
+export type WorkspaceAppOutputFile = {
+  document_id?: string;
+  name: string;
+  fs_path?: string;
+  open_url?: string;
+  mime?: string;
+};
+
+export type WorkspaceAppOutputRun = {
+  /** "chat": a request an App entry sent to an Agent; it opens at its reply in chat. */
+  kind?: "chat";
+  /** For a chat request: the chat message to open (its reply, or the request until one exists). */
+  message_id?: string;
+  run_id: string;
+  workflow_id: string;
+  binding_id: string | null;
+  /** The App entry the run was started from, when an entry started it. */
+  app_action?: string | null;
+  /** The action or Flow that made it. */
+  title: string;
+  /** What came out: the result's own title and line. */
+  result_title?: string | null;
+  result_summary?: string | null;
+  status: string;
+  business_outcome: string | null;
+  trigger_source: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  files: WorkspaceAppOutputFile[];
+  file_count: number;
+  /** Person-facing stages from the persisted run summary; absent for older runs. */
+  progress?: {
+    stages: Array<{ name: string; status: string }>;
+    stage_count: number;
+    done_count: number;
+    current: { id: string | null; name: string | null; index: number | null; status: string; waiting: boolean } | null;
+  } | null;
+  publications?: Array<{
+    platform?: string;
+    title?: string;
+    published_url?: string;
+    verification_status?: string;
+    published_at?: string;
+    account?: string;
+  }>;
+};
+
+export type WorkspaceAppQueueItem = WorkspaceAttentionReminder & {
+  /** A workflow review's in-place choice and a glimpse of what is waiting. */
+  primary_option?: string;
+  has_changes_option?: boolean;
+  previews?: Array<{ document_id: string; name: string }>;
+};
+
+export type WorkspaceAppMetric = {
+  kind: "stat" | "goal";
+  id: string;
+  title: string;
+  value_type: string;
+  unit: string | null;
+  value: number | null;
+  updated_at: string | null;
+  freshness_status: string;
+  /** "agent_review" when an agent assesses the value from evidence. */
+  collector_type: string | null;
+  /** What the last assessment could not verify. */
+  gaps: string[];
+  next_assessment_at: string | null;
+  /** The agent-review schedule and its latest run, for "assess now" and run links. */
+  assessment: {
+    next_run_at: string | null;
+    job_id: string | null;
+    workflow_id: string | null;
+    run_id: string | null;
+    run_status: string | null;
+  } | null;
+  goal: {
+    id: string;
+    title: string;
+    target: number | null;
+    baseline: number | null;
+    deadline: string | null;
+    pace_status: string | null;
+    status: string;
+  } | null;
+  series: Array<{ at: string; value: number }>;
+};
+
+export type WorkspaceAppSectionData =
+  | { id: string; block: "outputs"; items: WorkspaceAppOutputRun[] }
+  | { id: string; block: "queue"; items: WorkspaceAppQueueItem[] }
+  | { id: string; block: "connections"; items: WorkspaceConnectionRequirement[] }
+  | { id: string; block: "metrics"; items: WorkspaceAppMetric[]; suggestions?: WorkspaceAssessmentTemplate[] };
+
+/** An audience metric an agent can assess for a Workspace, named in the user's language. */
+export type WorkspaceAssessmentTemplate = { key: string; name: string; unit: string };
 
 export type WorkspaceAppView = {
   workspace_id: string;
@@ -277,11 +780,15 @@ export type WorkspaceAppView = {
   description: string;
   status: string;
   cover_image_url?: string | null;
-  cover_source?: "workspace" | "starter" | "none";
+  cover_source?: "workspace" | "app" | "starter" | "none";
   can_start: boolean;
   hero: string | null;
   actions: WorkspaceAppAction[];
   available_actions: WorkspaceAppAction[];
+  /** Absent from older servers; the page then shows only its actions. */
+  sections?: WorkspaceAppSection[];
+  /** The block catalog the sections follow; absent from older servers. */
+  blocks?: WorkspaceAppBlockSpec[];
   workflow_options: Array<{ binding_id: string; workflow_id: string; title: string; description: string; placeholder: string; inputs: WorkspaceAppActionInput[] }>;
   automation_options: Array<{ job_id: string; title: string; description?: string; enabled: boolean } & Pick<WorkspaceAppAction, "last_status" |
     "job_type" | "schedule_kind" | "every_seconds" | "run_at" | "cron_expr" | "timezone" | "instructions" | "target_title" | "target_workflow_id">>;
@@ -295,12 +802,19 @@ export type GlobalChatFlowEntrypoint = WorkspaceChatEntrypoint & {
   workspace_name: string;
 };
 
+export type DocumentMediaKind = "audio" | "video" | "image" | "document";
 type DocumentListParams = {
   search?: string;
   folder_id?: string;
   scope?: "all";
   workspace_id?: string;
   include_generated_assets?: boolean;
+  /** Only these media kinds, filtered by the server so every page holds matches. */
+  kinds?: DocumentMediaKind[];
+  /** Leave out files made on the way to a result (QA frames, recipes, timelines). */
+  results_only?: boolean;
+  /** Skip the folder's total size and count when nothing shows them. */
+  include_usage?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -364,6 +878,41 @@ export type FreeMusicTrack = {
   genres: string[];
 };
 
+export type MediaJobPhase = "queued" | "submitting" | "generating" | "saving" | "done" | "failed";
+
+export type MediaJob = {
+  id: string;
+  status: "pending" | "processing" | "completed" | "failed" | string;
+  kind: string;
+  prompt: string;
+  model?: string | null;
+  params: Record<string, any>;
+  result_url?: string | null;
+  document_id?: string | null;
+  error?: string | null;
+  duration_seconds?: number | null;
+  credits?: number | null;
+  byok?: boolean;
+  progress?: { phase: MediaJobPhase; at?: string } | null;
+  eta_seconds?: number | null;
+  regenerated_from?: string | null;
+  lineage_root?: string | null;
+  run_id?: string | null;
+  unit_id?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type MediaJobRegenerateInput = {
+  prompt?: string;
+  model?: string;
+  duration?: number;
+  resolution?: string;
+  aspect_ratio?: string;
+  keep_seed?: boolean;
+};
+
 export type FreeMusicSearchResult = {
   items: FreeMusicTrack[];
   page: number;
@@ -382,6 +931,9 @@ function listDocuments(params?: DocumentListParams) {
   if (params?.folder_id !== undefined) q.set("folder_id", params.folder_id);
   if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
   if (params?.include_generated_assets !== undefined) q.set("include_generated_assets", String(params.include_generated_assets));
+  for (const kind of params?.kinds || []) q.append("kind", kind);
+  if (params?.results_only) q.set("results_only", "true");
+  if (params?.include_usage === false) q.set("include_usage", "false");
   if (params?.limit) q.set("limit", String(params.limit));
   if (params?.offset) q.set("offset", String(params.offset));
   return request<DocumentListResponse>(`/documents?${q}`);
@@ -419,6 +971,17 @@ function browseDocumentsPage(
   q.set("limit", String(params.limit ?? 50));
   if (params.cursor) q.set("cursor", params.cursor);
   return request<DocumentBrowsePageResponse>(`/documents/browse-page?${q}`, { signal });
+}
+
+/** Documents whose text (or a media file's stored description) matches ``q``. */
+function searchDocumentContent(
+  params: { q: string; workspace_id?: string; folder_id?: string; limit?: number },
+  signal?: AbortSignal,
+) {
+  const q = new URLSearchParams({ q: params.q, limit: String(params.limit ?? 20) });
+  if (params.workspace_id) q.set("workspace_id", params.workspace_id);
+  if (params.folder_id) q.set("folder_id", params.folder_id);
+  return request<KnowledgeContentSearchResponse>(`/documents/content-search?${q}`, { signal });
 }
 
 function listDocumentIndexingStatuses(ids: string[]) {
@@ -785,6 +1348,25 @@ export interface WorkspaceCreditUsageSummary {
   week_credits: number;
   all_time_credits: number;
   timezone: string;
+  /** A client delivery trial's provider pays this Workspace's AI usage. */
+  paid_by_provider?: boolean;
+}
+
+/** One row of the per-source usage report. */
+export interface UsageBySourceRow {
+  /** Agent / feature name, or "customer_trial" for a client trial this company paid for. */
+  source: string;
+  /** Server label for a customer_trial row: "Customer trial: <customer> / <Workspace>". */
+  label?: string;
+  /** "<customer> / <Workspace>" of a customer_trial row. */
+  trial_name?: string;
+  workspace_id?: string;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  credit_used: number;
+  last_used: string | null;
 }
 
 export interface WorkspaceSetupStatus {
@@ -888,6 +1470,8 @@ export interface WorkspaceDraftFinalize {
 
 // ── Workspace Blueprint / Marketplace types (M12) ─────────────────────
 
+export type WorkspaceConnectionRequirement = WorkspaceConnectionStatus["requirements"][number];
+
 export interface WorkspaceConnectionStatus {
   workspace_id: string;
   required_issue_count: number;
@@ -901,6 +1485,8 @@ export interface WorkspaceConnectionStatus {
     reason: string;
     service_keys: string[];
     setup_kind?: string | null;
+    /** Set when another connection (Chrome) already covers this one. */
+    covered_by?: string | null;
   }>;
 }
 
@@ -994,10 +1580,12 @@ export interface BlueprintSummary {
   is_owner?: boolean;
 }
 
+
 export interface BlueprintDetail extends BlueprintSummary {
   description: string | null;
   payload: Record<string, unknown>;
 }
+
 
 // Mirrors backend UpdateBlueprintRequest (apps/api/routers/blueprints.py):
 // only these fields are writable via PUT /blueprints/{id}.
@@ -1060,6 +1648,8 @@ export interface BlueprintExportKnowledgeDocument {
   file_size: number;
   groups: Array<{ id: string; name: string }>;
   groups_truncated?: boolean;
+  content_source?: "initial_template" | "current_content";
+  required_by_workflows?: string[];
 }
 
 export type InstallMode = "simulate" | "live";
@@ -1380,6 +1970,91 @@ export interface CostSection {
   simulation_days: number;
   daily_avg_credits: number;
   projected_monthly_credits: number;
+  /** Credits the billing ledger charged; projection uses the larger of this and total_credits. */
+  billed_credits: number;
+  /** Spent credits per completed task or successful workflow run. */
+  credits_per_outcome: number | null;
+}
+
+export interface RunBreakdown {
+  key: string;
+  label: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  success_rate: number | null;
+  /** succeeded + failed — the runs the rate is computed over. */
+  judged: number;
+}
+
+export interface RunOutcomes {
+  total: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  in_flight: number;
+  /** Runs that needed more than one attempt. */
+  retried: number;
+  /** succeeded / (succeeded + failed); cancellations are reported beside it. Null when nothing was judged. */
+  success_rate: number | null;
+  avg_duration_seconds: number | null;
+  top_errors: { message: string; count: number }[];
+  breakdown: RunBreakdown[];
+  /** Agents / workflows / jobs with enough runs whose own rate misses the target, worst first. */
+  below_target: RunBreakdown[];
+  /** Finished runs per UTC day, oldest first. */
+  daily: { day: string; succeeded: number; failed: number }[];
+}
+
+export interface HumanLoad {
+  requested: number;
+  approved: number;
+  denied: number;
+  expired: number;
+  pending: number;
+  per_day: number;
+  median_wait_minutes: number | null;
+  oldest_pending_hours: number | null;
+  /** Review / authorize requests a person approved or denied. */
+  accepted: number;
+  rejected: number;
+}
+
+export interface OperationsSection {
+  tasks: RunOutcomes;
+  agents: RunOutcomes;
+  workflows: RunOutcomes;
+  automations: RunOutcomes;
+  human: HumanLoad;
+  stalled_tasks: number;
+  stalled_workflow_runs: number;
+  auto_paused_automations: string[];
+  failing_automations: string[];
+}
+
+export type LaunchCheckStatus = "pass" | "warn" | "fail" | "na";
+export type LaunchVerdict = "ready" | "at_risk" | "blocked" | "insufficient_data";
+
+export interface LaunchCheck {
+  key: string;
+  status: LaunchCheckStatus;
+  /** Stable code; the UI localises it with ``values``. */
+  reason: string;
+  values: Record<string, string | number | null>;
+  details: string[];
+}
+
+export interface LaunchReadiness {
+  verdict: LaunchVerdict;
+  checks: LaunchCheck[];
+}
+
+export type ValueVerdict = "on_track" | "concerns" | "below_expectations" | "unproven";
+
+/** Goal pace and output acceptance, judged apart from operational readiness. */
+export interface ValueEvidence {
+  verdict: ValueVerdict;
+  checks: LaunchCheck[];
 }
 
 export interface CounterfactualOutcome {
@@ -1410,10 +2085,17 @@ export interface SimulationReport {
   governance_preset: GovernancePresetKey | null;
   window_start: string | null;
   window_end: string;
+  /** Simulation start; window_start is later when recent_days narrowed it. */
+  simulation_started_at: string | null;
+  /** Set when a simulation was promoted; null for running or never-simulated Workspaces. */
+  promoted_at: string | null;
   activity: ActivitySection;
   cost: CostSection;
   counterfactuals: CounterfactualOutcome[];
   goals: GoalPace[];
+  operations: OperationsSection;
+  readiness: LaunchReadiness;
+  value: ValueEvidence;
   notes: string[];
 }
 
@@ -1426,23 +2108,51 @@ let _sessionRedirecting = false;
 export function handleSessionExpired(path = "") {
   if (typeof window === "undefined" || _sessionRedirecting) return;
   if (path.startsWith("/auth/") && path !== "/auth/renew") return;
+  // The embedded frame has no sign-in of its own: it shows that access ended.
+  if (EMBED) {
+    endEmbeddedSession();
+    return;
+  }
   if (window.location.pathname.startsWith("/login")) return;
+  // The companion composer stays in its frame and offers an explicit sign-in
+  // link. Other app routes (including login) must not become frameable.
+  if (window.parent !== window && ["/task-import/embed", "/calendar-picker/embed"].includes(window.location.pathname)) {
+    _sessionRedirecting = true;
+    window.dispatchEvent(new Event("manor:companion-session-ended"));
+    clearAuthBrowserState();
+    _sessionRedirecting = false;
+    return;
+  }
   _sessionRedirecting = true;
   clearAuthBrowserState();
   const next = window.location.pathname + window.location.search + window.location.hash;
-  window.location.assign(`/login?next=${encodeURIComponent(next)}`);
+  window.location.assign(signInPath(next));
 }
 
-function handleUnauthorizedResponse(path: string, requestToken: string | null) {
+function handleUnauthorizedResponse(path: string, requestToken: string | null, detail?: unknown) {
   // A late response from an old account/token must not sign out the new one.
   if (requestToken !== getAuthToken()) {
     if (!getAuthToken()) notifyAuthTokenChanged();
     return;
   }
+  // Session recovery could not move an ended collaboration home (no
+  // remember-me cookie): the sign-in page explains why and goes home.
+  if (requestToken && _extractCodedDetail(detail).code === "collaboration_ended") markCollaborationEndedSignIn();
   if (requestToken) handleSessionExpired(path);
   // Missing credentials can coexist with a stale in-memory signed-in UI.
   // The session boundary reconciles it; truly anonymous public pages stay put.
   else notifyAuthTokenChanged();
+}
+
+/**
+ * For paths that never replay through session refresh (uploads, streams): a
+ * 401 for an ended collaboration moves the session to the person's own
+ * company instead of signing them out. True when it did; the request is then
+ * abandoned, never replayed in that company.
+ */
+async function leftEndedCollaboration(detail: unknown, requestToken: string | null): Promise<boolean> {
+  if (_extractCodedDetail(detail).code !== "collaboration_ended" || !requestToken || requestToken !== getAuthToken()) return false;
+  return restorePersistentSession().catch(() => false);
 }
 
 export class ApiError extends Error {
@@ -1497,6 +2207,19 @@ export class DocumentUploadStalledError extends Error {
       ? "Upload processing did not finish in time"
       : "Upload stopped making progress");
     this.name = "DocumentUploadStalledError";
+  }
+}
+
+/**
+ * A request abandoned because an ended collaboration moved the session to the
+ * person's own company. It is a cancellation (name "AbortError", so abort
+ * handling applies) with no message: the collaboration-ended notice already
+ * tells the person, and inline error displays have nothing to show.
+ */
+export class SessionMovedError extends Error {
+  constructor() {
+    super("");
+    this.name = "AbortError";
   }
 }
 
@@ -1575,7 +2298,7 @@ export function translateApiError(err: unknown, fallback?: string): string {
 }
 
 /** Which plan limit was hit — drives the reminder's title/CTA. */
-export type PlanLimitKind = "credit" | "storage" | "workspaces" | "users" | "generic";
+export type PlanLimitKind = "credit" | "trial_credit" | "storage" | "workspaces" | "users" | "generic";
 
 /** Shape of FastAPI's plan-gate 402 response detail. */
 export interface PlanLimitDetail {
@@ -1600,7 +2323,7 @@ type DocumentDownloadCacheEntry = {
 
 export type ProtectedFileResponseOptions = { signal?: AbortSignal };
 type DocumentBlobOptions = ProtectedFileResponseOptions & { cache?: boolean; force?: boolean };
-type DocumentResponseOptions = ProtectedFileResponseOptions;
+type DocumentResponseOptions = ProtectedFileResponseOptions & { force?: boolean };
 type DocumentThumbnailOptions = DocumentBlobOptions & {
   persistent?: boolean;
   version?: string | null;
@@ -1854,40 +2577,56 @@ function pruneDocumentDownloadCache(protectedId?: string) {
 
 function invalidateDocumentDownloadCache(id?: string) {
   if (id) {
+    const persistedInvalidation = invalidateCachedFiles(`${API_BASE}/documents/${id}`);
     [id, `download:${id}`, `preview:${id}`, `thumbnail:${id}`].forEach((key) => {
       documentDownloadCache.delete(key);
       documentDownloadInflight.delete(key);
     });
     invalidatePersistentThumbnailCache(id);
-    return;
+    return persistedInvalidation;
   }
   documentDownloadCache.clear();
   documentDownloadInflight.clear();
   invalidatePersistentThumbnailCache();
 }
 
-/** The file endpoint answers 503 + Retry-After while its download slots are
- * busy. Retry a couple of times so a page that loads several files at once
- * doesn't leave some previews permanently broken. */
+/** Retry transient file-read failures within a bounded budget. Never replay writes
+ * or retry before a long Retry-After window allows another request. */
 export async function fetchWithBusyRetry(
   url: string,
   init: RequestInit,
   { retries = 2, maxDelayMs = 3000 }: { retries?: number; maxDelayMs?: number } = {},
 ): Promise<Response> {
+  const safeRead = !init.method || ["GET", "HEAD"].includes(init.method.toUpperCase());
   for (let attempt = 0; ; attempt += 1) {
-    const res = await fetch(url, init);
-    if (res.status !== 503 || attempt >= retries || init.signal?.aborted) return res;
-    const retryAfter = Number(res.headers.get("Retry-After"));
-    const delayMs = Math.min(
-      maxDelayMs,
-      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1000,
-    );
+    init.signal?.throwIfAborted();
+    let res: Response | undefined;
+    try {
+      res = await fetch(url, init);
+    } catch (error) {
+      if (!safeRead || attempt >= retries || init.signal?.aborted || !(error instanceof TypeError)) throw error;
+    }
+    if (res && (!safeRead || ![429, 500, 502, 503, 504].includes(res.status) || attempt >= retries)) return res;
+    const header = res?.headers.get("Retry-After");
+    const seconds = Number(header);
+    const retryAfterMs = header && !Number.isFinite(seconds)
+      ? Date.parse(header) - Date.now() : seconds * 1000;
+    const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 500 * (attempt + 1);
+    if (res && delayMs > maxDelayMs) return res;
+    await res?.body?.cancel();
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(resolve, delayMs);
-      init.signal?.addEventListener("abort", () => {
+      const done = () => {
+        init.signal?.removeEventListener("abort", abort);
+        resolve();
+      };
+      const timer = setTimeout(done, delayMs);
+      const abort = () => {
         clearTimeout(timer);
+        init.signal?.removeEventListener("abort", abort);
         reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError"));
-      }, { once: true });
+      };
+      if (init.signal?.aborted) abort();
+      else init.signal?.addEventListener("abort", abort, { once: true });
     });
   }
 }
@@ -1952,15 +2691,15 @@ function cacheBustUrl(url: string): string {
 }
 
 async function fetchProtectedDocumentBlob(
-  cacheKey: string,
+  _cacheKey: string,
   path: string,
   options: DocumentBlobOptions = {},
 ): Promise<Blob> {
-  return fetchProtectedBlob(cacheKey, cacheBustUrl(`${API_BASE}${path}`), { ...options, cache: false });
+  return (await fetchCachedFile(`${API_BASE}${path}`, { ...options, force: options.force || options.cache === false }, fetchWithBusyRetry)).blob();
 }
 
 async function fetchDocumentBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
-  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, { ...options, cache: false });
+  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, options);
 }
 
 async function fetchDocumentResponse(
@@ -1968,14 +2707,11 @@ async function fetchDocumentResponse(
   options: DocumentResponseOptions = {},
   action = "download",
 ): Promise<Response> {
-  const token = await getReadyAuthToken();
-  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/${action}`), {
-    cache: "no-store",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    signal: options.signal,
-  });
-  if (!response.ok) throw new ApiError(response.status, "Download failed");
-  return response;
+  // Editable source reads retain their fresh-download contract. Preview and
+  // download share persistent local copies, including response MIME/filename.
+  return fetchCachedFile(`${API_BASE}/documents/${id}/${action}`, {
+    ...options, force: options.force || action === "editable-file",
+  }, fetchWithBusyRetry);
 }
 
 async function fetchDocumentThumbnailBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
@@ -2218,7 +2954,7 @@ async function fetchDocumentPresentationThumbnailUrl(id: string, options: Docume
   return URL.createObjectURL(blob);
 }
 
-const PLAN_LIMIT_KINDS: PlanLimitKind[] = ["credit", "storage", "workspaces", "users", "generic"];
+const PLAN_LIMIT_KINDS: PlanLimitKind[] = ["credit", "trial_credit", "storage", "workspaces", "users", "generic"];
 
 export function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitDetail {
   if (typeof detail === "object" && detail !== null) {
@@ -2391,7 +3127,9 @@ async function requestUncoalesced<T>(
         path,
       },
     });
-    throw error;
+    // The browser's own wording ("Failed to fetch", "Load failed") is not for people; callers that
+    // show the message get a plain one, and ones that retry still see a TypeError.
+    throw new TypeError(t("lib.api.connection_lost"), { cause: error });
   }
   const tokenIsCurrent = () => token === getAuthToken();
 
@@ -2458,6 +3196,12 @@ async function requestUncoalesced<T>(
       && !path.startsWith("/auth/session/")) {
       const recovered = tokenIsCurrent() ? await restorePersistentSession() : isSameAuthIdentity(token, getAuthToken());
       if (recovered) {
+        // An ended collaboration recovers into the person's own company; a
+        // request addressed to the customer's Workspace is not replayed there.
+        const company = decodeAuthTokenClaims(token)?.entity_id;
+        if (company && company !== decodeAuthTokenClaims(getAuthToken())?.entity_id) {
+          throw new SessionMovedError();
+        }
         return requestUncoalesced<T>(path, options, undefined, rateLimitAttempt, true);
       }
     }
@@ -2466,7 +3210,7 @@ async function requestUncoalesced<T>(
     if (
       res.status === 401 &&
       authTokenOverride === undefined
-    ) handleUnauthorizedResponse(path, token);
+    ) handleUnauthorizedResponse(path, token, detail);
     // Background reads own their loading/empty/error state. A missing resource
     // should not produce a global toast for every query that referenced it.
     if (!sharedRateLimit && shouldShowRequestErrorToast(res.status, options.method, suppressErrorToast)) {
@@ -2535,10 +3279,13 @@ function documentUploadHttpError(
   }
 
   if (xhr.status === 401) {
-    handleUnauthorizedResponse(path, requestToken);
+    handleUnauthorizedResponse(path, requestToken, detail);
   }
   if (isBackendUnavailableStatus(xhr.status)) {
-    const error = new ApiError(xhr.status, t("lib.api.backend_unavailable"));
+    // A server that explains itself (the virus check timed out, ...) is up;
+    // only a bare gateway failure reads as the backend being unavailable.
+    const explained = typeof detail === "string" ? detail : typeof detail?.message === "string" ? detail.message : "";
+    const error = new ApiError(xhr.status, explained || t("lib.api.backend_unavailable"));
     if (coded.code) error.code = coded.code;
     if (coded.vars) error.vars = coded.vars;
     if (typeof detail === "object" && detail !== null) {
@@ -2836,6 +3583,12 @@ async function uploadDocumentRequest(
             return;
           }
         }
+        if (xhr.status === 401 && _extractCodedDetail(body.detail).code === "collaboration_ended") {
+          void leftEndedCollaboration(body.detail, token).then((left) => finishReject(
+            left ? new DocumentUploadAuthChangedError() : documentUploadHttpError(xhr, path, token, body),
+          ));
+          return;
+        }
         const error = documentUploadHttpError(xhr, path, token, body);
         if (uploadBytesSent && xhr.status >= 500) {
           finishHttpFailureReconciliation(error);
@@ -2965,8 +3718,11 @@ async function requestStreamResponse(
       || response.statusText;
     const coded = _extractCodedDetail(detail);
     const displayMessage = coded.code ? t(coded.code, coded.vars) || message : message;
+    if (response.status === 401 && await leftEndedCollaboration(detail, token)) {
+      throw new SessionMovedError();
+    }
     if (response.status === 401) {
-      handleUnauthorizedResponse(path, token);
+      handleUnauthorizedResponse(path, token, detail);
     } else {
       useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
     }
@@ -3465,7 +4221,7 @@ export interface WorkspaceStatDefinition {
   last_collection_status: string | null;
   last_collection_error: string | null;
   last_assessment?: { observation_id: string; status: string; observed_at: string; evidence?: { gaps?: string[]; reasoning?: string } } | null;
-  assessment_runtime?: { workflow_id: string; binding_id: string; run_id: string | null; run_status: string | null; next_run_at: string | null };
+  assessment_runtime?: { workflow_id: string; binding_id: string; job_id?: string; run_id: string | null; run_status: string | null; next_run_at: string | null };
   freshness_status: "fresh" | "stale" | "no_data" | "collection_error" | "paused" | string;
   revision: number;
   created_at: string;
@@ -3593,7 +4349,28 @@ interface FilesystemWriteOptions {
   saveIntent?: EditorSaveIntent;
 }
 
+export interface OwnedApprovalRequest {
+  id: string;
+  status: string;
+  action_key: string | null;
+  risk_level: string;
+  reason: string | null;
+  hitl_type: string;
+  payload: { review?: { summary?: string; review_artifacts?: Array<{ kind?: string; url?: string; title?: string }> } } & Record<string, unknown>;
+  step_id: string | null;
+  created_at: string | null;
+  decided_at: string | null;
+}
+
+
 export const api = {
+  approvalRequests: {
+    get: (requestId: string) => request<OwnedApprovalRequest>(`/approval-requests/${encodeURIComponent(requestId)}`),
+    decide: (requestId: string, decision: "approve" | "reject") =>
+      request<OwnedApprovalRequest>(`/approval-requests/${encodeURIComponent(requestId)}/decision`, {
+        method: "POST", body: JSON.stringify({ decision }),
+      }),
+  },
   approvalCommands: {
     get: (requestId: string) => request<ApprovalCommandProjection>(`/approval-commands/hitl/${encodeURIComponent(requestId)}`),
     saveRule: (command: ApprovalSaveRuleCommand) => request<ApprovalCommandResult>("/approval-commands", { method: "POST", body: JSON.stringify(command) }),
@@ -3605,6 +4382,14 @@ export const api = {
     overrides: (entityId: string, offset = 0) => request<ApprovalOverrides>(`/approval-settings/accounts/${encodeURIComponent(entityId)}/overrides?limit=50&offset=${offset}`),
   },
   chatRooms: {
+    publicInvite: (id: string) => request<{ token: string | null }>(`/chat/rooms/${encodeURIComponent(id)}/public-invite`),
+    enablePublicInvite: (id: string, reset = false) => request<{ token: string }>(`/chat/rooms/${encodeURIComponent(id)}/public-invite`, {
+      method: "PUT", body: JSON.stringify({ reset }),
+    }),
+    disablePublicInvite: (id: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}/public-invite`, { method: "DELETE" }),
+    joinPublicInvite: (token: string) => request<ChatRoom>("/chat/rooms/public-invites/join", {
+      method: "POST", body: JSON.stringify({ token }),
+    }),
     list: () => request<ChatRoom[]>("/chat/rooms"),
     groupUsage: () => request<{ used: boolean }>("/chat/rooms/group-usage"),
     get: (id: string) => request<ChatRoom>(`/chat/rooms/${encodeURIComponent(id)}`),
@@ -3684,10 +4469,14 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ document_id: documentId, content, mentioned_user_ids: mentionedUserIds, reply_to_message_id: replyToMessageId, mentioned_agent_binding_ids: mentionedAgentBindingIds }),
       }),
-    downloadFile: (id: string, fileId: string, options: DocumentBlobOptions = {}) => fetchProtectedBlob(
-      `room:${id}:${fileId}`,
+    prepareFileDownload: (id: string, fileIds: string[], archive: boolean, signal?: AbortSignal) =>
+      request<{ download_url: string }>(`/chat/rooms/${encodeURIComponent(id)}/file-downloads`, {
+        method: "POST", body: JSON.stringify({ file_ids: fileIds, archive }), signal,
+      }),
+    downloadFile: (id: string, fileId: string, options: DocumentBlobOptions = {}) => downloadRoomFile(
       `${API_BASE}/chat/rooms/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`,
-      { ...options, cache: false },
+      options,
+      fetchWithBusyRetry,
     ),
     deleteFile: (id: string, fileId: string) => request<void>(
       `/chat/rooms/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`,
@@ -3742,6 +4531,7 @@ export const api = {
       invitation_code?: string;
       invite_token?: string;
       chat_invite_token?: string;
+      timezone?: string;
     }) =>
       request<{ access_token: string; user_id: string; entity_id: string; role: string; is_new?: boolean }>("/auth/register", {
         method: "POST",
@@ -3786,6 +4576,8 @@ export const api = {
     updateProfile: (data: {
       display_name?: string; first_name?: string; last_name?: string;
       phone?: string; timezone?: string; locale?: string; llm_model?: string;
+      /** "device": sync the device's zone unless the user chose one. */
+      timezone_source?: "user" | "device";
     }) =>
       request<User>("/auth/me", { method: "PUT", body: JSON.stringify(data) }),
     deleteAccount: () =>
@@ -3816,6 +4608,7 @@ export const api = {
         role_api_keys?: Record<string, string>;
         role_base_urls?: Record<string, string>;
         role_api_key_models?: Record<string, string>;
+        role_model_limits?: Record<string, { model: string; context_window_tokens?: number; max_output_tokens?: number }>;
         byok_allowed?: boolean;
         byok_effective?: boolean;
       }>("/auth/me/llm-config"),
@@ -3831,7 +4624,7 @@ export const api = {
       request<{ ok: boolean; detail: string; provider?: string | null; latency_ms?: number | null; test_token?: string | null }>("/auth/me/models/test", {
         method: "POST", body: JSON.stringify(data),
       }),
-    saveCustomModel: (data: { role: string; model: string; api_key?: string; use_saved_api_key?: boolean; base_url?: string; test_token?: string | null }) =>
+    saveCustomModel: (data: { role: string; model: string; api_key?: string; use_saved_api_key?: boolean; base_url?: string; test_token?: string | null; context_window_tokens?: number; max_output_tokens?: number }) =>
       request<{ detail: string; models: Record<string, string>; masked: string }>("/auth/me/models/custom", {
         method: "PUT", body: JSON.stringify(data),
       }),
@@ -3883,6 +4676,7 @@ export const api = {
     resetPassword: (token: string, newPassword: string) =>
       request<any>("/auth/reset-password", {
         method: "POST",
+        headers: { "X-Silent-Error": "1" },
         body: JSON.stringify({ token, new_password: newPassword }),
       }),
     inviteInfo: (token: string) =>
@@ -3941,11 +4735,6 @@ export const api = {
         method: "PUT",
         body: JSON.stringify(data),
       }),
-    updateStatus: (id: string, status: string) =>
-      request<Task>(`/tasks/${id}/status`, {
-        method: "PUT",
-        body: JSON.stringify({ status }),
-      }),
     delete: (id: string) =>
       request<void>(`/tasks/${id}`, { method: "DELETE" }),
     board: (workspaceId?: string, offset = 0, limit = 50, signal?: AbortSignal) => {
@@ -3963,7 +4752,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ note }),
       }),
-    respondHITL: (taskId: string, data: { step_id?: string; response?: string; choice?: string; fields?: Record<string, any>; note?: string }) =>
+    respondHITL: (taskId: string, data: { request_id?: string; response?: string; choice?: string; fields?: Record<string, any>; note?: string }) =>
       request<TaskHITLResponse>(`/tasks/${taskId}/hitl-response`, {
         method: "POST",
         body: JSON.stringify(data),
@@ -3973,12 +4762,10 @@ export const api = {
         method: "POST",
         body: JSON.stringify(data),
       }),
-    escalate: (taskId: string) =>
-      request<any>(`/tasks/${taskId}/escalate`, { method: "POST" }),
     logs: (taskId: string) =>
       request<any[]>(`/tasks/${taskId}/logs`),
-    addLog: (taskId: string, content: string, logType: string = "comment", attachments?: any[], mentions?: { type: "agent" | "user"; id: string }[]) =>
-      request<any>(`/tasks/${taskId}/logs`, { method: "POST", body: JSON.stringify({ content, log_type: logType, attachments: attachments || [], mentions: mentions || [] }) }),
+    addLog: (taskId: string, content: string, logType: string = "comment", attachments?: any[], mentions?: { type: "agent" | "user"; id: string }[], requestId?: string) =>
+      request<any>(`/tasks/${taskId}/logs`, { method: "POST", body: JSON.stringify({ content, log_type: logType, attachments: attachments || [], mentions: mentions || [], request_id: requestId }) }),
     uploadAttachment: async (taskId: string, file: File) => {
       const token = await getReadyAuthToken();
       const form = new FormData();
@@ -3991,27 +4778,11 @@ export const api = {
       if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
       return res.json() as Promise<{ filename: string; original_name: string; size: number; content_type: string; url: string }>;
     },
-    reassign: (taskId: string) =>
-      request<any>(`/tasks/${taskId}/reassign`, { method: "POST" }),
     fromTemplate: (templateId: string, overrides?: Partial<Task>) =>
       request<Task>("/tasks/from-template", {
         method: "POST",
         body: JSON.stringify({ template_id: templateId, ...overrides }),
       }),
-    checklist: {
-      list: (taskId: string) =>
-        request<any[]>(`/tasks/${taskId}/checklist`),
-      add: (taskId: string, content: string, sortOrder?: number) =>
-        request<any>(`/tasks/${taskId}/checklist`, {
-          method: "POST",
-          body: JSON.stringify({ content, sort_order: sortOrder }),
-        }),
-      toggle: (taskId: string, itemId: string, isCompleted: boolean) =>
-        request<any>(`/tasks/${taskId}/checklist/${itemId}`, {
-          method: "PUT",
-          body: JSON.stringify({ is_completed: isCompleted }),
-        }),
-    },
     categories: {
       list: () => request<TaskCategory[]>("/tasks/categories"),
       create: (data: Partial<TaskCategory>) =>
@@ -4085,8 +4856,13 @@ export const api = {
       if (day) q.set("day", day);
       return request<DailyAgendaResponse>(`/calendar-settings/day${q.toString() ? `?${q}` : ""}`);
     },
-    events: (start: string, end: string) => {
+    events: (start: string, end: string, source?: { provider: string; connectionId: string }) => {
       const q = new URLSearchParams({ start, end });
+      if (source) {
+        q.set("provider", source.provider);
+        q.set("connection_id", source.connectionId);
+        q.set("include_bookings", "true");
+      }
       return request<ExternalCalendarEventsResponse>(`/calendar-settings/events?${q}`);
     },
     publicBookingLink: (slug: string, ownerId?: string, month?: string, timezone?: string) => {
@@ -4169,6 +4945,8 @@ export const api = {
         localWorkerId?: string;
         workspaceId?: string;
         workspaceContext?: boolean;
+        /** The Workspace App entry sending this request, so the App lists it under that entry. */
+        workspaceAppAction?: string;
         threadRef?: { kind: "task" | "plan" | "goal"; id: string };
         chatMode?: string;
         chatModePayload?: Record<string, unknown>;
@@ -4202,6 +4980,9 @@ export const api = {
       if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
       if (opts?.workspaceContext) form.append("workspace_context", "true");
       if (opts?.workspaceContext && opts?.workspaceId) form.append("workspace_id", opts.workspaceId);
+      if (opts?.workspaceContext && opts?.workspaceId && opts?.workspaceAppAction) {
+        form.append("workspace_app_action", opts.workspaceAppAction);
+      }
       if (opts?.threadRef?.kind) form.append("thread_ref_kind", opts.threadRef.kind);
       if (opts?.threadRef?.id) form.append("thread_ref_id", opts.threadRef.id);
       if (opts?.chatMode) form.append("chat_mode", opts.chatMode);
@@ -4328,6 +5109,22 @@ export const api = {
     },
   },
 
+  mediaJobs: {
+    get: (id: string) => request<MediaJob>(`/media/jobs/${encodeURIComponent(id)}`),
+    /** Every version of one clip, oldest first. */
+    versions: (lineageRoot: string) => request<MediaJob[]>(
+      `/media/jobs?lineage_root=${encodeURIComponent(lineageRoot)}&limit=50`,
+    ),
+    /** Every job a Workflow run started, newest first, regenerated versions included. */
+    forRun: (runId: string) => request<MediaJob[]>(
+      `/media/jobs?run_id=${encodeURIComponent(runId)}&limit=50`,
+    ),
+    regenerate: (id: string, input: MediaJobRegenerateInput) => request<MediaJob>(
+      `/media/jobs/${encodeURIComponent(id)}/regenerate`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  },
+
   videoEditor: {
     searchFreeMusic: (query: string, page = 1, pageSize = 18): Promise<FreeMusicSearchResult> => {
       const params = new URLSearchParams({
@@ -4380,10 +5177,23 @@ export const api = {
     listAll: listAllDocuments,
     browse: browseDocuments,
     browsePage: browseDocumentsPage,
+    contentSearch: searchDocumentContent,
     indexingStatuses: listDocumentIndexingStatuses,
-    move: (id: string, folderId: string | null, filingOnly = false) =>
-      request<Document>(`/documents/${id}/move`, { method: "POST", body: JSON.stringify({ folder_id: folderId, filing_only: filingOnly }) }),
-    get: (id: string) => request<Document>(`/documents/${id}`),
+    move: async (id: string, folderId: string | null, filingOnly = false) => {
+      const result = await request<Document>(`/documents/${id}/move`, { method: "POST", body: JSON.stringify({ folder_id: folderId, filing_only: filingOnly }) });
+      await invalidateDocumentDownloadCache(id);
+      return result;
+    },
+    get: (id: string, signal?: AbortSignal) => request<Document>(`/documents/${id}`, { signal }),
+    // Preview metadata is a local snapshot, not authorization for server writes.
+    getForPreview: async (id: string, options: DocumentResponseOptions = {}): Promise<Document> => {
+      const response = await fetchCachedFile(`${API_BASE}/documents/${id}`, options, async (url, init) => {
+        const result = await fetchWithBusyRetry(url, init);
+        if (!result.ok) throw new ApiError(result.status, result.status >= 500 ? t("lib.api.backend_unavailable") : "Failed to load document");
+        return result;
+      });
+      return response.json();
+    },
     upload: (
       file: File,
       folderId?: string | null,
@@ -4409,13 +5219,16 @@ export const api = {
     ),
     delete: async (id: string) => {
       const result = await request<void>(`/documents/${id}`, { method: "DELETE" });
-      invalidateDocumentDownloadCache(id);
+      await invalidateDocumentDownloadCache(id);
       return result;
     },
-    rename: (id: string, name: string) =>
-      request<Document>(`/documents/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
-    getContent: (id: string) =>
-      request<{ content: string }>(`/documents/${id}/content`),
+    rename: async (id: string, name: string) => {
+      const result = await request<Document>(`/documents/${id}`, { method: "PUT", body: JSON.stringify({ name }) });
+      await invalidateDocumentDownloadCache(id);
+      return result;
+    },
+    getContent: (id: string, signal?: AbortSignal) =>
+      request<{ content: string }>(`/documents/${id}/content`, { signal }),
     saveContent: async (
       id: string,
       content: string,
@@ -4430,7 +5243,7 @@ export const api = {
           save_sequence: saveIntent?.sequence,
         }),
       }, authTokenOverride);
-      invalidateDocumentDownloadCache(id);
+      await invalidateDocumentDownloadCache(id);
       return result;
     },
     replaceFile: async (
@@ -4463,15 +5276,10 @@ export const api = {
         const message = (typeof detail === "string" ? detail : (detail as any)?.message) || res.statusText;
         throw new ApiError(res.status, message);
       }
-      invalidateDocumentDownloadCache(id);
+      await invalidateDocumentDownloadCache(id);
       return res.json() as Promise<Document>;
     },
     getVersions: (id: string) => request<any[]>(`/documents/${id}/versions`),
-    restoreVersion: async (id: string, versionId: string): Promise<Document> => {
-      const result = await request<Document>(`/documents/${id}/versions/${versionId}/restore`, { method: "POST" });
-      invalidateDocumentDownloadCache(id);
-      return result;
-    },
     download: async (id: string, options?: DocumentBlobOptions): Promise<string> => {
       const blob = await fetchDocumentBlob(id, options);
       return URL.createObjectURL(blob);
@@ -4516,7 +5324,7 @@ export const api = {
       fetchProtectedDocumentBlob(
         `presentation-object:${id}:${slideIndex}:${objectId}`,
         `/documents/${id}/slides/${slideIndex}/objects/${encodeURIComponent(objectId)}`,
-        { cache: false, signal },
+        { signal },
       ),
     getPages: (id: string, signal?: AbortSignal) =>
       request<{
@@ -4545,8 +5353,14 @@ export const api = {
       request<Document>("/documents/ai-draft", { method: "POST", body: JSON.stringify(data) }),
     createFromUrl: (data: { url: string; name?: string }) =>
       request<Document>("/documents/from-url", { method: "POST", body: JSON.stringify(data) }),
-    trash: (id: string) => request<void>(`/documents/${id}/trash`, { method: "POST" }),
-    restore: (id: string) => request<void>(`/documents/${id}/restore`, { method: "POST" }),
+    trash: async (id: string) => {
+      await request<void>(`/documents/${id}/trash`, { method: "POST" });
+      await invalidateDocumentDownloadCache(id);
+    },
+    restore: async (id: string) => {
+      await request<void>(`/documents/${id}/restore`, { method: "POST" });
+      await invalidateDocumentDownloadCache(id);
+    },
     listTrash: () => request<Document[]>("/documents/trash"),
     emptyTrash: () => request<void>("/documents/trash/empty", { method: "POST" }),
     reindex: () => request<{ count: number }>("/documents/reindex", { method: "POST" }),
@@ -4560,13 +5374,16 @@ export const api = {
       request<Document>("/documents/from-google-drive", {
         method: "POST", body: JSON.stringify(data),
       }),
-    syncGoogleDrive: (docId: string, data: {
+    syncGoogleDrive: async (docId: string, data: {
       file_id: string; name: string; mime_type?: string;
       file_size?: number; modified_time?: string; access_token: string;
-    }) =>
-      request<{ status: string }>(`/documents/${docId}/sync-google-drive`, {
+    }) => {
+      const result = await request<{ status: string }>(`/documents/${docId}/sync-google-drive`, {
         method: "POST", body: JSON.stringify(data),
-      }),
+      });
+      await invalidateDocumentDownloadCache(docId);
+      return result;
+    },
   },
 
   folders: {
@@ -5001,31 +5818,6 @@ export const api = {
     },
   },
 
-  plans: {
-    list: (params?: { workspace_id?: string; task_id?: string; status?: string; limit?: number }) => {
-      const q = new URLSearchParams();
-      if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
-      if (params?.task_id) q.set("task_id", params.task_id);
-      if (params?.status) q.set("status", params.status);
-      if (params?.limit) q.set("limit", String(params.limit));
-      return request<ExecutionPlan[]>(`/plans?${q}`);
-    },
-    get: (id: string) => request<ExecutionPlan>(`/plans/${id}`),
-    steps: (id: string) => request<ExecutionStep[]>(`/plans/${id}/steps`),
-    approve: (id: string) =>
-      request<ExecutionPlan>(`/plans/${id}/approve`, { method: "POST" }),
-    retryFailedSteps: (id: string, note?: string) =>
-      request<PlanRetryResponse>(`/plans/${id}/retry-failed-steps`, {
-        method: "POST",
-        body: JSON.stringify({ note }),
-      }),
-    retryStep: (stepId: string, note?: string) =>
-      request<StepRetryResponse>(`/plans/steps/${stepId}/retry`, {
-        method: "POST",
-        body: JSON.stringify({ note }),
-      }),
-  },
-
   users: {
     list: () => request<User[]>("/auth/users"),
     directory: () => request<UserSummary[]>("/auth/users/directory"),
@@ -5077,9 +5869,18 @@ export const api = {
     invite: (workspaceId: string, data: CollaborationInvite) => request<CollaborationGrant>(`/workspaces/${workspaceId}/collaboration`, { method: "POST", body: JSON.stringify(data) }),
     change: (workspaceId: string, id: string, action: "authorize" | "revoke" | "update", data?: CollaborationInvite) => request<CollaborationGrant>(`/workspaces/${workspaceId}/collaboration/${id}/${action}`, { method: "POST", ...(data ? { body: JSON.stringify(data) } : {}) }),
     linkGroup: (workspaceId: string, groupId: string | null) => request<CollaborationCommunication>(`/workspaces/${workspaceId}/collaboration-group`, { method: "PUT", body: JSON.stringify({ group_id: groupId }) }),
-    phase: (workspaceId: string, action: "request_acceptance" | "accept", note: string) => request(`/workspaces/${workspaceId}/delivery-phase`, { method: "POST", body: JSON.stringify({ action, note }) }),
+    // `provider` is required on accept while the provider's trial grant is live.
+    phase: (workspaceId: string, action: "request_acceptance" | "accept", note: string, provider?: "keep" | "remove") => request(`/workspaces/${workspaceId}/delivery-phase`, { method: "POST", body: JSON.stringify({ action, note, ...(provider ? { provider } : {}) }) }),
     portal: (id: string, signal?: AbortSignal) => request<CollaborationPortal>(`/workspace-collaborations/${id}`, { signal }),
     accept: (id: string) => request<CollaborationGrant>(`/workspace-collaborations/${id}/accept`, { method: "POST" }),
+    /** A scoped session for the embedded frame of a granted Workspace; the caller stays in their own company. */
+    session: (id: string) => request<CollaboratorSession>(`/workspace-collaborations/${id}/session`, { method: "POST", headers: { "X-Silent-Error": "1" } }),
+  },
+  clientTrials: {
+    /** Deliveries of this source Workspace the provider team can open now. */
+    list: (workspaceId: string, signal?: AbortSignal) => request<ClientTrial[]>(`/workspaces/${workspaceId}/client-trials`, { signal }),
+    /** A scoped session for the embedded customer-trial frame; the caller stays in their own company. */
+    session: (workspaceId: string, deliveryId: string) => request<CollaboratorSession>(`/workspaces/${workspaceId}/client-trials/${deliveryId}/session`, { method: "POST", headers: { "X-Silent-Error": "1" } }),
   },
   clients: {
     list: () => request<{ items: ClientRecord[]; total: number }>("/clients"),
@@ -5092,6 +5893,7 @@ export const api = {
     deliveries: (id: string, signal?: AbortSignal) => request<ClientDeliveryReceipt[]>(`/clients/${id}/deliveries`, { signal }),
     prepareDelivery: (id: string, data: { contact_id: string; workspace_id: string; phase?: "trial" | "delivered"; knowledge_document_ids?: string[] }) => request<ClientDeliveryReceipt>(`/clients/${id}/deliveries`, { method: "POST", body: JSON.stringify(data) }),
     requestMaintenance: (clientId: string, deliveryId: string) => request<CollaborationGrant>(`/clients/${clientId}/deliveries/${deliveryId}/maintenance/request`, { method: "POST" }),
+    publishDeliveryUpdate: (clientId: string, deliveryId: string, data: { release_notes?: string }) => request<ClientDeliveryReceipt & { published: boolean }>(`/clients/${clientId}/deliveries/${deliveryId}/publish-update`, { method: "POST", body: JSON.stringify(data) }),
     changeInvite: (clientId: string, deliveryId: string, action: "rotate" | "revoke") => request<ClientDeliveryReceipt>(`/clients/${clientId}/deliveries/${deliveryId}/${action}`, { method: "POST" }),
     invitation: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}`),
     acceptDelivery: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}/accept`, { method: "POST", body: JSON.stringify({}) }),
@@ -5125,6 +5927,39 @@ export const api = {
       `/workspaces/${id}/app-view${options?.includeCatalog === false ? "?include_catalog=false" : ""}`,
       { signal: options?.signal },
     ),
+    appViewContexts: (id: string, componentKey: string, options?: { cursor?: string; limit?: number; signal?: AbortSignal }) => {
+      const params = new URLSearchParams();
+      if (options?.cursor) params.set("cursor", options.cursor);
+      if (options?.limit) params.set("limit", String(options.limit));
+      const suffix = params.size ? `?${params}` : "";
+      return request<WorkspaceAppDataContextsResponse>(
+        `/workspaces/${id}/app-view/components/${encodeURIComponent(componentKey)}/contexts${suffix}`,
+        { signal: options?.signal },
+      );
+    },
+    appViewComponentData: (id: string, componentKey: string, options: {
+      contextKind: WorkspaceAppDataContextKind;
+      contextId: string;
+      block?: string;
+      window?: string;
+      cursor?: string;
+      limit?: number;
+      signal?: AbortSignal;
+    }) => {
+      const params = new URLSearchParams({ context_kind: options.contextKind, context_id: options.contextId });
+      if (options.block) params.set("block", options.block);
+      if (options.window) params.set("window", options.window);
+      if (options.cursor) params.set("cursor", options.cursor);
+      if (options.limit) params.set("limit", String(options.limit));
+      return request<WorkspaceAppDataResponse>(
+        `/workspaces/${id}/app-view/components/${encodeURIComponent(componentKey)}/data?${params}`,
+        { signal: options.signal },
+      );
+    },
+    appViewSection: (id: string, sectionId: string, signal?: AbortSignal) => request<WorkspaceAppSectionData>(
+      `/workspaces/${id}/app-view/sections/${encodeURIComponent(sectionId)}`,
+      { signal },
+    ),
     saveAppView: async (id: string, config: WorkspaceAppViewConfig, previous: WorkspaceAppViewConfig) => {
       const path = `/workspaces/${id}/operation/drafts`;
       const entries = Object.fromEntries(
@@ -5141,6 +5976,9 @@ export const api = {
       );
       const forms = Object.fromEntries(
         Array.from(new Set([...Object.keys(previous.forms || {}), ...Object.keys(config.forms || {})])).map((key) => [key, config.forms?.[key] ?? null]),
+      );
+      const presets = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.presets || {}), ...Object.keys(config.presets || {})])).map((key) => [key, config.presets?.[key] ?? null]),
       );
       const targets = Object.fromEntries(
         Array.from(new Set([...Object.keys(previous.targets || {}), ...Object.keys(config.targets || {})])).map((key) => [key,
@@ -5159,9 +5997,16 @@ export const api = {
           eyebrow: config.eyebrow?.trim() || null,
           title: config.title?.trim() || null, description: config.description?.trim() ?? null,
           hero: attachPrimary ? null : config.hero, order: config.order, hidden: config.hidden,
-          labels, descriptions, forms, targets, entries, prompts, visual: config.visual, layout: config.layout,
+          labels, descriptions, forms, targets, entries, prompts, presets, visual: config.visual, layout: config.layout,
+          data_sources: config.data_sources || {}, components: config.components || [],
           ...(config.motion_cover_url !== previous.motion_cover_url || config.motion_cover_source_url !== previous.motion_cover_source_url
             ? { motion_cover_url: config.motion_cover_url, motion_cover_source_url: config.motion_cover_source_url }
+            : {}),
+          ...(JSON.stringify(config.sections ?? null) !== JSON.stringify(previous.sections ?? null)
+            ? { sections: config.sections ?? null }
+            : {}),
+          ...(JSON.stringify(config.theme ?? null) !== JSON.stringify(previous.theme ?? null)
+            ? { theme: config.theme ?? null }
             : {}),
         } }, ...attachments] }),
       });
@@ -5195,6 +6040,7 @@ export const api = {
       id: string,
       variableValues?: Record<string, unknown>,
       channelConfigIds?: Record<string, string>,
+      targetVersion?: string,
     ) =>
       request<{
         upgrade_protocol_version: number;
@@ -5207,6 +6053,30 @@ export const api = {
         synchronization_status?: "current" | "customized";
         can_revert: boolean;
         restore_point?: { applied_at: string; blueprint_version?: string | null } | null;
+        /** The release this Workspace runs, the one the preview moves it to, and the latest. */
+        installed_version?: string | null;
+        current_version?: string | null;
+        latest_version?: string | null;
+        target_version?: string | null;
+        downgrade?: boolean;
+        /** Listed releases it can move to, newest first. */
+        available_versions?: Array<{
+          version: string;
+          published_at: string | null;
+          changelog: string | null;
+          min_bump: "major" | "minor" | "patch" | null;
+          deprecated: string | null;
+          prerelease: boolean;
+        }>;
+        /** The semver step from the installed release to the target, and why. */
+        version_change?: {
+          from: string;
+          to: string;
+          min_bump: "major" | "minor" | "patch";
+          reasons: string[];
+        } | null;
+        /** Releases newer than the installed one, oldest first. */
+        changelog?: Array<{ version: string; changelog: string | null; published_at: string | null }>;
         active_runs: Array<{ id: string; name: string; kind: string; status: string }>;
         setup_preflight: BlueprintInstallPreflight;
         kept_setup_preflight?: BlueprintInstallPreflight;
@@ -5221,29 +6091,39 @@ export const api = {
           name: string;
           id?: string;
           revision?: number;
-          action: "update" | "keep_yours" | "unchanged" | "missing" | "remove";
+          // customized: your edit to an item the Blueprint did not change; kept unless you pick use_blueprint.
+          action: "update" | "keep_yours" | "customized" | "unchanged" | "missing" | "remove";
           changes: string[];
           current_content: unknown;
           new_content: unknown;
           baseline_content?: unknown;
           baseline_known: boolean;
           blocked_reason?: string;
+          compatibility_issues?: Array<{
+            code: "missing_tools" | "missing_skills" | "missing_inputs";
+            names: string[];
+            required_by: Array<{ key: string; kind: string; name: string }>;
+            contract_required: string[];
+          }>;
         }>;
       }>(
-        variableValues === undefined && channelConfigIds === undefined
+        variableValues === undefined && channelConfigIds === undefined && !targetVersion
           ? `/workspaces/${id}/blueprint/upgrade/v3`
           : `/workspaces/${id}/blueprint/upgrade/v3/preview`,
-        variableValues === undefined && channelConfigIds === undefined
+        variableValues === undefined && channelConfigIds === undefined && !targetVersion
           ? undefined
           : {
               method: "POST",
               body: JSON.stringify({
                 variable_values: variableValues ?? {},
                 channel_config_ids: channelConfigIds ?? {},
+                ...(targetVersion ? { target_version: targetVersion } : {}),
               }),
             },
       ),
     applyBlueprintUpgrade: (id: string, data: {
+      /** The release the reviewed preview targeted; omitted = latest. */
+      target_version?: string;
       expected_blueprint_fingerprint: string;
       expected_plan_fingerprint: string;
       variable_values?: Record<string, unknown>;
@@ -5318,6 +6198,11 @@ export const api = {
         request<{ stat: WorkspaceStatDefinition; observation: WorkspaceStatObservation }>(
           `/workspaces/${wsId}/stats/${statId}/collect`,
           { method: "POST" },
+        ),
+      addAssessedMetrics: (wsId: string, data: { templates: string[]; cadence?: "daily" | "weekly"; service_key?: string }) =>
+        request<{ items: WorkspaceStatDefinition[]; job_id: string; schedule_enabled: boolean; service_key: string }>(
+          `/workspaces/${wsId}/stats/assessed-metrics`,
+          { method: "POST", body: JSON.stringify(data) },
         ),
       observations: (wsId: string, statId: string, limit = 50) =>
         request<{ items: WorkspaceStatObservation[] }>(
@@ -5424,8 +6309,9 @@ export const api = {
       // unknown fields, so safe to send today.
       assign: (wsId: string, data: { staff_id: string; role?: string; expires_at?: string; user_id?: string }) =>
         request<WorkspaceStaff>(`/workspaces/${wsId}/staff`, { method: "POST", body: JSON.stringify(data) }),
-      remove: (wsId: string, staffId: string) =>
-        request<void>(`/workspaces/${wsId}/staff/${staffId}`, { method: "DELETE" }),
+      // `id` is the Staff row, or the seat (or user) id of a seat without one.
+      remove: (wsId: string, id: string) =>
+        request<void>(`/workspaces/${wsId}/staff/${encodeURIComponent(id)}`, { method: "DELETE" }),
     },
     channels: (wsId: string) => request<any[]>(`/workspaces/${wsId}/channels`),
     residentPmsAccounts: (wsId: string) => request<{ accounts: { id: string; display_name: string }[] }>(`/workspaces/${wsId}/resident-pms/accounts`),
@@ -5554,6 +6440,22 @@ export const api = {
         `/workspaces/${wsId}/export-blueprint-payload`,
         { method: "POST", body: JSON.stringify(data) },
       ),
+    /** The Workspace as a .manor package: its payload plus the files its App
+     *  and Skills point at, so another account sees the same App. */
+    exportBlueprintPackage: async (wsId: string, data: ExportBlueprintPayloadRequest = {}) => {
+      const token = await getReadyAuthToken();
+      const res = await fetch(`${API_BASE}/workspaces/${wsId}/export-blueprint-package`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new ApiError(res.status, typeof body?.detail === "string" ? body.detail : `Export failed (${res.status})`);
+      }
+      const match = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
+      return { blob: await res.blob(), filename: match?.[1] || "blueprint.manor" };
+    },
     promote: (wsId: string, force = false) =>
       request<PromoteResponse>(
         `/workspaces/${wsId}/promote`,
@@ -5561,8 +6463,10 @@ export const api = {
       ),
     promotePreflight: (wsId: string) =>
       request<UnmetRequirement[]>(`/workspaces/${wsId}/promote/preflight`),
-    simulationReport: (wsId: string) =>
-      request<SimulationReport>(`/workspaces/${wsId}/simulation-report`),
+    simulationReport: (wsId: string, recentDays?: number) =>
+      request<SimulationReport>(
+        `/workspaces/${wsId}/simulation-report${recentDays ? `?recent_days=${recentDays}` : ""}`,
+      ),
     // ── Workspace Chat ──────────────────────────────────────────────
     chat: {
       listEntrypoints: (wsId: string) =>
@@ -5638,8 +6542,8 @@ export const api = {
             thread_ref_id: threadRef?.id,
           }),
         }),
-      listUnreadAttention: (wsId: string, signal?: AbortSignal) =>
-        request<{ items: WorkspaceAttentionReminder[] }>(`/workspaces/${wsId}/chat/attention`, { signal }),
+      listPendingAttention: (wsId: string, signal?: AbortSignal) =>
+        request<{ items: WorkspaceAttentionReminder[] }>(`/workspaces/${wsId}/chat/attention?scope=open`, { signal }),
       markAttentionSeen: (wsId: string, keys: string[]) =>
         request<{ unseen_actions: number; unseen_action_keys: Record<string, Record<string, string>> }>(
           `/workspaces/${wsId}/chat/attention/seen`,
@@ -5826,6 +6730,22 @@ export const api = {
         "/blueprints/install-payload",
         { method: "POST", body: JSON.stringify(data) },
       ),
+    /** Install a .manor package: the server stores its files, then installs
+     *  its payload exactly as installPayload does. */
+    installPackage: (file: File, options: {
+      mode?: InstallMode;
+      workspace_name?: string;
+      create_missing_agents?: boolean;
+      agent_ids_by_service_key?: Record<string, string>;
+      governance_preset?: GovernancePresetKey;
+      variable_values?: Record<string, unknown>;
+      channel_config_ids?: Record<string, string>;
+    }) => {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("options", JSON.stringify(options));
+      return request<InstallBlueprintResponse>("/blueprints/install-package", { method: "POST", body: form });
+    },
     installPayloadPreflight: (data: {
       payload: Record<string, unknown>;
       mode?: InstallMode;
@@ -6197,7 +7117,7 @@ export const api = {
     daily: (days?: number, scope: "company" | "member" = "company") =>
       request<{ date: string; input: number; output: number; total: number }[]>(`/usage/daily?days=${days || 30}&scope=${scope}`),
     bySource: (days?: number, scope: "company" | "member" = "company") =>
-      request<any[]>(`/usage/by-source?days=${days || 30}&scope=${scope}`),
+      request<UsageBySourceRow[]>(`/usage/by-source?days=${days || 30}&scope=${scope}`),
     team: (params?: { days?: number; activity_limit?: number }) => {
       const q = new URLSearchParams();
       q.set("days", String(params?.days || 30));
@@ -6238,6 +7158,12 @@ export const api = {
       }),
     disable: (code: string) =>
       request<void>("/auth/2fa/disable", { method: "POST", body: JSON.stringify({ code }) }),
+  },
+
+  oauthConnections: {
+    list: () => request<OAuthConnection[]>("/oauth/connections"),
+    revoke: (id: string) =>
+      request<void>(`/oauth/connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
   },
 
   staff: {
@@ -6432,6 +7358,10 @@ export const api = {
         updated_at?: string | null;
       }>>(`/workflows/projects/candidates?${q}`);
     },
+    listRecordChoices: (params: { workflow_id: string; input_key: string; workspace_id: string }) =>
+      request<Array<{ value: string; label: string; description?: string | null }>>(
+        `/workflows/${encodeURIComponent(params.workflow_id)}/run-inputs/${encodeURIComponent(params.input_key)}/choices?${new URLSearchParams({ workspace_id: params.workspace_id })}`,
+      ),
     templates: () => request<any[]>("/workflows/templates"),
     installTemplate: (templateId: string, workspaceId?: string) =>
       request<any>(`/workflows/templates/${encodeURIComponent(templateId)}/install`, {
@@ -6456,10 +7386,14 @@ export const api = {
       data?: { variables?: Record<string, any>; trigger_data?: Record<string, any> },
     ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, onRun, data),
     runs: (id: string) => request<any[]>(`/workflows/${id}/runs`),
-    listRuns: (params?: { workspace_id?: string; binding_id?: string; status?: string; limit?: number }, signal?: AbortSignal) => {
+    listRuns: (params?: { workspace_id?: string; binding_id?: string; workflow_id?: string; include_unbound?: boolean; app_action?: string; include_unlabelled?: boolean; status?: string; limit?: number }, signal?: AbortSignal) => {
       const q = new URLSearchParams();
       if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
       if (params?.binding_id) q.set("binding_id", params.binding_id);
+      if (params?.workflow_id) q.set("workflow_id", params.workflow_id);
+      if (params?.include_unbound) q.set("include_unbound", "true");
+      if (params?.app_action) q.set("app_action", params.app_action);
+      if (params?.include_unlabelled) q.set("include_unlabelled", "true");
       if (params?.status) q.set("status", params.status);
       if (params?.limit) q.set("limit", String(params.limit));
       return request<any[]>(`/workflows/runs${q.toString() ? `?${q}` : ""}`, {
@@ -6477,19 +7411,26 @@ export const api = {
     ),
     cancelRun: (runId: string) => request<any>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
     pauseRun: (runId: string) => request<any>(`/workflows/runs/${runId}/pause`, { method: "POST" }),
-    resolveRuntimeApproval: (runId: string, requestId: string, choice: "approve" | "reject") =>
+    resolveRuntimeApproval: (runId: string, requestId: string, choice: "approve" | "reject", review?: unknown) =>
       request<any>(`/workflows/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(requestId)}/resolve`, {
         method: "POST",
-        body: JSON.stringify({ choice }),
+        body: JSON.stringify({ choice, ...(review !== undefined ? { review } : {}) }),
       }),
     retryRun: (runId: string, data: {
       from_step_id?: string;
       variables?: Record<string, any>;
       execute?: boolean;
+      effect_review?: { step_id: string; effect_fingerprint: string; decision: "not_applied" | "applied"; confirmed: true; note: string; result?: Record<string, unknown>; project_revisions?: Record<string, number> };
     }) => request<any>(`/workflows/runs/${runId}/retry`, {
       method: "POST",
       body: JSON.stringify(data),
     }),
+    /** The next version of a finished run's result, from its Workflow's production.revise. */
+    reviseRun: (runId: string, data: { notes?: string; unit_versions?: Record<string, string> }) =>
+      request<{ id: string; status: string }>(`/workflows/runs/${runId}/revise`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
     resumeRun: (runId: string, variables?: Record<string, any>, expectedStepId?: string) =>
       request<any>(`/workflows/runs/${runId}/resume`, {
         method: "POST",
@@ -6600,8 +7541,6 @@ export const api = {
       request<void>(`/skills/${id}`, { method: "DELETE" }),
     invoke: (id: string, input: string | Record<string, unknown>) =>
       request<any>(`/skills/${id}/invoke`, { method: "POST", body: JSON.stringify({ input }) }),
-    preview: (id: string, data: { message: string; metadata?: Record<string, unknown> }) =>
-      request<any>(`/skills/${id}/preview`, { method: "POST", body: JSON.stringify(data) }),
     generate: (prompt: string, category?: string) =>
       request<any>("/skills/generate", {
         method: "POST",
@@ -6717,20 +7656,22 @@ export const api = {
       request<any>(`/integrations/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     delete: (id: string) =>
       request<void>(`/integrations/${id}`, { method: "DELETE" }),
-    listConnectionGrants: (kind: "integration" | "oauth_account", connectionId: string) =>
-      request<Array<{ id: string; user_id: string; capabilities: string[] }>>(
+    getConnectionShares: (kind: ConnectionKind, connectionId: string) =>
+      request<ConnectionShareState>(`/integrations/connections/${kind}/${connectionId}/grants`),
+    shareConnectionWithUsers: (kind: ConnectionKind, connectionId: string, userIds: string[]) =>
+      request<ConnectionShareState>(
         `/integrations/connections/${kind}/${connectionId}/grants`,
+        { method: "POST", body: JSON.stringify({ user_ids: userIds }) },
       ),
-    createConnectionGrant: (
-      kind: "integration" | "oauth_account",
-      connectionId: string,
-      data: { user_id: string },
-    ) => request<{ id: string; user_id: string; capabilities: string[] }>(
-      `/integrations/connections/${kind}/${connectionId}/grants`,
-      { method: "POST", body: JSON.stringify(data) },
-    ),
+    setConnectionEntityShare: (kind: ConnectionKind, connectionId: string, enabled: boolean) =>
+      request<ConnectionShareState>(
+        `/integrations/connections/${kind}/${connectionId}/entity-share`,
+        { method: "PUT", body: JSON.stringify({ enabled }) },
+      ),
+    listConnectionUsage: (kind: ConnectionKind, connectionId: string) =>
+      request<ConnectionUse[]>(`/integrations/connections/${kind}/${connectionId}/usage`),
     deleteConnectionGrant: (
-      kind: "integration" | "oauth_account",
+      kind: ConnectionKind,
       connectionId: string,
       grantId: string,
     ) => request<void>(
@@ -7265,11 +8206,6 @@ export const api = {
       request<any>("/entities/me", { method: "PUT", body: JSON.stringify(data) }),
   },
 
-  health: {
-    check: () => request<{ status: string }>("/health"),
-    deep: () => request<Record<string, any>>("/health/deep"),
-  },
-
   // ── Entity Filesystem (JuiceFS) ──
   fs: {
     list: (path = ".", showSystem = false) =>
@@ -7458,8 +8394,12 @@ export interface ClientContactRecord extends Omit<ClientContactInput, "phone" | 
 export interface ClientDeliveryReceipt {
   id: string; client_id: string; contact_id: string; source_workspace_id: string; title: string;
   recipient_email: string; status: string; expires_at: string; invite_path?: string;
-  target_workspace_id?: string; target_entity_id?: string; provider_access: "none"; can_manage?: boolean;
+  target_workspace_id?: string; target_entity_id?: string; provider_access: "none" | "trial" | "maintainer"; can_manage?: boolean;
+  /** The viewer can open this delivery's customer trial from the source Workspace. */
+  can_open_trial?: boolean;
   phase?: string; acceptance?: Record<string, unknown>; maintenance?: CollaborationGrant | null;
+  /** The release the delivery holds; accepted Workspaces upgrade toward it. */
+  content_version?: string; published_at?: string | null;
   email_delivery?: { status?: "pending" | "sent" | "failed" | "disabled" | "unconfigured"; sent_at?: string; attempted_at?: string; locale?: string };
 }
 
@@ -7481,9 +8421,24 @@ export interface CrmOverview { clients: Partial<Record<CrmLifecycle, number>>; o
 export interface ClientContactInput { name: string; email: string; phone: string; job_title: string; is_primary: boolean; }
 
 
-export interface CollaborationInvite { email: string; role: "tester" | "maintainer"; days: number; share_configuration: boolean; }
-export interface CollaborationGrant { id: string; workspace_id: string; delivery_id?: string; email: string; role: "tester" | "maintainer"; status: string; expires_at: string; share_configuration: boolean; path: string; }
-export interface CollaborationManagement { workspace_id: string; title: string; status: string; phase?: string; acceptance?: Record<string, unknown>; grants: CollaborationGrant[]; communication: CollaborationCommunication; group_options: CollaborationGroup[]; }
+// days null keeps a grant without expiry (a kept maintainer) without one; updates only.
+export interface CollaborationInvite { email: string; role: "tester" | "maintainer"; days: number | null; share_configuration: boolean; }
+// A null expires_at never expires: the provider's trial grant and a kept maintainer.
+// `team`: one provider-team member's grant of the delivery; the customer decides on the team as a whole.
+export interface CollaborationGrant { id: string; workspace_id: string; delivery_id?: string; email: string; role: "tester" | "maintainer" | "provider_trial"; status: string; expires_at: string | null; share_configuration: boolean; path: string; team?: boolean; }
+export interface ProviderTeamMember { grant_id: string; email: string; user_id?: string | null; role: CollaborationGrant["role"]; accepted_at?: string | null; }
+export interface ProviderTeam { delivery_id: string; access: "trial" | "maintainer" | "none"; members: ProviderTeamMember[]; }
+export interface CollaborationManagement { workspace_id: string; title: string; status: string; phase?: string; acceptance?: Record<string, unknown>; grants: CollaborationGrant[]; communication: CollaborationCommunication; group_options: CollaborationGroup[]; provider_team?: ProviderTeam | null; }
+/** A delivery the provider team can open from its source Workspace (GET /workspaces/{id}/client-trials). */
+export interface ClientTrial {
+  delivery_id: string; client_id: string; client_name: string | null; customer_name: string | null; title: string | null;
+  phase: string; access: "trial" | "maintainer"; target_workspace_id: string; target_entity_id: string; accepted_at: string | null;
+}
+/** A short-lived token for one customer Workspace, held only by the embedded frame. */
+export interface CollaboratorSession {
+  access_token: string; expires_at: string; entity_id: string; workspace_id: string; role: string;
+  customer_name: string | null; phase: string | null; access: string;
+}
 export interface CollaborationPortal { grant: CollaborationGrant; title: string; configuration?: {revision: number; services: Record<string, unknown>[]; processes: Record<string, unknown>[]}; communication: CollaborationCommunication; }
 
 export interface CollaborationGroup { id: string; title: string; path: string; }

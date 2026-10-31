@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from typing import Any, Callable
 
 from packages.core.ai.runtime.context_window import context_digest
 from packages.core.ai.runtime.token_estimate import runtime_estimate_tokens_for_text as estimate
+
+logger = logging.getLogger(__name__)
 
 CHECKPOINT_PREFIX = "[Earlier conversation compacted: checkpoint v1]"
 CHECKPOINT_FIELDS = (
@@ -113,6 +116,16 @@ class ContextBudgetExceeded(ValueError):
     """Protected input cannot fit; do not submit an oversized request."""
 
 
+class ContextArchiveUnavailable(RuntimeError):
+    """The original history could not be stored; compaction degrades instead."""
+
+
+ARCHIVE_UNAVAILABLE_NOTE = (
+    "The original records summarized here could not be archived, so their exact "
+    "details cannot be read back. Re-run the relevant tool if exact details matter."
+)
+
+
 def encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -139,13 +152,19 @@ def request_tokens(messages: list[dict], tools: list[dict] | None = None) -> int
 
 
 def model_window(metadata: dict | None, fallback: int, *, model: str | None = None) -> int:
-    """An explicit ``context_window_tokens`` wins; else the model's window."""
+    """An explicit ``context_window_tokens`` wins; else the model's window.
+
+    The model's window includes a limit its BYOK credential declared.
+    """
     value = (metadata or {}).get("context_window_tokens")
     if value is None:
-        if model:
-            from packages.core.services.model_context_window import effective_context_window_tokens
+        from packages.core.services.model_context_window import (
+            declared_model_limits,
+            effective_context_window_tokens,
+        )
 
-            return effective_context_window_tokens(model)
+        if model or declared_model_limits(metadata, model):
+            return effective_context_window_tokens(model, metadata)
         return fallback
     if isinstance(value, bool):
         raise ValueError("context_window_tokens must be a positive integer")
@@ -219,6 +238,16 @@ async def compact_context(
     ledger: str = "", keep_recent: int = 12, target_ratio: float | None = None,
 ) -> list[dict]:
     original = deepcopy(messages)
+
+    async def archive_original() -> tuple[str | None, bool]:
+        """Archive id and whether the original history is stored."""
+        if not archive:
+            return None, True
+        try:
+            return await archive(original), True
+        except ContextArchiveUnavailable:
+            return None, False
+
     hard_budget = window - max(0, reserve)
     soft_budget = min(hard_budget, max(1, int(window * ratio) - max(0, reserve)))
     # Compact well below the trigger so the next rounds' output does not
@@ -227,6 +256,16 @@ async def compact_context(
         soft_budget, max(1, int(window * target_ratio) - max(0, reserve)),
     )
     size = request_tokens(original, tools)
+
+    def retain_or_fail(reason):
+        # The soft trigger is advisory. Never replace source history with an
+        # invalid summary, and never send it beyond the hard input/output limit.
+        if size <= hard_budget:
+            validate_request(original, tools, window=window, reserve=reserve)
+            logger.warning("context_compaction_retained_history reason=%s", reason)
+            return messages
+        raise ContextBudgetExceeded(f"Context compaction failed ({reason}); original history was retained.")
+
     # Token pressure is the trigger; a message count is only an opt-in guard.
     if size < soft_budget and (count_threshold is None or len(original) < count_threshold):
         return messages
@@ -301,9 +340,9 @@ async def compact_context(
         flattened.append(message)
     dropped = flattened
     if not dropped:
-        # Everything evicted was a repeat of the retained window.
-        if archive:
-            await archive(original)
+        # Everything evicted was a repeat of the retained window, so nothing
+        # depends on the archive succeeding.
+        await archive_original()
         deduped = [*fixed, *anchored, *[m for group in tail_groups for m in group], *fresh]
         validate_request(deduped, tools, window=window, reserve=reserve)
         return deduped
@@ -313,19 +352,31 @@ async def compact_context(
         return [*fixed, checkpoint, *anchored, *[m for group in tail_groups for m in group], *fresh]
     packed = assemble(lossless)
     if request_tokens(packed, tools) <= target_budget:
-        archive_id = await archive(original) if archive else None
+        # Lossless: the records travel inside the checkpoint, so a missing
+        # archive only drops the pointer, never content.
+        archive_id, _ = await archive_original()
         packed = assemble(_checkpoint_message({"records": dropped}, archive_id, digest))
         validate_request(packed, tools, window=window, reserve=reserve)
         return packed
-    # Archive before any lossy transform. A storage failure leaves the caller's
-    # messages untouched and does not send a summarization request.
-    archive_id = await archive(original) if archive else None
+    # Archive before any lossy transform. Without it, wait for a later round
+    # while the window still has room; once it does not, summarize anyway and
+    # tell the model the originals cannot be read back.
+    archive_id, archived = await archive_original()
+    if not archived:
+        try:
+            validate_request(original, tools, window=window, reserve=reserve)
+        except ContextBudgetExceeded:
+            pass
+        else:
+            return messages
     summary_budget = min(4096, available, max(128, (window - estimate(SUMMARY_INSTRUCTIONS) - 768) // 4))
     previous = {field: [] for field in CHECKPOINT_FIELDS}
-    overhead = estimate(SUMMARY_INSTRUCTIONS) + summary_budget * 2 + 512
+    # Keep the previous checkpoint and generation headroom separate. Reasoning
+    # and JSON framing can consume output tokens beyond the checkpoint target.
+    overhead = estimate(SUMMARY_INSTRUCTIONS) + summary_budget * 3 + 512
     chunk_budget = min(24000, window - overhead)
     if chunk_budget < 128:
-        raise ContextBudgetExceeded("Model window is too small for a safe compaction request.")
+        return retain_or_fail("compaction_input_too_large")
     batch = []
     batches = []
     summary_records = deepcopy(dropped)
@@ -345,39 +396,86 @@ async def compact_context(
         batch.append(fragment)
     if batch:
         batches.append(batch)
-    for batch in batches:
-        prompt = SUMMARY_INSTRUCTIONS + "\n" + encode({
-            "budget_tokens": summary_budget, "previous_checkpoint": previous,
-            "records": batch,
-        })
-        if estimate(prompt) + summary_budget + 64 > window:
-            raise ContextBudgetExceeded("Compaction input exceeds the model window.")
-        content, usage = await complete(prompt, model=model, metadata=metadata, max_tokens=summary_budget)
-        if record_usage:
-            record_usage(usage)
-        if (usage or {}).get("error"):
-            raise ContextBudgetExceeded("Context summarization failed; original history was retained.")
-        try:
-            # Some provider routes wrap JSON mode output in Markdown. Accept
-            # one complete fence while preserving strict JSON/schema validation.
-            lines = content.strip().splitlines()
-            if len(lines) >= 3 and lines[0].strip() in {"```json", "```"} and lines[-1].strip() == "```":
-                content = "\n".join(lines[1:-1])
-            parsed = json.loads(content)
-            if not isinstance(parsed, dict) or not any(parsed.get(field) for field in CHECKPOINT_FIELDS) or any(
-                not isinstance(parsed.get(field), list)
-                or any(not isinstance(item, str) for item in parsed[field])
-                for field in CHECKPOINT_FIELDS
-            ):
-                raise ValueError("invalid checkpoint fields")
-        except (TypeError, ValueError) as exc:
-            raise ContextBudgetExceeded("Invalid context checkpoint; original history was retained.") from exc
-        previous = {field: parsed[field] for field in CHECKPOINT_FIELDS}
-        if estimate(encode(previous)) > summary_budget:
-            raise ContextBudgetExceeded("Context checkpoint exceeded its budget; original history was retained.")
-    checkpoint = _checkpoint_message({"summary": previous}, archive_id, digest)
-    if ledger:
-        checkpoint["content"] += "\n" + ledger
-    compacted = assemble(checkpoint)
+    # An earlier summary whose originals were never archived stays unreadable.
+    originals_lost = not archived or any(
+        (_checkpoint_payload(message) or {}).get("note") == ARCHIVE_UNAVAILABLE_NOTE
+        for message in dropped
+    )
+
+    def checkpoint_messages(summary):
+        checkpoint = _checkpoint_message(
+            {"summary": summary, **({"note": ARCHIVE_UNAVAILABLE_NOTE} if originals_lost else {})},
+            archive_id, digest,
+        )
+        if ledger:
+            checkpoint["content"] += "\n" + ledger
+        return assemble(checkpoint)
+
+    def summary_prompt(checkpoint, batch, target, retry_error=None):
+        payload = {"budget_tokens": target, "previous_checkpoint": checkpoint, "records": batch}
+        if retry_error:
+            payload["retry_error"] = retry_error
+            payload["retry_instruction"] = (
+                "Regenerate a shorter complete JSON checkpoint from the same records and previous checkpoint. "
+                "Include every required field as a list of strings. Preserve constraints and uncertainty; "
+                "do not infer missing facts or permissions."
+            )
+        return SUMMARY_INSTRUCTIONS + "\n" + encode(payload)
+
+    for batch_index, batch in enumerate(batches):
+        error = None
+        for attempt in range(2):
+            target = summary_budget if attempt == 0 else max(128, summary_budget * 3 // 4)
+            prompt = summary_prompt(previous, batch, target, error)
+            input_tokens = request_tokens([{"role": "user", "content": prompt}])
+            output_budget = min(target * 2, window - input_tokens - 512)
+            if output_budget < 128:
+                return retain_or_fail("compaction_input_too_large")
+            content, usage = await complete(prompt, model=model, metadata=metadata, max_tokens=output_budget)
+            if record_usage:
+                record_usage(usage)
+            if (usage or {}).get("error"):
+                # The provider layer owns transport retries.
+                return retain_or_fail("provider_error")
+            error = None
+            if str((usage or {}).get("finish_reason")).lower() in {"length", "max_tokens", "max_output_tokens"}:
+                error = "output_truncated"
+            else:
+                try:
+                    if not isinstance(content, str):
+                        raise ValueError("checkpoint response is not text")
+                    # Accept one complete fence, but no surrounding commentary.
+                    lines = content.strip().splitlines()
+                    if len(lines) >= 3 and lines[0].strip() in {"```json", "```"} and lines[-1].strip() == "```":
+                        content = "\n".join(lines[1:-1])
+                    parsed = json.loads(content)
+                    if not isinstance(parsed, dict) or not any(parsed.get(field) for field in CHECKPOINT_FIELDS) or any(
+                        not isinstance(parsed.get(field), list)
+                        or any(not isinstance(item, str) for item in parsed[field])
+                        for field in CHECKPOINT_FIELDS
+                    ):
+                        raise ValueError("invalid checkpoint fields")
+                    parsed = {field: parsed[field] for field in CHECKPOINT_FIELDS}
+                except (TypeError, ValueError):
+                    error = "invalid_checkpoint"
+                else:
+                    # A generation target is not a hard limit. Validate the
+                    # actual packed request, including tools, ledger and notes.
+                    try:
+                        validate_request(checkpoint_messages(parsed), tools, window=window, reserve=reserve)
+                    except ContextBudgetExceeded:
+                        error = "checkpoint_too_large"
+                    if not error and batch_index + 1 < len(batches):
+                        next_prompt = summary_prompt(parsed, batches[batch_index + 1], summary_budget)
+                        if request_tokens([{"role": "user", "content": next_prompt}]) + summary_budget * 2 + 512 > window:
+                            error = "checkpoint_too_large"
+            if not error:
+                previous = parsed
+                break
+            logger.warning("context_compaction_recovery batch=%s attempt=%s reason=%s", batch_index, attempt + 1, error)
+        else:
+            return retain_or_fail(error)
+
+    compacted = checkpoint_messages(previous)
     validate_request(compacted, tools, window=window, reserve=reserve)
     return compacted

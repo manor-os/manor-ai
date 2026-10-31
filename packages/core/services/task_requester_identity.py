@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from packages.core.constants.agents import (
     MANOR_AGENT_NAME,
@@ -28,6 +28,31 @@ class TaskRequesterIdentityError(RuntimeError):
         self.reason = reason
         task_label = task_id or "unknown"
         super().__init__(f"Task {task_label} requester identity is invalid: {reason}")
+
+
+TASK_STEERING_ENDED_CODE = "task_collaborator_access_ended"
+TASK_STEERING_ENDED_MESSAGE = (
+    "This task was edited by an external collaborator whose access has ended; "
+    "review it and save it to run again"
+)
+
+
+class TaskSteeringEndedError(TaskRequesterIdentityError):
+    """A collaborator who steered the Task no longer has a live grant on its Workspace.
+
+    Every run of a steered Task is narrowed to its collaborators' live grants
+    (runtime_authorization.collaborator); once one has lapsed nothing is left,
+    so the Task stops until a customer member reviews and saves it, which
+    clears the steering.
+    """
+
+    code = TASK_STEERING_ENDED_CODE
+
+    def __init__(self, task_id: str | None) -> None:
+        super().__init__(task_id, TASK_STEERING_ENDED_MESSAGE)
+
+    def __str__(self) -> str:
+        return TASK_STEERING_ENDED_MESSAGE
 
 
 def _value(row: Any, key: str) -> Any:
@@ -418,9 +443,16 @@ async def resolve_task_execution_user_id(db: Any, task: Any) -> str | None:
     entity_id = _text(_value(task, "entity_id"))
     if not entity_id:
         raise TaskRequesterIdentityError(task_id, "the Task has no entity scope")
+    steering = _value(task, "collaborator_ids")
+    if steering:
+        from packages.core.services.runtime_authorization.collaborator import task_steering_ended
 
-    from packages.core.models.staff import Staff
-    from packages.core.models.user import User, UserMembership
+        if await task_steering_ended(
+            db, entity_id=entity_id, workspace_id=_text(_value(task, "workspace_id")), collaborator_ids=steering,
+        ):
+            raise TaskSteeringEndedError(task_id)
+
+    from packages.core.models.user import User
 
     execution_user_id = resolution.user_id
     if not execution_user_id:
@@ -454,10 +486,26 @@ async def resolve_task_execution_user_id(db: Any, task: Any) -> str | None:
                 "no trusted User or explicit system provenance owns the Task",
             )
 
+    return await _executable_entity_member(
+        db, task_id=task_id, entity_id=entity_id, user_id=execution_user_id,
+    )
+
+
+async def _executable_entity_member(
+    db: Any,
+    *,
+    task_id: str | None,
+    entity_id: str,
+    user_id: str,
+) -> str:
+    """``user_id`` when it is an active User who belongs to the Task's entity."""
+    from packages.core.models.staff import Staff
+    from packages.core.models.user import User, UserMembership
+
     executable_user = (
         await db.execute(
             select(User).where(
-                User.id == execution_user_id,
+                User.id == user_id,
                 User.status == "active",
                 User.deleted_at.is_(None),
             )
@@ -473,7 +521,7 @@ async def resolve_task_execution_user_id(db: Any, task: Any) -> str | None:
         (
             await db.execute(
                 select(UserMembership).where(
-                    UserMembership.user_id == execution_user_id,
+                    UserMembership.user_id == user_id,
                     UserMembership.entity_id == entity_id,
                 )
             )
@@ -483,7 +531,7 @@ async def resolve_task_execution_user_id(db: Any, task: Any) -> str | None:
         (
             await db.execute(
                 select(Staff).where(
-                    Staff.user_id == execution_user_id,
+                    Staff.user_id == user_id,
                     Staff.entity_id == entity_id,
                 )
             )
@@ -515,4 +563,101 @@ async def resolve_task_execution_user_id(db: Any, task: Any) -> str | None:
             task_id,
             "the requester is inactive or no longer belongs to the Task entity",
         )
-    return execution_user_id
+    return user_id
+
+
+async def resolve_task_run_user_id(db: Any, task: Any) -> str | None:
+    """The member a Task's agent-loop run executes as.
+
+    A requested Task runs as its executing requester. A Task with trusted
+    system provenance (a Strategist proposal, a scheduled job) has none:
+    ``resolve_task_execution_user_id`` returns ``None`` and every caller of it
+    keeps the system semantics (entity billing, the system-agent document
+    rule). Its agent-loop run alone executes as the owner of the scope the
+    work belongs to, who approved it by owning that scope: the Workspace's
+    owner, or the account's owner for a Task outside any Workspace. The run
+    holds an owner's model, tool, approval and capability authority and can
+    acquire what it lacks instead of asking for it. ``None`` when no owner
+    can execute.
+    """
+
+    user_id = await resolve_task_execution_user_id(db, task)
+    if user_id:
+        return user_id
+    if _text(_value(task, "workspace_id")):
+        return await _workspace_owner_executor(db, task)
+    return await _account_owner_executor(db, task)
+
+
+async def _first_executable(db: Any, task: Any, owner_ids: Any) -> str | None:
+    task_id = _text(_value(task, "id"))
+    entity_id = _text(_value(task, "entity_id"))
+    for owner_id in dict.fromkeys(str(value) for value in owner_ids):
+        try:
+            return await _executable_entity_member(
+                db, task_id=task_id, entity_id=entity_id, user_id=owner_id,
+            )
+        except TaskRequesterIdentityError:
+            continue
+    return None
+
+
+async def _account_owner_executor(db: Any, task: Any) -> str | None:
+    """The longest-standing active account owner who can execute, if any."""
+    from packages.core.models.user import UserMembership
+
+    entity_id = _text(_value(task, "entity_id"))
+    if not entity_id:
+        return None
+    owner_ids = (await db.execute(
+        select(UserMembership.user_id)
+        .where(
+            UserMembership.entity_id == entity_id,
+            UserMembership.status == "active",
+            UserMembership.deleted_at.is_(None),
+            func.lower(UserMembership.role) == "owner",
+        )
+        .order_by(UserMembership.created_at.asc(), UserMembership.user_id.asc())
+    )).scalars().all()
+    if not owner_ids:
+        from packages.core.models.user import User
+
+        # An account from before memberships: its owner is a User of the entity.
+        owner_ids = (await db.execute(
+            select(User.id)
+            .where(
+                User.entity_id == entity_id,
+                User.status == "active",
+                User.deleted_at.is_(None),
+                func.lower(User.role) == "owner",
+            )
+            .order_by(User.created_at.asc(), User.id.asc())
+        )).scalars().all()
+    return await _first_executable(db, task, owner_ids)
+
+
+async def _workspace_owner_executor(db: Any, task: Any) -> str | None:
+    """The longest-standing active Workspace owner who can execute, if any."""
+    from datetime import datetime, timezone
+
+    from packages.core.models.workspace import WorkspaceStaff
+
+    entity_id = _text(_value(task, "entity_id"))
+    workspace_id = _text(_value(task, "workspace_id"))
+    if not entity_id or not workspace_id:
+        return None
+    owner_ids = (await db.execute(
+        select(WorkspaceStaff.user_id)
+        .where(
+            WorkspaceStaff.workspace_id == workspace_id,
+            WorkspaceStaff.status == "active",
+            WorkspaceStaff.user_id.is_not(None),
+            func.lower(WorkspaceStaff.role) == "owner",
+            or_(
+                WorkspaceStaff.expires_at.is_(None),
+                WorkspaceStaff.expires_at > datetime.now(timezone.utc),
+            ),
+        )
+        .order_by(WorkspaceStaff.created_at.asc(), WorkspaceStaff.id.asc())
+    )).scalars().all()
+    return await _first_executable(db, task, owner_ids)

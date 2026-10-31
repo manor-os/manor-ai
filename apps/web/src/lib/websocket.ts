@@ -10,7 +10,13 @@ import {
 import { useLocation } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 import { captureClientError } from "./clientErrors";
+import { EMBED } from "../embed/embedContext";
 import type { ChatRoomMessage } from "./chatRoomTypes";
+import {
+  REALTIME_RESYNC_HIDDEN_GAP_MS,
+  createConnectionGapTracker,
+  requestRealtimeResync,
+} from "./realtimeResync";
 
 export interface ChatRoomChangeEvent {
   room_id: string;
@@ -25,6 +31,8 @@ interface UseWebSocketOptions {
   onJobUpdate?: (data: Record<string, any>) => void;
   onGoalProgress?: (data: Record<string, any>) => void;
   onWorkspaceChatMessage?: (data: Record<string, any>) => void;
+  /** Someone changed a Workspace's configuration (packages/core/services/workspace_change_events). */
+  onWorkspaceChanged?: (data: Record<string, any>) => void;
   onConversationMessage?: (data: Record<string, any>) => void;
   onChatRoomChanged?: (data: ChatRoomChangeEvent) => void;
   /** In-progress reply for a turn this tab is not streaming (see chat_service). */
@@ -33,6 +41,8 @@ interface UseWebSocketOptions {
   onTyping?: (data: Record<string, any>) => void;
   onPresence?: (data: Record<string, any>) => void;
   onVideoReady?: (data: Record<string, any>) => void;
+  /** A media job moved to another phase (submitting, generating, saving). */
+  onMediaJobUpdate?: (data: Record<string, any>) => void;
 }
 
 type Subscriber = {
@@ -51,6 +61,10 @@ let sharedReconnectAttempts = 0;
 let latestUnreadCount = 0;
 let nextSubscriberId = 1;
 const subscribers = new Map<number, Subscriber>();
+// Events published while no socket is open are lost; views reconcile after a gap.
+const connectionGaps = createConnectionGapTracker();
+let lifecycleListenersInstalled = false;
+let hiddenSince: number | null = null;
 
 function isUsableJwt(token: string | null | undefined): token is string {
   if (!token) return false;
@@ -95,6 +109,9 @@ function closeSharedSocket(manual = true) {
     sharedHeartbeatInterval = undefined;
   }
   if (sharedWs) {
+    // The customer-trial frame rotates its short-lived token often; every such
+    // reconnect reconciles, however short the gap.
+    if (sharedWs.readyState === WebSocket.OPEN) connectionGaps.lost(manual && !EMBED);
     (sharedWs as any)._manualClose = manual;
     sharedWs.close();
   }
@@ -118,6 +135,8 @@ function dispatchMessage(event: MessageEvent) {
 
     switch (msg.event) {
       case "connected":
+        // Anything pushed between the previous socket and this one is gone.
+        if (connectionGaps.connected()) requestRealtimeResync("reconnect");
         latestUnreadCount =
           (msg.data.unread_notifications as number | undefined) || 0;
         for (const sub of subscribers.values()) {
@@ -152,6 +171,11 @@ function dispatchMessage(event: MessageEvent) {
           sub.optionsRef.current.onWorkspaceChatMessage?.(msg.data);
         }
         break;
+      case "workspace_changed":
+        for (const sub of subscribers.values()) {
+          sub.optionsRef.current.onWorkspaceChanged?.(msg.data);
+        }
+        break;
       case "conversation_message":
         for (const sub of subscribers.values()) {
           sub.optionsRef.current.onConversationMessage?.(msg.data);
@@ -181,6 +205,15 @@ function dispatchMessage(event: MessageEvent) {
         for (const sub of subscribers.values()) {
           sub.optionsRef.current.onVideoReady?.(msg.data);
         }
+        break;
+      case "media_job_update":
+        for (const sub of subscribers.values()) {
+          sub.optionsRef.current.onMediaJobUpdate?.(msg.data);
+        }
+        break;
+      case "resync":
+        // The server lost events for this socket (its Redis relay resubscribed).
+        requestRealtimeResync("server");
         break;
       case "ping":
         sendShared({ type: "ping" });
@@ -224,7 +257,9 @@ function connectShared(token: string) {
     `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`,
   );
 
+  let opened = false;
   ws.onopen = () => {
+    opened = true;
     sharedReconnectAttempts = 0;
     updateConnectedRefs(true);
     sharedHeartbeatInterval = window.setInterval(() => {
@@ -241,6 +276,7 @@ function connectShared(token: string) {
     }
     updateConnectedRefs(false);
     if ((ws as any)._manualClose) return;
+    if (opened) connectionGaps.lost(false);
     if (subscribers.size === 0) return;
 
     const latestToken = useAuthStore.getState().token;
@@ -259,8 +295,46 @@ function connectShared(token: string) {
   sharedWs = ws;
 }
 
+/** Reconnect now instead of waiting out the backoff, when the page can use a socket again. */
+function reviveSharedSocket() {
+  if (subscribers.size === 0) return;
+  if (
+    sharedWs?.readyState === WebSocket.OPEN ||
+    sharedWs?.readyState === WebSocket.CONNECTING
+  ) {
+    return;
+  }
+  const token = useAuthStore.getState().token;
+  // An expired token renews through AuthSessionBoundary; the hook reconnects then.
+  if (!isUsableJwt(token)) return;
+  clearSharedReconnect();
+  sharedReconnectAttempts = 0;
+  connectShared(token);
+}
+
+function installLifecycleListeners() {
+  if (lifecycleListenersInstalled || typeof document === "undefined") return;
+  lifecycleListenersInstalled = true;
+  hiddenSince = document.visibilityState === "hidden" ? Date.now() : null;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      hiddenSince ??= Date.now();
+      return;
+    }
+    const hiddenFor = hiddenSince === null ? 0 : Date.now() - hiddenSince;
+    hiddenSince = null;
+    if (subscribers.size === 0) return;
+    // A long-hidden tab may have been frozen with its socket still "open",
+    // so a reconnect alone cannot prove nothing was missed.
+    if (hiddenFor >= REALTIME_RESYNC_HIDDEN_GAP_MS) requestRealtimeResync("resume");
+    reviveSharedSocket();
+  });
+  window.addEventListener("online", reviveSharedSocket);
+}
+
 function subscribeToSharedWebSocket(token: string, subscriber: Subscriber): number {
   clearSharedClose();
+  installLifecycleListeners();
   const id = nextSubscriberId++;
   subscriber.connectedRef.current = sharedConnected;
   subscriber.setUnreadCount(latestUnreadCount);
@@ -305,6 +379,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     setUnreadCount((c) => Math.max(0, c - 1));
   }, []);
 
+  // An external collaborator's socket is accepted too; the server delivers it
+  // only events for the granted Workspace (apps/api/routers/ws.py).
   useEffect(() => {
     if (!isUsableJwt(token)) {
       disconnect();

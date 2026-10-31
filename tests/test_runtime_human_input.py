@@ -320,6 +320,7 @@ async def test_question_and_answer_are_messages_ordered_before_the_reply(db_sess
     prompt.created_at = datetime.now(timezone.utc) - timedelta(seconds=2)
     placeholder = await add_message(db_session, "conv_order", role="assistant", content="")
     placeholder.created_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    placeholder.author_subscription_id = "sub_asking_agent"
     run = await create_runtime_run(
         db_session,
         conversation_id="conv_order",
@@ -338,7 +339,12 @@ async def test_question_and_answer_are_messages_ordered_before_the_reply(db_sess
     assert question.content == "Which unit?\nOptions: 4C / 5A\nTwo units match."
     assert question.meta["runtime_input_role"] == "question"
 
-    answer = await record_human_input_answer_message(db_session, run=run, answer_text="4C")
+    # The question is the asking agent's, not the workspace chief's.
+    assert question.author_subscription_id == "sub_asking_agent"
+
+    answer = await record_human_input_answer_message(db_session, run=run, answer_text="4C", user_id="user_hi")
+    # The answer names the person, so chat does not show an unknown participant.
+    assert answer.meta["author_user_id"] == "user_hi"
     placeholder.content = "Noted: unit 4C."
     await db_session.flush()
 

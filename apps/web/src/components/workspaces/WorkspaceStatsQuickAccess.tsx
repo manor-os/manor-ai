@@ -12,6 +12,7 @@ import { preserveReturnToInHistory } from "../../lib/chatRouteReferences";
 import { fileReferenceKind } from "../../lib/fileReferences";
 import { relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
+import { folderDisplayName } from "../../lib/knowledgeLayout";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
 import type { Document, Task, Workspace } from "../../lib/types";
 import {
@@ -26,6 +27,7 @@ import {
   unseenTaskAttentionSeverity,
 } from "../../lib/workspaceTaskAttention";
 import { useAuthStore } from "../../stores/auth";
+import { useIsCollaborator } from "../../lib/collaboratorSession";
 import {
   IconArrowDown,
   IconArrowUp,
@@ -110,6 +112,7 @@ interface WorkspaceDocumentGroup {
 interface WorkspaceDocumentFolder {
   id: string;
   name: string;
+  display_name?: string | null;
   parent_id?: string | null;
 }
 
@@ -165,7 +168,7 @@ function buildWorkspaceDocumentTree(group: WorkspaceDocumentGroup): WorkspaceDoc
   }
 
   const finalizeFolder = (folder: WorkspaceDocumentFolderNode): number => {
-    folder.children.sort((left, right) => left.name.localeCompare(right.name));
+    folder.children.sort((left, right) => folderDisplayName(left).localeCompare(folderDisplayName(right)));
     const childCount = folder.children.reduce(
       (total, child) => total + finalizeFolder(child),
       0,
@@ -173,7 +176,7 @@ function buildWorkspaceDocumentTree(group: WorkspaceDocumentGroup): WorkspaceDoc
     folder.documentCount = folder.documents.length + childCount;
     return folder.documentCount;
   };
-  rootFolders.sort((left, right) => left.name.localeCompare(right.name));
+  rootFolders.sort((left, right) => folderDisplayName(left).localeCompare(folderDisplayName(right)));
   rootFolders.forEach(finalizeFolder);
   return { folders: rootFolders, documents: rootDocuments };
 }
@@ -524,7 +527,7 @@ function WorkspaceQuickFolderNode({
 }: WorkspaceQuickFolderNodeProps) {
   const folderKey = workspaceQuickFolderKey(groupId, folder.id);
   const expanded = expandedFolderIds.has(folderKey);
-  const folderName = folder.name || t("component.workspace_chat.untitled_folder");
+  const folderName = folderDisplayName(folder) || t("component.workspace_chat.untitled_folder");
   const contentId = `workspace-quick-folder-${groupId}-${folder.id}`;
   return (
     <div className="workspace-chat-quick-nested-folder" role="listitem">
@@ -823,6 +826,54 @@ function WorkspaceQuickDetailHeader({
   );
 }
 
+/** A new Task of this Workspace; the Workspace's own Agents pick it up from there. */
+function WorkspaceTaskQuickCreate({ workspaceId, onDone }: { workspaceId: string; onDone: () => void }) {
+  const queryClient = useQueryClient();
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const create = useMutation({
+    mutationFn: () => api.tasks.create({ title: title.trim(), description: description.trim(), workspace_id: workspaceId }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      onDone();
+    },
+  });
+  return (
+    <form
+      className="space-y-2 px-1 pb-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (title.trim() && !create.isPending) create.mutate();
+      }}
+    >
+      <Input
+        ariaLabel={t("page.tasks.task_title")}
+        placeholder={t("page.tasks.task_title")}
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        disabled={create.isPending}
+        autoFocus
+      />
+      <Textarea
+        ariaLabel={t("component.workspace_chat.task_details_optional")}
+        placeholder={t("component.workspace_chat.task_details_optional")}
+        value={description}
+        onChange={(event) => setDescription(event.target.value)}
+        disabled={create.isPending}
+        rows={3}
+      />
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="outline" size="sm" onClick={onDone} disabled={create.isPending}>
+          {t("action.cancel")}
+        </Button>
+        <Button type="submit" size="sm" loading={create.isPending} disabled={!title.trim()}>
+          {t("page.tasks.create_task")}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 interface WorkspaceTasksQuickBodyProps {
   tasks: Task[];
   returnTo: string;
@@ -1050,6 +1101,8 @@ export default function WorkspaceStatsQuickAccess({
   const [pageIsActive, setPageIsActive] = useState(false);
   const [editing, setEditing] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [creatingTask, setCreatingTask] = useState(false);
+  const collaborator = useIsCollaborator();
   const [preference, setPreference] = useState<QuickViewPreference | null>(null);
   const [taskAttentionSeenState, setTaskAttentionSeenState] = useState(() => ({
     storageKey: taskAttentionSeenStorageKey,
@@ -1638,16 +1691,35 @@ export default function WorkspaceStatsQuickAccess({
                 backButtonRef={detailBackRef}
                 onBack={returnToOverview}
                 actions={(
-                  <Link
-                    to={`/tasks?workspaceId=${encodeURIComponent(workspaceId)}`}
-                    state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
-                    onClick={() => preserveReturnToInHistory(currentReturnTo)}
-                  >
-                    {t("component.workspace_chat.view_all")}
-                    <IconChevronRight size={13} />
-                  </Link>
+                  <>
+                    {canManage && !creatingTask && (
+                      <button
+                        type="button"
+                        className="workspace-chat-stats-popover-header-add"
+                        aria-label={t("page.tasks.new_task")}
+                        title={t("page.tasks.new_task")}
+                        onClick={() => setCreatingTask(true)}
+                      >
+                        <IconPlus size={17} />
+                      </button>
+                    )}
+                    {/* The company task board is not part of a collaborator's session. */}
+                    {!collaborator && (
+                      <Link
+                        to={`/tasks?workspaceId=${encodeURIComponent(workspaceId)}`}
+                        state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
+                        onClick={() => preserveReturnToInHistory(currentReturnTo)}
+                      >
+                        {t("component.workspace_chat.view_all")}
+                        <IconChevronRight size={13} />
+                      </Link>
+                    )}
+                  </>
                 )}
               />
+              {creatingTask && (
+                <WorkspaceTaskQuickCreate workspaceId={workspaceId} onDone={() => setCreatingTask(false)} />
+              )}
               <WorkspaceTasksQuickBody
                 tasks={taskBriefs}
                 returnTo={currentReturnTo}

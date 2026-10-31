@@ -10,6 +10,8 @@ import { IconArrowDown, IconArrowRight, IconArrowUp, IconChatBubble, IconClock, 
 import Button from "../ui/Button";
 import GlassCard from "../ui/GlassCard";
 import Select from "../ui/Select";
+import WorkspaceAppDataSettings from "./WorkspaceAppDataSettings";
+import WorkspaceAppSectionsSettings from "./WorkspaceAppSectionsSettings";
 import WorkspaceAppView from "./WorkspaceAppView";
 import "./WorkspaceAppViewSettings.css";
 
@@ -24,6 +26,7 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
     queryFn: () => api.workspaces.appView(workspaceId),
   });
   const [config, setConfig] = useState<WorkspaceAppViewConfig | null>(null);
+  const [dataSettingsValid, setDataSettingsValid] = useState(true);
   useEffect(() => { if (view) setConfig(view.config); }, [view]);
 
   const actions = useMemo(() => {
@@ -84,6 +87,9 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
       source_title: pendingPrimary.title, description: pendingPrimary.description || "",
       workflow_id: pendingPrimary.workflow_id, inputs: pendingPrimary.inputs,
     }] : [])],
+    sections: config.sections
+      ? config.sections.map((section) => ({ ...section, implicit: false, available: true, source_title: null }))
+      : view.sections,
     config,
   } : undefined;
 
@@ -101,6 +107,12 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
   });
 
   const update = (next: Partial<WorkspaceAppViewConfig>) => setConfig((current) => current ? { ...current, ...next } : current);
+  // An unset field follows the platform; an empty theme is no theme.
+  const updateTheme = (next: NonNullable<WorkspaceAppViewConfig["theme"]>) => setConfig((current) => {
+    if (!current) return current;
+    const merged = Object.fromEntries(Object.entries({ ...(current.theme || {}), ...next }).filter(([, value]) => value));
+    return { ...current, theme: Object.keys(merged).length ? merged : null };
+  });
   const addEntry = () => {
     if (!config) return;
     const key = `action:${crypto.randomUUID()}`;
@@ -114,16 +126,30 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
     const next = {
       ...config, entries: { ...config.entries }, labels: { ...config.labels },
       descriptions: { ...config.descriptions }, forms: { ...config.forms },
-      targets: { ...config.targets }, prompts: { ...config.prompts },
+      targets: { ...config.targets }, prompts: { ...config.prompts }, presets: { ...(config.presets || {}) },
+      asks: { ...(config.asks || {}) }, choices: { ...(config.choices || {}) },
     };
     delete next.entries[key];
-    for (const field of ["labels", "descriptions", "forms", "targets", "prompts"] as const) {
+    for (const field of ["labels", "descriptions", "forms", "targets", "prompts", "presets", "asks", "choices"] as const) {
       delete next[field][key];
+    }
+    if (config.icons?.[key]) {
+      next.icons = { ...config.icons };
+      delete next.icons[key];
     }
     next.order = config.order.filter((item) => item !== key);
     next.hidden = config.hidden.filter((item) => item !== key);
     if (next.hero === key) next.hero = null;
     setConfig(next);
+  };
+  // An empty preset removes it, so the Flow's own default shows again.
+  const setPreset = (key: string, field: string, value: string) => {
+    if (!config) return;
+    const presets = { ...(config.presets || {}) };
+    const values = { ...(presets[key] || {}) };
+    if (value) values[field] = value; else delete values[field];
+    if (Object.keys(values).length) presets[key] = values; else delete presets[key];
+    update({ presets });
   };
   const setTarget = (key: string, value: string) => {
     if (!config) return;
@@ -248,6 +274,16 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
             </label>)}
           </div>
         </GlassCard>
+        {Boolean(config.components?.length) && <GlassCard hoverable={false}>
+          <WorkspaceAppDataSettings
+            components={config.components || []}
+            dataSources={config.data_sources || {}}
+            onChange={(components) => update({ components })}
+            onDataSourcesChange={(data_sources) => update({ data_sources })}
+            disabled={!canManage || save.isPending}
+            onValidityChange={setDataSettingsValid}
+          />
+        </GlassCard>}
         <GlassCard hoverable={false}>
           <div className="workspace-app-settings__section-head">
             <div><h3>{t("component.workspace_app_view.entries_title")}</h3><p>{t("component.workspace_app_view.entries_description")}</p></div>
@@ -316,6 +352,15 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
                       <p>{t("component.workspace_app_view.flow_inputs_hint")}</p>
                       {resolved.workflow_id && <Link to={workflowPath(resolved.workflow_id)}>{t("component.workspace_app_view.configure_flow")} <IconArrowRight size={13} /></Link>}
                     </div>}
+                    {resolved.kind === "workflow" && (resolved.inputs || []).some((input) => input.type !== "file") && <div className="workspace-app-settings__presets">
+                      <p>{t("component.workspace_app_view.presets_hint")}</p>
+                      {(resolved.inputs || []).filter((input) => input.type !== "file").map((input) => <label key={input.key}>
+                        <span>{input.label}</span>
+                        <textarea className="manor-input" rows={3} maxLength={4000} value={config.presets?.[action.key]?.[input.key] ?? ""}
+                          onChange={(event) => setPreset(action.key, input.key, event.target.value)} disabled={!canManage || save.isPending}
+                          aria-label={`${t("component.workspace_app_view.presets_label")} ${input.label}`} />
+                      </label>)}
+                    </div>}
                     {targetValue.startsWith("attach:") && <p className="workspace-app-settings__target-note" role="status">{t("component.workspace_app_view.flow_connect_on_save")}</p>}
                     {resolved.kind === "automation" && <div className="workspace-app-settings__execution-detail">
                       <p>{t("component.workspace_app_view.automation_config_hint")}</p>
@@ -354,6 +399,12 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
         </GlassCard>
 
         <GlassCard hoverable={false}>
+          <div className="workspace-app-settings__section-head"><div><h3>{t("component.workspace_app_view.sections_title")}</h3><p>{t("component.workspace_app_view.sections_description")}</p></div></div>
+          <WorkspaceAppSectionsSettings view={view} sections={config.sections} disabled={!canManage || save.isPending}
+            onChange={(sections) => update({ sections })} />
+        </GlassCard>
+
+        <GlassCard hoverable={false}>
           <div className="workspace-app-settings__section-head"><div><h3>{t("component.workspace_app_view.appearance")}</h3><p>{t("component.workspace_app_view.appearance_description")}</p></div><IconSparkles size={17} /></div>
           <div className="workspace-app-settings__visuals" role="radiogroup" aria-label={t("component.workspace_app_view.appearance")}>
             {visualOptions.map((option) => <label key={option.value} className={`workspace-app-settings__visual${config.visual === option.value ? " workspace-app-settings__visual--selected" : ""}`}>
@@ -366,18 +417,38 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
             {!view.cover_image_url && <span>{t("component.workspace_app_view.no_cover_hint")} </span>}
             <Link to={`/workspaces/${encodeURIComponent(workspaceId)}?tab=settings#workspace-cover-image`}>{view.cover_image_url ? t("component.workspace_app_view.change_cover") : t("component.workspace_app_view.add_cover")}</Link>
           </p>}
-          {view.cover_image_url && (config.visual === "image" || config.visual === "auto" || config.visual === "motion") && <div className="workspace-app-settings__cover-preview"><img src={view.cover_image_url} alt="" /><span>{t(view.cover_source === "starter" ? "component.workspace_app_view.using_starter_cover" : "component.workspace_app_view.using_workspace_cover")}</span></div>}
+          {view.cover_image_url && (config.visual === "image" || config.visual === "auto" || config.visual === "motion") && <div className="workspace-app-settings__cover-preview"><img src={view.cover_image_url} alt="" /><span>{t(view.cover_source === "starter" || view.cover_source === "app" ? "component.workspace_app_view.using_starter_cover" : "component.workspace_app_view.using_workspace_cover")}</span></div>}
           {config.visual === "motion" && view.cover_image_url && <label className="workspace-app-settings__motion-source">
             {t("component.workspace_app_view.motion_cover_label")}
             <input className="manor-input" type="text" value={config.motion_cover_url || ""} onChange={(event) => update({ motion_cover_url: event.target.value || null, motion_cover_source_url: event.target.value ? view.cover_image_url : null })} placeholder="https://…/cover.mp4" disabled={!canManage || save.isPending} />
             <small>{t("component.workspace_app_view.motion_cover_hint")}</small>
             {config.motion_cover_url && config.motion_cover_source_url !== view.cover_image_url && <small role="status">{t("component.workspace_app_view.motion_cover_changed")}</small>}
           </label>}
+          <div className="workspace-app-settings__theme">
+            <label className="workspace-app-settings__theme-accent">
+              {t("component.workspace_app_view.theme_accent")}
+              <span>
+                <input type="color" value={config.theme?.accent || "#4f7d75"} aria-label={t("component.workspace_app_view.theme_accent")}
+                  onChange={(event) => updateTheme({ accent: event.target.value })} disabled={!canManage || save.isPending} />
+                {config.theme?.accent
+                  ? <Button variant="ghost" size="sm" onClick={() => updateTheme({ accent: undefined })} disabled={!canManage || save.isPending}>{t("component.workspace_app_view.theme_default")}</Button>
+                  : <small>{t("component.workspace_app_view.theme_default")}</small>}
+              </span>
+            </label>
+            <Select value={config.theme?.surface || "neutral"} disabled={!canManage || save.isPending}
+              ariaLabel={t("component.workspace_app_view.theme_surface")}
+              onChange={(value) => updateTheme({ surface: value === "neutral" ? undefined : value as "tinted" | "deep" })}
+              options={(["neutral", "tinted", "deep"] as const).map((value) => ({ value, label: t(`component.workspace_app_view.theme_surface_${value}`) }))} />
+            <Select value={config.theme?.radius || "soft"} disabled={!canManage || save.isPending}
+              ariaLabel={t("component.workspace_app_view.theme_radius")}
+              onChange={(value) => updateTheme({ radius: value === "soft" ? undefined : value as "sharp" | "round" })}
+              options={(["sharp", "soft", "round"] as const).map((value) => ({ value, label: t(`component.workspace_app_view.theme_radius_${value}`) }))} />
+          </div>
         </GlassCard>
         {canManage && <div className="workspace-app-settings__footer">
           {dirty && <span className="workspace-app-settings__unsaved" role="status">{t("component.workspace_app_view.unsaved")}</span>}
           <Button variant="ghost" onClick={() => setConfig(view.config)} disabled={!dirty || save.isPending}>{t("action.cancel")}</Button>
-          <Button variant="primary" onClick={() => save.mutate()} disabled={!dirty || save.isPending} loading={save.isPending}>{t("action.save")}</Button>
+          <Button variant="primary" onClick={() => save.mutate()} disabled={!dirty || save.isPending || (Boolean(config.components?.length) && !dataSettingsValid)} loading={save.isPending}>{t("action.save")}</Button>
         </div>}
       </div>
       <div className="workspace-app-settings__preview-wrap">

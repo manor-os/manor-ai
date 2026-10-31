@@ -9,6 +9,19 @@ from typing import Any, NotRequired, TypedDict
 NARRATION_VOICE_MODE_RANDOM_PER_TASK = "random_per_task"
 NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION = "random_per_conversation"
 NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE = "fixed_per_workspace"
+# The project the work runs in, or the ancestor that holds its voices.
+NARRATION_VOICE_MODE_FIXED_PER_PROJECT = "fixed_per_project"
+NARRATION_VOICE_MODES = (
+    NARRATION_VOICE_MODE_RANDOM_PER_TASK,
+    NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION,
+    NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE,
+    NARRATION_VOICE_MODE_FIXED_PER_PROJECT,
+)
+# What a call may ask for. A project's voice is never asked for: inside a
+# project that holds or declares one, narration uses it on its own.
+REQUESTABLE_NARRATION_VOICE_MODES = NARRATION_VOICE_MODES[:3]
+# The voice a narration speaks in when a project holds several (host, guest).
+DEFAULT_NARRATION_VOICE_ROLE = "narrator"
 
 
 class StringValueEnum(str, Enum):
@@ -57,7 +70,6 @@ class AudioGenerationFormat(StringValueEnum):
 
 
 class AudioGenerationStatus(StringValueEnum):
-    PENDING = "pending"
     COMPLETED = "completed"
     ERROR = "error"
     # Optional audio (music) that could not be made: nothing was produced and
@@ -77,6 +89,7 @@ class AudioGenerationErrorCode(StringValueEnum):
     NARRATION_VOICE_PROFILE_TASK_REQUIRED = "narration_voice_profile_task_required"
     NARRATION_VOICE_PROFILE_CONVERSATION_REQUIRED = "narration_voice_profile_conversation_required"
     NARRATION_VOICE_PROFILE_WORKSPACE_REQUIRED = "narration_voice_profile_workspace_required"
+    NARRATION_VOICE_PROFILE_PROJECT_REQUIRED = "narration_voice_profile_project_required"
     NARRATION_VOICE_PROFILE_UNSUPPORTED = "narration_voice_profile_unsupported"
     NARRATION_VOICE_PROFILE_INVALID = "narration_voice_profile_invalid"
 
@@ -86,7 +99,7 @@ class AudioGenerationProvider(StringValueEnum):
     GOOGLE = "google"
     OPENAI = "openai"
     ZYPHRA = "zyphra"
-    SUNO = "suno"
+    ELEVENLABS = "elevenlabs"
     UNKNOWN = "unknown"
 
     @classmethod
@@ -148,7 +161,11 @@ class AudioGenerationCompletedResult(TypedDict):
     requested_duration_seconds: float | None
     file_size: int
     file: NotRequired[dict[str, Any]]
+    # The Knowledge document the saved file was registered as.
+    document_id: NotRequired[str]
     narration_profile: NotRequired[dict[str, str | int]]
+    # Where the voice is pinned: scope (project, workspace, task, conversation), its id, the role.
+    voice_reference: NotRequired[dict[str, Any]]
 
 
 class AudioGenerationErrorResult(TypedDict):

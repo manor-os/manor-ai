@@ -161,7 +161,7 @@ async def test_live_template_cannot_reassign_a_shared_document(db_session, keyed
             group_id=groups[1].id, knowledge_pack_slug="guide", document={
                 "path": "guide.md", "body_md": "Template body",
                 **({"key": "guide"} if keyed else {}),
-                "template": {"id": "guide", "mode": "live_projection", "renderer": "guide"},
+                "template": {"id": "guide", "mode": "live_projection", "renderer": "guide", "version": 1},
             },
         )
     assert document.metadata_ == original

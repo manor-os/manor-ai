@@ -92,6 +92,8 @@ WORKSPACE_AGENT_SCHEMA = {
                         "For get_goal_status pass optional goal_id; the current workspace_id "
                         "is applied automatically. For update_goal_value pass goal_id (or goal_key) AND value in the same params object, "
                         "and optional note to append a verified manual goal_measurements row. "
+                        "For add_assessed_metrics pass templates (latest_video_views, latest_video_comments, "
+                        "latest_video_likes, followers, active_users), optional service_key and cadence=daily|weekly. "
                         "For resolve_hitl pass message_id or hitl_id and action='respond' "
                         "with response for ordinary input; payload.fields/answers and "
                         "payload.attachments may carry structured answers or file references. "
@@ -99,7 +101,8 @@ WORKSPACE_AGENT_SCHEMA = {
                         "note is an optional approval explanation. "
                         "For operation pass params.action ("
                         + "/".join(WORKSPACE_OPERATION_ACTIONS)
-                        + "), optional draft_id, and patches as [{op, payload}]. "
+                        + "), optional draft_id, and patches as [{op, payload}]; design_app takes "
+                        "brief and optional feedback instead of patches. "
                         "Use operation action=get_current first for read-only source "
                         "rule keys/types/patterns and live governance before changing restrictions. "
                         "create_draft requires nonempty patches in the same call. "
@@ -434,12 +437,59 @@ WORKSPACE_UPDATE_TASK_RUNTIME_SCHEMA = {
                     "type": "boolean",
                     "description": "When true, replace runtime_context instead of appending.",
                 },
+                "start": {
+                    "type": "boolean",
+                    "description": "Start this pending Task's own run now (e.g. one drafted earlier).",
+                },
             },
             "required": ["task_id"],
         },
     },
 }
 
+
+WORKSPACE_START_TASK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_start_task",
+        "description": (
+            "Start a pending workspace Task (for example one drafted earlier without "
+            "starting): it runs with its own instructions, Agents and rules."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Pending workspace task id."}},
+            "required": ["task_id"],
+        },
+    },
+}
+
+WORKSPACE_HOLD_FOR_APPROVAL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_hold_for_approval",
+        "description": (
+            "Pause kinds of action at a review card for the rest of this conversation, when "
+            "the user asks for that here (\"stop at the card\", \"let me check before you "
+            "save\"). It only adds reviews. Standing Workspace rules use add_rule instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "categories": {
+                    "type": "array", "minItems": 1,
+                    "items": {"type": "string", "enum": [
+                        "files", "communication", "publishing", "deletion",
+                        "purchases", "automation", "browser", "workspace",
+                    ]},
+                    "description": "files covers Knowledge and file writes.",
+                },
+                "reason": {"type": "string", "description": "The user's words, briefly."},
+            },
+            "required": ["categories"],
+        },
+    },
+}
 
 WORKSPACE_ADD_RULE_SCHEMA = {
     "type": "function",
@@ -449,7 +499,11 @@ WORKSPACE_ADD_RULE_SCHEMA = {
             "Add a persistent workspace-level operating rule/guardrail. Natural-language "
             "description is agent-visible guidance only. For runtime enforcement, explicitly "
             "supply rule_type plus action_patterns or capability_patterns; no keyword inference "
-            "is performed. By default "
+            "is performed. action_patterns must be action keys Manor runs (a rule naming "
+            "anything else is rejected); for a whole kind of action use the operation "
+            'draft\'s approval_selectors, e.g. [{"kind": "category", "category": "publishing"}]. '
+            "A limit or condition such as 'at most 6 per "
+            "person' is guidance: omit rule_type and action_patterns. By default "
             "this creates an operation draft and asks the user to approve before "
             "syncing runtime governance. Use only when the user clearly wants "
             "the rule to apply to the workspace beyond a single task. Do not "
@@ -486,7 +540,10 @@ WORKSPACE_ADD_RULE_SCHEMA = {
                 "action_patterns": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional explicit governance action-key patterns.",
+                    "description": (
+                        "Optional governance action keys Manor runs, e.g. social_post.publish, "
+                        "external_message.send, workspace.file.create, or <integration>.<action>."
+                    ),
                 },
                 "capability_patterns": {
                     "type": "array",
@@ -626,6 +683,12 @@ WORKSPACE_OPERATION_SCHEMA = {
                     "type": "boolean",
                     "description": "Must be true to apply a draft after the user confirms.",
                 },
+                "brief": {"type": "string", "description": (
+                    "design_app only: what the person wants to do from the App page, in their words."
+                )},
+                "feedback": {"type": "string", "description": (
+                    "design_app only: why the last design was sent back and what to change; pass its draft_id too."
+                )},
             },
             "required": ["action"],
         },
@@ -768,7 +831,8 @@ async def _workspace_agent_handler(
             **_workspace_action_params(params),
         )
 
-    if action in {WorkspaceToolAction.GET_STAT_STATUS, WorkspaceToolAction.RECORD_STAT_ASSESSMENT}:
+    if action in {WorkspaceToolAction.GET_STAT_STATUS, WorkspaceToolAction.RECORD_STAT_ASSESSMENT,
+                  WorkspaceToolAction.ADD_ASSESSED_METRICS}:
         return await runtime_stat_action(
             action=action.value, entity_id=entity_id, workspace_id=workspace_id,
             user_id=user_id, params=_workspace_action_params(params),
@@ -779,6 +843,8 @@ async def _workspace_agent_handler(
     handlers = {
         WorkspaceToolAction.CREATE_TASK: _workspace_create_task_handler,
         WorkspaceToolAction.UPDATE_TASK_RUNTIME: _workspace_update_task_runtime_handler,
+        WorkspaceToolAction.START_TASK: _workspace_start_task_handler,
+        WorkspaceToolAction.HOLD_FOR_APPROVAL: _workspace_hold_for_approval_handler,
         WorkspaceToolAction.LIST_KNOWLEDGE: _workspace_list_knowledge_handler,
         WorkspaceToolAction.CREATE_KNOWLEDGE_FOLDER: _workspace_create_knowledge_folder_handler,
         WorkspaceToolAction.ADD_KNOWLEDGE_DOCUMENTS: _workspace_add_knowledge_documents_handler,
@@ -810,15 +876,16 @@ async def _workspace_agent_handler(
     }
     runtime_task_id = str(context_kwargs.get("task_id") or "").strip()
     requested_task_id = str(params.get("task_id") or "").strip()
+    targets_task = action in {WorkspaceToolAction.UPDATE_TASK_RUNTIME, WorkspaceToolAction.START_TASK}
     if (
-        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        targets_task
         and runtime_task_id
         and requested_task_id
         and requested_task_id != runtime_task_id
     ):
         return _dumps({"error": "task_id conflicts with active runtime task"})
     if (
-        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        targets_task
         and not runtime_task_id
         and requested_task_id
     ):
@@ -829,6 +896,7 @@ async def _workspace_agent_handler(
     if action in {
         WorkspaceToolAction.CREATE_TASK,
         WorkspaceToolAction.UPDATE_TASK_RUNTIME,
+        WorkspaceToolAction.START_TASK,
     }:
         actor_agent_id = str(kwargs.get("_agent_id_from_context") or "").strip()
         if actor_agent_id:
@@ -883,6 +951,46 @@ async def _workspace_update_task_runtime_handler(
         **actor_kwargs,
         params=kwargs,
     )
+
+
+async def _workspace_start_task_handler(**kwargs: Any) -> str:
+    """``update_task_runtime`` with ``start=true``: the name a model reaches for."""
+    return await _workspace_update_task_runtime_handler(**{**kwargs, "start": True})
+
+
+async def _workspace_hold_for_approval_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    from packages.core.database import async_session
+    from packages.core.governance.conversation_holds import HOLDABLE_CATEGORIES, add_conversation_holds
+
+    raw = kwargs.get("categories")
+    categories = [raw] if isinstance(raw, str) else list(raw or [])
+    unknown = [c for c in categories if c not in HOLDABLE_CATEGORIES]
+    if not categories or unknown:
+        return json.dumps({
+            "error": "invalid_categories", "unknown": unknown,
+            "message": f"Hold one or more of: {', '.join(HOLDABLE_CATEGORIES)}.",
+        })
+    if not conversation_id:
+        return json.dumps({"error": "conversation_required", "message": "Holds belong to a conversation."})
+    async with async_session() as db:
+        held = await add_conversation_holds(
+            db, entity_id=entity_id, conversation_id=conversation_id,
+            categories=categories, reason=str(kwargs.get("reason") or ""),
+        )
+        await db.commit()
+    return json.dumps({
+        "held": held,
+        "next": (
+            "Matching actions in this conversation now stop at an approval card. Go ahead with "
+            "the work the user asked for; a held action waits for their approval."
+        ),
+    })
 
 
 async def _workspace_list_knowledge_handler(

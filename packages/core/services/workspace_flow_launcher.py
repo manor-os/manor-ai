@@ -20,6 +20,7 @@ from packages.core.models.workflow import (
     WorkflowTemplateInstallation,
 )
 from packages.core.models.workspace import Workspace
+from packages.core.services.workflow_record_source import resolve_record_select_inputs
 from packages.core.services.workspace_workflow_router import (
     WorkspaceChatEntrypoint,
     assemble_workspace_workflow_inputs,
@@ -27,6 +28,35 @@ from packages.core.services.workspace_workflow_router import (
     validate_workspace_workflow_inputs,
     workflow_attachment_descriptors,
 )
+
+
+async def _prepare_chat_inputs(
+    db: AsyncSession,
+    entrypoint: WorkspaceChatEntrypoint,
+    *,
+    message: str,
+    attachment_refs: list[dict[str, Any]],
+    entity_id: str,
+    user_id: str | None,
+    workspace_id: str,
+    unmatched: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """Prefill from Chat, offering record choices as their current Ledger options."""
+    pinned = await resolve_record_select_inputs(
+        db,
+        entrypoint.run_inputs,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    return await prepare_workspace_workflow_inputs(
+        replace(entrypoint, run_inputs=pinned),
+        message=message,
+        attachment_refs=attachment_refs,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        unmatched=unmatched,
+    )
 
 
 StarterPolicy = Literal["always_review", "only_missing"]
@@ -348,14 +378,18 @@ async def launch_workspace_flow(
         )
 
     explicit_keys = {str(key) for key in (input_values or {})}
+    # Choices named in Chat that the input does not offer: ask, never guess.
+    unmatched: dict[str, list[str]] = {}
     if input_values is None:
-        initial_values = await prepare_workspace_workflow_inputs(
+        initial_values = await _prepare_chat_inputs(
+            db,
             entrypoint,
             message=source_brief,
             attachment_refs=workflow_attachment_descriptors(attachments),
             entity_id=entity_id,
             user_id=user_id,
             workspace_id=workspace_id,
+            unmatched=unmatched,
         )
     else:
         declared_inputs = {
@@ -373,13 +407,15 @@ async def launch_workspace_flow(
                 supplied_values,
             )
         except ValueError:
-            initial_values = await prepare_workspace_workflow_inputs(
+            initial_values = await _prepare_chat_inputs(
+                db,
                 entrypoint,
                 message=source_brief,
                 attachment_refs=workflow_attachment_descriptors(attachments),
                 entity_id=entity_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                unmatched=unmatched,
             )
             for key, value in supplied_values.items():
                 single_input_entrypoint = replace(
@@ -404,7 +440,7 @@ async def launch_workspace_flow(
         conversation_id=conversation_id,
     )
     initial_variables = assemble_workspace_workflow_inputs(entrypoint, initial_values)
-    requires_input = workspace_flow_requires_starter_input(
+    requires_input = bool(unmatched) or workspace_flow_requires_starter_input(
         entrypoint,
         initial_values,
         starter_policy=starter_policy,
@@ -496,8 +532,13 @@ async def launch_workspace_flow(
                 "description": entrypoint.description,
                 "workflow_run_id": run.id,
                 "workflow_binding_id": binding.id,
+                "workflow_id": run.workflow_id,
                 "inputs": [dict(item) for item in entrypoint.run_inputs],
                 "values": initial_values,
+                **({"input_notes": {
+                    key: "Not found among the available choices: " + ", ".join(names)
+                    for key, names in unmatched.items()
+                }} if unmatched else {}),
                 "options": ["run", "cancel"],
             },
             meta={
@@ -533,7 +574,17 @@ async def enqueue_workspace_flow_launch(
 
     if not launched.created or launched.starter_message is not None:
         return True
-    run = launched.run
+    return await enqueue_workflow_run_or_fail(db, launched.run)
+
+
+async def enqueue_workflow_run_or_fail(db: AsyncSession, run: WorkflowRun) -> bool:
+    """Hand a committed run to the worker queue, or fail it visibly.
+
+    Workflow execution belongs on the worker queue, never inside the request
+    that started it: a request process cannot be recovered mid-node. A run
+    the broker refused is failed rather than left pending with no owner.
+    """
+
     from packages.core.ai.workflow_runner import WorkflowRunner
 
     if WorkflowRunner.enqueue(run.id) is False:
@@ -553,3 +604,138 @@ async def enqueue_workspace_flow_launch(
         await db.commit()
         return False
     return True
+
+
+async def start_binding_run(
+    db: AsyncSession,
+    *,
+    binding: WorkflowBinding,
+    user: User,
+    variables: dict | None,
+    trigger_data: dict | None,
+    workspace_scoped: bool,
+) -> tuple[WorkflowRun, WorkspaceFlowLaunch | None]:
+    """Start a Workflow binding as the person's manual run, uncommitted.
+
+    A Workspace manual run goes through the Flow launcher (Chat origin, input
+    policy, App entry); anything else starts straight from the binding. The
+    caller commits, then publishes with ``enqueue_binding_run``.
+    """
+    from packages.core.services import workflow_service
+
+    execution_binding = await workflow_service.execution_binding_for_automation(db, binding)
+    trigger_data = dict(trigger_data or {"manual_test": True})
+    trigger_data.pop("_workspace_user_request", None)
+    if execution_binding.id != binding.id:
+        trigger_data.setdefault("automation_binding_id", binding.id)
+    launched = None
+    if workspace_scoped and trigger_data.get("workspace_manual") is True:
+        from packages.core.services.conversation_messages import add_message
+        from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+        from packages.core.workspace_chat.service import ensure_main_conversation
+
+        workflow = await workflow_service.get_workflow(
+            db,
+            execution_binding.workflow_id,
+            user.entity_id,
+        )
+        entrypoint = (
+            normalize_chat_entrypoint(execution_binding, workflow)
+            if workflow is not None
+            else None
+        )
+        if entrypoint is not None:
+            conversation = await ensure_main_conversation(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=str(execution_binding.workspace_id),
+            )
+            origin_message = await add_message(
+                db,
+                conversation.id,
+                role="system",
+                content=f"Started {entrypoint.title} from Workspace Flows.",
+                message_kind="system",
+                refs=[
+                    {
+                        "type": "workflow",
+                        "id": entrypoint.workflow_id,
+                        "title": entrypoint.title,
+                    },
+                    {
+                        "type": "workspace",
+                        "id": execution_binding.workspace_id,
+                    },
+                ],
+                meta={
+                    "author_user_id": user.id,
+                    "workflow_route_source": "workspace_manual",
+                    "workflow_binding_id": execution_binding.id,
+                },
+            )
+            input_values = dict(variables or {})
+            input_values.update(trigger_data)
+            launched = await launch_workspace_flow(
+                db,
+                source="manual",
+                entrypoint=entrypoint,
+                binding=execution_binding,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                workspace_id=str(execution_binding.workspace_id),
+                conversation_id=conversation.id,
+                origin_message_id=origin_message.id,
+                source_brief="",
+                input_values=input_values,
+                starter_policy="only_missing",
+                origin_metadata={
+                    "route_source": "workspace_manual",
+                    "surface": "workspace_flows",
+                },
+                transaction_owner="caller",
+            )
+            run = launched.run
+            run.trigger_data = {
+                **trigger_data,
+                **dict(run.trigger_data or {}),
+            }
+            declared_input_roots = {
+                str(item.get("key") or "")
+                for item in entrypoint.run_inputs
+            } | {
+                str(item.get("target") or item.get("key") or "").split(".", 1)[0]
+                for item in entrypoint.run_inputs
+            }
+            extra_variables = {
+                str(key): value
+                for source in (
+                    variables or {},
+                    trigger_data,
+                )
+                for key, value in source.items()
+                if str(key) not in declared_input_roots
+                and not str(key).startswith("_")
+            }
+            run.variables = {
+                **dict(run.variables or {}),
+                **extra_variables,
+                "trigger": dict(run.trigger_data),
+            }
+    if launched is None:
+        run = await workflow_service.start_workflow_from_binding(
+            db,
+            execution_binding,
+            variables=variables,
+            trigger_data=trigger_data,
+            trigger_source="manual",
+            started_by=user.id,
+        )
+    return run, launched
+
+
+async def enqueue_binding_run(db: AsyncSession, run: WorkflowRun, launched: WorkspaceFlowLaunch | None) -> None:
+    """Publish a committed run from ``start_binding_run``."""
+    if launched is not None:
+        await enqueue_workspace_flow_launch(db, launched)
+    else:
+        await enqueue_workflow_run_or_fail(db, run)

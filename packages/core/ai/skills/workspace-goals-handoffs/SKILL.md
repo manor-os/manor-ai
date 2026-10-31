@@ -12,6 +12,9 @@ records a verified manual measurement with goal_id and numeric value.
 record_stat_assessment requires current stat_id/expected_revision, a stable
 idempotency_key, status, reasoning, versioned document evidence and explicit gaps.
 Only a returned persisted observation_id proves an assessment was saved.
+To track audience numbers (latest video views, comments, likes, followers,
+active users), call add_assessed_metrics with templates; it creates the stats and
+one scheduled agent assessment. Report whether the schedule is running.
 Changes to goal definitions or measurement sources use operation get_current,
 then a reviewed draft with goal.upsert/goal.measurement_sources.update; goals.replace
 replaces the collection. Apply only after approval and verify the saved definitions.

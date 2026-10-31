@@ -84,7 +84,9 @@ export const parseCsv = (s: string) =>
 const SYSTEM_ROLE_VALUES = new Set(["viewer", "member", "admin", "owner"]);
 
 function formRoleValue(s: any): string {
-  const value = String(s.role || s.role_name || "member").trim().toLowerCase();
+  // role_name comes from the assigned StaffRole (the authority); role is the
+  // legacy label and can be stale.
+  const value = String(s.role_name || s.role || "member").trim().toLowerCase();
   return SYSTEM_ROLE_VALUES.has(value) ? value : "member";
 }
 

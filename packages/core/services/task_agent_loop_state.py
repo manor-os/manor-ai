@@ -30,13 +30,26 @@ UNCONFIRMED_REFUSAL_KEY = "unconfirmed_refusal"
 # and retries so a re-block with no new work posts nothing.
 POSTED_WORK_KEY = "posted_work_digest"
 NON_SUBMIT_RETRIES_KEY = "non_submit_retries"
+# How this run's delegate_to_agent runs its agents: "durable" (each one its
+# own child run; services.task_agent_delegation) or "inline" (nested in this
+# worker). Frozen at the first wake that offers delegation.
+DELEGATION_MODE_KEY = "delegation_mode"
+DELEGATION_MODE_DURABLE = "durable"
+DELEGATION_MODE_INLINE = "inline"
+DELEGATION_MODES = frozenset({DELEGATION_MODE_DURABLE, DELEGATION_MODE_INLINE})
+
+# The host's buffer of the finished calls of the round in progress; the
+# round checkpoint journals and clears it (services.task_run_journal).
+ROUND_JOURNAL_KEY = "round_journal"
 
 # Live loop state that a round checkpoint never carries: the CAS version,
-# control flags, the payload last persisted, and the wait this wake resumes
-# (the park path writes that one itself). Every other key of the live state
-# is a registered slot (guarded in test_run_state_roundtrip).
+# control flags, the payload last persisted, the wait this wake resumes (the
+# park path writes that one itself) and the round's journal buffer (its row
+# is written with the round). Every other key of the live state is a
+# registered slot (guarded in test_run_state_roundtrip).
 TASK_LOOP_EPHEMERAL_STATE_KEYS = frozenset({
     "version", "yield", "phase_running", "last_checkpoint", "resumed_wait",
+    ROUND_JOURNAL_KEY,
 })
 
 
@@ -50,6 +63,7 @@ def task_loop_initial_state(version: int) -> dict[str, Any]:
         "last_checkpoint": {},
         # The parked wait this wake resumes (task_loop_wait), if any.
         "resumed_wait": None,
+        ROUND_JOURNAL_KEY: [],
         "task_plan": None,
         "submission": None,
         "completion": None,
@@ -57,6 +71,7 @@ def task_loop_initial_state(version: int) -> dict[str, Any]:
         "unconfirmed_refusal": None,
         "posted_work_digest": None,
         "non_submit_retries": 0,
+        DELEGATION_MODE_KEY: None,
     }
     return state
 
@@ -116,14 +131,26 @@ def task_loop_run_state_slots(state: dict[str, Any]) -> RuntimeRunStateSlots:
             decode=_non_negative_int,
             default=lambda: 0,
         ),
+        # A retry keeps the mode its run started with: the child runs it
+        # already made, and their results, belong to that mode.
+        RuntimeRunStateSlot(
+            DELEGATION_MODE_KEY, RETRY_CARRY,
+            encode=lambda mode: mode if mode in DELEGATION_MODES else None,
+            decode=lambda raw: raw if raw in DELEGATION_MODES else None,
+        ),
     ]
     return RuntimeRunStateSlots(slots, live=state)
 
 
 __all__ = [
+    "DELEGATION_MODES",
+    "DELEGATION_MODE_DURABLE",
+    "DELEGATION_MODE_INLINE",
+    "DELEGATION_MODE_KEY",
     "INSPECTION_KEY",
     "NON_SUBMIT_RETRIES_KEY",
     "POSTED_WORK_KEY",
+    "ROUND_JOURNAL_KEY",
     "TASK_COMPLETION_KEY",
     "TASK_LOOP_EPHEMERAL_STATE_KEYS",
     "TASK_PLAN_KEY",

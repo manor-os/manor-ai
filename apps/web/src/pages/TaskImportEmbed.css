@@ -1,0 +1,83 @@
+/* Only this embedded document inherits the companion's neutral palette. */
+html[data-companion-task-theme] {
+  --surface-app: #fff;
+  --surface-panel: #fff;
+  --surface-muted: #f5f5f5;
+  --surface-sunken: #fafafa;
+  --text-strong: #202020;
+  --text-default: #202020;
+  --text-muted: #5b5b5b;
+  --text-faint: #737373;
+  --border-subtle: #e8e8e8;
+  --border-default: #e8e8e8;
+  --border-strong: #d1d1d1;
+  --companion-solid: #202020;
+  --companion-on-solid: #fff;
+}
+html[data-companion-task-theme="dark"] {
+  --surface-app: #1c1c1c;
+  --surface-panel: #1c1c1c;
+  --surface-muted: #242424;
+  --surface-sunken: #141414;
+  --text-strong: #ededed;
+  --text-default: #ededed;
+  --text-muted: #b5b5b5;
+  --text-faint: #a0a0a0;
+  --border-subtle: #303030;
+  --border-default: #303030;
+  --border-strong: #494949;
+  --companion-solid: #ededed;
+  --companion-on-solid: #181818;
+}
+html[data-companion-task-theme] {
+  --modal-bg: var(--surface-app);
+  --modal-muted-bg: var(--surface-muted);
+  --modal-sunken-bg: var(--surface-sunken);
+  --modal-control-bg: var(--surface-app);
+  --modal-control-hover-bg: var(--surface-muted);
+  --modal-border: var(--border-default);
+  --modal-border-strong: var(--border-strong);
+  --accent: var(--text-strong);
+  --accent-hover: var(--text-default);
+  --accent-soft: var(--surface-muted);
+  --accent-soft-border: var(--border-default);
+  --accent-ring: var(--border-strong);
+  --on-accent: var(--companion-on-solid);
+  background: var(--surface-app);
+  color: var(--text-default);
+}
+html[data-companion-task-theme] body { background: var(--surface-app); color: var(--text-default); }
+.companion-task-overlay { padding: 0 !important; background: var(--surface-panel) !important; backdrop-filter: none !important; }
+.companion-task-modal { width: 100% !important; height: 100dvh !important; max-width: none !important; max-height: 100dvh !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important; filter: grayscale(1); }
+.companion-task-account { display: flex; justify-content: space-between; gap: 12px; margin: 0 0 18px; font-size: 12px; color: var(--text-faint); }
+.companion-task-account span { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.companion-task-modal .manor-dialog-header { display: none; }
+.companion-task-modal .manor-dialog-body { padding: 20px; }
+.companion-task-modal .manor-dialog-footer { padding: 14px 20px; border-top: 1px solid var(--border-subtle); }
+.companion-task-fields { display: flex; flex-direction: column; gap: 16px; }
+.companion-task-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.companion-task-assignee { display: flex; flex-direction: column; gap: 8px; }
+.companion-task-assignee .manor-label { margin-bottom: 0; }
+.companion-task-assignee .task-assignee-summary { display: none !important; }
+.companion-task-options { border-top: 1px solid var(--border-subtle); padding-top: 12px; }
+.companion-task-options summary { width: fit-content; cursor: pointer; color: var(--text-faint); font-size: 13px; }
+.companion-task-options[open] summary { margin-bottom: 16px; }
+.companion-task-options summary:focus-visible { outline: 2px solid var(--text-strong); outline-offset: 4px; border-radius: 2px; }
+@media (max-width: 420px) {
+  .companion-task-modal .manor-dialog-body { padding: 16px; }
+  .companion-task-modal .manor-dialog-footer { padding: 12px 16px; }
+  .companion-task-row { grid-template-columns: minmax(0, 1fr); }
+}
+.companion-task-modal .manor-dialog-close { display: none; }
+.companion-task-message { min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 16px; text-align: center; }
+.companion-task-message a { text-decoration: underline; }
+.companion-task-message button { border: 1px solid var(--border-default); border-radius: 8px; padding: 10px 16px; }
+
+.companion-task-message { background: var(--surface-panel); color: var(--text-default); }
+.companion-task-message button { background: var(--surface-muted); color: var(--text-default); }
+html[data-companion-task-theme] .companion-task-submit {
+  background: var(--companion-solid) !important;
+  color: var(--companion-on-solid) !important;
+}
+html[data-companion-task-theme] .companion-task-submit:hover:not(:disabled) { opacity: .85; }
+html[data-companion-task-theme] .manor-select-menu { filter: grayscale(1); }

@@ -6,7 +6,6 @@ historical call IDs and the loop appended the raw tool_error JSON as a bare
 user-role message, so the model replied "you just sent a system error".
 """
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -150,88 +149,6 @@ async def test_rejected_reply_feedback_reaches_the_model_marked_as_runtime(mock_
         if message.get("role") == "user" and not runtime_is_host_feedback_message(message)
     ]
     assert real_user_turns == [message for message in seen[0] if message.get("role") == "user"]
-
-
-@pytest.mark.asyncio
-async def test_worker_contract_correction_feedback_reaches_followup_as_runtime_message(monkeypatch):
-    from packages.core.ai import runtime
-    from packages.core.workers import internal
-
-    captured = {}
-
-    async def followup(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(messages=[], usage={}, rounds=0, tool_calls_made=[])
-
-    monkeypatch.setattr(runtime, "runtime_execute_worker_subagent_followup", followup)
-    monkeypatch.setattr(
-        internal,
-        "_artifact_aware_submit_result_capture",
-        lambda _snapshot: (lambda _payload: None, lambda: None),
-    )
-    attempt = internal._AttemptTranscript(
-        SimpleNamespace(
-            messages=[
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "original request"},
-            ]
-        )
-    )
-
-    submission, ran = await internal._contract_correction_round(
-        {},
-        ctx=SimpleNamespace(runtime_envelope=None, model="test", llm_metadata=None),
-        prompt="original request",
-        system_prompt="system",
-        attempt=attempt,
-        submit_tool={},
-        errors=[{"path": "$.result", "message": "missing"}],
-    )
-
-    assert (submission, ran) == (None, True)
-    messages = captured["initial_messages"]
-    assert messages[0] == {"role": "user", "content": "original request"}
-    assert runtime_is_host_feedback_message(messages[-1])
-    assert "Contract correction" in messages[-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_worker_forced_submit_feedback_reaches_followup_as_runtime_message(monkeypatch):
-    from packages.core.ai import runtime
-    from packages.core.workers import internal
-
-    captured = {}
-
-    async def followup(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(messages=[], usage={}, rounds=0, tool_calls_made=[])
-
-    monkeypatch.setattr(runtime, "runtime_execute_worker_subagent_followup", followup)
-    attempt = internal._AttemptTranscript(
-        SimpleNamespace(
-            messages=[
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "original request"},
-            ]
-        )
-    )
-
-    submission = await internal._force_submit_result_round(
-        {},
-        ctx=SimpleNamespace(runtime_envelope=None, model="test", llm_metadata=None),
-        prompt="original request",
-        system_prompt="system",
-        attempt=attempt,
-        submit_tool={},
-        submit_handler=lambda _payload: None,
-        get_submit_payload=lambda: None,
-    )
-
-    assert submission is None
-    messages = captured["initial_messages"]
-    assert messages[0] == {"role": "user", "content": "original request"}
-    assert runtime_is_host_feedback_message(messages[-1])
-    assert "submit_result" in messages[-1]["content"]
 
 
 def test_language_guidance_stays_next_to_the_real_request_after_feedback():

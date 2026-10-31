@@ -80,7 +80,7 @@ async def test_sandbox_create_without_skill_uses_blank_generic_manifest(monkeypa
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
     monkeypatch.setattr(get_settings(), "SANDBOX_SERVICE_URL", "http://sandbox-service")
 
-    result = await sandbox_tools._sandbox_create(entity_id="entity-1")
+    result = await sandbox_tools._sandbox_create(entity_id="entity-1", conversation_id="conversation-1")
 
     assert calls == {
         "skill_name": "generic-sandbox",
@@ -128,12 +128,16 @@ async def test_sandbox_create_records_conversation_owner(monkeypatch) -> None:
         async def close(self):
             return None
 
-    async def record_context(conversation_id, sandbox_id, skill_id, **kwargs):
+    async def record_context(scope, sandbox_id, skill_id, **kwargs):
         recorded.update(
-            conversation_id=conversation_id,
+            conversation_id=scope.binding_key,
             sandbox_id=sandbox_id,
             skill_id=skill_id,
-            **kwargs,
+            entity_id=scope.entity_id,
+            user_id=scope.user_id,
+            agent_id=kwargs.get("agent_id"),
+            holds_credentials=kwargs.get("holds_credentials"),
+            credentials_owner_user_id=kwargs.get("credentials_owner_user_id"),
         )
         return recorded
 
@@ -144,7 +148,7 @@ async def test_sandbox_create_records_conversation_owner(monkeypatch) -> None:
         return True
 
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
-    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_context", record_context)
+    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_binding", record_context)
     monkeypatch.setattr(sandbox_session_service, "load_sandbox_session", no_registry)
     monkeypatch.setattr(sandbox_session_service, "register_sandbox_session", register)
     monkeypatch.setattr(get_settings(), "SANDBOX_SERVICE_URL", "http://sandbox-service")
@@ -163,6 +167,8 @@ async def test_sandbox_create_records_conversation_owner(monkeypatch) -> None:
         "entity_id": "entity-1",
         "user_id": "user-1",
         "agent_id": "agent-1",
+        "holds_credentials": False,
+        "credentials_owner_user_id": None,
     }
 
 
@@ -210,7 +216,8 @@ async def test_sandbox_create_reuses_owner_sandbox_from_registry(monkeypatch) ->
     async def load_registry(owner, *, scope=None):
         assert owner.entity_id == "entity-1"
         assert owner.user_id == "user-1"
-        assert scope == "conversation:conversation-2:agent:agent-1:generic"
+        # The user's general container, whichever conversation or agent asks.
+        assert scope == "user"
         return SandboxSession(
             sandbox_id="sandbox-existing",
             base_url="http://sandbox-service",
@@ -228,7 +235,7 @@ async def test_sandbox_create_reuses_owner_sandbox_from_registry(monkeypatch) ->
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
     monkeypatch.setattr(sandbox_session_service, "load_sandbox_session", load_registry)
     monkeypatch.setattr(sandbox_session_service, "register_sandbox_session", register)
-    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_context", bind)
+    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_binding", bind)
     monkeypatch.setattr(get_settings(), "SANDBOX_SERVICE_URL", "http://sandbox-service")
 
     result = await sandbox_tools._sandbox_create(
@@ -300,6 +307,10 @@ async def test_generic_sandbox_create_queues_and_attaches_like_a_skill(
         id=f"runner-{suffix}", base_url="http://runner-generic:8000",
         status=SandboxRunnerStatus.HEALTHY.value, active_limit=50, executing_limit=50,
     )
+    # The claim below is global: only this test's runner and ticket may be placed.
+    from tests.sandbox_scheduling_isolation import fence_foreign_scheduling, lift_scheduling_fence
+
+    fence = await fence_foreign_scheduling(db_session)
     db_session.add_all([run, runner])
     await db_session.commit()
     call = {
@@ -338,7 +349,11 @@ async def test_generic_sandbox_create_queues_and_attaches_like_a_skill(
     assert f"sandbox_id: sbx-{suffix}"[:36] in attached and "sandbox_kind: generic" in attached
     await db_session.refresh(reservation)
     assert reservation.status == SandboxReservationStatus.CONSUMED.value
-    ctx = fake_cache.store[f"sandbox:ctx:{conversation_id}"]
+    from packages.core.ai.runtime.sandbox import RuntimeSandboxScope
+
+    ctx = fake_cache.store[
+        RuntimeSandboxScope(entity_id, user_id, conversation_id).key("sbx", f"sbx-{suffix}"[:24])
+    ]
     assert ctx["sandbox_id"] == f"sbx-{suffix}"[:24] and ctx["skill_id"] == ""
 
     # This test commits; leave no queued or active rows for the next one.
@@ -350,6 +365,7 @@ async def test_generic_sandbox_create_queues_and_attaches_like_a_skill(
     await db_session.execute(delete(SandboxReservation).where(SandboxReservation.runtime_run_id == run_id))
     await db_session.execute(delete(RuntimeRun).where(RuntimeRun.id == run_id))
     await db_session.execute(delete(SandboxRunner).where(SandboxRunner.id == runner.id))
+    await lift_scheduling_fence(db_session, fence)
     await db_session.commit()
 
 
@@ -412,7 +428,7 @@ async def test_sandbox_create_destroys_unadmitted_instance_when_context_save_fai
         return True
 
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
-    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_context", fail_context)
+    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_binding", fail_context)
     monkeypatch.setattr(sandbox_session_service, "load_sandbox_session", no_registry)
     monkeypatch.setattr(sandbox_session_service, "register_sandbox_session", register)
     monkeypatch.setattr(get_settings(), "SANDBOX_SERVICE_URL", "http://sandbox-service")
@@ -429,28 +445,30 @@ async def test_sandbox_create_destroys_unadmitted_instance_when_context_save_fai
 
 
 @pytest.mark.asyncio
-async def test_sandbox_access_rejects_agent_switch(monkeypatch) -> None:
+async def test_sandbox_access_follows_the_user_not_the_agent_or_conversation(fake_cache) -> None:
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
+    from packages.core.ai.runtime.sandbox import runtime_init_sandbox_binding, runtime_sandbox_scope
 
-    async def load_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-owned",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-            "agent_id": "agent-1",
-        }
+    def scope(**overrides):
+        return runtime_sandbox_scope(
+            **{"entity_id": "entity-1", "user_id": "user-1", "binding_key": "conversation-1", **overrides}
+        )
 
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", load_context)
+    await runtime_init_sandbox_binding(scope(), "sandbox-owned", "", agent_id="agent-1")
 
-    result = await sandbox_tools._sandbox_instance_access_error(
-        sandbox_id="sandbox-owned",
-        entity_id="entity-1",
-        user_id="user-1",
-        agent_id="agent-2",
-        conversation_id="conversation-1",
-    )
-
-    assert json.loads(result)["error"]["code"] == "sandbox_access_denied"
+    # Any agent of the same user may use it -- a delegate, or the same user's
+    # other conversation (in its own work area).
+    assert await sandbox_tools._sandbox_instance_access_error(sandbox_id="sandbox-owned", scope=scope()) is None
+    assert await sandbox_tools._sandbox_instance_access_error(
+        sandbox_id="sandbox-owned", scope=scope(binding_key="conversation-2"),
+    ) is None
+    for foreign in (
+        {"user_id": "user-2"},
+        {"entity_id": "entity-2"},
+        {"user_id": "", "binding_key": "conversation-1"},
+    ):
+        result = await sandbox_tools._sandbox_instance_access_error(sandbox_id="sandbox-owned", scope=scope(**foreign))
+        assert json.loads(result)["error"]["code"] == "sandbox_access_denied", foreign
 
 
 @pytest.mark.asyncio
@@ -486,7 +504,8 @@ async def test_sandbox_destroy_releases_binding_and_keeps_container(monkeypatch)
     assert "released for reuse" in result
     assert "stays warm" in result
     assert released and released[0]["sandbox_id"] == "sandbox-owned"
-    assert released[0]["conversation_id"] == "conversation-1"
+    assert released[0]["scope"].binding_key == "conversation-1"
+    assert released[0]["agent_id"] == "agent-1"
 
 
 @pytest.mark.asyncio
@@ -519,14 +538,11 @@ async def test_sandbox_destroy_reports_destroyed_when_not_reusable(monkeypatch) 
 async def test_sandbox_exec_rejects_foreign_conversation_sandbox(monkeypatch) -> None:
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
 
-    async def load_foreign_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-other",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-        }
+    async def load_foreign_context(scope, sandbox_id):
+        # The conversation binds only "sandbox-other"; nothing for the id asked.
+        return None
 
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", load_foreign_context)
+    monkeypatch.setattr(sandbox_tools, "_load_binding", load_foreign_context)
     monkeypatch.setattr(
         sandbox_tools,
         "_get_client",
@@ -548,14 +564,11 @@ async def test_sandbox_exec_rejects_foreign_conversation_sandbox(monkeypatch) ->
 async def test_sandbox_respond_rejects_foreign_conversation_sandbox(monkeypatch) -> None:
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
 
-    async def load_foreign_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-other",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-        }
+    async def load_foreign_context(scope, sandbox_id):
+        # The conversation binds only "sandbox-other"; nothing for the id asked.
+        return None
 
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", load_foreign_context)
+    monkeypatch.setattr(sandbox_tools, "_load_binding", load_foreign_context)
     monkeypatch.setattr(
         sandbox_tools,
         "_get_client",
@@ -582,7 +595,7 @@ async def test_sandbox_agent_can_start_poll_and_cancel_background_command(monkey
     calls: list[tuple[str, str]] = []
 
     class FakeSandboxClient:
-        async def start_exec(self, sandbox_id, command, timeout, execution_id):
+        async def start_exec(self, sandbox_id, command, timeout, execution_id, **placement):
             calls.append(("start", execution_id or ""))
             return SimpleNamespace(
                 sandbox_id=sandbox_id,
@@ -706,12 +719,14 @@ async def test_sandbox_agent_can_start_poll_and_cancel_background_command(monkey
     assert polled["waiting_for_response"] is True
     assert responded["accepted"] is True
     assert cancelled["cancelled"] is True
+    # Every command is named, even outside a durable run, so it can be stopped.
+    assert execution_id.startswith("manor-")
     assert calls == [
-        ("start", ""),
-        ("status", "execution-1"),
-        ("status", "execution-1"),
+        ("start", execution_id),
+        ("status", execution_id),
+        ("status", execution_id),
         ("respond", "input-1"),
-        ("cancel", "execution-1"),
+        ("cancel", execution_id),
     ]
 
 
@@ -820,48 +835,21 @@ async def test_sandbox_create_routes_stored_skills_through_invoke_skill(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_authenticated_sandbox_create_requires_conversation_owner() -> None:
+@pytest.mark.parametrize("user_id", ["user-1", ""])
+async def test_sandbox_create_without_a_binding_scope_is_denied(user_id) -> None:
+    """No conversation and no task: there is nothing to bind a sandbox to, so
+    nothing is created, whether or not the run has a user."""
+
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
 
     result = await sandbox_tools._sandbox_create(
         entity_id="entity-1",
-        user_id="user-1",
+        user_id=user_id,
     )
 
-    assert json.loads(result) == {
-        "ok": False,
-        "error": {
-            "code": "sandbox_access_denied",
-            "message": ("Authenticated sandbox creation requires a conversation owner context."),
-        },
-    }
-
-
-@pytest.mark.asyncio
-async def test_sandbox_create_rejects_foreign_generic_context(monkeypatch) -> None:
-    """A bound generic sandbox is still owner-checked, not silently taken over."""
-
-    import packages.core.ai.tools.sandbox_tools as sandbox_tools
-
-    async def load_foreign_generic_context(_conversation_id):
-        return {
-            "sandbox_id": "sb-x",
-            "skill_id": "",
-            "entity_id": "entity-1",
-            "user_id": "other-user",
-            "agent_id": "agent-1",
-        }
-
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", load_foreign_generic_context)
-
-    result = await sandbox_tools._sandbox_create(
-        entity_id="entity-1",
-        user_id="user-1",
-        conversation_id="conversation-1",
-        _agent_id_from_context="agent-1",
-    )
-
-    assert json.loads(result)["error"]["code"] == "sandbox_access_denied"
+    payload = json.loads(result)
+    assert payload["error"]["code"] == "sandbox_access_denied"
+    assert "no sandbox binding scope" in payload["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -942,6 +930,7 @@ async def test_sandbox_create_does_not_bind_entity_fs_by_default(
 
     result = await sandbox_tools._sandbox_create(
         entity_id="entity_1",
+        conversation_id="conversation_1",
     )
 
     assert calls["config"] is None
@@ -955,6 +944,7 @@ async def test_sandbox_write_file_injects_entity_fs_bytes_with_base64(
     tmp_path,
 ) -> None:
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
+    from packages.core.ai.runtime import workspace_reads
     from packages.core.config import get_settings
 
     settings = get_settings()
@@ -977,11 +967,16 @@ async def test_sandbox_write_file_injects_entity_fs_bytes_with_base64(
 
     monkeypatch.setattr(sandbox_tools, "_get_client", lambda: FakeSandboxClient())
 
+    async def allow_access(**_kwargs):
+        return None
+
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", allow_access)
+
     async def allow_file_read(**_kwargs):
         return None
 
     monkeypatch.setattr(
-        sandbox_tools,
+        workspace_reads,
         "runtime_guard_file_read_access",
         allow_file_read,
     )
@@ -991,6 +986,7 @@ async def test_sandbox_write_file_injects_entity_fs_bytes_with_base64(
             sandbox_id="sandbox_1",
             path="/skill/input.png",
             workspace_path="/workspace/uploads/chat/image.bin",
+            conversation_id="conversation_1",
         )
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
@@ -1013,6 +1009,7 @@ async def test_sandbox_workspace_read_stops_before_bytes_when_acl_denies(
     tmp_path,
 ) -> None:
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
+    from packages.core.ai.runtime import workspace_reads
 
     entity_root = tmp_path / "entity_1"
     entity_root.mkdir()
@@ -1030,22 +1027,22 @@ async def test_sandbox_workspace_read_stops_before_bytes_when_acl_denies(
         return '{"error":"entity_file_acl_denied"}'
 
     monkeypatch.setattr(
-        sandbox_tools,
+        workspace_reads,
         "runtime_entity_file_root",
         lambda _entity_id: str(entity_root),
     )
     monkeypatch.setattr(
-        sandbox_tools,
+        workspace_reads,
         "runtime_entity_filesystem_read_lock",
         lambda _entity_root: FakeReadLock(),
     )
     monkeypatch.setattr(
-        sandbox_tools,
+        workspace_reads,
         "runtime_guard_file_read_access",
         deny_file_read,
     )
     monkeypatch.setattr(
-        sandbox_tools,
+        workspace_reads,
         "runtime_open_entity_file_snapshot",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("denied files must not be opened")),
     )
@@ -1076,12 +1073,17 @@ async def test_sandbox_workspace_read_stops_before_bytes_when_acl_denies(
 
 @pytest.mark.asyncio
 async def test_sandbox_destroy_twice_is_benign(monkeypatch) -> None:
-    """A second release finds no binding at all; that is done, not denied."""
+    """A second release finds the release tombstone; that is done, not denied."""
 
     import packages.core.ai.tools.sandbox_tools as sandbox_tools
 
-    async def no_binding(_conversation_id):
-        return None
+    async def no_binding(scope, sandbox_id):
+        return {
+            "released_sandbox_id": sandbox_id,
+            "entity_id": scope.entity_id,
+            "user_id": scope.user_id,
+            "owner": scope.principal,
+        }
 
     async def access_denied(**_kwargs):
         return '{"error":{"code":"sandbox_access_denied"}}'
@@ -1089,7 +1091,7 @@ async def test_sandbox_destroy_twice_is_benign(monkeypatch) -> None:
     async def unexpected_release(**_kwargs):
         raise AssertionError("an already-released sandbox must not be released again")
 
-    monkeypatch.setattr(sandbox_tools, "_load_ctx", no_binding)
+    monkeypatch.setattr(sandbox_tools, "_load_binding", no_binding)
     monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", access_denied)
     monkeypatch.setattr(sandbox_tools, "release_sandbox_session", unexpected_release)
 

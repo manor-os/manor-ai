@@ -10,6 +10,7 @@ from packages.core.models.task import Task
 from packages.core.humans import open_commitment, resolve_commitment
 from packages.core.workspace_chat.context import (
     _build_summary,
+    _operating_rules_block,
     _query_matches,
     get_summary,
     workspace_search,
@@ -48,6 +49,22 @@ async def test_optional_channel_summary_failure_does_not_poison_chat_session(
         select(Workspace.id).where(Workspace.id == workspace_id)
     )).scalar_one() == workspace_id
 
+
+
+def test_operating_rules_reach_the_chat_summary_as_bounded_instructions() -> None:
+    """A rule's description is the operator's instruction; a bare count hid it."""
+    block = _operating_rules_block([
+        {"rule_key": "rule_1", "name": "English only", "description": "Write every deliverable in English."},
+        {"rule_key": "rule_2", "name": "Watchlist edits", "description": "x" * 2500},
+        {"rule_key": "rule_3", "name": "Second long", "description": "y" * 2500},
+        {"rule_key": "rule_4", "name": "Dropped", "description": "z" * 2500},
+    ])
+
+    assert block.startswith("Operating rules (4)")
+    assert "- English only: Write every deliverable in English." in block
+    assert "x" * 2000 + " ..." in block and "x" * 2001 not in block
+    assert "Dropped" not in block and "search rules with manor(action='workspace')" in block
+    assert len(block) < 5200
 
 
 def test_query_matches_exact_substring_and_any_token() -> None:

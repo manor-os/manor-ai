@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from fnmatch import fnmatch
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 
@@ -30,6 +32,13 @@ os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")
 # service.
 _TEST_REDIS = RedisTestResource.from_environment()
 os.environ["REDIS_URL"] = _TEST_REDIS.url
+# Every approval evaluation in the suite must reach a declared effect
+# (packages/core/governance/action_effects.py); an undeclared action key
+# raises instead of silently evaluating as ``unknown``.
+os.environ.setdefault("MANOR_STRICT_EFFECT_CONTRACT", "1")
+# A Task run journal write that collides with an existing seq is a journal
+# write without its own run-row bump: production logs it, tests fail on it.
+os.environ.setdefault("MANOR_TASK_RUN_JOURNAL_STRICT", "1")
 TEST_EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024") or 1024)
 
 import pytest  # noqa: E402
@@ -141,6 +150,28 @@ async def _delete_test_tables(conn, tables=None) -> None:
         await conn.execute(text(f"DO {delimiter} BEGIN\n{deletes}\nEND {delimiter};"))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _schema_for_unfixtured_database_tests() -> None:
+    """Create the schema up front for lanes that select tests without DB fixtures.
+
+    Some tests reach the database only through production code and depend on
+    an earlier client/db_session fixture having created the schema. A lane
+    whose selection may contain no such fixture user opts in with
+    MANOR_TEST_PREPARE_SCHEMA=1; other lanes keep lazy schema creation.
+    """
+    if os.environ.get("MANOR_TEST_PREPARE_SCHEMA") != "1":
+        return
+
+    async def prepare() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
+        try:
+            await _prepare_test_database(engine, truncate_existing=False)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(prepare())
+
+
 @pytest_asyncio.fixture(scope="session")
 async def _test_database_guard() -> AsyncGenerator[None, None]:
     """Keep one process's shared test schema stable for its entire session."""
@@ -188,6 +219,34 @@ def _test_password_hashing(request, monkeypatch) -> None:
     monkeypatch.setattr(bcrypt, "gensalt", test_gensalt)
 
 
+_APP_CACHE: OrderedDict[frozenset[tuple[str, str]], object] = OrderedDict()
+_APP_CACHE_SIZE = 4
+
+
+def _test_app():
+    """Reuse an assembled API app for an identical process environment.
+
+    Assembling ~1000 routes dominates API test setup. ``create_app`` derives
+    its routers, CORS and docs only from the environment; module state and
+    the database factories are resolved per request, so a fresh app per test
+    adds no isolation. Overrides are per-test and are cleared on reuse.
+    """
+    from apps.api.main import create_app
+
+    key = frozenset(
+        (name, value) for name, value in os.environ.items() if name != "PYTEST_CURRENT_TEST"
+    )
+    app = _APP_CACHE.get(key)
+    if app is None:
+        app = _APP_CACHE[key] = create_app()
+        while len(_APP_CACHE) > _APP_CACHE_SIZE:
+            _APP_CACHE.popitem(last=False)
+    else:
+        _APP_CACHE.move_to_end(key)
+    app.dependency_overrides.clear()
+    return app
+
+
 @pytest.fixture
 def _client_database_reset() -> None:
     """Declare that the root API client needs a clean database for this test."""
@@ -223,7 +282,6 @@ async def client(
         else:
             os.environ[key] = str(value)
 
-    from apps.api.main import create_app
     import packages.core.database as db_module
 
     # Create a fresh engine in THIS event loop
@@ -235,7 +293,7 @@ async def client(
         db_module.engine = engine
         db_module.async_session = session_factory
 
-        app = create_app()
+        app = _test_app()
 
         # Persisted browser Chat now always runs through the durable worker.
         # ASGI tests have no Celery consumer: drive that same worker in-process
@@ -303,6 +361,17 @@ async def db_session(_client_database_preparation, _test_password_hashing) -> As
     await engine.dispose()
 
 
+@pytest.fixture
+def undeclared_effects_allowed(monkeypatch):
+    """Run the production fallback for undeclared action effects.
+
+    Only for tests that deliberately exercise an undeclared key (it evaluates
+    as ``unknown`` and asks), e.g. plan_dag steps whose action key is a raw
+    tool name or absent. Every other test runs the strict effect contract.
+    """
+    monkeypatch.delenv("MANOR_STRICT_EFFECT_CONTRACT", raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _reset_builtin_skill_seed_verification() -> None:
     """Built-in Skill seeding is verified once per process; each test gets a
@@ -310,6 +379,21 @@ def _reset_builtin_skill_seed_verification() -> None:
     from packages.core.services.skill_service import reset_builtin_skill_seed_cache
 
     reset_builtin_skill_seed_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_plan_cache() -> Generator[None, None, None]:
+    """Plan gates re-read subscription_plans into a process-global cache; a
+    test that seeds plan rows must not leave its plans to the next test."""
+    from packages.core.constants import plans
+
+    snapshot = dict(plans.PLANS)
+    loaded, read_at = plans._cache_loaded_from_db, plans._cache_read_at
+    plans._cache_read_at = None
+    yield
+    plans.PLANS.clear()
+    plans.PLANS.update(snapshot)
+    plans._cache_loaded_from_db, plans._cache_read_at = loaded, read_at
 
 
 @pytest.fixture(autouse=True)
@@ -326,6 +410,11 @@ def _isolate_sandbox_owner_registry() -> Generator[None, None, None]:
 
     original_prefix = cache.PREFIX
     cache.PREFIX = _TEST_REDIS.cache_prefix_for_test()
+    # The session service also keeps a per-process answer per runner URL
+    # (its capabilities); every test starts without another test's answer.
+    session_service = sys.modules.get("packages.core.services.sandbox_session_service")
+    if session_service is not None:
+        session_service._RUNNER_CAPABILITIES_CACHE.clear()
 
     try:
         yield

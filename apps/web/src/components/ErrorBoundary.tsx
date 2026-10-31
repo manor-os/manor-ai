@@ -11,6 +11,7 @@ import {
   shouldAutoReloadForRecoverableError,
 } from "../utils/recoverableErrors";
 import { t } from "../lib/i18n";
+import { appPath } from "../embed/embedContext";
 import { captureClientError } from "../lib/clientErrors";
 
 
@@ -108,7 +109,7 @@ export default class ErrorBoundary extends Component<Props, State> {
                 <button
                   onClick={() => {
                     this.setState({ hasError: false, error: null, autoReloadUnavailable: false });
-                    window.location.href = "/";
+                    window.location.href = appPath("/");
                   }}
                   className="px-4 py-2 btn-manor-outline"
                 >

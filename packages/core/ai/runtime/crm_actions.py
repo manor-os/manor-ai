@@ -10,6 +10,7 @@ from sqlalchemy import select
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.people import Client
 from packages.core.services import crm, client_delivery
+from packages.core.services.external_collaboration_access import COLLABORATOR_MEMBERSHIP_ROLE
 from packages.core.services.people_service import delete_client
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_is_external_customer
 
@@ -90,6 +91,10 @@ async def crm_actor(db, *, entity_id, user_id):
         raise HTTPException(403, "Company access is no longer active")
     if membership is None and user.entity_id != entity_id:
         raise HTTPException(403, "Company membership is required")
+    if membership is not None and membership.role == COLLABORATOR_MEMBERSHIP_ROLE:
+        # An external collaborator works inside one Workspace; the company CRM
+        # is outside it whatever the runtime gate admitted.
+        raise HTTPException(403, "Company CRM is not available to external collaborators")
     return SimpleNamespace(
         id=user.id, entity_id=entity_id, role=membership.role if membership is not None else user.role, email=user.email
     )

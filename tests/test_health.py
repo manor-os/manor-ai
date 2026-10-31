@@ -81,7 +81,7 @@ async def test_client_config_enables_flows_locally_or_by_override(client, monkey
 @pytest.mark.asyncio
 async def test_client_config_reports_local_ai_credits_as_unlimited(client, monkeypatch):
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv("MANOR_ENV", "local")
 
     local_response = await client.get("/config")
 

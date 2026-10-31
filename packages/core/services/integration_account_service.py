@@ -32,7 +32,6 @@ from packages.core.models.permission import (
     GrantStatus,
     ResourceGrant,
     ResourceType,
-    SubjectType,
 )
 from packages.core.models.user import OAuthAccount, User, UserMembership
 from packages.core.permissions import user_has_permission
@@ -1401,11 +1400,10 @@ async def set_default_runtime_integration_account(
             account_id=account_id,
         ),
     )
-    if (
-        canonical_provider in {"email", "gmail", "outlook"}
-        and target.ownership is IntegrationAccountOwnership.MINE
-    ):
-        # One sender preference spans mail providers and connection storage types.
+    if canonical_provider in {"email", "gmail", "outlook"}:
+        # One sender preference spans mail providers and connection storage
+        # types. It only touches the actor's own preferences, so a shared
+        # mailbox may be the default sender too.
         await _write_runtime_integration_account_preference(
             db, user_id=user_id, entity_id=entity_id, provider="email_sender",
             preference=RuntimeIntegrationAccountPreference(kind=resolved_kind, account_id=account_id),
@@ -1749,18 +1747,14 @@ async def _load_runtime_integration_registry(
     if requested is not None:
         storage_keys = {alias for provider in requested for alias in provider_key_aliases(provider)}
 
-    oauth_ids = await _shared_resource_ids(
+    shared_ids = await _shared_resource_ids_by_type(
         db,
         entity_id=entity_id,
         user_id=user_id,
-        resource_type=ResourceType.OAUTH_ACCOUNT,
+        resource_types=(ResourceType.OAUTH_ACCOUNT, ResourceType.INTEGRATION),
     )
-    integration_ids = await _shared_resource_ids(
-        db,
-        entity_id=entity_id,
-        user_id=user_id,
-        resource_type=ResourceType.INTEGRATION,
-    )
+    oauth_ids = shared_ids[ResourceType.OAUTH_ACCOUNT]
+    integration_ids = shared_ids[ResourceType.INTEGRATION]
 
     oauth_query = select(OAuthAccount).where(
         (OAuthAccount.user_id == user_id) | OAuthAccount.id.in_(oauth_ids),
@@ -1786,7 +1780,7 @@ async def _load_runtime_integration_registry(
     shared_owner_ids = {row.user_id for row in oauth_rows if row.user_id != user_id} | {
         row.owner_user_id for row in entity_rows if row.owner_user_id and row.owner_user_id != user_id
     }
-    active_shared_owner_ids = await _active_entity_member_ids(
+    active_shared_owner_ids = await _sharing_owner_ids(
         db,
         entity_id=entity_id,
         user_ids=shared_owner_ids,
@@ -2188,7 +2182,7 @@ async def load_integration_catalog_accounts(
         entity_query = entity_query.where(Integration.provider.in_(storage_keys))
     catalog_oauth_rows = list((await db.execute(oauth_query.order_by(OAuthAccount.created_at.desc()))).scalars().all())
     catalog_entity_rows = list((await db.execute(entity_query.order_by(Integration.created_at.desc()))).scalars().all())
-    active_shared_owner_ids = await _active_entity_member_ids(
+    active_shared_owner_ids = await _sharing_owner_ids(
         db,
         entity_id=entity_id,
         user_ids={row.user_id for row in catalog_oauth_rows if row.user_id != user_id}
@@ -2300,46 +2294,59 @@ async def load_integration_catalog_accounts(
     )
 
 
-async def _active_entity_member_ids(
+async def _sharing_owner_ids(
     db: AsyncSession,
     *,
     entity_id: str,
     user_ids: Iterable[str],
 ) -> set[str]:
+    """Owners whose shares currently work in this Entity.
+
+    Batch form of ``integration_access._active_entity_member_role``: an active
+    user with an internal role. An explicit membership row is authoritative;
+    only users without one fall back to the legacy primary-entity columns.
+    """
+    from packages.core.services.integration_access import SHARING_MEMBER_ROLES
+
     requested = {user_id for user_id in user_ids if user_id}
     if not requested:
         return set()
-    active = set(
-        (
-            await db.execute(
-                select(UserMembership.user_id).where(
-                    UserMembership.user_id.in_(requested),
-                    UserMembership.entity_id == entity_id,
-                    UserMembership.status == "active",
-                    UserMembership.deleted_at.is_(None),
-                )
+    # One round trip for every owner: this runs on each registry load.
+    rows = (
+        await db.execute(
+            select(
+                User.id,
+                User.entity_id,
+                User.role,
+                UserMembership.id.label("membership_id"),
+                UserMembership.status.label("membership_status"),
+                UserMembership.deleted_at.label("membership_deleted_at"),
+                UserMembership.role.label("membership_role"),
+            )
+            .outerjoin(
+                UserMembership,
+                (UserMembership.user_id == User.id) & (UserMembership.entity_id == entity_id),
+            )
+            .where(
+                User.id.in_(requested),
+                User.status == "active",
+                User.deleted_at.is_(None),
             )
         )
-        .scalars()
-        .all()
-    )
-    missing = requested - active
-    if missing:
-        active.update(
-            (
-                await db.execute(
-                    select(User.id).where(
-                        User.id.in_(missing),
-                        User.entity_id == entity_id,
-                        User.status == "active",
-                        User.deleted_at.is_(None),
-                    )
-                )
+    ).all()
+    owners: set[str] = set()
+    for row in rows:
+        if row.membership_id is not None:
+            role = (
+                row.membership_role or "member"
+                if row.membership_status == "active" and row.membership_deleted_at is None
+                else None
             )
-            .scalars()
-            .all()
-        )
-    return active
+        else:
+            role = (row.role or "member") if row.entity_id == entity_id else None
+        if role in SHARING_MEMBER_ROLES:
+            owners.add(row.id)
+    return owners
 
 
 async def _shared_resource_ids(
@@ -2370,6 +2377,12 @@ async def _shared_resource_ids_by_type(
     shared_ids = {resource_type: set() for resource_type in requested_types}
     if not requested_types:
         return shared_ids
+    from packages.core.services.integration_access import (
+        grant_subject_clause,
+        use_grant_subjects,
+    )
+
+    subjects = await use_grant_subjects(db, entity_id=entity_id, user_id=user_id)
     now = datetime.now(UTC)
     rows = (
         (
@@ -2377,8 +2390,7 @@ async def _shared_resource_ids_by_type(
                 select(ResourceGrant).where(
                     ResourceGrant.entity_id == entity_id,
                     ResourceGrant.resource_type.in_(requested_types),
-                    ResourceGrant.subject_type == SubjectType.USER,
-                    ResourceGrant.subject_id == user_id,
+                    grant_subject_clause(subjects),
                     ResourceGrant.status == GrantStatus.ACTIVE,
                 )
             )

@@ -18,10 +18,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, desc, event, or_, select, update
+from sqlalchemy import and_, desc, event, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message, Task
 
@@ -270,14 +269,23 @@ async def spawn_thread(
     db: AsyncSession,
     *,
     entity_id: str,
-    workspace_id: str,
+    workspace_id: Optional[str],
     thread_ref_kind: str,
     thread_ref_id: str,
     title: Optional[str] = None,
 ) -> Conversation:
-    """Idempotent: re-call returns the existing thread for the same ref."""
+    """Idempotent: re-call returns the existing thread for the same ref.
+
+    ``workspace_id`` is None only for the thread of a Task assigned directly
+    to an Agent, outside any Workspace.
+    """
     if thread_ref_kind not in {"task", "plan", "goal"}:
         raise ValueError(f"unsupported thread_ref_kind={thread_ref_kind!r}")
+    if workspace_id is None and thread_ref_kind != "task":
+        raise ValueError("only a Task thread may exist outside a Workspace")
+
+    def in_scope(column):
+        return column.is_(None) if workspace_id is None else column == workspace_id
 
     # A Task is the durable authority for its thread. Lock it before the
     # check/create sequence so simultaneous first turns cannot create two
@@ -287,7 +295,7 @@ async def spawn_thread(
             select(Task.id).where(
                 Task.id == thread_ref_id,
                 Task.entity_id == entity_id,
-                Task.workspace_id == workspace_id,
+                in_scope(Task.workspace_id),
             ).with_for_update()
         )).scalar_one_or_none()
         if not task_id:
@@ -296,7 +304,7 @@ async def spawn_thread(
     existing = (await db.execute(
         select(Conversation).where(
             Conversation.entity_id == entity_id,
-            Conversation.workspace_id == workspace_id,
+            in_scope(Conversation.workspace_id),
             Conversation.scope == "workspace_thread",
             Conversation.thread_ref_kind == thread_ref_kind,
             Conversation.thread_ref_id == thread_ref_id,
@@ -490,12 +498,12 @@ async def count_open_pending_actions(
     "still waiting" copy sits there until a reload. Meanwhile the sidebar
     badge re-counted from the DB and dropped — one answer, two numbers.
     """
-    from .pending_actions import count_pending_actions_by_workspace
+    from .pending_actions import count_pending_actions_by_workspace, pending_action_total
 
     counts = await count_pending_actions_by_workspace(
         db, entity_id=entity_id, workspace_ids=[workspace_id],
     )
-    return sum(counts[workspace_id].values())
+    return pending_action_total(counts[workspace_id])
 
 
 async def list_messages(
@@ -583,13 +591,16 @@ async def resolve_pending_action(
     message_id: str,
     user_id: str,
     resolution: dict,
-    emit_followup: bool = True,
+    publish_resolution: bool = True,
 ) -> Optional[Message]:
     """User clicked a button on an interactive message. Records the
-    resolution + emits a follow-up agent reply summarising the choice.
+    resolution on that message; the card itself shows the choice.
 
-    Returns the original message; the follow-up reply is in the same
-    conversation. Caller commits."""
+    No separate receipt message is written: the answered card collapses into
+    one "you chose" line, and any outcome the caller records in ``resolution``
+    (for example ``delivery_outcome``) is shown on that same line.
+
+    Returns the original message. Caller commits."""
     msg = (await db.execute(
         select(Message).where(Message.id == message_id)
     )).scalar_one_or_none()
@@ -604,139 +615,39 @@ async def resolve_pending_action(
     msg.resolved_at = datetime.now(timezone.utc)
     msg.resolved_by_user_id = user_id
 
-    if emit_followup:
-        await _emit_pending_action_resolution_followup(
-            db,
-            message=msg,
-            resolution=resolution,
-        )
+    if publish_resolution:
+        await _publish_pending_action_resolution(db, message=msg)
 
     return msg
 
 
-async def resolve_effect_reconciliation_pending_action(
-    db: AsyncSession,
-    *,
-    message_id: str,
-    approval_request_id: str,
-    pending_action_kind: str,
-    user_id: str,
-    resolution: dict,
-) -> tuple[Optional[Message], bool]:
-    """Resolve a reconciliation card through one database CAS.
-
-    The caller has already acquired the reconciliation service's canonical
-    execution/request locks. Identical replays may validate successfully, but
-    only the transaction that changes ``resolved_at`` from NULL may project
-    Chat receipts or trigger post-commit work.
-    """
-
-    winner_id = (await db.execute(
-        update(Message)
-        .where(
-            Message.id == message_id,
-            Message.resolved_at.is_(None),
-            Message.pending_action["approval_request_id"].as_string()
-            == approval_request_id,
-            Message.pending_action["kind"].as_string()
-            == pending_action_kind,
-        )
-        .values(
-            resolution=resolution,
-            resolved_at=datetime.now(timezone.utc),
-            resolved_by_user_id=user_id,
-        )
-        .returning(Message.id)
-        .execution_options(synchronize_session=False)
-    )).scalar_one_or_none()
-    msg = (await db.execute(
-        select(Message)
-        .where(Message.id == message_id)
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if msg is None:
-        return None, False
-    won = winner_id is not None
-    if won:
-        await _emit_pending_action_resolution_followup(
-            db,
-            message=msg,
-            resolution=resolution,
-        )
-    return msg, won
-
-
-async def _emit_pending_action_resolution_followup(
+async def _publish_pending_action_resolution(
     db: AsyncSession,
     *,
     message: Message,
-    resolution: dict,
 ) -> None:
-    """Project the standalone Chat receipt for one resolved action."""
+    """Tell other open clients that one card was answered.
+
+    Shared workspaces need a cross-tab signal: clients that loaded the card
+    close it with the recorded choice, whichever surface answered it, and
+    refresh their sidebar counts. Callers that publish their own event pass
+    ``publish_resolution=False``."""
 
     msg = message
-    # Workspace Chat keeps a standalone resolution receipt for continuity.
-    # Personal Chat approval handlers already persist the user's choice and an
-    # assistant continuation message, while the original card also gains its
-    # resolved badge. Emitting this receipt there would show the same outcome
-    # twice, so those callers explicitly disable it.
-    choice = resolution.get("choice") or ""
-    note = resolution.get("note") or ""
-    is_retry = choice in ("retry", "retry_now")
-    is_feedback = choice == "feedback"
-    is_response = choice in ("respond", "provide_answers", "submit", "ok")
-    is_workflow_start = (
-        msg.pending_action.get("kind") == PendingActionKind.WORKFLOW_STARTER_INPUT
-        and choice in ("run", "start", "confirm")
-    )
-    is_cancelled = "cancel" in choice or choice in ("skip", "stopped")
-    is_approve = (
-        "approve" in choice
-        or choice in ("yes", "accept", "confirm", "continue_after_login")
-    )
-    if is_retry:
-        content = "Retry requested"
-    elif is_feedback:
-        content = "✓ Feedback sent"
-    elif is_response:
-        content = "✓ Response submitted"
-    elif is_workflow_start:
-        content = "✓ Workflow started"
-    elif is_cancelled:
-        content = "✗ Cancelled"
-    else:
-        label = "Approved" if is_approve else "Rejected" if choice else "Resolved"
-        content = f"✓ {label}" if is_approve else f"✗ {label}"
-    if note:
-        content += f" — {note}"
-    follow = Message(
-        id=generate_ulid(),
-        conversation_id=msg.conversation_id,
-        role="system",
-        content=content,
-        author_kind="system",
-        message_kind="system",
-        refs=[{"type": "message", "id": msg.id}],
-    )
-    db.add(follow)
-    await db.flush()
-
-    # Let other open clients refresh their sidebar counts. The API caller also
-    # updates optimistically, but shared workspaces need a cross-tab signal.
     try:
         conv = (await db.execute(
             select(Conversation).where(Conversation.id == msg.conversation_id)
         )).scalar_one_or_none()
         if conv and conv.workspace_id:
-            entity_id = conv.entity_id
-            workspace_id = conv.workspace_id
-            await _publish_workspace_chat_event(entity_id, {
-                "workspace_id": workspace_id,
+            await _publish_workspace_chat_event(conv.entity_id, {
+                "workspace_id": conv.workspace_id,
                 "conversation_id": msg.conversation_id,
-                "message_id": follow.id,
+                "message_id": msg.id,
                 "resolved_message_id": msg.id,
-                "message_kind": "system",
-                "author_kind": "system",
+                "resolved_at": msg.resolved_at.isoformat() if msg.resolved_at else None,
+                "resolution": msg.resolution,
+                "message_kind": msg.message_kind,
+                "author_kind": msg.author_kind,
                 "has_pending_action": False,
                 "action_resolved": True,
             })

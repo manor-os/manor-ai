@@ -23,7 +23,7 @@ from packages.core.models.workspace import (
 from packages.core.models.task import (
     TaskCategory, Task, TaskLog, Conversation, Message,
 )
-from packages.core.models.chat_room import ChatRoom, ChatRoomMember, ChatRoomInvite, ChatRoomMessage, ChatRoomMessageReaction, ChatRoomFile, ChatRoomAgentBinding, ChatRoomAgentRun, ChatRoomToolApproval  # noqa: F401
+from packages.core.models.chat_room import ChatRoom, ChatRoomMember, ChatRoomInvite, ChatRoomMessage, ChatRoomMessageReaction, ChatRoomFile, ChatRoomFileChunk, ChatRoomAgentBinding, ChatRoomAgentRun, ChatRoomToolApproval  # noqa: F401
 from packages.core.models.agent_delegation_session import AgentContextArchive, AgentDelegationSession
 from packages.core.models.conversation_transcript import ConversationTranscriptItem
 from packages.core.models.task_template import TaskTemplate
@@ -41,6 +41,7 @@ from packages.core.models.client_delivery import ClientContact, ClientWorkspaceD
 from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.metrics import MetricsDailyUsage, MetricsDailyToolCalls
+from packages.core.models.workspace_health import MetricsWorkspaceDaily, WorkspaceHealthSnapshot
 from packages.core.models.system_metrics import SystemMetricsSample
 from packages.core.models.http_stats import HttpRequestHourly
 from packages.core.models.user_session import (
@@ -118,6 +119,12 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
+from packages.core.models.blueprint_registry import (
+    BlueprintDistTag,
+    BlueprintPackage,
+    BlueprintVersion,
+    WorkspaceBlueprintUpgrade,
+)
 from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
 from packages.core.models.workspace_draft import WorkspaceDraft
 from packages.core.models.nango_webhook_event import NangoWebhookEvent
@@ -148,7 +155,8 @@ from packages.core.models.permission import (
     GrantStatus,
     PendingStatus,
 )
-from packages.core.models.oauth_provider import OAuthClientApp, OAuthAuthorizationCode
+from packages.core.models.connection_use import IntegrationConnectionUse
+from packages.core.models.oauth_provider import OAuthClientApp, OAuthAuthorizationCode, OAuthRefreshToken
 from packages.core.models.client_error import ClientErrorEvent
 from packages.core.models.tool_path_memory import ToolIntentPath
 from packages.core.models.runtime_run import (
@@ -163,11 +171,8 @@ from packages.core.models.runtime_run import (
     SandboxRunnerStatus,
 )
 from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
-from packages.core.models.task_plan_submission import (
-    TaskPlanSubmission,
-    TaskPlanSubmissionKind,
-    TaskPlanSubmissionState,
-)
+from packages.core.models.task_agent_child import TaskAgentChildRun
+from packages.core.models.task_run_journal import TaskRunJournal, TaskRunJournalKind, TaskRunKind
 
 __all__ = [
     "Base", "generate_ulid", "TimestampMixin", "SoftDeleteMixin",
@@ -187,6 +192,7 @@ __all__ = [
     "ClientContact", "ClientWorkspaceDelivery", "WorkspaceCollaboration", "WorkspaceCollaborationEntry",
     "TokenUsageLog", "ToolCallLog", "UserSessionLog", "UserSessionLease", "UserPageViewLog",
     "MetricsDailyUsage", "MetricsDailyToolCalls",
+    "MetricsWorkspaceDaily", "WorkspaceHealthSnapshot",
     "SystemMetricsSample",
     "HttpRequestHourly",
     "ExecutionPlan", "ExecutionStep", "RuntimeExecutionClaim",
@@ -231,6 +237,7 @@ __all__ = [
     "GovernancePolicy", "GovernanceRevision",
     "ChannelPairingCode",
     "WorkspaceBlueprint", "BlueprintFavorite",
+    "BlueprintPackage", "BlueprintVersion", "BlueprintDistTag", "WorkspaceBlueprintUpgrade",
     "WorkspaceDraft",
     "NangoWebhookEvent",
     "CLIToolSpec", "BrowserToolSpec",
@@ -247,11 +254,12 @@ __all__ = [
     "PlatformModelProviderKey",
     "PlatformSetting",
     "ResourceGrant", "ResourceGrantPending", "Share",
+    "IntegrationConnectionUse",
     "DocumentAccessLog",
     "ResourceType", "SubjectType", "Capability",
     "Visibility", "Classification",
     "GrantStatus", "PendingStatus",
-    "OAuthClientApp", "OAuthAuthorizationCode",
+    "OAuthClientApp", "OAuthAuthorizationCode", "OAuthRefreshToken",
     "ClientErrorEvent",
     "WebchatResidentBinding",
     "ResidentCreateGrant", "ResidentMaintenanceDraft",
@@ -259,11 +267,12 @@ __all__ = [
     "RuntimeRun", "RuntimeRunStatus", "RuntimeFileCommit", "SandboxReservation", "SandboxReservationStatus",
     "SandboxRequesterKind",
     "SandboxRunner", "SandboxRunnerStatus", "SandboxInstance", "RuntimeOutboxEvent",
-    "TaskCoordinatorPhase", "TaskCoordinatorRun",
-    "TaskPlanSubmission", "TaskPlanSubmissionKind", "TaskPlanSubmissionState",
+    "TaskCoordinatorPhase", "TaskCoordinatorRun", "TaskAgentChildRun",
+    "TaskRunJournal", "TaskRunJournalKind", "TaskRunKind",
 ]
 
 from packages.core.models.webchat_resident import WebchatResidentBinding
 from packages.core.models.runtime_file_commit import RuntimeFileCommit
 
 from packages.core.models.webchat_resident_create import ResidentCreateGrant, ResidentMaintenanceDraft
+

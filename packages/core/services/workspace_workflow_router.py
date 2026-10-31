@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.contracts.json_schema import SchemaContractValidatorFactory
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+from packages.core.services.viewer_language import binding_name_for, binding_text_for, localized, without_i18n
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ class WorkspaceChatEntrypoint:
     minimum_confidence: float
     projection: dict[str, Any]
     wait_bridge: bool
+    # Rules across several inputs (at least one platform), checked before a run starts.
+    input_rules: tuple[dict[str, Any], ...] = ()
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -109,8 +112,14 @@ def normalize_chat_entrypoint(
     workflow: Any,
     *,
     include_unpublished: bool = False,
+    locale: str | None = None,
 ) -> WorkspaceChatEntrypoint | None:
-    config = _mapping(getattr(binding, "config", None))
+    """Project a binding's chat entry point; ``locale`` is the viewer's.
+
+    Pass a locale only for what a person reads. Intent routing and prefill
+    read the authored text.
+    """
+    config = _mapping(localized(getattr(binding, "config", None), locale))
     raw = _mapping(config.get("chat_entrypoint"))
     workspace_id = str(getattr(binding, "workspace_id", None) or "").strip()
     # Older Workspace UI bindings predate the explicit chat_entrypoint block.
@@ -130,8 +139,12 @@ def normalize_chat_entrypoint(
     except (TypeError, ValueError):
         order = 100
 
-    title = str(raw.get("title") or getattr(binding, "name", None) or getattr(workflow, "name", "Workflow")).strip()
-    description = str(raw.get("description") or getattr(workflow, "description", "") or "").strip()
+    binding_name = binding_name_for(getattr(binding, "name", None), getattr(binding, "config", None), locale)
+    title = str(raw.get("title") or binding_name or getattr(workflow, "name", "Workflow")).strip()
+    # An entry without its own description shows its Flow's, translated beside the binding.
+    description = str(raw.get("description") or binding_text_for(
+        "description", getattr(workflow, "description", "") or "", getattr(binding, "config", None), locale,
+    ) or "").strip()
     threshold = _bounded_confidence(
         intent.get("minimum_confidence"),
         _DEFAULT_MINIMUM_CONFIDENCE,
@@ -144,7 +157,8 @@ def normalize_chat_entrypoint(
         description=description,
         placeholder=str(raw.get("placeholder") or "").strip(),
         order=order,
-        run_inputs=workflow_run_inputs(workflow),
+        run_inputs=workflow_run_inputs(workflow, locale=locale),
+        input_rules=workflow_run_input_rules(workflow, locale=locale),
         intent_enabled=bool(intent.get("enabled")),
         intent_description=str(intent.get("description") or description).strip(),
         intent_examples=_strings(intent.get("examples")),
@@ -218,10 +232,68 @@ def _run_input_prefill(value: Any) -> dict[str, Any] | None:
     }
 
 
-def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
-    """Read the canonical runtime inputs declared by Workflow entry nodes."""
+def workflow_run_input_rules(workflow: Any, *, locale: str | None = None) -> tuple[dict[str, Any], ...]:
+    """Rules across a Flow's run inputs, declared on its entry node as ``input_rules``.
+
+    Each rule is a JSON Schema the whole set of answers must meet (``anyOf`` of
+    ``const`` answers for "choose at least one"), with an optional ``x-message``
+    shown on every input the rule names. The form checks them before starting
+    and the run is refused without them, so a run never starts only to fail on them.
+    """
+    steps = getattr(workflow, "steps", None)
+    steps = localized(steps, locale) if locale else without_i18n(steps)
+    rules: list[dict[str, Any]] = []
+    for step in steps if isinstance(steps, list) else []:
+        if not isinstance(step, dict) or str(step.get("type") or "").lower() not in {"trigger", "webhook"}:
+            continue
+        for rule in _mapping(step.get("config")).get("input_rules") or []:
+            if isinstance(rule, dict) and rule:
+                rules.append(deepcopy(rule))
+    return tuple(rules)
+
+
+def input_rule_fields(rule: Any) -> list[str]:
+    """The inputs a rule is about: those it requires or constrains, at any depth."""
+    if not isinstance(rule, dict):
+        return []
+    fields = [str(key) for key in rule.get("required") or []]
+    fields += [str(key) for key in _mapping(rule.get("properties"))]
+    for keyword in ("anyOf", "allOf", "oneOf"):
+        for branch in rule.get(keyword) or []:
+            fields += input_rule_fields(branch)
+    for keyword in ("if", "then", "else", "not"):
+        fields += input_rule_fields(rule.get(keyword))
+    return list(dict.fromkeys(fields))
+
+
+def input_rule_errors(rules: Iterable[dict[str, Any]], values: dict[str, Any],
+                      labels: dict[str, str] | None = None) -> dict[str, str]:
+    """Each broken rule's message, on every input it names."""
+    errors: dict[str, str] = {}
+    for rule in rules:
+        schema = {key: value for key, value in rule.items() if key != "x-message"}
+        try:
+            broken = next(iter(SchemaContractValidatorFactory.build(schema).iter_errors(values)), None) is not None
+        except Exception:
+            continue  # a malformed rule is reported where the Flow is saved, never on a person's run
+        if not broken:
+            continue
+        fields = input_rule_fields(rule)
+        names = ", ".join((labels or {}).get(field, field) for field in fields)
+        message = str(rule.get("x-message") or "").strip() or f"Fill in at least one of: {names}."
+        for field in fields:
+            errors.setdefault(field, message)
+    return errors
+
+
+def workflow_run_inputs(workflow: Any, *, locale: str | None = None) -> tuple[dict[str, Any], ...]:
+    """Read the canonical runtime inputs declared by Workflow entry nodes.
+
+    With the viewer's ``locale`` the labels, hints and defaults are theirs.
+    """
     variables = _mapping(getattr(workflow, "variables", None))
     steps = getattr(workflow, "steps", None)
+    steps = localized(steps, locale) if locale else without_i18n(steps)
     if not isinstance(steps, list):
         return ()
     seen: set[str] = set()
@@ -230,6 +302,10 @@ def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
         if not isinstance(step, dict) or str(step.get("type") or "").lower() not in {"trigger", "webhook"}:
             continue
         config = _mapping(step.get("config"))
+        # The run is validated against input_schema; the form reads each input's
+        # schema, so its constraints travel with the input and the form refuses
+        # what the run would refuse.
+        declared = _mapping(_mapping(config.get("input_schema")).get("properties"))
         default_prefill = _run_input_prefill(config.get("run_input_prefill"))
         rows = config.get("run_inputs")
         if not isinstance(rows, list):
@@ -267,10 +343,20 @@ def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
                 target,
             ):
                 normalized["target"] = target
+            # A step only groups the form into pages; every input is still
+            # submitted and validated together.
+            step = str(row.get("step") or "").strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", step):
+                normalized["step"] = step
+                step_label = str(row.get("step_label") or "").strip()
+                if step_label:
+                    normalized["step_label"] = step_label
             if "schema" in row:
                 normalized["schema"] = deepcopy(row["schema"])
             elif raw_type == "integer":
                 normalized["schema"] = {"type": "integer"}
+            if isinstance(declared.get(key), dict):
+                normalized["schema"] = {**normalized.get("schema", {}), **deepcopy(declared[key])}
             prefill = (
                 _run_input_prefill(row.get("prefill"))
                 if "prefill" in row
@@ -338,7 +424,7 @@ def prefill_workspace_workflow_inputs(
             is_selection = (
                 "enum" in schema
                 or "const" in schema
-                or ui.get("control") in {"select", "workflow_project_select", "knowledge_file"}
+                or ui.get("control") in {"select", "workflow_project_select", "knowledge_file", "record_select"}
             )
             if (
                 item.get("type") == "string"
@@ -487,6 +573,21 @@ def _merge_schema_draft(default: Any, proposed: Any, schema: Any) -> Any:
     return deepcopy(candidate)
 
 
+def _choices_outside_options(proposed: Any, schema: dict[str, Any]) -> list[str]:
+    """Extracted values of a choice input (``enum`` or array of ``enum``) it does not offer."""
+    items = schema.get("items") if schema.get("type") == "array" else None
+    options = (items if isinstance(items, dict) else schema).get("enum")
+    if not isinstance(options, list):
+        return []
+    values = proposed if isinstance(proposed, list) else [proposed]
+    offered = {str(option) for option in options}
+    return [
+        str(value).strip()
+        for value in values
+        if isinstance(value, (str, int, float)) and str(value).strip() and str(value) not in offered
+    ][:10]
+
+
 def _unwrap_structured_prefill_value(value: Any, schema: dict[str, Any]) -> Any:
     properties = schema.get("properties")
     properties = properties if isinstance(properties, dict) else {}
@@ -553,8 +654,13 @@ async def prepare_workspace_workflow_inputs(
     entity_id: str,
     user_id: str,
     workspace_id: str,
+    unmatched: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Build editable defaults, including declared structured Chat extraction."""
+    """Build editable defaults, including declared structured Chat extraction.
+
+    When given, ``unmatched`` collects, per input, extracted choices that are
+    not among the input's options, so the caller can ask instead of guessing.
+    """
     values = prefill_workspace_workflow_inputs(
         entrypoint,
         message=message,
@@ -601,13 +707,18 @@ async def prepare_workspace_workflow_inputs(
             key = str(item["key"])
             if key not in extracted:
                 continue
+            proposed = _unwrap_structured_prefill_value(extracted[key], item["schema"])
             merged = _merge_schema_draft(
                 values.get(key, _MISSING),
-                _unwrap_structured_prefill_value(extracted[key], item["schema"]),
+                proposed,
                 item["schema"],
             )
             if merged is not _MISSING:
                 values[key] = merged
+            if unmatched is not None:
+                outside = _choices_outside_options(proposed, item["schema"])
+                if outside:
+                    unmatched[key] = outside
     except Exception:
         logger.info(
             "Workspace Workflow structured input prefill fell back to defaults",
@@ -620,7 +731,7 @@ def validate_workspace_workflow_inputs(
     entrypoint: WorkspaceChatEntrypoint,
     values: Any,
 ) -> dict[str, Any]:
-    return validate_workflow_run_input_values(entrypoint.run_inputs, values)
+    return validate_workflow_run_input_values(entrypoint.run_inputs, values, rules=entrypoint.input_rules)
 
 
 class WorkflowRunInputError(ValueError):
@@ -657,9 +768,56 @@ def check_declared_workflow_run_inputs(
     ``target`` path in the merged run variables first, then the flat
     ``trigger_data`` key. Hidden inputs are server/chat-populated and skipped.
     """
-    run_inputs = [item for item in workflow_run_inputs(workflow) if not item.get("hidden")]
+    run_inputs, values = _declared_run_input_values(
+        workflow, variables=variables, trigger_data=trigger_data,
+    )
     if not run_inputs:
         return
+    # Hidden inputs are filled by the server or chat, so only rules over visible inputs apply here.
+    visible = {str(item["key"]) for item in run_inputs}
+    rules = [rule for rule in workflow_run_input_rules(workflow) if set(input_rule_fields(rule)) <= visible]
+    try:
+        validate_workflow_run_input_values(run_inputs, values, rules=rules)
+    except ValueError as exc:
+        # The shared validator reports ``{input path: message}`` as JSON.
+        errors = json.loads(str(exc))
+        raise WorkflowRunInputError(errors, _run_input_labels(run_inputs)) from None
+
+
+async def check_declared_workflow_record_selections(
+    db: AsyncSession,
+    workflow: Any,
+    *,
+    variables: dict[str, Any] | None,
+    trigger_data: dict[str, Any] | None,
+    entity_id: str,
+    workspace_id: str | None,
+) -> None:
+    """Reject ``record_select`` keys that the input's record source no longer offers."""
+    from packages.core.services.workflow_record_source import record_selection_errors
+
+    run_inputs, values = _declared_run_input_values(
+        workflow, variables=variables, trigger_data=trigger_data,
+    )
+    errors = await record_selection_errors(
+        db, run_inputs, values, entity_id=entity_id, workspace_id=workspace_id,
+    )
+    if errors:
+        raise WorkflowRunInputError(errors, _run_input_labels(run_inputs))
+
+
+def _run_input_labels(run_inputs: Iterable[dict[str, Any]]) -> dict[str, str]:
+    return {str(item["key"]): str(item.get("label") or item["key"]) for item in run_inputs}
+
+
+def _declared_run_input_values(
+    workflow: Any,
+    *,
+    variables: dict[str, Any] | None,
+    trigger_data: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Visible run inputs and the values a run would read for them."""
+    run_inputs = [item for item in workflow_run_inputs(workflow) if not item.get("hidden")]
     merged = dict(_mapping(getattr(workflow, "variables", None)))
     merged.update(variables or {})
     flat = trigger_data if isinstance(trigger_data, dict) else {}
@@ -671,15 +829,7 @@ def check_declared_workflow_run_inputs(
             values[key] = value
         elif key in flat:
             values[key] = flat[key]
-    try:
-        validate_workflow_run_input_values(run_inputs, values)
-    except ValueError as exc:
-        # The shared validator reports ``{input path: message}`` as JSON.
-        errors = json.loads(str(exc))
-        raise WorkflowRunInputError(
-            errors,
-            {str(item["key"]): str(item.get("label") or item["key"]) for item in run_inputs},
-        ) from None
+    return run_inputs, values
 
 
 def apply_declared_run_input_values(
@@ -708,15 +858,42 @@ def apply_declared_run_input_values(
         root = target.split(".", 1)[0]
         if key in explicit or root in explicit:
             continue
-        parts = target.split(".")
-        current = result
-        for part in parts[:-1]:
-            nested = current.get(part)
-            nested = dict(nested) if isinstance(nested, dict) else {}
-            current[part] = nested
-            current = nested
-        current[parts[-1]] = deepcopy(trigger_data[key])
+        _set_variable_path(result, target, deepcopy(trigger_data[key]))
     return result
+
+
+def apply_declared_run_input_defaults(
+    workflow: Any,
+    merged_variables: dict[str, Any],
+    trigger_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fill each declared input the caller left out with its declared default.
+
+    The Run dialog submits every field pre-filled with its default; API, MCP
+    and chat starts may omit optional ones. Without this, nodes render the
+    literal ``{{key}}`` placeholder for an omitted input instead of its default.
+    """
+    flat = trigger_data if isinstance(trigger_data, dict) else {}
+    result = dict(merged_variables)
+    for item in workflow_run_inputs(workflow):
+        key = str(item["key"])
+        default = item.get("default")
+        target = str(item.get("target") or key)
+        if default is None or key in flat or _walk_variable_path(result, target)[0]:
+            continue
+        _set_variable_path(result, target, deepcopy(default))
+    return result
+
+
+def _set_variable_path(variables: dict[str, Any], target: str, value: Any) -> None:
+    parts = target.split(".")
+    current = variables
+    for part in parts[:-1]:
+        nested = current.get(part)
+        nested = dict(nested) if isinstance(nested, dict) else {}
+        current[part] = nested
+        current = nested
+    current[parts[-1]] = value
 
 
 def required_workflow_run_inputs_without_default(workflow: Any) -> list[str]:
@@ -733,10 +910,25 @@ def required_workflow_run_inputs_without_default(workflow: Any) -> list[str]:
     ]
 
 
+_URL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_BARE_HOST = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]\S*)?$", re.IGNORECASE)
+
+
+def with_url_scheme(value: str) -> str:
+    """People type www.example.com; a URL input means https://www.example.com."""
+    text = value.strip()
+    if _URL_SCHEME.match(text) or not _BARE_HOST.match(text.removeprefix("//")):
+        return text
+    return "https://" + text.removeprefix("//")
+
+
 def validate_workflow_run_input_values(
     run_inputs: Iterable[dict[str, Any]],
     values: Any,
+    *,
+    rules: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
+    run_inputs = tuple(run_inputs)
     provided = values if isinstance(values, dict) else {}
     result: dict[str, Any] = {}
     errors: dict[str, str] = {}
@@ -784,6 +976,8 @@ def validate_workflow_run_input_values(
                 value = json.loads(value)
             elif input_type == "string":
                 value = str(value).strip()
+                if isinstance(item.get("schema"), dict) and item["schema"].get("format") == "uri":
+                    value = with_url_scheme(value)
         except (TypeError, ValueError, json.JSONDecodeError):
             errors[key] = f"Enter a valid {input_type} value."
             continue
@@ -805,6 +999,9 @@ def validate_workflow_run_input_values(
             if validation_errors:
                 continue
         result[key] = value
+    if not errors:
+        labels = {str(item["key"]): str(item.get("label") or item["key"]) for item in run_inputs}
+        errors = input_rule_errors(rules, result, labels)
     if errors:
         raise ValueError(json.dumps(errors, ensure_ascii=False))
     return result
@@ -833,8 +1030,8 @@ def auto_routing_allowed(
         or str(manual_skill_refs or "").strip()
     ):
         return False
-    if re.search(r"(^|\s)@\S", str(message or "")):
-        return False
+    # A picked @mention arrives as ``agent_id`` (above). Text like "@nasa" is
+    # content -- social handles, emails -- and must not bypass the Workflows.
     if str(chat_mode or "").strip().lower() not in {"", "auto"}:
         return False
     if disable_tools or str(blocked_tools or "").strip():
@@ -947,6 +1144,7 @@ async def list_workspace_chat_entrypoints(
     user: Any | None = None,
     require_control: bool = False,
     include_unpublished: bool = False,
+    locale: str | None = None,
 ) -> list[WorkspaceChatEntrypoint]:
     if require_control:
         from packages.core.services.workspace_access import (
@@ -990,7 +1188,7 @@ async def list_workspace_chat_entrypoints(
         normalized
         for binding, workflow in rows
         if (normalized := normalize_chat_entrypoint(
-            binding, workflow, include_unpublished=include_unpublished,
+            binding, workflow, include_unpublished=include_unpublished, locale=locale,
         )) is not None
         and (not intent_only or normalized.intent_enabled)
     ]

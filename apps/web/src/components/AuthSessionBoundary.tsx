@@ -86,7 +86,8 @@ export default function AuthSessionBoundary() {
   useEffect(() => {
     if (!token) return;
     const claims = decodeAuthTokenClaims(token);
-    if (!claims || claims.typ === "impersonation") return;
+    // A scoped collaborator session renews through the parent page (embeddedSession).
+    if (!claims || claims.typ === "impersonation" || claims.typ === "collaborator_session") return;
 
     const renewForActivity = () => {
       if (token !== getAuthToken()) return;

@@ -147,6 +147,8 @@ async def test_deleted_workspace_folder_is_hidden_preserved_and_restored(
     visible_folder_ids = {folder["id"] for folder in tree}
     assert active["artifact_folder_id"] in visible_folder_ids
     assert deleted["artifact_folder_id"] not in visible_folder_ids
+    tree_by_id = {folder["id"]: folder for folder in tree}
+    assert tree_by_id[active["artifact_folder_id"]]["delete_blocked_by_workspace"] is True
 
     root_browse = (await client.get(
         "/api/v1/documents/browse",
@@ -545,3 +547,50 @@ async def test_child_logical_folder_resolves_to_workspace_storage(db_session) ->
     assert (await db_session.execute(
         select(DocumentFolder).where(DocumentFolder.id == root.id)
     )).scalar_one().name == "Design"
+
+
+@pytest.mark.asyncio
+async def test_run_archive_folders_list_by_title_but_keep_their_id_names(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from packages.core.models.task import Task
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    headers = await _register(client)
+    created = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Studio"})
+    assert created.status_code == 201, created.text
+    workspace = created.json()
+    entity_id, root = workspace["entity_id"], workspace["artifact_folder_id"]
+    task_id, run_id = generate_ulid(), generate_ulid()
+    workflow = WorkflowDefinition(entity_id=entity_id, name="Daily Publish")
+    db_session.add_all([
+        Task(id=task_id, entity_id=entity_id, workspace_id=workspace["id"], title="Launch teaser"),
+        workflow,
+    ])
+    await db_session.flush()
+    db_session.add(WorkflowRun(
+        id=run_id, workflow_id=workflow.id, entity_id=entity_id, workspace_id=workspace["id"],
+    ))
+    await db_session.commit()
+    task_folder, run_folder = [
+        await ensure_workspace_document_folder(
+            entity_id=entity_id, workspace_id=workspace["id"],
+            rel_path=f"Workspaces/_by_id/{root}/{archive}/{owner_id}/final.png",
+        )
+        for archive, owner_id in (("tasks", task_id), ("workflow", run_id))
+    ]
+
+    response = await client.get("/api/v1/documents/folders", headers=headers)
+    assert response.status_code == 200, response.text
+    listed = {folder["id"]: folder for folder in response.json()}
+    assert listed[task_folder]["name"] == task_id
+    assert listed[task_folder]["display_name"] == f"Launch teaser ({task_id[-6:]})"
+    assert listed[run_folder]["display_name"] == f"Daily Publish ({run_id[-6:]})"
+    assert listed[root]["display_name"] is None
+    # Physical paths still resolve from the canonical (ID) folder names.
+    binding = await resolve_workspace_folder_binding(
+        db_session, entity_id=entity_id, folder_id=task_folder,
+    )
+    assert binding.relative_parts == ("tasks", task_id)

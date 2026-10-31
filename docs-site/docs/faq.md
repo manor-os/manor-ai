@@ -46,10 +46,12 @@ pgvector, Redis, MinIO, and the execution sandbox. Start with the
 
 Manor AI is **source-available**, not OSI-approved open source. Its public
 source is available under the
-[Manor Sustainable Use License 1.0](https://github.com/manor-os/manor-ai/blob/main/LICENSE).
-The license permits self-hosting and modification for allowed uses, while
-restricting resale, white-labeling, and competing hosted services. Use the
-complete license text as the authority.
+[Sustainable Use License 1.0](https://github.com/manor-os/manor-ai/blob/main/LICENSE).
+It permits internal business, personal and non-commercial use and modification.
+Distribution or provision to others must be free of charge for non-commercial
+purposes; commercial hosted access requires a separate agreement. Preserve
+required notices and identify modifications. Trademark permissions are separate;
+the complete license text governs software use and distribution.
 
 ## Is Manor AI an AI agent framework?
 
@@ -118,6 +120,13 @@ docker compose up --build -d
 
 Then open `http://localhost:18080`. Replace default secrets before sharing a
 deployment or using real data.
+
+## Where can self-hosted users get support?
+
+Use [GitHub Discussions](https://github.com/manor-os/manor-ai/discussions) for
+community questions and [GitHub Issues](https://github.com/manor-os/manor-ai/issues)
+for reproducible bugs. The app's Community support link opens Discussions.
+Manor Cloud's hosted support-ticket inbox is not included in the self-hosted edition.
 
 ## What is the canonical source for Manor AI facts?
 

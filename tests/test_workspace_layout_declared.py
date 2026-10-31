@@ -24,7 +24,6 @@ WRITER_GLOBS = (
     "packages/core/ai/tools/generate_file/*.py",
     "packages/core/ai/runtime/generated_files.py",
     "packages/core/tasks/media_tasks.py",
-    "packages/core/workers/internal.py",
 )
 
 

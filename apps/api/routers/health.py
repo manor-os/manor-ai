@@ -116,7 +116,6 @@ async def client_config():
         "flows_available": _feature_available("FLOWS_AVAILABLE", environment),
         "flows_released": _feature_available("FLOWS_RELEASED", environment),
         "ai_credits_unlimited": not ai_credit_limits_enabled(),
-        "support_tickets_enabled": deployment_mode.lower() == "cloud",
     }
     return config
 
@@ -224,7 +223,7 @@ async def deep_health():
 
 @router.get("/health/ready")
 async def readiness():
-    """Kubernetes readiness probe — verifies DB connectivity."""
+    """Readiness probe — verifies DB connectivity."""
     probe = await _probe_database()
     if probe.ready:
         return {"ready": True}

@@ -14,17 +14,32 @@ POST /api/v1/oauth/authorize
 
 POST /api/v1/oauth/token
     No auth header. Standard OAuth 2.0 form-encoded or JSON body.
-    Body: { grant_type=authorization_code, code, client_id, client_secret, redirect_uri, code_verifier? }
-    Returns: { access_token, token_type, expires_in, scope, user }
+    Body: { grant_type=authorization_code, code, client_id, client_secret?, redirect_uri, code_verifier? }
+       or { grant_type=refresh_token, refresh_token, client_id }   (public clients)
+    Returns: { access_token, token_type, expires_in, scope, user, refresh_token? }
+
+POST /api/v1/oauth/register
+    RFC 7591 dynamic registration of a public PKCE client (native MCP clients).
+    Unauthenticated and always rate-limited per client IP.
+
+GET    /api/v1/oauth/connections
+DELETE /api/v1/oauth/connections/{id}
+    Authenticated. The current user's live sign-ins from public clients (one per
+    refresh-token family) and revocation of one of them.
+
+GET /.well-known/oauth-authorization-server   (RFC 8414, see oauth_metadata.py)
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+from datetime import datetime
 from typing import List, Optional
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +47,7 @@ from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services import oauth_provider_service as svc
 from apps.api.deps import get_current_user
+from apps.api.middleware.rate_limit import RateLimiter, client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +64,10 @@ class ClientInfo(BaseModel):
     allowed_scopes: List[str]
     require_pkce: bool = False
     require_verified_email: bool = False
+    # False for self-registered clients: their name is unverified.
+    verified: bool = True
+    # Answer for the ``redirect_uri`` query parameter, when one was sent.
+    redirect_uri_allowed: Optional[bool] = None
 
 
 class AuthorizeRequest(BaseModel):
@@ -68,12 +88,17 @@ class AuthorizeResponse(BaseModel):
 
 class TokenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    grant_type: str = Field(..., description="must be 'authorization_code'")
-    code: str
+    grant_type: str = Field(..., description="'authorization_code' or 'refresh_token'")
     client_id: str
-    client_secret: str
-    redirect_uri: str
+    client_secret: Optional[str] = None
+    code: Optional[str] = None
+    redirect_uri: Optional[str] = None
     code_verifier: Optional[StrictStr] = None
+    refresh_token: Optional[str] = None
+    # RFC 8707 resource indicator. The audience is fixed per client, so this is
+    # accepted for compatibility and not used to widen it.
+    resource: Optional[str] = None
+    scope: Optional[str] = None
 
 
 class TokenUserInfo(BaseModel):
@@ -91,6 +116,7 @@ class TokenResponse(BaseModel):
     expires_in: int
     scope: str = ""
     user: TokenUserInfo
+    refresh_token: Optional[str] = None
 
 
 def _unique_parameters(pairs):
@@ -130,6 +156,7 @@ async def _authorize_body(request: Request) -> AuthorizeRequest:
 @router.get("/clients/{client_id}", response_model=ClientInfo)
 async def get_client_info(
     client_id: str,
+    redirect_uri: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
     client = await svc.get_client_by_id(db, client_id)
@@ -143,7 +170,106 @@ async def get_client_info(
         allowed_scopes=client.allowed_scopes or [],
         require_pkce=bool(client.require_pkce),
         require_verified_email=bool(client.require_verified_email),
+        verified=client.registration_source != svc.REGISTRATION_SOURCE_DYNAMIC,
+        redirect_uri_allowed=(
+            None if redirect_uri is None else svc.validate_redirect_uri(client, redirect_uri)
+        ),
     )
+
+
+# ── /register (RFC 7591) ──
+
+# Registration is unauthenticated, so it is always limited per IP — independent
+# of the global RATE_LIMIT_ENABLED switch. A coding agent registers once per
+# install; retries and a few machines behind one NAT stay well under this.
+REGISTER_RATE_LIMIT = int(os.getenv("MANOR_OAUTH_REGISTER_RATE_LIMIT", "20"))
+REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("MANOR_OAUTH_REGISTER_RATE_WINDOW_SECONDS", "3600"))
+_register_limiter = RateLimiter(redis_enabled=True)
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register_client(request: Request, db: AsyncSession = Depends(get_db)):
+    """Self-register a public PKCE client. Its tokens only reach the MCP endpoint."""
+    decision = await _register_limiter.check(
+        f"oauth-register:{client_ip(request)}", REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS,
+    )
+    if not decision.allowed:
+        retry_after = str(decision.retry_after or REGISTER_RATE_WINDOW_SECONDS)
+        return _oauth_error("too_many_requests", status.HTTP_429_TOO_MANY_REQUESTS,
+                            "too many client registrations from this address",
+                            headers={"Retry-After": retry_after})
+    try:
+        metadata = json.loads(await request.body())
+    except ValueError:
+        metadata = None
+    if not isinstance(metadata, dict):
+        return _oauth_error("invalid_client_metadata", status.HTTP_400_BAD_REQUEST, "body must be a JSON object")
+    try:
+        client = await svc.register_dynamic_client(db, metadata)
+    except svc.ClientRegistrationError as e:
+        return _oauth_error(e.code, status.HTTP_400_BAD_REQUEST, e.description)
+    await db.commit()
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        headers={"Cache-Control": "no-store"},
+        content={
+            "client_id": client.client_id,
+            "client_id_issued_at": int(client.created_at.timestamp()) if client.created_at else None,
+            "client_name": client.name,
+            "redirect_uris": client.redirect_uris,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+
+
+def _oauth_error(
+    code: str, status_code: int, description: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> JSONResponse:
+    # ``detail`` keeps the historical FastAPI error shape for existing clients.
+    body = {"error": code, "detail": code}
+    if description:
+        body["error_description"] = description
+    return JSONResponse(status_code=status_code, content=body,
+                        headers={"Cache-Control": "no-store", **(headers or {})})
+
+
+# ── Connected clients (the current user's sign-ins from public clients) ──
+
+class ConnectedClient(BaseModel):
+    id: str  # refresh-token family
+    client_id: str
+    name: str
+    verified: bool
+    entity_id: str
+    connected_at: datetime
+    last_used_at: datetime
+    expires_at: datetime
+
+
+@router.get("/connections", response_model=List[ConnectedClient])
+async def list_connections(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Coding agents (and other public clients) that can still refresh as this user."""
+    return [ConnectedClient(**row) for row in await svc.list_connected_clients(db, user)]
+
+
+@router.delete("/connections/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_connection(
+    connection_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke one connection. Other connections and the browser session are untouched."""
+    if not await svc.revoke_connected_client(db, user, connection_id):
+        await db.rollback()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown connection")
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ── /authorize ──
@@ -209,26 +335,49 @@ async def token(
     """OAuth 2.0 token endpoint. Accepts JSON body OR application/x-www-form-urlencoded."""
     body = await _protocol_body(request, TokenRequest)
 
-    if body.grant_type != "authorization_code":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unsupported_grant_type")
-
     try:
-        result = await svc.exchange_code_for_token(
-            db,
-            code=body.code,
-            client_id=body.client_id,
-            client_secret=body.client_secret,
-            redirect_uri=body.redirect_uri,
-            code_verifier=body.code_verifier,
-        )
+        if body.grant_type == "authorization_code":
+            if not body.code or not body.redirect_uri:
+                return _oauth_error("invalid_request", status.HTTP_400_BAD_REQUEST)
+            result = await svc.exchange_code_for_token(
+                db,
+                code=body.code,
+                client_id=body.client_id,
+                client_secret=body.client_secret,
+                redirect_uri=body.redirect_uri,
+                code_verifier=body.code_verifier,
+            )
+        elif body.grant_type == "refresh_token":
+            if not body.refresh_token:
+                return _oauth_error("invalid_request", status.HTTP_400_BAD_REQUEST)
+            result = await svc.refresh_access_token(
+                db,
+                refresh_token=body.refresh_token,
+                client_id=body.client_id,
+                client_secret=body.client_secret,
+            )
+        else:
+            return _oauth_error("unsupported_grant_type", status.HTTP_400_BAD_REQUEST)
         await db.commit()
+    except svc.RefreshTokenReuse as e:
+        await db.commit()  # persist the family revocation
+        return _oauth_error(str(e), status.HTTP_400_BAD_REQUEST)
     except ValueError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+        await db.rollback()
+        return _oauth_error(str(e), status.HTTP_400_BAD_REQUEST)
 
-    return TokenResponse(
+    response = TokenResponse(
         access_token=result["access_token"],
         token_type=result["token_type"],
         expires_in=result["expires_in"],
         scope=result["scope"],
         user=TokenUserInfo(**result["user"]),
+        refresh_token=result.get("refresh_token"),
+    )
+    content = response.model_dump()
+    if content["refresh_token"] is None:
+        del content["refresh_token"]
+    return JSONResponse(
+        content=content,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )

@@ -28,8 +28,8 @@ flowchart TB
     S["Strategist review"]
     P["Proposal cohort and governance"]
     T["Task instance"]
-    PL["Planner and execution plan"]
-    D["Plan executor / dispatcher / worker lease"]
+    PL["Task agent loop (TaskCoordinatorRun)"]
+    D["Agent tools, delegation, worker-job leases"]
     H["HITL approval or user input"]
     F["Workspace Flow / Workflow runtime"]
     A["Artifact capture and Knowledge projection"]
@@ -74,7 +74,7 @@ flowchart TB
 
 The solid arrows are business-state transitions. The dotted credit edges are
 cross-cutting controls. Governance is also cross-cutting: Proposal approval,
-Plan/Step approval, Workflow action approval, and direct chat tool approval
+Task agent-loop tool approval, Workflow action approval, and direct chat tool approval
 share policy concepts but have different execution origins and resume paths.
 
 ## End-to-end operating loop
@@ -86,8 +86,8 @@ sequenceDiagram
     participant Strategist
     participant Governance
     participant Task
-    participant Executor
-    participant Worker
+    participant Loop as Task agent loop
+    participant Worker as Agents and tools
     participant Knowledge
     participant Evaluation
 
@@ -97,20 +97,22 @@ sequenceDiagram
     Strategist->>Governance: Proposal with Task/workflow/change items
     Governance-->>Strategist: allow / needs_human / deny
     Governance->>Task: approved ProposedTask becomes executable Task
-    Task->>Executor: validated Plan and materialized Steps
-    Executor->>Worker: dispatch one runnable WorkLease
-    Worker-->>Executor: result / failure / needs_human
-    Executor->>Executor: validate envelope, refs, output, approval, retries
-    Executor->>Knowledge: project materialized artifact references
+    Task->>Loop: start intent (outbox) claims one TaskCoordinatorRun wake
+    Loop->>Worker: own tool calls or delegate_to_agent
+    Worker-->>Loop: tool receipts / child results / approval or input park
+    Loop->>Loop: update_task_plan, checkpoint every round, self-verify
+    Loop->>Knowledge: complete_task with host-verified deliverables
     Knowledge-->>Task: Document id, viewer URL, canonical artifact reference
     Task->>Evaluation: terminal status and execution evidence
     Evaluation-->>Strategist: goal impact, outcomes, learning, next review context
 ```
 
 This is the autonomous Task path. A Workflow can be launched directly by the
-user, scheduler, event, or Proposal; it does not become a Task Plan. Workflow
-nodes execute inside `WorkflowRun`, while Task steps execute inside
-`ExecutionPlan` and `ExecutionStep` through the Dispatcher.
+user, scheduler, event, or Proposal; it does not become a Task. Workflow
+nodes execute inside `WorkflowRun`, while a Workspace Task executes as one
+durable agent loop on its `TaskCoordinatorRun`. `ExecutionPlan`/`ExecutionStep`
+rows and the Dispatcher now carry only external worker jobs (local CLI actions,
+Claude Code/remote coding, local worker), which have no Task.
 
 ## State ownership map
 
@@ -126,7 +128,8 @@ nodes execute inside `WorkflowRun`, while Task steps execute inside
 | Strategist behavior constraints | `operating_model.strategist` | Workspace | Yes |
 | Proposal cohort and decisions | Proposal records, proposed `Task` rows | Runtime | No |
 | Task | `Task` | Workspace or entity | No |
-| Plan and Step | `ExecutionPlan`, `ExecutionStep` | Task/runtime | No |
+| Task run | `TaskCoordinatorRun` (engine `agent_loop`: checkpoint, claim, wake generation), delegated `TaskAgentChildRun` | Task/runtime | No |
+| Worker-job Plan and Step | `ExecutionPlan`, `ExecutionStep` (external worker jobs only; no Task) | Runtime | No |
 | Worker lease | `WorkLease` | Step/runtime | No |
 | Workflow definition | `WorkflowDefinition` | Workspace or entity | Yes when Workspace-owned/bound |
 | Workflow deployment | `WorkflowBinding` | Workspace | Yes |
@@ -349,6 +352,16 @@ Discard, rollback and target identity; native persisted-file reloads report thei
 actual saved state separately. Stopped or failed previews never become successful
 editor steps, and temporary conversation cleanup retains its owner scope.
 
+History compaction treats the summary length target as advisory. A complete,
+validated checkpoint may exceed it only when its actual packed request,
+including tools, ledger, archive notes and reserved output, fits the model
+window; intermediate summaries also leave the next batch full output headroom.
+Invalid, truncated or oversized checkpoints allow one shorter regeneration from
+the same records and previous valid checkpoint. Every completed attempt retains
+the configured model/BYOK route and usage. Failed recovery keeps original history
+only when that history and reserved output still fit; otherwise it fails closed.
+This WS-02 recovery policy changes no approval, lifecycle or Blueprint state.
+
 History compaction checks cancellation between preparation stages and during
 summary model waits. A cancelled turn drains the pending model request, retains
 completed usage, and publishes the interrupted Message and cancelled stream
@@ -387,7 +400,7 @@ with incomplete bindings need an explicit scoped configuration change.
 
 The authenticated user's saved `User.locale` also supplies the default language
 for generated answers, progress, titles, summaries, and artifact text. Runtime
-prompt assembly, one-shot generation, Planner, and Task calls share that rule;
+prompt assembly, one-shot generation, and Task agent-loop calls share that rule;
 nested Agent work inherits its parent turn's language. A later turn or resume
 reads the current preference. Explicit output/recipient language and external
 customer/channel audiences retain their own language contract; machine keys,
@@ -464,7 +477,7 @@ diagnostics expose field paths, schema expectations and parse coordinates, not
 secret input values. The runtime never repairs arguments or guesses an action:
 normal, forced and resumed loops return evidence for the model to correct the
 next call within existing permissions and budgets. Uncertain prior writes still
-require reconciliation. Input, Plan, acceptance, artifact and draft validators
+require reconciliation. Input, Task completion, artifact and draft validators
 use the common diagnostic constructor; they keep exact causes and constraints,
 not executable repair recipes. Provider `recommended_next_calls` are observations,
 never automatically scheduled calls or authorization to load MCP schemas.
@@ -489,10 +502,10 @@ and representational-action classifications. Missing or changed proof, locator,
 or argument hash fails before policy evaluation; an invalid continuation cannot
 fall through to a broader ordinary-action allow rule. The approval card projects
 the observed target label without changing the frozen call or its hash.
-The separate Planner loop uses the same model projection and reports malformed
-arguments instead of substituting an empty object. Pydantic diagnostics exclude
-input values. Delivery snapshot retries are reserved for `artifact_busy`;
-non-retryable failures retain their original code and cause for the coordinator.
+Pydantic diagnostics exclude input values. When `complete_task` verifies a
+deliverable, only `artifact_busy` (the file is being written) may fall back to
+the run's receipt; other verification failures keep their original code and
+cause and return to the same Task agent loop as a preflight refusal.
 These are run-local contracts, not Blueprint state,
 extra grants, lifecycle changes or changes to credit accounting.
 
@@ -593,8 +606,14 @@ extra grants, lifecycle changes or changes to credit accounting.
   through a pinned-size/hash attachment after a succeeded claim receipt.
   Folder identity remains stable after room rename. Existing personal or
   Workspace Knowledge never becomes readable through a group file tool.
-  Member-uploaded and Knowledge-copied group files are limited to 100 MiB each
-  and 500 MiB of retained inline bytes per room. Those copies count toward the
+  Member-uploaded and Knowledge-copied group files are limited to 1 GiB each
+  and 10 GiB of retained room copies per room. Copies above 100 MiB use
+  immutable 4 MiB database chunks with a pinned size/hash and parent-delete
+  cascade; existing inline copies remain readable. Batch downloads admit up to
+  100 visible files totaling 5 GiB, prepare ZIP64 archives on bounded private
+  temporary disk, then stream after revalidating current room authority.
+  Exact-selection download tickets expire within ten minutes and never
+  outlive the initiating credential. Those copies count toward the
   owning Entity's Knowledge storage plan: a personal room uses its owner's
   primary Entity, and an Entity room uses its owning Entity. The copied bytes
   count separately from a source Knowledge Document; generated group Documents
@@ -1160,420 +1179,260 @@ requests, and Workspace changes may proceed.
   has explicitly taken ownership. Already-started Tasks and historical approval
   decisions are never rewound to manufacture an actionable approval card.
 
-### WS-06: Task lifecycle and planning
+### WS-06: Task lifecycle and agent-loop runtime
 
-Purpose: turn an approved execution Task's business contract into a validated
-executable Plan DAG, while keeping an `interactive` Task on its task-scoped
-conversation runtime rather than dispatching it as background Plan work.
+Purpose: route an approved execution Task to exactly one runtime and run a
+Workspace Task as one durable agent loop that owns it end to end, while keeping
+an `interactive` Task on its task-scoped conversation runtime rather than
+dispatching it as background work. The retired Plan/Step DAG engine (Planner,
+Plan executor, Plan cycles, Step coordinator) no longer runs any Task;
+`docs/TASK_AGENT_EXECUTION_ZH.md` is the runtime reference.
 
-Planner platform-tool discovery resolves each allowed service through the same
-Workspace runtime as its subagent worker, including the exact deployment,
-requester, Task and surface. Native platform schemas identify a `subagent`
-execution path; they are never fabricated provider/action bindings. Service
-scopes remain distinct when one Agent serves multiple roles, and ambiguous
-active deployments fail before planning. Materialized subagent steps carry
-their resolved deployment identity into context assembly; execution rechecks
-current authorization even when a prior plan or schema snapshot allowed a tool.
+Every Task enters the closed `TaskRuntimeKind` factory
+(`services/task_execution.py::resolve_task_execution`) independently from its
+extensible business `TaskType`. A Workspace Task whose service scope resolves
+to its subscriptions uses `COORDINATED_PLAN` (the name predates the engine's
+retirement; the value is persisted) and runs as the Task agent loop;
+interactive and approval Tasks use their typed foreground/HITL adapters; a
+Task assigned directly to an Agent outside a Workspace is `COORDINATED_PLAN`
+too, with an Agent-only selection (its personal hire when it names one) and a
+run whose `workspace_id` is NULL; an unresolved Workspace service scope is
+`MANUAL` and is rejected before an `in_progress` write. Custom Task type slugs therefore inherit the same
+background runtime instead of accidentally selecting a new engine. API start,
+status transition, Kanban, bulk, retry, and recovery all consume this same
+factory result; none re-derive routing from prose or a second string switch.
+An owner is optional for team Tasks; owner/delegate constraints, when present,
+remain authoritative.
 
-First execution and manual recovery share `services/task_execution.py` routing
-and the Planner's active Workspace subscription scope. An owner is optional for
-team Tasks; owner/delegate constraints, when present, remain authoritative.
-Recovery does not invent an owner from a historical Plan. It resumes valid
-checkpoints or starts the same Planner with prior outputs and tool receipts.
-Initial status dispatch waits for commit; rollback cannot enqueue new work.
-Recovery preserves old Plans and does not grant publication authority.
+Task start is a transactional outbox intent. Entering `in_progress` stages
+`runtime.dispatch_task_execution` for the Task's lifecycle generation in the
+same transaction (`stage_task_execution_intent`), so rollback cannot enqueue
+work. Its consumer rechecks that the start is still current and calls
+`ensure_task_coordinator_run`, which creates or reuses the Task's single
+`TaskCoordinatorRun` (unique per Task, engine `agent_loop`) and stages the run's
+own wake `runtime.dispatch_task_coordinator`. The run freezes the root
+subscription, root Agent, selection fingerprint and Task lifecycle generation;
+a replacement Workspace subscription never silently takes over an existing
+checkpoint. The wake is delivered to `runtime.run_task_agent_loop` on the HEAVY
+queue, and broker acceptance is not an ACK.
 
-Every Task enters the closed `TaskRuntimeKind` factory independently from its
-extensible business `TaskType`. Executable Workspace background Tasks use
-`COORDINATED_PLAN`; an existing Plan uses `PLAN_RESUME`; interactive and
-approval Tasks use their typed foreground/HITL adapters; a standalone assigned
-Agent is the only legacy-runner compatibility case; an unresolved or ambiguous
-Workspace service scope is `MANUAL` and is rejected before an `in_progress`
-write. Custom Task type slugs therefore inherit the same background runtime
-instead of accidentally selecting a new engine. API start, status transition,
-Kanban, bulk, retry, recovery, and Plan resume all consume this same factory
-result; none re-derive routing from prose or a second string switch.
+Every wake first admits `Workspace -> Task` in canonical lock order
+(`workers/task_run_host.admit_task_scope`). It defers without touching the
+claim when the Task is no longer in progress, when the Workspace does not allow
+work, when an automatic (not user-directed) Task meets a paused Workspace
+(`workspace_autonomy_paused`), and, while the Workspace's blocking Blueprint
+setup is incomplete, for every Task except the authorized setup Task
+(`workspace_setup_incomplete`); recovery redelivers the wake once the
+Workspace runs again. Setup authority comes only from
+`task_is_authorized_workspace_setup`: the protected Blueprint setup
+fingerprint, current ScheduledJob revision, live ScheduledJobRun child receipt
+and active AgentSubscription must all match; Task details and copied scheduler
+markers are lookup hints, never authority. Admission then resolves the factory
+with subscription locks, defers a stale lifecycle generation or a run frozen
+to another engine, and claims that exact wake generation with a fresh claim
+token (`claim_task_coordinator_wake`). No database lock or connection is held
+across provider I/O.
 
-Planner freezes one canonical, order-independent selection identity before
-provider I/O: the root plus every scoped service/subscription/Agent binding.
-It briefly locks the selected subscription rows to confirm that identity, then
-commits the read transaction before calling the provider. After the provider
-returns it reacquires `Workspace -> Task -> subscription` locks, recomputes the
-full identity, and rejects any owner, scope, subscription, or Agent drift before
-Plan/Step writes. The same expected identity crosses the public persistence
-gate and is checked once more there; folding and materialization use only those
-exact pinned IDs. No database lock or connection is held across provider I/O.
+One claimed wake runs the Task brief as the query of the shared Agent loop
+(`workers/task_agent_loop.py`, hosted by `workers/task_loop_host.py`). The Task
+runs as its requester; a system Task (Strategist, scheduler) runs as the
+Workspace's earliest active owner (`resolve_task_run_user_id`), and when no
+executable member exists the Task is BLOCKED with
+`agent_loop_requester_unavailable` rather than borrowing another identity. The
+loop sees its Agent's own bound tools plus the host controls
+`update_task_plan`, `complete_task`, `wait_until`, `wait_media_jobs`,
+`request_input`, `read_context_archive`, `delegate_to_agent`, and in Cloud
+`acquire_capabilities`. `update_task_plan` records model-authored items and
+acceptance criteria as a revisioned checkpoint slot and Task log line; it is
+not a DAG the server executes, and there are no Plan or Step rows. A heartbeat
+renews the claim while provider I/O runs, `fence_before_model` rechecks claim,
+Task lifecycle, Workspace and factory selection before every model call, and
+every round CAS-writes the checkpoint (transcript, evidence ledger, plan,
+counters) against `state_version`. A delivery yields at a round boundary after
+its time slice and re-stages its own wake; the next delivery resumes from the
+checkpoint. Delegation, parks and their wakes are described in WS-07/WS-08.
 
-The normal V3 Workspace Task owns one durable `TaskCoordinatorRun` outside its
-Plan. That Task-level Agent loop calls `plan_task`, `delegate_ready_steps`,
-`replan_task`, `inspect_task_delivery`, and `submit_task`; it does not run as a
-root `ExecutionStep`.
-Planning with the live TaskCoordinator claim persists the typed source DAG as
-Plan Steps, rather than folding it into a single Plan root. The coordinator
-releases dependency-ready Steps through the ordinary Plan executor (up to its
-bounded concurrency), observes their durable results, and can request a new
-Plan revision when a concrete failure warrants it. It does not silently mutate
-the executing DAG or treat model prose as Task completion. V3 submission must
-pass server-owned completion/evidence gates before Plan and Task settle.
-`replan_task` first attempts one bounded same-Plan repair of exhausted,
-effect-free Agent branches. It preserves completed siblings, their results,
-original receipts and file provenance; failed branches and never-executed
-successors return to PAUSED for explicit coordinator release. A host-pinned
-input/dependency digest must still match, cumulative attempts are not reset,
-and the exact control-call receipt makes replay idempotent. Own writer effects,
-unknown outcomes, HITL, executed descendants, missing legacy snapshots, and
-changed inputs remain fail-closed. This is not unrestricted structural DAG
-revision or permission to replay successful effects across Plans.
+The loop ends only through `complete_task(outcome=completed|blocked)`. The
+host (`workers/task_agent_loop_completion.py`) checks that the submission is
+coherent with what this run observably did: every acceptance criterion of the
+current plan has an answer, every deliverable is a receipt handle in this
+run's ledger or an existing readable Knowledge file in the Task's scope, every
+file deliverable was inspected after its last write, nothing the Task started
+is still running, and an unconfirmed effect is never reported as confirmed (it
+is listed as an exception, and without a verified delivery the Task is blocked
+for review). A failed check returns to the same loop as a preflight refusal
+without spending continuation budget. The fenced terminal write locks
+Workspace -> Task -> Run, requires the exact claim and wake generation, and
+commits status, `actual_output`, terminal log, artifacts, summary comment and
+run journal together; the `task.succeeded`/`task.failed` event is emitted after
+commit. A loop that stops without `complete_task` is re-woken a bounded number
+of times and then BLOCKED; repeated crashes on one wake generation block the
+run, while connection-level transient errors are redelivered without counting.
+This checks evidence coherence, not exhaustive semantic correctness: a model
+can still omit a requirement, so live content tests remain necessary.
 
-After Steps settle, the same V3 Task coordinator AgentLoop uses the read-only
-`inspect_task_delivery` tool to page through the verified manifest, Step
-results and actual scoped artifact text. It compares that evidence with every
-explicit original requirement and calls `submit_task` with a typed verdict,
-issue list, evidence digest and grounded checks. An old empty-argument call
-only returns a manifest; it cannot finish the Task. The host requires every
-evidence page to have been presented to this loop before accepting.
-An inspection result only counts after its tool round is checkpointed and
-presented to a subsequent model call; inspecting and submitting in one batch
-cannot claim the unseen result. A resumed wake keeps its persisted inspection
-marker separate from new pages for the same reason. Invalid
-assessment format, stale digest, or unsupported citations return actionable
-tool feedback inside the same loop, not `review_invalid` user HITL or a replay
-of successful Steps. A real content defect returns issues for a safe Task-level
-repair/replan decision. Binary or truncated artifact bytes have verified
-identity/hash but not fully visible semantic content; the coordinator must
-return unverifiable when an explicit quality requirement depends on unseen
-content. Temporary file-lock contention stages an exact, host-owned read retry
-without spending another model round or replaying a Step.
+Manual Retry (`services/task_retry_service.prepare_task_retry`) returns the
+Task to `in_progress` and stages a new start intent. `ensure_task_coordinator_run`
+reopens a stopped (failed or human-waiting) run under the new lifecycle
+generation, continuing its own transcript, and refuses while the prior
+lifecycle still has a live claim or a delegated child with a live claim. A
+paused loop (ready, running, or parked on a wait) is rebound on resume with its
+checkpoint intact. A run left by the retired engine was closed by migration
+`20261025_10_retire_plan_dag_task_runs` (Task BLOCKED with `runtime_migrated`);
+its retry switches the run to `agent_loop` and starts the loop fresh on the
+same Task. Retry does not rewrite artifacts, replay recorded effects or add
+authority. User cancellation or Task failure stops the run and its delegated
+children through `reconcile_terminal_task_coordinator_runs_once`.
 
-Delivery inspection has one provider/host argument contract: `kind/index/offset`
-address a page, while `pointer` is a nonempty canonical scalar citation only
-for `kind=evidence` and otherwise must be omitted or null. Static constraints
-run before snapshot reads; dynamic bounds and citation errors return the same
-`tool_error` with `path/schema_rule/expected`, not a silently repaired call.
-Missing inspection feedback includes typed page arguments as well as durable
-page IDs. The existing Runtime final-response contract rejects premature prose
-and returns those outstanding requirements to the same coordinator loop with
-its tools intact. It neither submits for the model nor grants execution authority.
-If bounded recovery still exhausts, the Task is BLOCKED and its Run is FAILED,
-not WAITING_HUMAN: the active Plan, DONE Steps and receipts remain available for
-an explicit same-Plan retry. The checkpoint/log retains the structured stop
-reason, exhausted budget and missing evidence. Only an explicitly admitted retry
-of that exact host-recorded failure renews coordinator round/continuation budget;
-it retains transcript, usage, observations and outcomes and cannot bypass a live
-claim/lease, pending human decision or unresolved effect. An automatic wake does
-not renew the budget. A later terminal Task transition still reconciles
-that failed Run's active Plan; no orphan execution survives cancellation.
-
-The manifest carries the original request, every Step/result (small results
-inline), artifact identity, and the Plan's acceptance criteria. Long request,
-criterion, and Step JSON navigation pages use offsets measured after JSON
-escaping; artifact text pages use original text offsets. Step pages advertise
-bounded, paged canonical scalar-leaf citation pointers, while an on-demand
-evidence page shows the selected leaf's decoded original text (or JSON scalar)
-and uses offsets in that value. The inspection and submission paths resolve
-these pointers through one strict delivered-evidence resolver; a Step's
-`result_pointer` labels its container location, not a text quotation target.
-Each required tool result counted as inspected is actually visible. Each
-accepted Plan criterion needs a grounded check using its unique check_id and
-evidence from its declared Step or that Step's verified artifact. Negative
-verdicts also require complete inspection before they can drive a replan.
-
-No database transaction is held across model turns; final submission locks
-Workspace -> Task -> deployment subscriptions -> Plans -> leases -> Steps ->
-Run, resolves the current factory, and checks the claim plus exact acceptance
-digest again. Requirement, output, file, lifecycle, or selection drift cannot
-reuse a stale acceptance. Only the existing server finalizer writes terminal
-status; this does not introduce a second Supervisor, new approval authority,
-or an infallible content oracle.
-Accepted content assessments additionally cite exact values using JSON
-Pointers into the supplied Step results or actual artifact text. Text uses
-literal contiguous excerpts; a container citation must be complete valid JSON
-equal to the entire pointed value, preserving types and array order. Partial
-objects, duplicate keys, double-escaped strings and non-finite numbers cannot
-stand in for container evidence. The host
-validates every nonempty quote before minting acceptance, and persists these
-checks with the final snapshot digest. Task prompts, schemas, imagined SSE
-responses and nonexistent fields cannot supply that proof. This checks citation
-grounding and evidence-page visibility, not exhaustive semantic correctness: a model can still omit a
-requirement or misinterpret a real quote, so live content tests remain necessary.
-V3 read-time Task status reconciliation also requires the Plan's persisted
-accepted assessment and completed verdict; mechanical Plan completion alone
-cannot synthesize accepted Task delivery.
-Read-only artifact `submit_result` validation failures before terminal capture
-use host-typed preflight feedback, allowing normal/forced/resumed loops to read
-and correct mismatched references within the same Step attempt. Ordinary tool
-JSON cannot mint that proof; verification never settles an unknown effect.
 Formal Task output rendering preserves business fields beside file references,
 including custom summary fields, rather than treating a file list as the entire
 delivery. Internal receipts remain hidden from this user-facing summary.
 
-Planner's initial delegation catalog contains allowed service keys and each
-Agent's short `description`, never its private `system_prompt` or a dump of its
-tools. `get_agent_schema` resolves one uniquely active service deployment and
-returns the shared `prompt` input contract, per-Step output declaration
-(`output_shape` or exact `expected_output_schema`), and a capability summary
-derived from that deployment's real callable tool/MCP/Skill scope. The summary
-does not grant execution authority. `get_task_context` retrieves one named
-Task input or the document/staff index on demand; binding user constraints,
-required Plan steps, and replan evidence remain visible without exposing all
-of `Task.details` as a Planner prompt. Ordinary tool-using work routes to a
-subagent with its own Agent configuration; `llm` remains an explicit text-only
-contract.
+`delegate_to_agent` is offered only when the runtime's own authorization would
+allow it, and its schema names this Workspace's other deployed Agents
+(`runtime_specialize_delegate_to_agent`); it is dropped when there are none.
+A delegated Agent works with its own Agent configuration and bindings; the
+delegating loop's tool scope or a Task's `required_capabilities` never widen
+it. Task requirements are not grants.
 
-The Planner's `submit_plan` schema exposes exact canonical output-shape names,
-not prose or payload paths. Output declarations belong on the Step, alongside
-`kind` and `params`. Rejected contracts return the affected Step and field path
-with concrete repair choices in the same planning conversation; the Runtime
-never chooses a missing contract or relaxes its completion checks. The unique
-terminal Step may still inherit an enforceable Task output schema.
-Canonical shapes are appropriate only when their required fields cover the
-requested deliverable. A file plus a requested summary or exact metadata fields
-requires a matching custom schema; putting those duties solely in the prompt
-or control-layer summary does not make them part of the delivered payload.
+Run wakes share the durable-run contract (`services/durable_run.py`): each
+wake carries an opaque generation, a newer wake never steals a live claim, and
+only the generation-matched owner can settle (ACK) its wake or stage the next
+one. A stale owner that lost its claim writes nothing more. The periodic
+`runtime.task_coordinator_recovery` sweep (`tasks/runtime_tasks.py`) restages
+lost wakes, wakes timed parks only when due, settles child batches, and
+reconciles runs of terminal Tasks.
 
-The V2 compatibility coordinator fold has one logical root Step, not one
-physical unit of work. Persistence expands every checklist item into a dormant
-typed child `ExecutionStep`; thus a source DAG with `N` items materializes as
-`1 + N` rows. Each child keeps the original kind
-(`llm`, `subagent`, `action`, `human`, or `sleep`), service/provider/action,
-input/output schema, dependencies, risk, expected evidence, approval contract,
-and retry policy. Stable root/item identity determines one child key and one
-delegation idempotency lineage across retry, pause, and resume. The model calls
-`delegate_to_service` with only the checklist item key; server state selects
-and validates the exact child, so model prose cannot replace or retarget its
-contract. Unsupported executor kinds fail planning instead of silently falling
-back to a different runtime.
-
-The V2 compatibility execution handshake is durable and capacity-safe:
-
-1. The root Agent loop selects a checklist item. Under the live parent fence,
-   Runtime locks the Plan steps, validates dependencies and the immutable
-   source contract, resolves references from completed typed children, and
-   releases exactly that dormant child.
-2. Runtime checkpoints the root's pending tool call, marks its current lease
-   `suspended`, clears the execution claim and credential leases, and parks the
-   root Step. Waiting for child work consumes no worker slot and no root retry.
-3. The released child enters the ordinary executor for its original kind.
-   Actions retain approval/effect receipts, `human` retains exact HITL resume,
-   `sleep` retains a durable wake deadline, and Agent steps retain the shared
-   multi-round Chat Agent loop and checkpoints. A folded `llm` child also uses
-   that durable loop for continuation and schema repair, but exposes only
-   `request_input` and `submit_result`, preserving its text-only authority.
-4. A terminal child wakes only its exact parked root. The new root lease
-   resumes the saved pending tool call, replays the child's durable typed
-   envelope, and records a handoff ACK before another item or final submission.
-5. Final submission is accepted only after every checklist contract is
-   terminal and ACKed; artifact/evidence validation, model Supervisor review,
-   Plan settlement, and Task settlement remain the V2 WS-07/WS-10 paths.
-
-Both new Workspace Task Plan API paths admit a durable Task Plan submission
-and return an asynchronous receipt; only a claimed V3 TaskCoordinatorRun may
-consume it and persist the source DAG. Existing materialized V2 Plans retain
-their resume path, while taskless and legacy entity-level Plan creation keep
-their separate API compatibility path.
-Receipt reuse is limited to the same `in_progress` Task generation's admission
-window. A deterministic manual DAG validation failure marks the receipt
-`rejected` and the Task `blocked` in one claim-fenced transaction. Only when
-that receipt is latest, no Plan exists, and the Task coordinator has no live
-claim can a different authored DAG atomically retry the Task and create a new
-`pending` receipt; the ordinary retry effect and approval gates still apply.
-
-Workspace Task admission and Plan continuation use two distinct transactional
-outbox boundaries. Entering `in_progress` stages a Task-generation intent in
-the same transaction; only its consumer may start the Planner after rechecking
-the current runtime factory, routing identity, and absence of a live Plan.
-After Plan creation, every runnable state transition stages one stable
-Plan-cycle outbox row whose payload carries an opaque wake generation. Delivery
-is publisher -> control consumer -> heavy executor, and broker acceptance at
-either hop is not an ACK. Only a committed executor cycle may compare-and-ACK
-that exact generation or atomically replace it with the next due generation.
-The heavy executor first acquires a Plan-wide generation claim, so even a
-concurrent redelivery with the same broker task identity cannot enter the
-business cycle twice. Both handoff stages enforce the row's not-before time;
-same-generation delayed messages cannot bypass a later busy/supervisor backoff.
-Normal `schedule_self` writes its successor generation in the same transaction
-as Plan/Step state, while outer settlement closes only the prior claim. A
-separate lower-frequency, advisory-locked, bounded `SKIP LOCKED` sweep
-reconstructs missing wakes for runnable non-terminal Plans with no live lease.
-The publisher reserves symmetric batch capacity for Plan and non-Plan events
-before filling unused capacity by due order. Each quota query has a matching
-partial due index, and its fixed event category is emitted as a SQL literal so
-PostgreSQL can prove the partial-index predicate under prepared statements.
-Generationless direct-queue and Redis-reservation helpers are removed, and the
-HEAVY executor fails closed without the exact event/generation pair. Recovery
-indexes are built concurrently and repair interrupted invalid builds so
-migration does not block the high-write orchestration tables.
-
-Concurrency is fenced at several independent boundaries: one non-terminal Plan
-per Task, a renewable planning claim around provider work, the exact selection
-fingerprint before/after provider I/O and at persistence, Task/Plan/Step row
-revalidation at persistence and release, database uniqueness for one active
-lease per Step, execution-claim ownership on worker completion, stable child
-idempotency, Task lifecycle generation, Plan wake generation, and deterministic
-lock ordering within each mutation family. Task- and Plan-facing retry surfaces
-re-enter the same factory and compare the Plan/root/child subscription pins
-before resetting any state. Duplicate deliveries may resume or replay committed
-state, but cannot create another child, widen or silently replace service scope,
-hold parent capacity while waiting, or repeat an evidenced effect.
+Concurrency is fenced at several independent boundaries: one
+`TaskCoordinatorRun` per Task (database uniqueness), Task lifecycle generation,
+frozen root selection fingerprint, wake generation plus claim token, the
+before-model fence, the round checkpoint's `state_version` CAS, one live
+delegated run per Agent per Task, and deterministic `Workspace -> Task -> Run
+-> child` lock ordering. Duplicate deliveries may resume committed state, but
+cannot start a second run, widen or silently replace service scope, or repeat
+an evidenced effect.
 
 - Code entry: `packages/core/models/task.py`,
   `packages/core/services/task_state_machine.py`,
   `packages/core/services/task_service.py`,
   `packages/core/services/task_execution.py`,
-  `packages/core/plans/planner.py`,
-  `packages/core/plans/coordinator.py`,
   `packages/core/models/task_coordinator.py`,
-  `packages/core/models/task_plan_submission.py`,
-  `packages/core/services/task_plan_submission.py`,
   `packages/core/services/task_coordinator_wakeup.py`,
-  `packages/core/services/task_coordinator_steps.py`,
-  `packages/core/workers/task_coordinator.py`,
-  `packages/core/plans/schema.py`, `packages/core/plans/service.py`,
-  `packages/core/plans/wakeup.py`, `packages/core/tasks/runtime_tasks.py`,
-  `apps/api/routers/plans.py`, and Task dispatch functions in
-  `packages/core/tasks/ai_tasks.py`.
+  `packages/core/services/durable_run.py`,
+  `packages/core/workers/task_run_host.py`,
+  `packages/core/workers/task_loop_host.py`,
+  `packages/core/workers/task_agent_loop.py`,
+  `packages/core/workers/task_agent_loop_completion.py`,
+  `packages/core/services/task_agent_loop_state.py`,
+  `packages/core/services/task_requester_identity.py`,
+  `packages/core/services/task_retry_service.py`,
+  `packages/core/services/task_terminal_events.py`,
+  `packages/core/services/task_capability_recovery.py`,
+  `packages/core/tasks/runtime_tasks.py`, Task dispatch functions in
+  `packages/core/tasks/ai_tasks.py`, and migration
+  `packages/core/migrations/versions/20261025_10_retire_plan_dag_task_runs.py`.
 - State: `Task` (including a dedicated `status_changed_at` lifecycle clock),
-  dependency links, expected output/deliverables, runtime capabilities,
-  Task-bound Plan submission/consumption state, `TaskCoordinatorRun`,
-  `ExecutionPlan`, materialized `ExecutionStep` rows, and the renewable
-  Task-planning execution claim.
-- Success invariant: Task status transitions are legal; the Plan is acyclic;
-  one Task has at most one non-terminal Plan across Planner, worker, and manual
-  persistence entrypoints; a Plan generated while its Task inputs change is
-  discarded before persistence. API and worker planning share one durable
-  Task-level claim through provider work and the fenced Plan commit, so a
-  duplicate request cannot enter the billable Planner path. A delivery that
-  rediscovers a committed non-terminal Plan republishes that exact Plan rather
-  than acknowledging it without dispatch. Planning failure locks Workspace then
-  Task and cannot replace a Task state backed by a committed active Plan;
-  service keys remain within owner/delegate scope; hard Task output is bound to
-  exactly one terminal producer step; dependencies block until predecessor
-  evidence is available. Provider actions and schemas are derived only from
-  accounts callable by the resolved Task requester, with the managed server catalog as the
-  credential-free fallback. User-triggered planning resolves the Task inside
-  the caller's Entity, locks and requires write access to its active Workspace
-  before any Planner/provider work, rejects interactive or terminal Tasks, and
-  rejects manual Task or AgentSubscription references whose Workspace or
-  service key falls outside the Plan owner's Task owner/delegate scope. Background
-  planning follows the same Workspace-before-Task lock and revalidation order.
-  User Plan mutations lock and revalidate Workspace before Task and Plan so
-  approval, cancellation, and retry serialize with pause/delete.
-  Task-bound retry re-enters the current runtime factory and validates every
-  persisted root/child subscription pin before changing Plan or Step state; an
-  inactive, ambiguous, or same-service replacement binding fails closed.
-  V3 source-DAG persistence and V2 compatibility folding both preserve every
-  per-item contract and stable identity; neither weakens DAG dependency,
-  terminal-producer, or service-scope validation. Task
-  `required_capabilities` are requirements, not grants: before billable
-  Planner provider I/O, the selected root/service Agents' callable runtime
-  scopes are checked for a conservative aggregate gap without requiring the
-  root to own every service capability. A typed gap cannot select a different
-  Agent or silently install or authorize a tool.
-- Failure boundary: planning failure, ambiguous terminal output, unsupported
-  step kinds, unresolved dependencies, or missing credits must not mark the
-  Task complete or start partial execution silently. Interactive Tasks must
-  not enter the background Planner/Runner merely because they have an Agent.
-  Deleting an interactive Task first cancels its active or queued durable chat
-  run and removes the session Conversation, so a delayed turn fails closed.
-  Ordinary Tasks cannot be planned while the Workspace's Blueprint setup gate
-  is active, including Tasks proposed before a dependency became unavailable.
-  An initialization Task may use the same coordinated Plan runtime only when
-  the protected Blueprint setup fingerprint, current ScheduledJob revision,
-  running ScheduledJobRun child receipt and active AgentSubscription all match.
-  Planner, Executor and Dispatcher revalidate that evidence; a model-authored
-  Task key or copied scheduler markers never confer setup authority. Approval, billing and
-  durable artifact gates remain on the ordinary execution path.
-  A residual typed capability gap becomes a fenced Task BLOCKED /
-  TaskCoordinatorRun FAILED state with the full missing-capability diagnostic,
-  not a fabricated human-input request. Planner and Strategist share
-  the same read-only, subscription-scoped effective capability projection;
-  configuration catalogs are never execution authority. A known native tool
-  gap can stage one ordinary Workspace operation review, pinned to the Task
-  generation and exact Agent deployment. Its reviewed effects explicitly
-  include continuing that same Task; apply rechecks its stopped, Plan-less
-  state and current capabilities before staging the durable execution intent
-  in the same transaction. Unknown scope/provider failures and policy denials
-  never invent a configuration grant. These reviewed configuration operations
-  remain a compatibility path, not the default response to a new planning gap.
-  Manual retry rechecks a persisted capability blocker before new planning spend;
-  an eligible stopped, Plan-less run may instead reach the existing worker
-  acquisition path, without applying or approving an old draft. A pending manual
-  DAG remains on its explicit admission path and is not silently rewritten to
-  add acquisition Steps. Strategist suppresses repeated
-  work requiring the same unavailable capability on the same owner, including
-  dependent proposals, instead of creating another recovery Task. The Task loop's four
-  control tools are not an automatic tool-registration or permission-grant path.
+  dependency links, expected output/deliverables, runtime capabilities, the
+  Task-start outbox intent, and one `TaskCoordinatorRun` per Task (frozen root
+  selection, lifecycle generation, engine, phase, checkpoint with transcript,
+  evidence ledger, plan and counters, wake generation, claim) with its
+  append-only `task_run_journal`. Historical `plan_dag` runs and Task-owned
+  Plans remain only as closed records.
+- Success invariant: Task status transitions are legal; one Task has at most
+  one run, and only the owner of the current wake's claim can checkpoint,
+  park, settle or write the terminal state. Every wake re-admits Workspace ->
+  Task, re-resolves the factory and rechecks the frozen selection before
+  provider I/O; a Task whose lifecycle generation changed cannot be advanced by
+  an old wake. Service keys remain within owner/delegate scope. Terminal
+  `COMPLETED` requires a `complete_task` submission that passed the host
+  coherence checks; an unconfirmed effect is never reported as confirmed.
+  Retry re-enters the current factory, reopens only a stopped run without a
+  live claim or live delegated child, and never replays a recorded effect.
+  Task `required_capabilities` are requirements, not grants; a capability gap
+  is closed only through the loop's own governed acquisition (Cloud, WS-07) or
+  reported in a blocked submission, never by silently selecting a different
+  Agent or authorizing a tool.
+- Failure boundary: a model stop without `complete_task`, a missing requester,
+  repeated wake crashes, or missing credits must not mark the Task complete or
+  start partial execution silently; they end BLOCKED with the reason recorded.
+  Interactive Tasks must not enter the background loop/Runner merely because
+  they have an Agent. Deleting an interactive Task first cancels its active or
+  queued durable chat run and removes the session Conversation, so a delayed
+  turn fails closed. Ordinary Tasks do not run while the Workspace's Blueprint
+  setup gate is active, including Tasks proposed before a dependency became
+  unavailable; their wakes are deferred, not failed. Automatic Tasks do not
+  run in a paused Workspace. Approval, billing and durable artifact gates
+  remain on the ordinary execution path. A historical
+  `details.capability_blocker` written by the retired planner is read-only
+  (`current_capability_blocker`); retry clears it, and Strategist still
+  suppresses repeated work requiring the same unavailable capability on the
+  same owner, including dependent proposals, instead of creating another
+  recovery Task. The loop's control tools are not an automatic
+  tool-registration or permission-grant path.
 
-### WS-07: Plan execution, Dispatcher, and worker lease
+### WS-07: Task agent-loop execution, delegation, and worker-job leases
 
-Purpose: execute runnable Plan steps once, with retries and captured evidence.
+Purpose: execute a Task's work once inside its agent loop, with tool receipts
+and evidence, and carry external worker jobs (which have no Task) through the
+Dispatcher's leases.
+
+A Task agent loop has no Plan-wide wall-clock cap; its waits carry their own
+deadlines. `wait_until` parks the run in `waiting_timer` until a frozen
+absolute time, and `wait_media_jobs` parks it in `waiting_job` until the job
+completion hook or the wait deadline wakes it; an expired resource wait
+returns a host-written result to the loop instead of hanging. Recovery wakes
+timed parks only when due. A worker job's Step instead carries an explicit
+runtime deadline (`services/step_deadline.py`, default six hours, overridable
+by Workspace execution policy, Plan metadata or Step params) that the
+Dispatcher hands to the worker with its lease, so a hung job fails with
+`StepDeadlineExceeded`. No Blueprint runtime state or credit/provider
+authorization is added by either timer.
 
 A completed Skill runtime keeps domain verdicts separate from execution status.
-Explicit BLOCKED/NEEDS_USER_INPUT results remain failures. A paired required
-Skill blocker cannot be replaced by parent submission or fallback; its bounded
-reason is persisted as RequiredSkillBlocked, with no unchanged lease retry or
-Plan replan. Human-only input retains the existing needs-human path; internal
-prerequisites terminate the Task for the next ordinary Strategist review. A
-later successful Skill invocation in the same transcript supersedes its old
-blocker. Approval, cancellation and credit controls retain their own semantics.
+Explicit BLOCKED/NEEDS_USER_INPUT and other waiting or failed business
+statuses return `skill_result_incomplete` to the calling loop rather than a
+success. Human-only input still goes through `request_input`; approval,
+cancellation and credit controls retain their own semantics.
 
-Action and subagent steps use the same tool-capable LLM runtime. For an action,
-the LLM can call only its bound provider/account/arguments or report a blocker;
-its native provider receipt is not rewritten by the model. Repeated tool calls
-within that attempt return the captured receipt instead of duplicating effects.
-Dispatcher validates the declared output schema and persists result, cost, and
-evidence_refs; Python/TypeScript Worker SDKs and Worker API accept the same
-structured receipts alongside legacy string references. V2 uses the separate
-model Supervisor for Plan outcome acceptance. V3 instead returns settled child
-results to the TaskCoordinatorRun; its server-owned submission gates decide
-Task completion after exact claim, Step, artifact, and effect checks. Live actions
-require a matching action receipt; `expects=['publish']` requires captured
-publishing-tool evidence. Missing evidence cannot become Task success or blind
-automatic republication. Simulated calls never generate live effect evidence.
-Receipts survive output-schema failures; these failures cannot automatically
-repeat an evidenced effect. Manual Task recovery sends the recorded receipts
-and output back to Planner for reconciliation instead of replaying that step.
-A text-only `llm` step with a publish expectation is rejected at planning.
+The loop's own tool calls and its delegated Agents use the same tool-capable
+Runtime. Every tool result is observed into the run's evidence ledger
+(`RuntimeToolEvidence`), which is checkpointed with each round; the model
+cannot rewrite a native provider receipt, and `complete_task` cites receipt
+handles from that ledger. Live actions require a matching action receipt;
+missing evidence cannot become Task success or blind automatic republication.
+Simulated calls never generate live effect evidence. An unconfirmed effect is
+reported as an exception of the delivery, never as confirmed, and is never
+replayed by a retry. For external worker jobs, the Dispatcher validates the
+declared output schema and persists result, cost, and evidence_refs;
+Python/TypeScript Worker SDKs and Worker API accept the same structured
+receipts alongside legacy string references.
 
-New Agent Steps separately declare `execution_contract.delivery` (`inline` or
-`artifact`) and `execution_contract.effects` (`read_only`, `artifact_write`, or
-`authorized`). Payload shape is not permission: an inline result may summarize
-an authorized action, and artifact delivery may reuse an existing file without
-writing. Materialization owns the reserved runtime parameter; the worker's
-context-local boundary follows nested work and only narrows Agent authority.
-Restricted calls are rejected before approval consumption or effect intent.
-Legacy persisted Plans without this declaration retain their existing behavior.
+Each `update_task_plan` revision is a Task log line; the final summary, its
+files and acceptance exceptions enter one Task Comment at the terminal write;
+raw execution traces remain in the Task log and run journal. `request_input` parks the exact Runtime call (WS-08). Task
+comments, the Task input route and Workspace cards all answer the same request
+identity and resume the saved transcript, usage and pending call. Stale or
+missing request IDs cannot answer a newer question. Feedback does not accept
+the Task or authorize an external operation. These checkpoints, comments and
+receipts are runtime state and are excluded from Blueprint configuration.
 
-Read-only artifact delivery accepts explicit existing Document/path references
-only after host verification of current entity/Workspace/actor scope, ACL,
-canonical identity, bytes hash and revision. Shared nonblocking file locks
-avoid waiting behind a writer while database locks are held. A result-bound
-host receipt records reuse as artifact evidence, not a new write/action effect.
-Settlement and output read-repair must not copy the file, change its producer
-lineage, or refresh its creation provenance. Search snippets and prose links
-alone are not delivery. Revalidation occurs at dependent release and terminal
-acceptance, and stale or unavailable references reject rather than project a
-new artifact from a claimed success.
-The host receipt is bound to the Step's exact submission, attempt, issuing
-lease and completion timestamp. Completion hydration must skip read-only
-artifact targets rather than rewriting their settled payload and invalidating
-that receipt; legacy producer hydration retains its existing path.
-After acceptance, the unique completed terminal Agent Step's marked Plan
-payload is also preserved as `Task.actual_output.result`, with its actual
-contract source. Custom field names are not guessed into a text-summary alias.
-The final writer and read-time reconciliation share this projection; Task-
-authored output contracts remain strictly authoritative and never fall back to
-a Plan payload on failure. Legacy/unmarked, nonunique, failed or unaccepted
-results cannot use this path to manufacture a formal deliverable or completion.
+Deliverable verification in `complete_task` accepts explicit existing
+Document/path references only after host verification of current
+entity/Workspace/actor scope, ACL, canonical identity and bytes
+(`services/artifact_delivery.py`). Reuse of an existing file is delivery
+evidence, not a new write/action effect, and must not copy the file, change
+its producer lineage, or refresh its creation provenance. Search snippets and
+prose links alone are not delivery; a changed, missing or unreadable reference
+is refused back to the loop rather than projected as a new artifact.
 
-External-effect state uses one closed Manor-owned enum/factory boundary. A
-pending intent and its terminal receipt match only by their server-derived
-effect identity, including Plan, Step, child, tool-call, arguments, and attempt
-generation scope; worker-supplied reconciliation or settlement records are
-discarded. If an attempt expires after dispatch and provider outcome is not
-provably quiescent, Dispatcher preserves the claim, records unknown-effect
-evidence, and parks the Step for exact per-effect reconciliation. Only a
-compare-and-swap winner for the bound request/card may apply those decisions.
+External-effect state uses one closed Manor-owned enum/factory boundary
+(`constants/tool_effects.py`, `dispatcher/effect_safety.py`). A pending intent
+and its terminal receipt match only by their server-derived effect identity,
+including execution scope, tool-call, arguments, and attempt generation;
+worker-supplied reconciliation or settlement records are discarded. If a
+worker-job attempt expires after dispatch and provider outcome is not provably
+quiescent, Dispatcher preserves the claim, records unknown-effect evidence,
+and parks the Step for a person instead of replaying it.
 `APPLIED`, `NOT_APPLIED`, and `CANCEL` are service-owned state transitions, not
 provider status strings or generic Task recovery choices.
 
@@ -1587,35 +1446,28 @@ The token fences Manor settlement, not provider-side exactly-once execution;
 provider idempotency remains required where available, and ambiguous expiry
 must fail closed instead of replaying the action.
 
-V3 source-DAG Agent Steps and V2 compatibility coordinator children run
-delegated service work through the shared Chat Agent loop rather than a separate
-one-shot worker protocol. Every completed round persists a bounded transcript
-checkpoint on its Step. Retry and restart continue that transcript; a terminal
-Step is reused, not re-executed. The first resolved service subscription and
-Agent are pinned on that Step before context construction/provider I/O, and
-every continuation fails closed if either identity is no longer the same active
-binding. Planner-supplied `params.system_prompt` is Step input, not an Agent
-configuration override; execution visibility and authorization come from the
-pinned Agent's own bindings and current deployment scope, never from Task
-requirements or a Planner capability summary. An inner `request_input` parks
-its Runtime pending-call checkpoint on the Step (never
-the V2 outer coordinator Step or the V3 TaskCoordinatorRun). In the V2 nested
-bridge, that same fenced commit clears prior answer channels and binds the
-parent to the exact child and pending tool-call ID. A successor forces the
-unique parked child even when no answer exists, replaying
-its stored blocked envelope so a crash before outer-card projection cannot lose
-the question. Free-form and structured answers replace rather than merge with
-one another; the matching answer is injected as that exact pending tool result
-and consumed atomically before a server-forced delegation resumes it.
-The V2 nested result is a typed envelope containing result, effect evidence,
-artifact and Knowledge references, usage, cost, and error detail. Evidence is
-derived from successful tool receipts, never assistant prose, and the declared
-output schema is validated again at the final boundary, including the
-max-round summary path. V2 parent and child completion both revalidate their
-current lease/lineage fences before accepting the handoff. V3's direct Step
-settlement wakes its TaskCoordinatorRun to observe the result and decide the
-next control action; Plan completion alone does not invoke a separate model
-Supervisor to decide that Task's final state.
+`delegate_to_agent` runs delegated work through the shared Chat delegation
+core (identity, context, tools, round budget, billing and result shape), not a
+separate one-shot worker protocol. The delegation mode is frozen per root run.
+Inline mode runs the delegated Agents inside the root's own worker. Durable
+mode (`services/task_agent_delegation.py`) validates the batch in the handler,
+then the host parks the call: one transaction inserts one `TaskAgentChildRun`
+per delegated task, stages each child's wake, moves the root run to
+`waiting_child` and releases its worker. Child rows are created only there,
+so a crash before the park commits leaves no orphan. Each child is its own
+durable run (`workers/task_agent_child_loop.py`) admitted under Workspace ->
+Task -> root Run -> parent child -> child locks, capped in concurrency per
+Task, checkpointed every round, and limited to one live run per Agent per Task
+and one further delegation level. The last settling child writes the batch's
+tool result into the parent's parked call and wakes only that parent
+(`services/task_agent_child_settlement.py`). A child's `request_input` or
+approval-gated call parks the child on its own card ("Asked by {agent}");
+only that child waits, and the Task waits on the person only once nothing in
+the run tree can move (`sync_task_human_wait_status`). Execution visibility
+and authorization come from the delegated Agent's own bindings and current
+deployment scope, never from Task requirements. Evidence is derived from
+successful tool receipts, never assistant prose; an interrupted child is not
+silently replayed (`continue_interrupted` must be explicit).
 
 Deterministic tool input rejection must precede approval consumption and the
 pre-I/O effect-intent barrier. For `generate_file`'s plain document route,
@@ -1634,13 +1486,13 @@ for any bound tool, including normal, forced, resumed and nested Agent loops.
 Only the host's typed preflight result may declare rejection before I/O or
 refresh a stale MCP schema binding. Invalid/missing schemas, handler failures,
 provider JSON, and a payload merely claiming `stale_binding` cannot manufacture
-that proof. Correction remains within the same Step attempt and its bounded
-loop budget, with run-local scope isolation under concurrent execution.
+that proof. Correction remains within the same loop and its bounded round
+budget, with run-local scope isolation under concurrent execution.
 
 The occupied-target branch of plain document creation is a narrower exception:
 the host checks the target under the entity file-mutation lock before any write
 admission or rendering. Its typed no-effect result may settle only the exact
-current intent as `runtime_confirmed_not_applied`, under the live lease/claim.
+current intent as `runtime_confirmed_not_applied`, under the live run claim.
 This is not an operator decision and cannot be minted by tool JSON. Persisting
 the settlement and pending result must succeed before same-loop correction;
 all other ambiguous failures keep the reconciliation requirement.
@@ -1655,32 +1507,38 @@ proof and must retain the ordinary reconciliation boundary.
 
 Repeated transcript scans must preserve the original exact terminal receipt,
 not reclassify a successful create as modify because its file now exists.
-Deduplication requires the current Plan/Step/generation and matching tool, call,
+Deduplication requires the current execution scope/generation and matching tool, call,
 arguments, result, and host effect identity; weak or cross-scope evidence is
 never authority to suppress a new effect.
 
 Nested `invoke_skill` Agent loops keep a host-owned continuation tree rooted in
 the parent tool call. Child tool intents, terminal receipts, and their exact
-pending result are persisted under the same Step/lease fence. A child round
+pending result are persisted under the owning run's claim fence. A child round
 never replaces the parent transcript. Resume uses the durable child frame or
 completed Skill response rather than replaying a settled write; a pre-result
 crash without authoritative terminal evidence still requires reconciliation.
 These frames are runtime-only and excluded from Blueprint configuration.
 
 
-- Code entry: `packages/core/plans/executor.py`,
-  `packages/core/dispatcher/service.py`, `packages/core/models/worker.py`,
-  `packages/core/workers/coordinator_tools.py`,
-  `packages/core/workers/internal.py`,
+- Code entry: `packages/core/workers/task_agent_loop.py`,
+  `packages/core/workers/task_agent_loop_waits.py`,
+  `packages/core/workers/task_agent_child_loop.py`,
+  `packages/core/services/task_agent_delegation.py`,
+  `packages/core/services/task_agent_child_settlement.py`,
   `packages/core/ai/runtime/workspace_delegation_actions.py`,
-  `packages/core/ai/task_runner.py`, the shared renewable execution-claim
-  service, scheduler API/mutation factory and Skill-generation task, internal
-  worker execution, and Agent/`execute_lease`/`run_plan` tasks.
-- State: Plan/Step status, `WorkLease`, execution claim, attempt counters,
-  result envelope, tool evidence, error, execution events, coordinator child
-  identity/idempotency key, pinned subscription/Agent, round transcript or
-  pending-input checkpoint, cumulative usage/cost watermark, one generation-fenced
-  durable Plan-cycle wake row per Plan, scheduled occurrence
+  `packages/core/dispatcher/service.py`, `packages/core/dispatcher/effect_safety.py`,
+  `packages/core/dispatcher/retry_policy.py`, `packages/core/services/step_deadline.py`,
+  `packages/core/models/worker.py`, `apps/api/routers/workers.py`,
+  `packages/core/workers/task_agent_loop.py`, the shared renewable execution-claim
+  service (`packages/core/models/execution_claim.py`), scheduler API/mutation
+  factory and Skill-generation task, and the Agent and
+  `runtime.run_task_agent_loop`/`runtime.run_task_agent_child` tasks.
+- State: the run checkpoint (transcript, evidence ledger, plan, counters,
+  parked call and wait, delegation mode, capability receipts),
+  `TaskAgentChildRun` rows with their own checkpoints and wakes, cumulative
+  usage/cost watermark; for worker jobs, Plan/Step status, `WorkLease`, attempt
+  token, attempt counters, result envelope, tool evidence and error; execution
+  events, scheduled occurrence
   and its durable `PREPARED`/`PUBLISHED` child handoff, and bounded worker
   shutdown of event persistence/delivery tasks. ScheduledJob definitions carry
   an indexed UTC `next_run_at` clock and a revision-scoped Skill-generation
@@ -1691,16 +1549,17 @@ These frames are runtime-only and excluded from Blueprint configuration.
   event/response mailbox keyed by its exact execution id. The mailbox is
   execution runtime state, is removed with Sandbox/history cleanup, and is not
   Blueprint-portable.
-- Success invariant: dependency-ready steps receive at most one active lease;
-  only the claimed worker can complete it; results pass schema/reference and
-  artifact checks; terminal Plan state reconciles exactly once to Task state.
-  Per-worker advisory admission serializes capacity decisions against the
-  persisted concurrency ceiling. Heartbeat capability updates lock and refresh
-  the Worker row, merge fencing versions monotonically, commit, and release that
-  row before checkout begins taking Workspace/Plan/Step locks. Supervisor model
-  review similarly persists an expiring claim and immutable fingerprint, then
-  releases database locks before provider I/O and accepts the verdict only
-  after reacquiring the canonical locks and matching the full fingerprint.
+- Success invariant: one wake of a Task run or delegated child run is executed
+  by at most one claim owner; every round checkpoint, park and terminal write
+  is fenced by that claim and the run's `state_version`; a delegated batch
+  settles into its parent's parked call exactly once. For worker jobs,
+  dependency-ready Steps receive at most one active lease; only the claimed
+  worker (with the current attempt token) can complete it; results pass
+  schema/reference checks. Per-worker advisory admission serializes capacity
+  decisions against the persisted concurrency ceiling. Heartbeat capability
+  updates lock and refresh the Worker row, merge fencing versions
+  monotonically, commit, and release that row before checkout begins taking
+  Workspace/Plan/Step locks.
   A background Agent Task has at most one live execution claim; a duplicate
   delivery that observes a live or possibly stale claim publishes a delayed
   recheck before acknowledging, and the Task terminal guard makes recovery
@@ -1823,61 +1682,53 @@ These frames are runtime-only and excluded from Blueprint configuration.
   business execution; its exact, still-pristine Task or WorkflowRun is
   idempotently cancelled while holding the same child execution claim, whereas
   work admitted before a later pause may finish.
-  Every new Plan cycle and lease checkout reloads the Workspace's current
-  Blueprint setup admission; a regressed dependency pauses already-materialized
-  pending work before any new lease is issued.
-  Lease completion/failure/expiry and other continuation transitions stage the
-  next Plan-cycle generation in the same transaction as business state.
-  Broker acceptance at the CONTROL handoff and CONTROL-to-HEAVY handoff is not
-  completion evidence; only the generation-matched `run_plan` cycle ACKs or
-  replaces the durable row. A Plan-wide execution claim prevents concurrent
-  HEAVY re-entry, and exact CONTROL/HEAVY deliveries honor the row's future due
-  time after same-generation backoff. A separately scheduled, advisory-locked,
-  bounded indexed skip-locked scan reconstructs a missing wake from non-terminal
-  Plan/Step state, skips active leases and true human-only waits, and retains an
-  age fallback for unstamped state writers. Its relative-sleep recovery does not
-  apply `seconds` twice. The shared publisher reserves capacity in both
-  directions so neither Plan nor generic outbox traffic can starve the other.
-  Dispatcher schema hydration uses the same resolved-requester account boundary as
-  planning and never merges another actor's discovered actions.
+  Every Task-run wake reloads the Workspace's current Blueprint setup
+  admission (WS-06), so a regressed dependency defers the next wake.
+  Broker acceptance of a run wake is not completion evidence; only the
+  generation-matched owner settles (ACKs) or replaces the durable wake row,
+  and the recovery sweep reconstructs a missing wake from the run's phase and
+  checkpoint without waking a run parked on a person or an undue timer.
+  Dispatcher schema hydration for worker jobs uses the resolved requester's
+  account boundary and never merges another actor's discovered actions.
   Structured Sandbox events receive server-assigned monotonic sequences;
   responses bind one exact response-requiring event, are idempotent for an
   identical payload, and resume the same process rather than starting another
   command. Event count, line size, stream size, response size, and history
   lifetime are bounded.
-- Failure boundary: stale/duplicate leases cannot complete a step; retry limits
-  terminate visibly; a worker claim of success without required effects/files
-  triggers replan/failure rather than false completion. A committed business
-  task does not remain on an active lease when the model provider requests
-  cooperative rate-limit backoff: the lease becomes a bounded, Retry-After-aware
-  pending retry without consuming a business attempt, while credit exhaustion
-  terminates visibly instead of burning the remaining attempts. One-shot model
-  failures retain their provider status rather than collapsing into an empty
-  response. If initial queue delivery fails after a Plan commit, retries target
-  that same Plan rather than invoking the planner again; exhausted delivery
-  becomes a visible Task recovery action. A committed business task does not remain unacknowledged
+- Failure boundary: a stale run owner cannot checkpoint or settle; stale or
+  duplicate leases cannot complete a worker-job Step; retry limits terminate
+  visibly; a claim of success without required effects/files is refused by
+  `complete_task` (or fails the worker-job Step) rather than becoming false
+  completion. A worker-job lease whose model provider requests cooperative
+  rate-limit backoff becomes a bounded, Retry-After-aware pending retry without
+  consuming a business attempt, while credit exhaustion terminates visibly
+  instead of burning the remaining attempts. One-shot model failures retain
+  their provider status rather than collapsing into an empty response. A lost
+  run wake is restaged by recovery for the same run, never by starting a second
+  run. A committed business task does not remain unacknowledged
   indefinitely for external event delivery;
   interrupted delivery is resumed from durable EventLog state instead of
   replaying the business task. A crashed Agent worker leaves only a bounded
   renewable lease; delayed recheck recovers after expiry rather than abandoning
-  the nonterminal Task. A lease admitted before setup regresses may finish; the
-  stricter gate applies to later Plan cycles and new leases.
+  the nonterminal Task. A wake claimed before setup regresses may finish its
+  delivery; the stricter gate applies to later wakes.
   Sandbox mailbox delivery proves that a response was atomically made
   available, not that untrusted code consumed it. A terminal, cancelled,
   expired, foreign-owned, unknown-event, conflicting duplicate, oversized, or
   secret-shaped response fails closed.
-  A Plan-cycle broker failure, consumer crash, or ACK persistence failure leaves
+  A run-wake broker failure, consumer crash, or ACK persistence failure leaves
   the exact generation recoverable and never marks already-committed business
-  execution failed. A stale cycle cannot acknowledge a newer generation.
-  A coordinator child with no valid checkpoint cannot be guessed back into
-  progress. An ambiguous external effect, invalid typed envelope, mismatched
-  lineage/lease, or unproven receipt fails closed and is not replayed as fresh
-  delegated work.
+  execution failed. A stale owner cannot acknowledge a newer generation.
+  Connection-level transient errors are redelivered without counting toward
+  the wake-failure limit. An interrupted delegated child is not guessed back
+  into progress or replayed as fresh delegated work unless the loop explicitly
+  asks to continue it. An ambiguous external effect, mismatched claim/lease, or
+  unproven receipt fails closed.
 
 - Resident Webchat self-read remains a WS-02 request-local capability. A Task,
   worker or nested runtime cannot acquire it by supplying tenant/account IDs or
   an envelope from another conversation. `resident_maintenance_status` preserves
-  its external actor and exact contact/session scope; Plan/worker authority is
+  its external actor and exact contact/session scope; Task/worker authority is
   unchanged and generic public management MCP remains denied.
 
 - Resident drafts are request-local private runtime artifacts, not Tasks or WorkflowRuns. Background workers cannot inherit the public proof or grant. Draft tool retries deduplicate by binding and runtime tool-call ID. Browser confirmation serializes draft revision/nonce checks with edit and freezes intent before external I/O; provider idempotency is the final side-effect boundary.
@@ -1896,13 +1747,21 @@ rejected; concurrent retransmissions cannot replace the accepted answer. The
 same loop resumes without replaying the asking tool or prior effects. Ordinary
 input remains separate from authority to submit an external application.
 
-Task detail projects existing pending `INPUT` cards from the matching live
-Plan, waiting Step, latest request/lease, and Workspace Chat message. Multiple
-parallel inputs are represented separately even while the Task is in progress.
-The UI reuses the Chat form and exact message resolver; it does not create a
-second approval path or change Task lifecycle merely to display a question.
-Only public question fields are projected, never tokens or tool continuations.
-Resolved ordinary input is labeled as a response, not permission approval.
+A Task agent loop (or a delegated child run) that calls `request_input` or
+reaches an approval-gated action parks in `waiting_human` on the existing
+cards: the Task input card (`ensure_task_input_hitl`) or the runtime approval
+card in the Task thread, each tagged with the exact run, call and checkpoint.
+Every answer surface (Task comment, Task `hitl-response`, Workspace Chat card)
+reaches `services/task_agent_loop_hitl.py`, which rechecks under Task -> Run
+locks that the run is still parked on that exact request and call before
+writing the answer as the pending call's result and staging a wake. An
+approval re-executes the exact gated call, which spends that grant once; a
+rejection (or a card closed without approval) wakes the run with a
+host-written result saying the action did not run. Parallel questions from
+child runs stay separate; the Task waits on the customer only once nothing in
+the run tree can move. Only public question fields are shown, never tokens or
+tool continuations. Resolved ordinary input is labeled as a response, not
+permission approval.
 
 Workspace `resolve_hitl` relays ordinary input with `action=respond` and an
 explicit `response` (or structured answers/attachments); approve/reject remain
@@ -1934,9 +1793,22 @@ before any HITL is created. The rationale is a model report, not execution proof
 or an authorization receipt. Historical questions remain resumable without the
 new field. File references identify review subjects, not new file access grants.
 
+`ai/runtime/human_input.runtime_request_input_refusal` is the shared server
+gate in front of every `request_input` handler (the agentic loop's tool
+execution entry). It refuses, as a
+`tool_error` with no card created: asking a person to grant tool access or
+change Agent configuration; any question while the run has an unresolved
+platform fault (a tool result carrying `internal_error: true`, which no person
+can repair; it clears once the same operation later succeeds); and re-asking a
+question this run already had answered (the earlier answer is returned). A
+Task blocked by a platform fault posts a plain status instead of an input card.
+OSS logs the diagnostic locally and directs the deployment operator to server
+logs.
+Reporting never changes the authoritative blocked Task or grants retry authority.
+
 Missing deliverable evidence, output validation, dispatch/lease timeouts and
 retry exhaustion do not by themselves authorize a customer verification card.
-Recoverable failures retain evidence for bounded Agent repair/replanning. A busy
+Recoverable failures retain evidence for bounded Agent repair. A busy
 delivery read backs off without replaying writes; exhausted read backoff returns
 its diagnostic to the current loop. If safe automated recovery is exhausted or
 the checkpoint cannot establish exact child identity, record an internal failure
@@ -1946,10 +1818,10 @@ remain separate; this contract neither grants tools nor authorizes blind replay.
 Legacy `auto_human_on_exhausted` retry settings remain readable for compatibility
 but cannot turn a retry count into a human-input requirement. These execution
 observations and justifications are runtime-only, not Blueprint content.
-For a V3 coordinator's exhausted internal recovery, keep its original Plan
-active, mark the Task blocked and Run failed, and save the diagnostic in
-`coordinator_outcome`. Explicit retry resumes that coordinator and never resets
-its Step rows through the legacy Plan-resume path. A persisted reconciliation
+When a Task agent loop exhausts its internal recovery, the Task is blocked,
+the run failed, and the diagnostic saved in the checkpoint's
+`coordinator_outcome`; explicit retry resumes that same run and transcript
+(WS-06). A persisted reconciliation
 error label alone is not evidence that an external outcome is still unknown;
 the current scoped operation records must support any reconciliation hold.
 
@@ -1959,22 +1831,26 @@ the current scoped operation records must support any reconciliation hold.
   `packages/core/services/tiktok_publish_review.py`,
   `apps/web/src/components/workflows/TikTokPublishReview.tsx`,
   `packages/core/services/task_comment_approval_origin.py`,
+  `packages/core/services/task_agent_loop_hitl.py`,
+  `packages/core/services/task_input_resume.py`,
+  `packages/core/ai/runtime/human_input.py`,
+  `packages/core/services/task_platform_block.py`,
   `packages/core/dispatcher/service.py::lease_needs_human`,
   `packages/core/services/task_blockers.py`,
-  `packages/core/services/step_resume.py`, pending-action services, and
-  Workspace chat resolution routes.
-- State: HITL request, pending action, approval payload hash/token, paused
-  Step/Lease/Workflow node, user response, consumed decision, resolved UI
-  message, a bounded typed runtime-tool continuation, the server-bound link
-  between a coordinator child's exact tool request and its parent lease card,
-  and the frozen provider
+  `packages/core/services/step_resume.py` (worker-job Steps waiting on a
+  person), pending-action services, and Workspace chat resolution routes.
+- State: HITL request, pending action, approval payload hash/token, parked
+  Task run (or child run) call and wait, paused worker-job Step/Lease, paused
+  Workflow node, user response, consumed decision, resolved UI
+  message, a bounded typed runtime-tool continuation, the signed approval tag
+  naming the exact run, call and checkpoint, and the frozen provider
   retry-mode snapshot on external-reply claim and delivery-attempt state.
-  TikTok video reviews additionally keep account identity, creator limits,
-  original attachment digest, a replaceable review ID, and the human's exact
+  TikTok video and photo reviews additionally keep account identity, creator limits,
+  original media digests, a replaceable review ID, and the human's exact
   submitted publication settings in that existing request context. These are
   runtime-only and never Blueprint-portable.
 - Success invariant: approval is scoped to exact action and arguments; one
-  response is consumed once; the original Task/Plan/Workflow resumes without
+  response is consumed once; the original Task run/worker job/Workflow resumes without
   starting a duplicate execution; terminal/cancel cleanup resolves stale cards.
   Generated image, ordinary audio, and video writes prepare a finite set of
   exact output paths before approval and provider I/O. Naming, extension, and
@@ -1991,13 +1867,16 @@ the current scoped operation records must support any reconciliation hold.
   reaches the provider only through the existing active authorization lease.
   A model argument or a bare Chat approval cannot manufacture that receipt.
   The authenticated preview route exposes only the original conversation
-  attachment's pinned bytes, without disclosing a provider download token.
+  attachment or active Workspace Document's pinned bytes, without disclosing a provider download token.
   Source digest, account identity and current creator limits are rechecked
   before provider initialization. Initialization is processing evidence, and
   only the provider's status response can establish publication. Unaudited
-  Direct Post access remains a TikTok audit requirement. This video flow
-  supports exact Chat attachments; arbitrary URLs and photo publication do not
-  receive implicit consent through it.
+  Direct Post access remains a TikTok audit requirement. Video review remains
+  version 1; photo review version 2 binds ordered JPEG/WebP source digests and
+  the human-selected cover index. Actual image bytes are decoded and every
+  preview must load before the form enables confirmation. Photo publication
+  uses the dedicated `post_photo` continuation and official PHOTO/DIRECT_POST
+  request. Arbitrary URLs never receive implicit consent through either path.
   When multiple HITL requests share one Message metadata document, terminal
   projection locks matching Message rows in deterministic order so concurrent
   decisions preserve every card's resolved marker instead of reopening a peer.
@@ -2069,26 +1948,16 @@ the current scoped operation records must support any reconciliation hold.
   from already authorized context or ask the user in Chat, then deliver the
   answer through the execution mailbox. Any action that independently requires
   approval must still create and consume the ordinary WS-08 continuation.
-  For a Task Agent Step's tool gate, the exact Runtime tool HITL remains the
-  action authority while a lease-scoped mirror remains the Task-facing card.
-  V3's direct source-DAG Step owns that lease/card and resumes its own saved
-  Agent-loop checkpoint; the TaskCoordinatorRun only observes the blocked
-  Step and never approves or consumes its token. A V2 typed child likewise
-  owns its lease/card and checkpoint, while a rolling-upgrade V1 dynamic child
-  keeps the legacy root-card bridge and saved delegation continuation. The
-  server binds the exact Task, Plan, Step, lease claim, tool, argument hash,
-  and frozen continuation (plus root/child lineage for the older shapes),
-  mirrors grant or denial atomically, and independently checks the approver's
-  authority for the nested request. A generic Chat decision or changed
-  Step/lineage cannot spend the token.
-  A coordinator child's `request_input` similarly resumes only from its saved
-  Runtime pending-call checkpoint: the Task-facing structured answer becomes
-  that call's tool result and is never converted into a fresh child prompt.
-  Parent answers are bound to the stable child/pending-call identity and the
-  alternate answer channel is cleared. If the child park commits before the
-  parent receives its blocker envelope, the next fenced parent lease first
-  replays that stored blocker and reconstructs the same card without rerunning
-  the child Agent loop.
+  For a Task agent loop's tool gate, the exact Runtime tool HITL is the action
+  authority and the Task-thread approval card. Its signed tag binds the exact
+  run (root, or child with its root run), call and runtime checkpoint digest;
+  the run that parked owns the card and resumes its own saved checkpoint, and
+  the approver's authority is checked independently. A generic Chat decision,
+  a stale card, or a run no longer parked on that call cannot spend the token.
+  A delegated child's `request_input` similarly resumes only from its saved
+  Runtime pending-call checkpoint: the structured answer becomes that call's
+  tool result and is never converted into a fresh child prompt, and it wakes
+  only the child that asked while its parent keeps waiting on it.
 - Failure boundary: expired/mismatched tokens fail closed. Login blockers are
   not converted into generic approvals. Manual pause/cancel clears processing
   state and does not leave the chat input locked. Stale/conflicting Runtime
@@ -2110,8 +1979,65 @@ the current scoped operation records must support any reconciliation hold.
 
 ### WS-09: Workspace Flow and Workflow runtime
 
-Purpose: execute a reusable graph independently of the Task Plan runtime.
+Purpose: execute a reusable graph independently of the Task agent-loop runtime.
 
+- Conversation-less Workflow tools and nested Skills derive their sandbox
+  work binding from the trusted WorkflowRun identity when no Task binding
+  exists. This scope never becomes a fake Task or Conversation. Human chat
+  bindings retain precedence; user-less work remains isolated per run. Video
+  Edit and Office Skills share this resolver, with ordinary owner, admission,
+  approval and credit checks. Runtime keys are not Blueprint configuration.
+  See `tests/test_worker_subagent_sandbox_binding.py` and
+  `tests/test_video_edit_runtime.py`.
+- Direct launches and bindings of a Workspace-owned `WorkflowDefinition`
+  inherit that Workspace before lifecycle admission, service-key dependency
+  resolution and run persistence. An explicitly different Workspace is
+  rejected during binding creation, update and execution, including a switch
+  to another definition. Shared
+  entity-level definitions retain their caller-supplied execution scope, or
+  remain unscoped when none is supplied. Editor/API launches must not silently
+  lose the Agent, Knowledge and approval context of an owned definition.
+- App action history can opt into unbound manual runs of its exact Workflow
+  in the same Workspace. Binding, definition and Workspace scope are checked
+  before pagination; another binding or scheduled executor is not that action's
+  history. The selected-run view applies the same scope as the list and labels
+  direct launches separately. A project record's execution link describes its
+  direct parent's latest related run, after entity/Workspace validation; a
+  mutable `last_run_id` is not immutable publication-receipt provenance.
+- A Page project data source may declare `execution_run_id_path` for a
+  string-typed producer field in project state. This explicit reference pins
+  the business execution family, and the App shows its latest canonical native
+  retry in the same entity, Workspace and Workflow. Missing or foreign explicit
+  references do not fall back to a later unrelated check run. The path is
+  portable configuration; referenced run IDs remain runtime state.
+- App data execution rows use the existing compact run API and native Retry
+  control for failed and cancelled runs. A cancelled Agent with no persisted
+  result is an unknown outcome and requires the same effect review at both
+  projection and submission; cancellation alone never proves safe replay.
+  The row validates run/Workspace identity and server
+  recovery capability, the control revalidates on opening, and the native
+  endpoint remains authoritative. App, inline run and full canvas views read
+  recovery actions from the compact API; full run payloads intentionally omit
+  these controls. Controllable failed runs retain a visible Retry entry even
+  when replay is blocked. Its dialog fetches fresh controls and exposes either
+  the native correction/review form or the blocking reason, original deadline
+  and a read-only recheck; it cannot submit an unavailable action. Eligible
+  unknown Agent outcomes offer operator review. Read-only users retain history
+  access without a recovery control. A successful retry refreshes the App
+  projection; this adds no Page configuration or Blueprint runtime state.
+  Paused rows with a controllable response open the existing Workflow review
+  dialog in the App. Native TikTok requests reuse the platform review form and
+  send its choices to the same canonical approval resolver; only the blocked
+  invocation resumes. Opening the dialog rechecks current authority and state.
+  A failed submission retains the local draft, while success refreshes the App.
+  Workspace schedules without an explicit conversation bind an existing active
+  main conversation in their own entity and Workspace, when one is available.
+- An input-schema validation failure without an explicit recovery schema can
+  project editable fields from the failed node's immutable input schema. Only
+  exact direct bindings to declared Workflow variables qualify; generated,
+  nested, read-only and write-only fields are excluded. Explicit recovery
+  schemas remain authoritative, and native Retry still validates the submitted
+  variable allowlist, family and execution scope before enqueueing.
 - Retry planning in `services/workflow_retry.py` retains valid completed
   parallel siblings and resumes every unfinished active frontier. Explicit
   checkpoints do not re-enter ambiguous upstream condition gates. Selected
@@ -2124,6 +2050,59 @@ Purpose: execute a reusable graph independently of the Task Plan runtime.
   or input changes cannot revive old output values; Agent effect evidence
   remains recovery context, not a successful output. Historical runs are not
   rewritten. See `tests/test_workflow_parallel_retry.py`.
+- Optional Agent node retries require host evidence of `effect_state=none`.
+  Confirmed or unconfirmed effects, absent evidence and bare timeouts stop
+  automatic replay. Nested effect evidence merges monotonically; an outer
+  empty ledger cannot erase a confirmed child effect. Native Retry rejects an
+  unreconciled failed effect unless the existing Chrome recovery checkpoint
+  can carry its evidence through the read-before-write recovery path.
+- Interactive Retry may accept an explicit `not_applied` operator review for
+  one failed Agent with an unconfirmed outcome and no existing Chrome recovery
+  checkpoint. It binds the decision to the exact run, immutable snapshot and
+  result fingerprint under the native family lock, requires verification
+  evidence and an explicit no-effects/no-pending confirmation, and refuses
+  confirmed effects, executed or unfinished browser operations, changed inputs
+  and stale decisions. Projection and submission consult the same durable
+  operation evidence; a blocked review exposes its reason without offering a
+  submit action. The new attempt carries the operator, time and evidence alongside
+  original Agent history; the old run is unchanged. This runtime review is
+  stripped from public trigger data and never exported as Blueprint state.
+  It does not mark a business result successful, authorize an external action,
+  or extend frozen deadlines; resumed tools retain their ordinary gates.
+- The same interactive review accepts `applied` with an exact verified result
+  only when the failed Agent has a concrete immutable object output schema.
+  The server validates that result, rejects pending/unknown browser operations,
+  changed inputs, stale fingerprints and foreign runs, and records an operator
+  attestation on the new attempt. The accepted producer is inherited as completed
+  and never executed again; its downstream frontier retains ordinary checks,
+  including the frozen effect deadline. Original failure history is unchanged.
+  This does not itself create a publication receipt or Stats observation. The
+  shared App/detail review form is driven by that frozen output contract; no
+  scenario-specific action or Blueprint runtime state is introduced. Completed
+  nested Skill responses survive a parent failure as bounded, redacted evidence;
+  they do not independently authorize replay or assert parent success.
+  If a completed maintenance run released a fenced project lease, this review
+  can also accept its current revision. The server requires an empty lease,
+  `verification_required`, a matching native output proving the current state,
+  and every original checkpoint value unchanged except the released lease.
+  Added fields are preserved. Submission checks the reviewed revision under the
+  row lock and only refreshes proved project projections in the new attempt;
+  changed original data, another owner, stale confirmation or missing provenance
+  cannot reclaim the lease. This is an explicit applied-result review, not an
+  automatic retry policy. See the unrelated client-report recovery case in
+  `tests/test_workflow_projects.py`.
+  A separate configured verification consumer may claim an expired terminal
+  owner's project in the same row-lock transaction only when its pending stages
+  explicitly include `verification_required`; the new lease preserves that
+  recovery stage so the Workflow takes its verification branch. Consumers
+  without that declaration continue to fence the project without executing it.
+- Expired project leases fenced as `verification_required` retain their owner
+  evidence. Native Retry may transfer one only under the project row lock,
+  within the same terminal execution family, and with proof that only the
+  fencing transition changed its revision and stage. Other business writes or
+  a newer lease owner require reconciliation. Blueprint pending stages decide
+  whether a scheduled queue may claim verification work; a completed poll is
+  never evidence that the underlying external action succeeded.
 - Node `config.timeout` is an optional total execution deadline in seconds:
   missing/null means no outer node deadline, finite positive numbers are
   explicit deadlines, and invalid values fail before dispatch/cache reuse.
@@ -2224,55 +2203,42 @@ check after physical I/O. Source Workspace deletion does not invalidate retained
 Knowledge; Entity lifecycle and the current executing Workspace still gate access.
 User-less agent scope remains unchanged.
 
-Artifact-delivery Steps resolve submitted identities through their declared
-output schema, including the Task envelope's `outputs.data` payload. A final
+Worker-job artifact-delivery Steps resolve submitted identities through their declared
+output schema, including the envelope's `outputs.data` payload. A final
 identity object/array can be annotated with `x-manor-deliverable: true`; legacy
 schemas may expose one unambiguous required identity slot for assessment.
 Competing slots, missing values and unsupported declarations produce typed
 diagnostics with source pointers, not recursive runtime-key guessing or payload
 rewriting. Declaration basis and pointers distinguish an explicitly marked
 delivery from a legacy structural candidate; neither proves content quality.
-The same resolver feeds preflight, dependency delivery, acceptance and output
-projection. Schema declarations never grant file access.
+The same resolver feeds preflight and output projection. Schema declarations
+never grant file access.
 
-Delivery inspection separates original execution results, recorded receipts,
+Task delivery verification in `complete_task` separates recorded receipts,
 submitted identities and current host verification. A failed reference check
-still exposes bounded Step results and verification issues to the same Task
-AgentLoop; it does not claim the file is absent or replay the writer. Diagnostic
-pages are not citable delivery evidence, and an unresolved verification cannot
-be accepted. Finalization rebuilds the strict snapshot and rechecks all current
-identity, version, access, lifecycle and completion gates before committing.
-Precommit observation failures return a shared no-commit error contract to the
-same loop, preserving the cause without an error-code whitelist. This receipt
-describes only the rejected submission, not prior Step effects; it allows
-another inspection, never an automatic business replay. The normal unknown
-effect gate and bounded file-lock retry remain separate authoritative controls.
-Refusing to replace a Plan with settled effects returns a shared `tool_error`
-containing its receipts, known effect state and permitted inspection action;
-it does not turn the refusal into a customer-verification HITL. Genuinely
-unknown effects retain the existing no-replay boundary.
+returns its cause to the same Task agent loop as a preflight refusal; it does
+not claim the file is absent or replay the writer. A changed file must be read
+again before resubmitting, and only `artifact_busy` may fall back to the run's
+own write receipt. The terminal write rechecks the claim and lifecycle before
+committing. The normal unknown effect boundary remains separate: an
+unconfirmed effect is reported as an exception, never turned into a
+customer-verification HITL or replayed.
 
-Proposal file deliverables may opt into document_id_path (a JSON Pointer into
-the typed Task result), workspace_folder (an exact relative logical folder),
-and require_readback. Supervisor resolves the canonical non-trashed Document
-inside the Task's Entity/Workspace and checks its physical file. Readback
-contracts require a current-Task generate_file/patch_file receipt followed by a
-read_file receipt for the same Document and final content hash. Model-authored
+Proposal file deliverables may carry document_id_path (a JSON Pointer into the
+typed Task result), workspace_folder (an exact relative logical folder), and
+require_readback as part of the proposed Task's contract. The loop is told to
+verify every deliverable itself, and `complete_task` independently requires
+each file deliverable to be an existing, readable Document in the Task's
+Entity/Workspace that this run inspected after its last write. Model-authored
 Skill artifact claims are not write receipts. Logical filing remains separate
 from fs_path; this validation moves no files and grants no new file authority.
-Legacy deliverables without these fields keep their existing acceptance rules.
 
-Task acceptance builds a host-owned artifact manifest from explicit submitted
-references and attributable Step evidence, binding Plan/Step/attempt, result
-and contract digests, canonical Document identities and file snapshots. Nested
-`outputs.data.files[].document_url` is supported without mutating strict Step
-payloads. Gates, persisted acceptance and terminal output projections consume
-the same manifest; raw evidence refs alone do not declare every intermediate
-artifact a final deliverable. File identity is not proof of content quality.
-Correctable acceptance diagnostics return to the same coordinator loop. The
-explicit delivery-review resume endpoint rechecks the exact old failed Plan,
-run revision, settled effects and absence of other HITLs before waking that
-coordinator; it never resets DONE Steps or marks the Task complete itself.
+The terminal Task output lists the files `complete_task` verified, with their
+canonical Document identities; raw evidence refs alone do not declare every
+intermediate artifact a final deliverable. File identity is not proof of
+content quality. Accepted artifact manifests of historical Plan-era Tasks stay
+readable as execution evidence (`accepted_task_artifact_manifest`); nothing
+new writes them for a Task.
 
 Runtime file projection writes/copies hold the shared entity mutation lock,
 persist a write-ahead `RuntimeFileCommit`, capture the installed inode/version
@@ -2344,6 +2310,14 @@ CREATE instead of overwriting or selecting an unapproved name. A failure after
 the MP4 has been saved remains an incomplete tool result with precise committed
 file/Document references, the failed delivery stage, and no-replay guidance;
 it cannot claim complete delivery or erase evidence of the existing video.
+The composition recipe retains the effective call-time subtitle, ducking and
+loudness settings in `generation.render_settings`; its audio cues follow the
+effective ducking policy rather than enabling ducking solely by track type.
+The source timeline/subtitle file plus these settings describe native
+reconstruction. This is not a claim of pixel-identical browser-editor export.
+Frame sampling accepts bounded sub-millisecond seek times near the end of a
+stream with a known frame rate; the automatic ending sample remains conservative.
+Sample timestamps describe requested seeks, not an exact frame-index/PTS API.
 Journals and manifests are
 infrastructure/runtime evidence, not authorization or Blueprint configuration.
 
@@ -2374,16 +2348,36 @@ Knowledge/
                        presentations,spreadsheets,code,artifacts}/
 ```
 
+Execution archive folders keep their ID as the DocumentFolder name, because
+physical paths are resolved from the folder chain. Folder APIs add a
+`display_name` of `<Task title or Workflow name> (<last 6 ID characters>)` for
+`tasks/<task_id>`, `workflow/<lineage_root_run_id>` and legacy `runs/<lineage>`
+under a Workspace root (`workspace_archive_folder_labels`); the UI shows it
+while rename, paths and bindings keep using the ID name.
+
 These are routing rules, not a list of directories to pre-create. A concrete
 write creates only its required ancestors. Blueprint `folder_structure` is
 declarative metadata; installation materializes ancestors of actual starters.
-Ordinary web Chat output in a default location is filed into a private
-`Chat sessions/<conversation title>` Knowledge folder owned by that Chat's
-user. Same-title folders receive a conversation-ID suffix. The conversation
-keeps the folder identity across title changes, while explicit output
-directories, Workspace/Task/Workflow routing, and physical `fs_path` stay
-unchanged. Renaming a Chat updates its existing folder without creating one
-for a Chat that has no files.
+Every new file an ordinary web Chat (no Workspace, no Task) produces in a
+default location is filed into a private `Chat sessions/<conversation title>`
+Knowledge folder owned by that Chat's user, whichever tool produced it:
+generate_file, media generation, code projects, bash, sandbox saves, Chrome
+captures, ElevenLabs and subagent artifacts all share
+`knowledge_sync`/`generated_artifact_service` filing. A default location is
+the entity root or a storage-only directory (`images/`, `videos/`, `audio/`);
+generators also treat their legacy type buckets as defaults, while a visible
+folder any other tool created is an explicit destination. `patch_file` and
+`replace_file` edits never refile. Filing is presentation only: if the Chat
+folder cannot be resolved the file keeps its ordinary filing and the write
+still succeeds. Same-title folders follow the Workspace folder convention:
+`<title> (<last 6 ID characters>)`, then `-2`, `-3` on a further collision. The conversation keeps
+the folder identity across title changes; renaming a Chat updates its existing
+folder without creating one for a Chat that has no files. Explicit output
+directories, files that already have a Document, Workspace/Task/Workflow
+routing, and physical `fs_path` stay unchanged. Workspace-less projections
+also record the producing conversation, Task, Agent, user and tool in
+`metadata.origin` when the Document is created; that provenance never grants
+access.
 Other user/Blueprint directory names remain open and are not reserved names.
 `Document.name` is always a basename; starter keys and full relative paths live
 in Blueprint provenance separately.
@@ -2407,13 +2401,23 @@ canonical paths remain readable. The latest YouTube receipt reads the old
 are unchanged.
 
 Bash commands that execute on the entity filesystem keep that working directory
-so source operands remain valid. Supported explicit write operands are scoped before approval, execution
-and projection by the same resolver; only their required ancestors are created
-after authorization. Existing canonical operands keep their identity; quoting,
-comments and directory operands retain their shell meaning. Commands executed in
-an ephemeral sandbox keep sandbox-local paths. Ambiguous new output paths are
-rejected rather than guessed. Sandbox exports and internal
-subagent text artifacts follow the same default Workspace/Task/Workflow home.
+so source operands remain valid. Each command of a list or pipeline is scoped on
+its own, before approval, execution and projection, by the same resolver: a
+line that starts with a local file command scopes every write redirection and
+the local file commands' destinations, while any other line only has explicit
+`$MANOR_OUTPUT_DIR/<name>` targets written out; only required ancestors are
+created after authorization. Existing
+canonical operands keep their identity; quoting, comments, here-documents and
+directory operands retain their shell meaning; commands after `cd` and sandbox
+scratch paths (`/tmp`, `/dev/null`) are not scoped. A Workspace run receives
+`$MANOR_OUTPUT_DIR`, its Workspace/Task/Workflow output folder in the working
+copy. Ambiguous new output paths are rejected rather than guessed: after
+execution, a new file or folder outside the Workspace storage root whose
+nearest existing ancestor is the entity root is reverted and refused
+(`bash_output_outside_workspace`). Edits of existing files and new files under
+existing folders remain explicit destinations subject to the guard and ACL.
+Sandbox exports and internal subagent text artifacts follow the same default
+Workspace/Task/Workflow home.
 
 Email attachments and Chrome captures without an explicit destination use the
 Workspace root, or Knowledge root without a Workspace. They do not create
@@ -2452,7 +2456,8 @@ Hide `_by_id` folder entries, never their projected Documents; workspace
   `apps/web/src/components/permissions/SignatureRequestDialog.tsx`,
   `apps/web/src/components/permissions/SignatureFieldEditor.tsx`,
   `apps/web/src/pages/SignDocument.tsx`,
-  `packages/core/services/task_execution_reconcile.py`,
+  `packages/core/services/artifact_delivery.py`,
+  `packages/core/workers/task_agent_loop_completion.py`,
   `packages/core/services/artifact_knowledge.py`,
   `packages/core/services/email_attachments.py`,
   `packages/core/services/knowledge_sync.py`,
@@ -2462,9 +2467,8 @@ Hide `_by_id` folder entries, never their projected Documents; workspace
   browser-upload idempotency receipt and hidden incomplete-upload recovery intent,
   Task/Workflow terminal result, and the EventLog external-delivery claim,
   attempt, lease, retry, and terminal evidence.
-  Coordinator child envelopes carry typed `evidence_refs`, `artifacts`, and
-  `knowledge_refs`; the parent records those trusted tool-result references
-  even when final output-schema validation fails.
+  A Task run's evidence ledger records trusted tool-result receipts and file
+  references in the run checkpoint (WS-07); `complete_task` cites only those.
   Generated-media output plans are runtime-only. Background video jobs persist
   a server-created plan bound to job, actor, Workspace, and Task; public job
   responses omit this private contract and Blueprints never export it.
@@ -2649,25 +2653,6 @@ metadata never imply a free run. Health checks use MCP handshake and tool
 discovery only. The local gateway remains the sole actor-start entry so remote
 MCP transport cannot bypass the durable budget and settlement owner.
 
-Suno has two explicit entry modes. The actor-scoped Integration/MCP route in
-`ai/mcp/suno.py` remains BYOK: the user's Suno account pays the provider and
-Manor does not reserve or debit platform Credits. Its `generate_music`,
-`create_cover`, and `create_mashup` calls are paid write actions, while
-`get_generation` and `get_usage` are read-only; MCP-returned URLs remain
-upstream references until separately projected into Knowledge. The Model
-Catalog route `suno/music` enters through
-`generate_file(kind="audio", purpose="music")` and persists a WS-10
-`MediaJob`. Role-scoped BYOK still incurs zero Manor Credits. A Cloud-managed
-`SUNO_API_KEY` route estimates cost from `SUNO_GENERATION_COST_USD`, creates a
-job and active WS-12 reservation in one transaction before provider I/O, and
-settles exactly one direct-credit usage plus the reservation only after the
-downloaded audio has a durable Knowledge Document. The worker atomically
-claims one paid submit, saves the provider job id immediately, and recovery
-only polls that id. A timeout or crash after the claim but before a durable id
-is reconciliation-required: no automatic resubmit and no reservation release.
-Credentials and provider-job runtime state never enter WS-14 Blueprint
-payloads.
-
 - Code entry: `packages/core/ai/runtime/billing.py`,
   `packages/core/services/credit_reservations.py`,
   `packages/core/services/usage_service.py`,
@@ -2678,14 +2663,17 @@ payloads.
   scheduled Skill-generation preflight, and Task/Workflow execution wrappers.
 - State: billing context, credit grant/balance, active reservation, usage
   record, transaction ledger, source identity, BYOK attribution, and measured
-  Browser/Twilio Realtime Voice usage. Coordinator child Steps retain the
-  nested Agent loop's typed usage and derived cost attribution; this is an
-  execution receipt and does not create a second billing call.
-- Success invariant: each coordinator child checkpoints cumulative usage/cost
-  with its durable inner transcript. In V2, each typed child settles through
-  the ordinary Dispatcher accounting path exactly once; the coordinator parent
-  keeps only a diagnostic child snapshot and never rolls those totals into its
-  own billable counters. Legacy V1 rows retain their compatibility roll-up.
+  Browser/Twilio Realtime Voice usage. Task runs and delegated child runs
+  retain their Agent loop's typed usage and derived cost attribution in their
+  checkpoints; this is an execution receipt and does not create a second
+  billing call.
+- Success invariant: each Task run and delegated child run checkpoints
+  cumulative usage/cost with its durable transcript. A delegated child's
+  provider calls are reserved and settled per call through the shared Chat
+  delegation billing path (`runtime_delegated_child_billing`) under a
+  suppressed outer billing context, so nothing is charged twice and a resumed
+  child keeps stable attribution. Worker-job Steps settle through the ordinary
+  Dispatcher accounting path.
   Provider billing remains owned by the original inner LLM calls. The Runtime
   billing wrappers and the provider paths listed
   in the node checklist resolve entity/source, gate before the provider call,
@@ -2726,7 +2714,7 @@ payloads.
 
 ### WS-13: Pause, soft delete, restore, and purge
 
-Purpose: pause autonomous work independently of user-directed work; soft delete
+Purpose: pause Strategist autonomy independently of deployed Workflows and user-directed work; soft delete
 preserves a restore window before removing Workspace-owned runtime data.
 
 Apify start revalidates actor, account and Workspace authorization. Recovery may
@@ -2762,8 +2750,16 @@ WS-14 Blueprint configuration.
 - Success invariant: pause suppresses new autonomous work; soft delete
   immediately removes automations and access while preserving restorable data;
   pause is not a Workspace-wide execution or file-access ban. Authorized users
-  can still chat, read/write artifacts, start/retry/approve Tasks and Plans,
+  can still chat, read/write artifacts, start/retry/approve Tasks,
   run Flows, collect measurements, and explicitly request a Strategist review.
+  Deployed Workflow schedules/event bindings and standalone Stats collectors
+  keep their own enabled state while Strategist is paused. Goal-owned schedules
+  and proactive Agent drivers remain autonomy-controlled. Scheduled Workflow
+  entry must validate its durable job occurrence and deployment, not promote
+  a trigger label into manual authority. Enabled automations remain visible in
+  the App and observability; deletion still stops every Workspace automation.
+  Workflow-only live Blueprint installations use paused autonomy without
+  disabling their configured Workflow schedules.
   Manual Task/Plan execution receipts are server-owned runtime lineage, not
   tool authority or Blueprint configuration; automatic provenance is retained.
   Runtime tools recognize an explicit foreground profile or an exact scoped
@@ -2775,7 +2771,9 @@ WS-14 Blueprint configuration.
   pause and lease admission serialize without changing already-admitted work.
   A human-requested review while paused produces proposals for explicit approval,
   even when a standing auto-approval policy exists. Scheduled/event reviews and
-  automatic Task dispatch remain stopped. Setup, membership, subscription,
+  automatic Task dispatch remain stopped; an automatic Task's agent-loop wake
+  is deferred (`workspace_autonomy_paused`) and redelivered on resume, while a
+  user-directed Task keeps running. Setup, membership, subscription,
   approval, credit, and soft-delete gates apply equally to manual work;
   protected Document content and browse reads, migrated Folder/Filesystem read
   batches, and Workspace list/detail reads retain one immutable admission
@@ -2956,6 +2954,16 @@ materialize it into a new Workspace without copying runtime history.
   Workspace's starter. New file receipts participate in ordinary rollback;
   uncertain commit outcomes retain bytes for reconciliation. Runtime output
   templates, approval and credit admission remain unchanged.
+- Mutable Knowledge files may declare `template: {id, mode: "initial_file",
+  version}` with a reviewed initial `body_md`. The installed Document retains
+  that seed separately from its live content. Explicitly selected files export
+  the seed even after a runtime update marks the file as an artifact; ordinary
+  artifacts remain excluded, and missing or invalid seed metadata fails closed.
+  Classification, sharing, PII, quarantine, size and Workspace membership gates
+  still apply. Installation and template upgrade/revert preserve existing file
+  bytes; an upgrade cannot silently change template mode or file path to reset
+  runtime data. This extends WS-10 → WS-14 configuration without copying rows
+  accumulated by the source Workspace.
 - Success invariant: the tested v1.1 export/install paths validate, contain no
   secret-shaped keys, credential values in free-form text, source IDs, or
   runtime Task state; install to new identities; expose
@@ -3050,6 +3058,19 @@ Redis Pub/Sub or Celery the source of truth.
   fan-out. A recipient's per-room mute suppresses new alerts, not unread
   counts; retraction cancels any related visible alert. Notification bodies
   carry sender and room identity only, not message or attachment content.
+  Native group/DM unread email reminders are a separate explicit producer in
+  `chat_email_notifications.py`, discovered by the existing notification Beat
+  task. User preferences enable reminders by default after 30 unread minutes,
+  with 5/15/30/60/120-minute choices and an off switch. Each recipient/room
+  range creates one hidden Notification plus durable outbox; metadata stores
+  references, never excerpts. Delivery rechecks the current verified registered
+  email, preferences, read cursor, mute, join boundary, room and owner lifecycle
+  under shared authority locks through provider I/O. At most three current
+  unread excerpts and attachment names use the existing common email template.
+  Read/revoked ranges cancel; longer delays, quiet hours and disabled SMTP defer
+  without consuming attempts. New ranges wait at least the configured interval
+  after the previous digest. These receipts and personal settings are runtime
+  state, not Workspace membership or Blueprint configuration.
 - Failure boundary: provider failure retries with a bounded backoff while the
   in-app fact remains visible; authorization resolution errors retry rather
   than masquerading as access denial; a dead dispatcher lease is reclaimed
@@ -3085,7 +3106,7 @@ mandatory host.
 
 - Code entry: `apps/api/routers/agent_initiatives.py`,
   `packages/core/services/agent_initiative_service.py`,
-  `packages/core/tasks/scheduler_tasks.py`, `packages/core/ai/task_runner.py`,
+  `packages/core/tasks/scheduler_tasks.py`, `packages/core/workers/task_agent_loop.py`,
   `packages/core/services/agent_initiative_decision.py`, and
   `packages/core/services/agent_initiative_delivery.py`.
 - State: an owner-scoped `AgentSubscription`, revisioned `AgentInitiative`,
@@ -3100,8 +3121,9 @@ mandatory host.
   Workspace Initiative rows remain manageable through scoped API/UI paths.
   Admission revalidates the exact Entity, owner,
   Subscription, Agent, optional Workspace, Conversation, and Initiative
-  revision before billable execution. TaskRunner accepts only a versioned
-  `notify`/`silent` JSON decision, with at most one no-tools repair. Settlement
+  revision before billable execution. The Task declares the decision as its
+  result schema; the Task agent loop accepts only a completion whose versioned
+  `notify`/`silent` result validates, and settlement re-validates it. Settlement
   applies mute, dedupe, cooldown, and rate limits under locks; it commits
   delivery intents before projection. Chat is projected before Notification,
   and delivery retry never reruns the Agent. Each projection step is claimed
@@ -3175,13 +3197,13 @@ These edges require tests on both sides whenever either endpoint changes.
 | WS-02 -> WS-10 | Email attachment import preserves actor/Workspace scope, commits bytes and Knowledge identity atomically, and gives the Agent only canonical refs plus bounded extracted text |
 | WS-03 -> WS-04 | Strategist uses installed services and real readiness only; a configured external Goal/Stat source adds only its named provider dependency |
 | WS-04 -> WS-05 | Proposal validates before governance and persistence; proposed Goal changes address stable Goal identity |
-| WS-05 -> WS-06 | Only approved, dependency-ready Tasks begin planning |
-| WS-06 -> WS-07 | V3 persists the typed source DAG under a TaskCoordinatorRun claim and releases ready Steps without a root control Step; V2 compatibility folding retains authoritative per-item contracts and maps each stable item identity to one child/idempotency lineage. Both preserve scoped capabilities, refs, and output contracts |
-| WS-06 -> WS-12 | API and worker planning share one durable claim through the fenced Plan commit, so duplicate entrypoints cannot duplicate billable provider work |
+| WS-05 -> WS-06 | Only approved, dependency-ready Tasks stage a start intent |
+| WS-06 -> WS-07 | One TaskCoordinatorRun per Task; each wake re-admits Workspace -> Task (pause and Blueprint setup gates), claims one exact wake generation, and runs the agent loop with the frozen root Agent's own scope plus loop controls; delegation creates child runs only in the fenced park transaction |
+| WS-06 -> WS-12 | Duplicate start intents and redelivered wakes reuse the same run and claim, so duplicate entrypoints cannot duplicate billable provider work |
 | WS-07 -> WS-12 | Enabled Scheduled Skill generation is revision-single-flight, persists a bounded attempt before provider I/O, and gates credits before generation; paused Jobs do not cross the billable boundary |
-| WS-07 -> WS-08 | Paused origin and resume identity remain exact; the V3 direct Step, V2 typed child, or legacy V1 root bridge has a lease card server-bound to one exact nested tool HITL, mirrors its decision, and resumes the server-saved continuation/checkpoint. The V3 TaskCoordinatorRun only observes the Step; a Sandbox mailbox request is advisory and cannot replace a durable approval/HITL continuation |
-| WS-07 -> WS-10 | Captured typed child evidence, artifact refs, and Knowledge refs remain attributable through the parent and become canonical artifact evidence |
-| WS-07 -> WS-12 | A delegated coordinator child records the nested Agent loop's usage/cost once without creating a second billing path |
+| WS-07 -> WS-08 | Paused origin and resume identity remain exact; the run (root or delegated child) that parked owns its card, whose signed tag binds the exact run, call and checkpoint, and resumes its own saved pending call; a worker-job Step keeps its lease card. A Sandbox mailbox request is advisory and cannot replace a durable approval/HITL continuation |
+| WS-07 -> WS-10 | `complete_task` deliverables are receipt handles from the run's evidence ledger or host-verified existing Documents, and become the Task's canonical artifact evidence |
+| WS-07 -> WS-12 | A delegated child run records its Agent loop's usage/cost once through the shared delegation billing path without creating a second billing path |
 | WS-08 -> WS-10 | Trusted Workspace/Task/Workflow scope selects the same destination for approval and saving; generated-media approval, synchronous saves, and video worker recovery share frozen exact CREATE targets, including root files and lineage archives; every encoding obeys current policy and a collision cannot silently become another file |
 | WS-09 -> WS-08 | Workflow HITL resumes the same run/node |
 | WS-09 -> WS-10 | Workflow-owned outputs use the stable lineage archive even with a Task association; shared Workspace state stays outside the run, legacy canonical sources remain usable, and durable outputs/receipts remain visible after terminal state |
@@ -3190,7 +3212,6 @@ These edges require tests on both sides whenever either endpoint changes.
 | WS-11 -> WS-04 | Next review sees current Goal configuration, measured outcomes, and open work once |
 | WS-12 -> tested execution entries | Credit gate applies before provider calls on covered entrypoints; new entries require their own gate test |
 | WS-02/07/09 -> Apify -> WS-12/13 | Shared MCP auth and approval select one actor/account; one quote starts at most one bounded Actor run, polling cannot create another charge, deletion blocks new work while durable recovery retains cancel/settlement responsibility; result URLs still require WS-10 projection and runtime rows never enter WS-14 |
-| WS-02/07/09 -> Suno -> WS-08/10/12/14 | Shared MCP auth selects one actor-owned BYOK account and keeps remote URLs upstream-only; Catalog `suno/music` selects role BYOK or Cloud-managed credentials, reserves before the single paid submit, polls only a durable provider id, projects success to a Knowledge Document, and settles once. Ambiguous submits retain reservation for reconciliation and never replay; credentials/job state never enter WS-14 |
 | WS-12 -> Realtime Voice | Browser and Twilio share one actor-aware route/transport/response-gate/strict-settlement engine; Browser retains its authenticated Chat/Public Chat scope and ephemeral reservation, while Twilio uses the persisted call owner's exact Workspace/Agent scope and durable call-keyed reservation; native OpenAI BYOK remains visible without platform media debit |
 | WS-13 -> WS-11 | Pause stops automatic Goal/Stat collection but allows explicit collection; deletion stops both. Restore and purge preserve the configuration/evidence boundary |
 | WS-13 -> tested runtime entries | Pause stops autonomous triggers and dispatch, not authorized manual work. Deletion stops both; new entries must retain lifecycle and trusted-origin guards |
@@ -3199,9 +3220,9 @@ These edges require tests on both sides whenever either endpoint changes.
 | WS-13 -> Twilio Voice | Integration disconnect and every supported Agent-binding change/remove path cancel only calls frozen to that binding while unconnected; connected history remains, and user, Workspace, and Entity hard purge remove only their owned Voice runtime rows |
 | WS-14 -> WS-01/03/09 | Installed portable configuration recreates runnable semantics, including Goal/Stat definitions without runtime measurements |
 | WS-07/08 -> WS-15 | Covered Task-event and HITL notification producers preserve recipient, Workspace scope, idempotency, and origin references; new Workflow or evaluation producers require their own explicit contract and regression |
-| WS-13 -> WS-15 | Deleted/inaccessible Workspace cancels pending delivery; paused Workspace suppresses automatic delivery but preserves exact, authorized manual Initiative delivery. Lifecycle, membership, access-mode, and delivery serialize on the Workspace access lock, with authorization and producer lineage rechecked before every external target |
+| WS-13 -> WS-15 | Deleted/inaccessible Workspace cancels pending delivery; paused autonomy preserves notifications with exact server-validated Workflow origin, including completed reports, and exact authorized manual Initiative delivery. Other autonomous notification delivery remains suppressed. The existing EventLog external outbox has no validated Workflow origin and retains pause cancellation. Lifecycle, membership, access-mode, and delivery serialize on the Workspace access lock, with authorization and producer lineage rechecked before every external target |
 | WS-18 -> WS-02 | New Initiatives are private Agent DM or Manor main Chat only, bound to one exact personal AgentSubscription and Conversation; Workspace Chat uses Workspace Automation, while historical Workspace Initiative rows remain manageable through scoped API/UI paths |
-| WS-18 -> WS-07/12 | The derived schedule admits one fenced occurrence and passes the normal TaskRunner credit/tool/approval boundary; pause blocks admission and manual run-now leaves the schedule clock unchanged |
+| WS-18 -> WS-07/12 | The derived schedule admits one fenced occurrence and passes the Task agent loop's credit/tool/approval boundary; pause blocks admission and manual run-now leaves the schedule clock unchanged |
 | WS-18 -> WS-15 | A strict notify decision commits idempotent Chat-first delivery intents; quiet hours suppress external targets but preserve Chat and in-app facts, and retries never replay Agent work |
 | WS-18 -> WS-13 | Subscription, owner, Agent, Workspace, and Conversation lifecycle changes fail closed at admission and again before delivery without fallback routing |
 | WS-18 -> WS-14 | Initiative owner, destination, policy, derived driver, state, runs, and deliveries are runtime-only and absent from Blueprint export/install payloads |

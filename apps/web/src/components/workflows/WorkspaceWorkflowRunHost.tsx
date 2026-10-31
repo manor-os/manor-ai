@@ -19,12 +19,15 @@ import ConfirmDialog from "../ui/ConfirmDialog";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Select from "../ui/Select";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
+import { usePreviewFeatureAccess } from "../../lib/previewFeatureAccess";
 import WorkflowRunProgress from "./WorkflowRunProgress";
 import {
   canCancelWorkflowRun,
   formatWorkflowError,
   isWorkflowRunActive,
   workflowRunStatusPresentation,
+  workflowStepActivity,
+  workflowStepOutcome,
   type WorkflowHistoryRun,
   type WorkflowRunAction,
   type WorkflowRunNode,
@@ -69,6 +72,7 @@ export interface WorkspaceWorkflowRunGroup {
 export const WORKFLOW_HOST_ACTION_KINDS = new Set([
   "workflow_starter_input",
   "workflow_retry",
+  "workflow_effect_review",
   "workflow_approval",
   "workflow_input",
 ]);
@@ -170,6 +174,7 @@ function workflowProjectionForGroup(
       order: index,
       subscriptionId: nonEmptyString(step?.subscription_id) || null,
       error: step?.error,
+      ...workflowStepOutcome(step),
     } satisfies WorkflowRunNode];
   });
   const actionKind = nonEmptyString(action?.kind);
@@ -580,6 +585,8 @@ export function mergeWorkflowRunView(
           order: index,
           subscriptionId: nonEmptyString(node?.subscription_id) || null,
           error: node?.error,
+          ...workflowStepOutcome(node),
+          ...workflowStepActivity(node),
         } satisfies WorkflowRunNode];
       })
     : snapshotNodes.length > 0
@@ -599,7 +606,11 @@ export function mergeWorkflowRunView(
         } satisfies WorkflowRunNode];
       })
       : projection.nodes;
-  const nodes = detailIsAuthoritative ? serverNodes : projection.nodes;
+  // Activity exists only on the polled run, so it joins whichever nodes are shown.
+  const liveActivity = new Map((serverNodes as WorkflowRunNode[]).flatMap((node) => node.activity ? [[node.id, node.activity] as const] : []));
+  const nodes = detailIsAuthoritative
+    ? serverNodes
+    : projection.nodes.map((node) => liveActivity.has(node.id) ? { ...node, activity: liveActivity.get(node.id) } : node);
   const detailBusinessOutcome = businessOutcomeFromRunDetail(detail);
   const businessOutcome = detailIsAuthoritative
     ? detailBusinessOutcome || null
@@ -684,6 +695,13 @@ export function mergeWorkflowRunView(
       ? projection.error
       : hasAuthoritativeError ? detail.error : projection.error,
     action: mergedAction,
+    // The server's counts are the Flow's own stages; the drawn path is not.
+    processedCount: Number.isInteger(detail.processed_count)
+      ? Number(detail.processed_count)
+      : projection.processedCount ?? null,
+    totalCount: Number.isInteger(detail.total_count)
+      ? Number(detail.total_count)
+      : projection.totalCount ?? null,
   };
 }
 
@@ -861,9 +879,7 @@ function focusNextWorkflowControlOrComposer(): void {
 }
 
 function runSwitcherLabel(run: WorkflowRunView): string {
-  const status = t(
-    `component.workflow_run.status.${workflowRunStatusPresentation(run).labelKey}`,
-  );
+  const status = t(workflowRunStatusPresentation(run).stateKey);
   const attempt = t("component.workflow_run.attempt").replace(
     "{count}",
     String(run.attemptNumber || 1),
@@ -1086,6 +1102,10 @@ export default function WorkspaceWorkflowRunHost({
     const invalidations = [
       queryClient.invalidateQueries({ queryKey: ["workflow-run", runId] }),
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] }),
+      queryClient.invalidateQueries({ queryKey: ["workflow-run-history-control", runId] }),
+      queryClient.invalidateQueries({ queryKey: ["workspace-app-data", resolvedWorkspaceId] }),
+      queryClient.invalidateQueries({ queryKey: ["workspace-app-data-contexts", resolvedWorkspaceId] }),
+      queryClient.invalidateQueries({ queryKey: ["workspace-app-section", resolvedWorkspaceId] }),
       queryClient.invalidateQueries({
         queryKey: ["workspace-chat-workflow-run-family", runId],
         exact: true,
@@ -1185,6 +1205,8 @@ export default function WorkspaceWorkflowRunHost({
     cancelConfirmationRunId,
     foregroundRunId,
   ]);
+  // Flow and run pages are part of Flows; without it the bar links nowhere.
+  const flowsAccess = usePreviewFeatureAccess("flows");
 
   if (!foregroundGroup || !foregroundRun || serverConfirmedTerminal) return null;
 
@@ -1206,13 +1228,13 @@ export default function WorkspaceWorkflowRunHost({
     || resumeMutation.isPending
     || retryMutation.isPending;
   const scopedResolveError = actionMessageId === resolveMessageId ? resolveError : null;
-  const workflowHref = foregroundRun.workflowId
+  const workflowHref = flowsAccess.enabled && foregroundRun.workflowId
     ? workflowPath(foregroundRun.workflowId)
     : undefined;
-  const historyHref = foregroundRun.workflowId
+  const historyHref = flowsAccess.enabled && foregroundRun.workflowId
     ? workflowRunPath(foregroundRun.workflowId, foregroundRun.id, resolvedWorkspaceId)
     : undefined;
-  const approvalHistoryHref = foregroundRun.workflowId && approvalReviewRunId
+  const approvalHistoryHref = flowsAccess.enabled && foregroundRun.workflowId && approvalReviewRunId
     ? workflowRunPath(foregroundRun.workflowId, approvalReviewRunId, resolvedWorkspaceId)
     : undefined;
   const cancelActionLabel = t("component.workflow_run.action.cancel");
@@ -1237,7 +1259,7 @@ export default function WorkspaceWorkflowRunHost({
       if (interventionAction?.kind === "workflow_approval" && runtimeApprovalId) {
         if ((choice !== "approve" && choice !== "reject") || !interventionAction.options?.includes(choice)) return;
         const runId = workflowResumeTargetRunId(interventionAction, foregroundRunId);
-        await api.workflows.resolveRuntimeApproval(runId, runtimeApprovalId, choice);
+        await api.workflows.resolveRuntimeApproval(runId, runtimeApprovalId, choice, payload?.review);
         await invalidateRunSurfaces(runId);
         if (runId !== foregroundRunId) await invalidateRunSurfaces(foregroundRunId);
         return;

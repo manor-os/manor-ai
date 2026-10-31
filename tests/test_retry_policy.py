@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from packages.core.services.retry_policy import (
+from packages.core.dispatcher.retry_policy import (
     error_with_retry_policy,
     merge_retry_policy_configs,
     retry_delay_seconds,

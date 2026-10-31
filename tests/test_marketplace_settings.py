@@ -33,6 +33,7 @@ async def test_fee_set_and_read_back(db_session):
 
         from packages.core.models.platform_setting import PlatformSetting
 
+        await db_session.rollback()
         await db_session.execute(
             delete(PlatformSetting).where(PlatformSetting.key == MARKETPLACE_SETTINGS_KEY)
         )
@@ -87,6 +88,7 @@ async def test_fee_read_clamps_corrupt_values(db_session):
         # in the `client` fixture, not for db_session-only tests.
         from sqlalchemy import delete
 
+        await db_session.rollback()
         await db_session.execute(
             delete(PlatformSetting).where(PlatformSetting.key == MARKETPLACE_SETTINGS_KEY)
         )

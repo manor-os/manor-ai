@@ -5,13 +5,20 @@ This directory contains the scripts used by the built-in PPTX generation path: p
 ## Directory Layout
 
 - Top-level `scripts/`: runnable entry scripts
+- `scripts/deck_engine/`: template mode — `deck.json` schema, slot layouts, text fitting, native PPTX rendering, and the re-plan verifier used by `pptx_quality_gate.py`; entry point `build_deck.py <project>/deck.json`
 - `scripts/template_import/`: internal PPTX reference-preparation helpers used by `pptx_template_import.py`
 - `scripts/svg_finalize/`: internal post-processing helpers used by `finalize_svg.py`
 - `scripts/docs/`: topic-focused script documentation
 
 ## Quick Start
 
-Typical end-to-end workflow:
+Template mode (default, one step):
+
+```bash
+python3 scripts/build_deck.py projects/<project_name>/deck.json
+```
+
+Free-design (PPT Master) end-to-end workflow:
 
 ```bash
 python3 scripts/project_manager.py init <project_name> --format ppt169

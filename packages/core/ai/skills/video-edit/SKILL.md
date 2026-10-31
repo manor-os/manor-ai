@@ -55,11 +55,32 @@ Use authentic product media when supplied. Do not invent replacement UI.
 When `video-production` supplies a reviewed `CANVAS.md`, treat its shot IDs,
 first/last frames, dialogue, audio cues, and chapter timing as the edit brief;
 record any necessary changes back against those IDs in `STORYBOARD.md`.
+When reference captions and the canonical soundtrack come from separate
+Knowledge Documents, `measure_media_audio_alignment` can measure their local
+constant offset using approximately corresponding 5–60 second source spans.
+Use the returned `target_time = reference_time + target_time_offset_seconds`
+mapping before applying the excerpt offset. It searches within one second of
+the supplied anchors; it is not global audio search, forced transcription, or
+final media certification. Preserve its source hashes and evidence, and reject
+unmatched/ambiguous timing instead of assuming the files share a zero point.
 For designed motion, typography, 3D or beat-driven edits, invoke
 built-in `motion-design`, then load each reference it lists that the edit needs
 with `invoke_skill(skill_id="motion-design", bundle_file="references/<name>.md")`
 and apply it. `read_file` cannot open another skill's references. This skill may
 invoke only the guidance skills `motion-design` and `video-type-playbooks`.
+
+## Work in parallel
+
+Every response is a full model round, so the number of responses sets most of
+the production time:
+
+- Put independent calls in the same response: request every independent image,
+  clip, narration line and sound effect together, read every file you need
+  together, then make one `wait_media_jobs` call for all pending job ids.
+- Do not re-read a file you just wrote or a result you already hold; reuse the
+  identifiers and measurements from the tool result.
+- Keep dependent steps sequential: a call that needs another call's output
+  goes in a later response.
 
 ## 2. Start the editable Sandbox project
 
@@ -86,7 +107,10 @@ music, voice, or canvas file cannot be resolved, omit that reference and report
 the missing file instead of inventing a path. For a revision of an existing
 editable project, start with its existing `project_path`; do not copy its own
 project directory into `reference_paths`. Use the exact Knowledge `fs_path` for
-each external asset that must be staged.
+each external asset that must be staged. A web URL is never a reference: an
+asset from the web (an openly licensed font, image or sound) must first be
+saved into Knowledge by the caller (a shell download saved with
+`manor push /tmp/<file> <Knowledge path>`); then pass that saved path.
 For a `/viewer/<document-id>` link, use
 `search_documents(query="<short filename>", detail="details")` and match the
 returned `document_id` exactly; the `fs_path` in that record is the file to
@@ -109,6 +133,23 @@ clip, image, voice track, music bed, or data file, deliver it without restarting
 
 `video_edit(operation="push_assets", session_id="<session_id>", reference_paths=[...])`
 
+When the edit needs a music bed that nobody supplied, take a licensed track
+from Manor's catalog: `search_free_music(query="<mood, genre, instruments>")`,
+then `import_free_music(track_id=..., source_path=<the project's CANVAS.md or
+video path>)`. Probe the imported Knowledge file, normalize
+it with `normalize_audio_loudness`, and stage it with `push_assets`; keep its
+license and attribution for the credits. When the catalog is unavailable or has
+nothing suitable, generate the bed instead: find the model with
+`generate_file(kind="search", params={"media_kind": "audio", "purpose": "music"})`,
+then `generate_file(kind="audio", prompt="<genre, mood, BPM, structure>",
+params={"purpose": "music", "expected_model": "<from search>"})`, and record in
+the storyboard why the catalog was skipped. An unavailable optional source is a
+reason to take the next route, not a blocker. When neither route works (for
+example the catalog is down and no music model is configured), build the bed
+from generated ambience or sound effects (`purpose: "ambience"` or `"sfx"`), or
+go without music, and list the missing music as an acceptance exception with
+the errors you saw. A music bed never blocks delivery of the video.
+
 The Sandbox has no arbitrary internet access. When it needs something missing,
 publish a structured request with `operation="report"` and
 `event_type="asset_request"`, acquire the material through Manor's approved
@@ -123,11 +164,108 @@ Write or update project source inside the active Sandbox with:
 
 `video_edit(operation="write_files", session_id="<session_id>", files={...})`
 
-`write_files` **replaces each named file in full**. For a revision, read the current
-file, apply the change to its complete contents, and submit that complete file.
-Never send only a CSS or JavaScript fragment as `index.html`: it destroys the
-composition root and makes review fail. After every write, inspect
-`missing_project_contract`; fix every listed item before calling `review`.
+`write_files` **replaces each named file in full**: use it to create files or
+rewrite one wholesale. Never send only a CSS or JavaScript fragment as
+`index.html`: it destroys the composition root and makes review fail.
+
+For revisions of an existing file (review fixes, timing, copy, styling), use
+`patch_files` so only the changed text is sent:
+
+`video_edit(operation="patch_files", session_id="<session_id>", patches=[{"path": "index.html", "edits": [{"old_text": "<exact current text>", "new_text": "<replacement>"}]}])`
+
+Each `old_text` must match the current file exactly once, including whitespace,
+unless `replace_all` is true; edits apply in order, each against the result of
+the previous one. A missing or ambiguous match fails the whole call and writes
+nothing; the error names the file and edit index. The result lists each patched
+file's new `size_bytes` and `sha256`. A patch is saved exactly like a write, so it
+also changes the source hash and requires a new `review` before `render`.
+
+After every write or patch, inspect `missing_project_contract`; fix every listed
+item before calling `review`.
+
+### Strict review rules
+
+Review fails on every **error and warning** (only info passes). Each failing
+finding comes back in `diagnostics` with `code`, `file`, `message`, `fix_hint`
+and often `manor_hint`; apply those. Write the source so these never fire:
+
+- `timeline_track_too_dense`: at most 3 timed elements per `data-track-index`
+  in one HTML file (video/audio, captions and sub-composition hosts exempt).
+  Give each layer its own track; past three scenes, one sub-composition per scene.
+- `duplicate_media_discovery_risk`: never repeat an `<img>`/`<video>`/`<audio>`
+  with the same `src` + `data-start` + `data-duration` in one file (a blurred
+  backdrop copy, a stamp thumbnail). Use one element per source window; paint
+  an extra image layer as a CSS `background-image` on a `<div>`.
+- `composition_file_too_large`: keep each HTML file at most 300 lines.
+- `overlapping_clips_same_track`: clips on one track must not overlap in time.
+- `invalid_parent_traversal_in_asset_path`: no `../` in any `src`, `href` or
+  CSS `url()`, also inside `compositions/`; paths are root-relative (`assets/…`).
+- `gsap_exit_missing_hard_kill` / `scene_layer_missing_visibility_kill`: after a
+  fade-out add `tl.set(<sel>, {visibility: "hidden"}, <end>)`; never tween
+  `visibility`/`display` on a `.clip` itself (`gsap_animates_clip_element`) —
+  animate an inner wrapper.
+- `gsap_timeline_set_initial_hide`: author initial hidden states in CSS or
+  `gsap.set()`, not `tl.set(..., 0)`.
+- Fonts: `font_family_without_font_face` and `google_fonts_import` fail; ship
+  the font file under `assets/` with `@font-face`. `system_font_will_alias`
+  and `timed_element_missing_visibility_hidden` are info only.
+- Media: every `<video>`/`<audio>` has `src`, `data-start` and a unique `id`;
+  a timed `<video>` is `muted` (sound via a separate `<audio>`) unless
+  `data-has-audio="true"`; no `preload="none"`.
+- `studio_missing_editable_id`: every timed element or host has an `id`.
+- Browser findings: any console/page error, failed request, held text
+  overflow/overlap, or contrast below WCAG AA (use `suggestedColor`) fails.
+
+Split compositions across files instead of one huge `index.html`:
+scenes as sub-compositions in `compositions/<scene>.html` (a `<template>`-wrapped
+root with its own timeline, mounted by a host clip with `data-composition-src`),
+and shared styles in local `.css` files referenced by root-relative paths. Manor's
+static contract reads only `index.html`: keep its single inline paused root
+`gsap.timeline` registration there, plus at least one inline timed
+`class="clip"` element (for example a full-length background section), because
+sub-composition hosts do not count as timed clips. Every such file is editable
+source: synced, hashed into `review_sha256`, and kept for render. Each
+sub-composition registers its own paused timeline at
+`window.__timelines["<its data-composition-id>"]` inside its template; one
+animated only from the root timeline instead puts `data-no-timeline` on its
+host element. Review rejects a sub-composition with neither: the render waits
+for that timeline and refuses to export (`sub_timeline_readiness_timeout`).
+
+Sub-composition contract. Export waits for `window.__timelines[<id>]` of every
+mounted scene and fails with `sub_timeline_readiness_timeout` when one never
+registers, which `review` does not catch. For each scene:
+
+- The host in `index.html` carries `data-composition-id`, the
+  `data-composition-src` path and the timing; the file's root inside
+  `<template>` carries the **same** `data-composition-id`.
+- The file's `<style>` and `<script>` go inside the root (scripts in `<head>`
+  are dropped). The script registers one paused timeline under that id; GSAP
+  comes from `index.html`, so do not load it again.
+- A scene with no animation of its own puts `data-no-timeline` on its host.
+- Style the scene through its root `id` (`#s01-root .title`), not
+  `[data-composition-id=…]`; target GSAP tweens by unique ids.
+
+```html
+<!-- index.html, inside the root -->
+<div id="s01-host" data-composition-id="s01" data-composition-src="compositions/s01.html"
+  data-start="0" data-duration="2" data-track-index="1"></div>
+<div id="s02-host" data-composition-id="s02" data-composition-src="compositions/s02.html"
+  data-no-timeline data-start="2" data-duration="2" data-track-index="1"></div>
+
+<!-- compositions/s01.html -->
+<template id="s01-template">
+  <div id="s01-root" data-composition-id="s01" data-width="1920" data-height="1080">
+    <h2 id="s01-title" class="title">Scene one</h2>
+    <style>#s01-root .title { position: absolute; left: 160px; top: 420px; }</style>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo("#s01-title", { x: -40 }, { x: 0, duration: 2, ease: "none" }, 0);
+      window.__timelines["s01"] = tl;
+    </script>
+  </div>
+</template>
+```
 
 Split large projects into logical batches. Every successful call writes inside
 the Sandbox and atomically synchronizes the same editable files back to Manor.
@@ -173,6 +311,14 @@ time so seeking and frame rendering reproduce the same state. Do not use live
 clocks, unseeded randomness, infinite repeats, network requests, or manual media
 playback.
 
+The returned authoring contract defines the supported HTML timing attributes.
+`data-source-start` on an `<audio>` element, or any other invented `data-*`
+attribute, is not an audio source-trim control and is ignored by Video Edit.
+Do not claim a source offset unless the project uses a verified editing path
+that supports it. For the native `compose_video_timeline` route, use its
+documented `audio_tracks[].source_start` or `sourceStart` field instead; this
+HTML route currently has no declarative audio-source-trim contract.
+
 Before the inline timeline, load
 `<script src="./assets/vendor/gsap.min.js"></script>`. The Sandbox supplies this
 library during review; do not download it. A `local_gsap_import` violation means
@@ -205,7 +351,7 @@ root `*.motion.json`** file: writing a valid new `index.motion.json` does not fi
 an invalid `hook.motion.json` or `timeline.motion.json`. Repair each reported
 file/pointer while retaining its other data; do not discard existing files.
 
-`write_files` returning `source_updated` / `source_saved` only confirms saved
+`write_files` / `patch_files` returning `source_updated` / `source_saved` only confirms saved
 source. Check `contract_valid` and `contract_violations` after every batch.
 Violations identify the file, rule, pointer, explanation and expected shape.
 Tool failures use the shared `tool_error` contract with `error`, `message` and
@@ -229,6 +375,19 @@ layers. Keep critical text as HTML/SVG text. Freeze every dependency under
   actions settle instead of keeping every element moving.
 - Vary scene composition without losing continuity. Make the final frame a
   deliberate closing composition.
+- Build designed motion scenes in layers: a background (texture, gradient or
+  footage with slow drift), the main subject, and a foreground of type and
+  accents, each with its own motion and easing. One animated element on a flat
+  background is a slide, not motion design.
+- Give every scene an entrance (staggered, varied easing), a hold with
+  secondary motion (drift, parallax, counters, light sweeps) and a designed
+  transition into the next scene (mask wipe, match cut, shared element, camera
+  push). Avoid fully static frames longer than one second unless the brief asks
+  for stillness.
+- Reveal headlines by line, word or character with masks or offsets rather
+  than a single fade, and keep them readable during the hold.
+- After the first review passes, make one craft pass that upgrades the two
+  weakest scenes, then review again.
 - Check captions, safe areas, clip boundaries, audio levels, and the first and
   last frame before review.
 - Make the canvas audio plan real in the composition: preserve separate voice,
@@ -251,6 +410,12 @@ layers. Keep critical text as HTML/SVG text. Freeze every dependency under
 Call:
 
 `video_edit(operation="review", session_id="<session_id>")`
+
+Every file inside the project is part of the reviewed source, so any write
+after a passing review invalidates its `review_sha256`. Keep review logs,
+acceptance notes and other records outside the project (in the storyboard or
+canvas document), and hand off only a hash returned by a review that came after
+your last write; if you wrote anything afterwards, review again.
 
 Fix every reported issue and review again until the strict gate passes. Return
 the review frames, the complete production canvas/assembly map, and `review_sha256`
@@ -275,6 +440,19 @@ Keep the same session open after a failed review so revisions can use
 `write_files` and `review` without rebuilding the Sandbox. Close it after
 successful delivery or when the user explicitly cancels the edit.
 
+A calling skill or brief may cap the number of review passes to bound cost.
+The cap limits iteration, not delivery. When it is used up and some revision of
+this version passed review, export that revision: if the source changed since,
+restore the passed revision's files exactly, review it once more to confirm the
+same `review_sha256` (re-confirming already-passed source does not count
+against the cap), and render it. Hand it off as delivered with exceptions: each
+unresolved review finding from the later attempts becomes an unmet acceptance
+criterion with the finding as its evidence. Report `blocked` only when no
+revision ever passed review, so there is nothing to render, with the remaining
+findings and the last review frames. The cap is the production's own cost
+control: never ask the user, an operator or any other authority to raise it or
+to grant an exception.
+
 The Tool runs untrusted project code only in the active network-isolated
 Sandbox. Never run the project HTML or render command inside the Manor API or
 worker. The review operation first synchronizes any Sandbox-authored changes to
@@ -292,10 +470,56 @@ rendering. If the user requests a revision, edit the durable source, review
 again, and obtain approval for the new hash. Return the registered MP4 and keep
 the source project as the editable master.
 
-After delivery, call `video_edit(operation="close", session_id="<session_id>")`
-to perform one final source sync and release the Sandbox. If the session expires
+After the rendered MP4 is registered, call
+`video_edit(operation="close", session_id="<session_id>")` to perform one final
+source sync and release the Sandbox. When your part ends at review and a later
+step or the user renders, leave the session open and return its `session_id`
+with the review hash; closing it there forces the renderer to start over. If the session expires
 before that, the Tool recovers it from the durable Manor source on the next
 session operation and reports the recovery as a progress event.
 
 If `video_edit` returns `runtime_unavailable`, report that exact blocker. Never
-silently switch to a lower-fidelity preset.
+silently switch to a lower-fidelity preset. When it also says `transient: true`,
+the Tool already waited out a Sandbox Service restart (`retry_attempts`,
+`retried_seconds`) and the project source is intact: retry the same operation
+once more before reporting the blocker.
+
+If a render returns `render_resource_limit`, the runtime already sized FFmpeg
+and browser concurrency to the Sandbox's own PID, memory and CPU limits and
+retried once at its minimum. `reason` (`pid_limit`, `oom`,
+`thread_spawn_failed`) and `step` say what ran out where; `retryable: false`
+means repeating the identical export fails the same way. Report that blocker,
+or, if the edit allows it, reduce how many video layers play at the same time
+and review again. There is no extra stderr or Sandbox control to inspect.
+
+If a render returns `render_audio_failed`, the audio mix stopped the export
+before frame capture (the renderer will not ship a silent video). `reason` says
+why (`source_not_found`, `invalid_media`, `ffmpeg_failed`, ...) and
+`missing_media` lists files the page requested but the render could not find.
+For `source_not_found` the Tool already repeated the render with every project
+file, so the file is genuinely absent: stage it with `push_assets`, point the
+element at the returned `project_path`, review and render again. A render
+failure does not invalidate the reviewed revision and never calls for edits to
+unrelated parts of the composition.
+
+If a review returns `snapshot_timeout` (or a render `render_timeout`), the
+Sandbox browser could not load the composition in time, and the runtime already
+retried once with doubled timeouts sized to the project's media. `step` says
+where (`quality_check`, `snapshot`, `render`); `retryable: true` means the same
+request can succeed once the host has capacity. Do not edit the project, drop
+snapshot times or change media preload to work around it: run the same
+operation again later, and report the blocker if it persists.
+
+If a review returns `snapshot_video_frames_missing`, frame capture could not
+copy one or more `<video>` frames into the review frames (they would have shown
+black), so no frames were kept; the runtime already retried once.
+`video_extraction` shows FFmpeg's direct attempt on each project video. With
+`retryable: true` every video extracted directly, so the host was at fault: run
+review again without editing the project. With `retryable: false` the error
+names either a clip shown past the end of its footage (`videos_past_source_end`:
+its slot is longer than the file — shorten its `data-duration`, slow it with
+`data-playback-rate`, loop it or use a longer clip, then review again), the
+video that cannot be read in the Sandbox (replace or re-encode that asset, then
+review again) or, when no video could be read, the Sandbox itself (report the
+blocker; do not touch the assets). Apart from a clip past its footage, never
+treat a black video in review frames as a composition bug.

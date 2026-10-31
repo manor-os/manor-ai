@@ -316,6 +316,63 @@ async def test_knowledge_update_and_retirement_keep_documents(db_session):
 
 
 @pytest.mark.asyncio
+async def test_initial_file_upgrade_and_revert_preserve_current_document(db_session, monkeypatch, tmp_path):
+    from pathlib import Path
+    from packages.core.config import get_settings
+    from packages.core.services.entity_fs import write_entity_file_atomic
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    payload = _payload()
+    payload["embedded"]["knowledge_packs"] = [{
+        "slug": "support", "title": "Support queue", "mode": "inline_text",
+        "starter_documents": [{
+            "key": "queue", "path": "support/queue.csv", "body_md": "ticket_id,status\n",
+            "template": {"id": "support-queue", "mode": "initial_file", "version": 1},
+        }],
+    }]
+    workspace = await _workspace(db_session)
+    planned = await plan_configuration(db_session, workspace=workspace, payload=payload)
+    installed = await apply_configuration(db_session, workspace=workspace, payload=payload, plan=planned, choices=_choices(planned))
+    document = (await db_session.scalars(select(Document).where(Document.entity_id == workspace.entity_id))).one()
+    current = "ticket_id,status\nprivate-ticket,investigating\n"
+    document.metadata_ = {**document.metadata_, "content_text": current}
+    document.file_size = len(current.encode())
+    write_entity_file_atomic(workspace.entity_id, document.fs_path, current.encode())
+    await db_session.commit()
+    original_metadata = copy.deepcopy(document.metadata_)
+    original_identity = document.id, document.name, document.fs_path, document.file_size, document.vector_status
+    newer = copy.deepcopy(payload)
+    starter = newer["embedded"]["knowledge_packs"][0]["starter_documents"][0]
+    starter["body_md"] = "ticket_id,status,priority\n"
+    starter["template"]["version"] = 2
+    planned = await plan_configuration(db_session, workspace=workspace, payload=newer, baseline=installed["baseline"])
+    document_plan = next(item for item in planned["items"] if item["kind"] == "knowledge_document")
+    assert document_plan["action"] == "update" and not document_plan.get("blocked_reason")
+    upgraded = await apply_configuration(db_session, workspace=workspace, payload=newer, plan=planned, choices=_choices(planned))
+    assert document.metadata_ == {
+        **original_metadata, "blueprint_initial_body_md": starter["body_md"], "blueprint_template": starter["template"],
+    }
+    assert (document.id, document.name, document.fs_path, document.file_size, document.vector_status) == original_identity
+    assert Path(tmp_path, workspace.entity_id, document.fs_path).read_bytes() == current.encode()
+    await revert_configuration(db_session, workspace=workspace, restore=upgraded["restore"])
+    assert document.metadata_ == original_metadata
+    assert (document.id, document.name, document.fs_path, document.file_size, document.vector_status) == original_identity
+    assert Path(tmp_path, workspace.entity_id, document.fs_path).read_bytes() == current.encode()
+
+    plain = copy.deepcopy(newer)
+    plain["embedded"]["knowledge_packs"][0]["starter_documents"][0].pop("template")
+    planned = await plan_configuration(db_session, workspace=workspace, payload=plain, baseline=installed["baseline"])
+    document_plan = next(item for item in planned["items"] if item["kind"] == "knowledge_document")
+    assert document_plan.get("blocked_reason")
+    with pytest.raises(ConfigurationUpgradeError):
+        await apply_configuration(db_session, workspace=workspace, payload=plain, plan=planned, choices=_choices(planned))
+    assert document.metadata_ == original_metadata
+    assert Path(tmp_path, workspace.entity_id, document.fs_path).read_bytes() == current.encode()
+
+
+@pytest.mark.asyncio
 async def test_subscription_rebind_reconciles_schedule_and_reverts_exact_local_references(db_session):
     workspace = await _workspace(db_session)
     old = Agent(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id, name="Old", slug="old")
@@ -399,10 +456,81 @@ async def test_shared_component_reference_remap_is_cas_revertible(db_session):
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_upgrade_and_undo_preserve_derived_schedule_rows(db_session):
+async def test_paused_configuration_upgrade_keeps_standalone_collection_enabled(db_session):
     workspace = await _workspace(db_session)
+    workspace.status = "paused"
+    source = _payload()
+    source["recipe"]["stats"] = [
+        {
+            "library_key": "workspace.tasks.completed",
+            "key": "completed_tasks",
+            "name": "Completed maintenance tasks",
+            "collection_cadence": "daily",
+        },
+        {
+            "library_key": "workspace.tasks.overdue",
+            "key": "overdue_tasks",
+            "name": "Overdue maintenance tasks",
+            "collection_cadence": "daily",
+        },
+    ]
+    planned = await plan_configuration(db_session, workspace=workspace, payload=source)
+    await apply_configuration(
+        db_session, workspace=workspace, payload=source, plan=planned, choices=_choices(planned),
+    )
+    stat = await db_session.scalar(select(WorkspaceStat).where(
+        WorkspaceStat.workspace_id == workspace.id,
+        WorkspaceStat.key == "completed_tasks",
+    ))
+    job = await db_session.scalar(select(ScheduledJob).where(ScheduledJob.job_id == f"wsstat:{stat.id}"))
+    unrelated_stat = await db_session.scalar(select(WorkspaceStat).where(
+        WorkspaceStat.workspace_id == workspace.id,
+        WorkspaceStat.key == "overdue_tasks",
+    ))
+    unrelated_job = await db_session.scalar(select(ScheduledJob).where(
+        ScheduledJob.job_id == f"wsstat:{unrelated_stat.id}",
+    ))
+    assert workspace.status == "paused" and not workspace.heartbeat_enabled
+    assert job is not None and job.enabled
+    assert unrelated_job is not None and unrelated_job.enabled
+    unrelated_job.enabled = False
+    await db_session.flush()
+    # Binding the same collector to a Goal makes it part of the paused Goal
+    # runtime, without introducing a scenario-specific collection rule.
+    source["recipe"]["goals"] = [{
+        "goal_key": "maintenance", "title": "Complete maintenance", "stat_key": "completed_tasks", "target_value": 10,
+    }]
+    planned = await plan_configuration(db_session, workspace=workspace, payload=source)
+    await apply_configuration(
+        db_session, workspace=workspace, payload=source, plan=planned, choices=_choices(planned),
+    )
+    await db_session.refresh(job)
+    await db_session.refresh(unrelated_job)
+    assert not job.enabled
+    assert not unrelated_job.enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sandbox", "disabled_status"),
+    [(False, "paused"), (True, "active")],
+)
+async def test_heartbeat_upgrade_and_undo_preserve_derived_schedule_rows(
+    db_session,
+    sandbox,
+    disabled_status,
+):
+    workspace = await _workspace(db_session)
+    if sandbox:
+        workspace.settings = {**workspace.settings, "sandbox": True}
     source = _payload()
     source["recipe"]["operating_model"].update({"heartbeat_enabled": True, "heartbeat_cadence": "daily"})
+    source["recipe"]["stats"] = [{
+        "library_key": "workspace.tasks.overdue",
+        "key": "overdue_tasks",
+        "name": "Overdue maintenance tasks",
+        "collection_cadence": "daily",
+    }]
     source["recipe"]["goals"] = [{"title": "Publish daily", "target_value": 30}]
     plan = await plan_configuration(db_session, workspace=workspace, payload=source)
     applied = await apply_configuration(
@@ -415,13 +543,66 @@ async def test_heartbeat_upgrade_and_undo_preserve_derived_schedule_rows(db_sess
     )
     assert jobs and all(job.enabled for job in jobs)
     identities = {job.id for job in jobs}
-    await revert_configuration(db_session, workspace=workspace, restore=applied["restore"])
+    independent_stat = await db_session.scalar(select(WorkspaceStat).where(
+        WorkspaceStat.workspace_id == workspace.id,
+        WorkspaceStat.key == "overdue_tasks",
+    ))
+    independent_job = await db_session.scalar(select(ScheduledJob).where(
+        ScheduledJob.job_id == f"wsstat:{independent_stat.id}",
+    ))
+    independent_job.enabled = False
+    await db_session.flush()
+
+    disabled_source = copy.deepcopy(source)
+    disabled_source["recipe"]["operating_model"]["heartbeat_enabled"] = False
+    disabled_plan = await plan_configuration(
+        db_session,
+        workspace=workspace,
+        payload=disabled_source,
+        baseline=applied["baseline"],
+    )
+    disabled = await apply_configuration(
+        db_session,
+        workspace=workspace,
+        payload=disabled_source,
+        plan=disabled_plan,
+        choices=_choices(disabled_plan),
+    )
+    await db_session.refresh(independent_job)
+    assert workspace.status == disabled_status
+    assert workspace.heartbeat_enabled is False
+    assert independent_job.enabled is False
+
+    await revert_configuration(db_session, workspace=workspace, restore=disabled["restore"])
     jobs_after = list(
         (await db_session.execute(select(ScheduledJob).where(ScheduledJob.workspace_id == workspace.id))).scalars()
     )
     assert {job.id for job in jobs_after} == identities
-    assert all(not job.enabled for job in jobs_after)
-    assert workspace.heartbeat_enabled is False
+    assert workspace.status == "active"
+    assert workspace.heartbeat_enabled is True
+    assert not independent_job.enabled
+    assert all(job.enabled for job in jobs_after if job.id != independent_job.id)
+
+    workspace.status = "paused"
+    await db_session.flush()
+    cadence_source = copy.deepcopy(source)
+    cadence_source["recipe"]["operating_model"]["heartbeat_cadence"] = "weekly"
+    cadence_plan = await plan_configuration(
+        db_session,
+        workspace=workspace,
+        payload=cadence_source,
+        baseline=applied["baseline"],
+    )
+    await apply_configuration(
+        db_session,
+        workspace=workspace,
+        payload=cadence_source,
+        plan=cadence_plan,
+        choices=_choices(cadence_plan),
+    )
+    await db_session.refresh(independent_job)
+    assert workspace.status == "paused"
+    assert independent_job.enabled is False
 
 
 @pytest.mark.asyncio

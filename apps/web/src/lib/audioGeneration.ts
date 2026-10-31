@@ -33,7 +33,6 @@ export enum AudioGenerationFormat {
 }
 
 export enum AudioGenerationStatus {
-  Pending = "pending",
   Completed = "completed",
   Error = "error",
 }
@@ -53,7 +52,6 @@ export enum AudioGenerationProvider {
   Google = "google",
   OpenAI = "openai",
   Zyphra = "zyphra",
-  Suno = "suno",
   Unknown = "unknown",
 }
 
@@ -82,20 +80,6 @@ export interface AudioGenerationCompletedResult {
   file_size: number;
 }
 
-export interface AudioGenerationPendingResult {
-  kind: GenerateFileKind.Audio;
-  status: AudioGenerationStatus.Pending;
-  provider: AudioGenerationProvider.Suno;
-  job_id: string;
-  prompt: string;
-  purpose: AudioGenerationPurpose.Music;
-  model: string;
-  name?: string;
-  credits_estimate: number;
-  billing_mode: "byok" | "platform";
-  message: string;
-}
-
 export interface AudioGenerationErrorResult {
   kind: GenerateFileKind.Audio;
   status: AudioGenerationStatus.Error;
@@ -114,7 +98,6 @@ export interface AudioGenerationErrorResult {
 }
 
 export type AudioGenerationResult =
-  | AudioGenerationPendingResult
   | AudioGenerationCompletedResult
   | AudioGenerationErrorResult;
 
@@ -145,21 +128,7 @@ export function parseAudioGenerationResult(
   if (!enumContains(AudioGenerationPurpose, value.purpose)) return null;
   if (!enumContains(AudioGenerationProvider, value.provider)) return null;
 
-  if (value.status === AudioGenerationStatus.Pending) {
-    if (
-      value.provider !== AudioGenerationProvider.Suno ||
-      value.purpose !== AudioGenerationPurpose.Music ||
-      typeof value.job_id !== "string" ||
-      typeof value.prompt !== "string" ||
-      typeof value.model !== "string" ||
-      (value.name !== undefined && typeof value.name !== "string") ||
-      typeof value.credits_estimate !== "number" ||
-      (value.billing_mode !== "byok" && value.billing_mode !== "platform") ||
-      typeof value.message !== "string"
-    ) {
-      return null;
-    }
-  } else if (value.status === AudioGenerationStatus.Completed) {
+  if (value.status === AudioGenerationStatus.Completed) {
     if (
       typeof value.result_url !== "string" ||
       typeof value.audio_url !== "string" ||

@@ -162,7 +162,10 @@ import {
 import {
   findPresentationPlaceholderShape,
   presentationInheritedTextStyleLevels,
+  presentationLineSpacingMultiplier,
+  PRESENTATION_DEFAULT_TEXT_INSETS,
   presentationPointsToCqh as pptxPointsToCqh,
+  presentationTextInsetPadding,
   type PresentationTextLevelStyle,
 } from "../lib/presentationStyleInheritance";
 import {
@@ -258,6 +261,7 @@ import {
 } from "../lib/plain-text-history.mjs";
 
 import { t } from "../lib/i18n";
+import { getPreferredTimeZone } from "../lib/format";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -2767,6 +2771,7 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
 
     // Line/paragraph spacing
     let lineSpacing: number | undefined = inherited.lineSpacing;
+    let lineSpacingPoints: number | undefined = inherited.lineSpacingPoints;
     let spaceBefore: number | undefined = inherited.spaceBefore;
     let spaceAfter: number | undefined = inherited.spaceAfter;
     if (pPr) {
@@ -2784,9 +2789,11 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
       const lnSpc = pptxXmlInner(pPr, "a:lnSpc");
       if (lnSpc) {
         const spcPct = lnSpc.match(/<a:spcPct val="(\d+)"/);
-        if (spcPct) lineSpacing = parseInt(spcPct[1], 10) / 100000;
         const spcPts = lnSpc.match(/<a:spcPts val="(\d+)"/);
-        if (spcPts) lineSpacing = parseInt(spcPts[1], 10) / 100 / paragraphFontSize;
+        if (spcPct || spcPts) {
+          lineSpacing = spcPct ? parseInt(spcPct[1], 10) / 100000 : undefined;
+          lineSpacingPoints = spcPts ? parseInt(spcPts[1], 10) / 100 : undefined;
+        }
       }
       const spcBef = pptxXmlInner(pPr, "a:spcBef");
       if (spcBef) spaceBefore = spacingPoints(spcBef);
@@ -2882,6 +2889,9 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
         firstFontSize = rFontSize; firstColor = rColor; firstFontFamily = rFontFamily;
         isFirst = false;
       }
+    }
+    if (lineSpacingPoints != null) {
+      lineSpacing = presentationLineSpacingMultiplier(lineSpacingPoints, runs.map((run) => run.fontSize), defFontSize);
     }
 
     if (paraText.trim() || paraText.includes("\n")) {
@@ -3975,11 +3985,9 @@ function pptxShapeVisualStyle(shape: PptxShape, size: PresentationSlideSize): Re
     display: "flex",
     flexDirection: "column",
     justifyContent: shape.vAlign === "bottom" ? "flex-end" : shape.vAlign === "middle" ? "center" : "flex-start",
-    padding: !isLine && shape.padding
-      ? `${pptxPointsToCqh(shape.padding.t)} ${pptxPointsToCqh(shape.padding.r)} ${pptxPointsToCqh(shape.padding.b)} ${pptxPointsToCqh(shape.padding.l)}`
-      : !isLine && shape.texts.length
-        ? `${pptxPointsToCqh(3.6)} ${pptxPointsToCqh(7.2)}`
-        : undefined,
+    padding: !isLine && (shape.padding || shape.texts.length)
+      ? presentationTextInsetPadding(shape.padding ?? PRESENTATION_DEFAULT_TEXT_INSETS, shape)
+      : undefined,
   };
 }
 
@@ -8815,7 +8823,7 @@ export default function DocEditor() {
     if (key === "image") insertRichTextImage();
     if (key === "divider") execCmd("insertHorizontalRule");
     if (key === "page-break") insertRichTextPageBreak();
-    if (key === "date") execCmd("insertText", new Date().toLocaleDateString());
+    if (key === "date") execCmd("insertText", new Date().toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }));
     if (key === "callout") insertRichTextCallout();
     if (key === "checklist") insertRichTextChecklist();
     if (key === "clear") execCmd("removeFormat");
@@ -9542,8 +9550,8 @@ export default function DocEditor() {
   }, [applyPlainTextTextareaEdit, commitPlainTextChange]);
 
   const handlePlainTextInsertAction = useCallback((key: string) => {
-    if (key === "date") insertPlainTextBlock(new Date().toLocaleDateString());
-    if (key === "time") insertPlainTextBlock(new Date().toLocaleString());
+    if (key === "date") insertPlainTextBlock(new Date().toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }));
+    if (key === "time") insertPlainTextBlock(new Date().toLocaleString(undefined, { timeZone: getPreferredTimeZone() }));
     if (key === "divider") insertPlainTextBlock("------------------------------------------------------------");
     if (key === "bullet") prefixPlainTextLines("- ");
     if (key === "numbered") prefixPlainTextLines("{n}. ");
@@ -12151,7 +12159,7 @@ export default function DocEditor() {
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <span style={{ fontSize: 12, fontWeight: 700, color: "#44403c" }}>{t("page.doc_editor.v")}{v.version_number}</span>
                       <span style={{ fontSize: 10, color: "#a8a29e" }}>
-                        {v.created_at ? new Date(v.created_at).toLocaleString() : ""}
+                        {v.created_at ? new Date(v.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : ""}
                       </span>
                     </div>
                     {v.change_summary && <p style={{ fontSize: 11, color: "#78716c", marginTop: 4, marginBottom: 0 }}>{v.change_summary}</p>}
@@ -12210,7 +12218,7 @@ export default function DocEditor() {
           />
         )}
         <div className="doc-editor-footer-status" style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          {doc?.created_at && <span>{t("page.dashboard.created")} {new Date(doc.created_at).toLocaleDateString()}</span>}
+          {doc?.created_at && <span>{t("page.dashboard.created")} {new Date(doc.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}</span>}
         </div>
       </div>
 

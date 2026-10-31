@@ -55,31 +55,3 @@ def test_no_builtin_tool_schema_uses_top_level_combinators():
     offenders = {name: sorted(found) for name, schema in schemas if (found := _top_level_combinators(schema))}
     assert offenders == {}, f"tool schemas with top-level anyOf/oneOf/allOf are rejected by Anthropic: {offenders}"
 
-
-def test_submit_result_tool_never_uses_top_level_combinators():
-    """``submit_result`` is built per step, outside the registry the scan
-    above covers. Its hard-contract form once carried the success/failure
-    branch as a top-level ``allOf`` and every Anthropic-routed plan step with
-    an output contract died with the same HTTP 400 (e2e, 2026-09-18)."""
-    from packages.core.contracts.task_output import (
-        PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
-        TASK_OUTPUT_CONTRACT_SOURCE_KEY,
-        output_contract_for_schema,
-    )
-    from packages.core.workers.submit_result import build_submit_result_tool
-
-    hard = {
-        TASK_OUTPUT_CONTRACT_SOURCE_KEY: PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
-        "type": "object",
-        "required": ["drill_day"],
-        "properties": {"drill_day": {"type": "string", "enum": ["Tuesday", "Thursday"]}},
-        "additionalProperties": False,
-    }
-    assert output_contract_for_schema(hard).requires_result, "fixture must be a hard contract"
-    legacy = {"type": "object", "properties": {"notice": {"type": "string"}}}
-    for label, schema in (("none", None), ("legacy", legacy), ("hard", hard)):
-        tool = build_submit_result_tool(schema)
-        assert _top_level_combinators(tool) == set(), label
-    # The hard contract still tells the model which member each outcome needs.
-    status = build_submit_result_tool(hard)["function"]["parameters"]["properties"]["status"]
-    assert "`result` is required" in status["description"]

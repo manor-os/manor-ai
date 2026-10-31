@@ -367,6 +367,16 @@ class MessageLog(Base, TimestampMixin):
             ),
         ),
         Index(
+            "uq_message_logs_email_inbound_message",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'email' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
             "uq_message_logs_ms_teams_inbound_event",
             "channel_config_id",
             "external_id",

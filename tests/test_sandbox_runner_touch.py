@@ -93,8 +93,7 @@ def test_touch_unknown_sandbox_does_not_create_one(ready_runner):
 def test_touch_active_execution_only_renews_idle_timestamp(ready_runner):
     runner, sandbox = ready_runner
     sandbox.status = SandboxStatus.EXECUTING
-    sandbox._active_command = "render original project"
-    sandbox._active_execution_id = "execution-1"
+    sandbox._executions = {"execution-1": ("render original project", 1000.0, 2000.0)}
     result = runner.touch_sandbox(sandbox.sandbox_id)
     assert result.status == SandboxStatus.EXECUTING
     assert result.active_command == "render original project"

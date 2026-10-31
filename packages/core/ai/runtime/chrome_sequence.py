@@ -487,6 +487,13 @@ def _stop_reason(tool_name: str, result: Any) -> str | None:
             for target in targets
         ):
             return "target_ambiguous"
+    if (
+        payload.get("action_executed") is False
+        and status == "read_page_required"
+        and str(payload.get("reason") or "").strip()
+        in {"snapshot_mismatch", "target_moved", "ref_not_found"}
+    ):
+        return "observation_required"
     if status in {"error", "failed", "blocked", "rejected", "unavailable"}:
         return "child_failed"
     if error or payload.get("ok") is False:
@@ -677,11 +684,15 @@ async def runtime_execute_chrome_sequence(
         if terminal_uncertainty is not None:
             stop_reason = "uncertain_result"
         if stop_reason == "observation_required":
-            # Execution completed; only its observation is pending. Stop the
-            # sequence before the next mutation and let the parent inspect it.
-            completed_steps.append(step_result)
+            # A completed action or stale, unexecuted locator requires a fresh
+            # observation before this sequence can continue.
+            if _payload(child_result).get("action_executed") is True:
+                completed_steps.append(step_result)
+                stopped_step = None
+            else:
+                stopped_step = step_result
             return {
-                **_result(status="stopped", completed_steps=completed_steps, stopped_step=None,
+                **_result(status="stopped", completed_steps=completed_steps, stopped_step=stopped_step,
                           elapsed_ms=round((loop.time() - started) * 1000), timed_out=False,
                           stop_reason="observation_required"),
                 "next_required_tool": "mcp__chrome__read_page",

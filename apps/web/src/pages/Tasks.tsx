@@ -6,6 +6,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 import { useWorkspaceFilter } from "../stores/workspace";
 import type { BookingRecord, DailyAgendaItem, ExternalCalendarEvent as ApiExternalCalendarEvent, Task, Workspace, WorkspaceStaff } from "../lib/types";
 import { formatDateShort as formatDate, formatDateFull as formatDateFull, formatDateLong, isDeadlineOverdue } from "../lib/format";
@@ -33,7 +34,6 @@ import { TaskType } from "../lib/taskTypes";
 import TaskPropertiesPanel, { filterWorkspaceScopedAgents } from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
-import { useTaskInputResolution } from "../components/task/useTaskInputResolution";
 import { currentTaskBlocker, taskBlockerView } from "../lib/taskBlocker";
 import ChatMarkdown from "../components/ChatMarkdown";
 import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
@@ -47,13 +47,8 @@ import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 import { inferRuntimeRuleFromText } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
-import {
-  canResumeLegacyAgentInput,
-  hasPendingPlanDecision,
-  pendingTaskInputRequests,
-  needsEffectReconciliation,
-  resumablePlanInputStep,
-} from "../lib/taskHitl";
+import { canResumeLegacyAgentInput } from "../lib/taskHitl";
+import { takeTaskDraftHandoff } from "../lib/taskDraftHandoff";
 import {
   ADD_SELECTION_TO_TASK_EVENT,
   SELECTED_TEXT_TASK_DRAFT_KEY,
@@ -1218,6 +1213,7 @@ function localDateKey(date: Date): string {
 function formatAgendaTime(value: string, timezone?: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
+  // timezone-exempt: booking's own zone; agenda days are keyed in the device zone
   return parsed.toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
@@ -1385,13 +1381,17 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Entity users — shared with the assignee picker in TaskPropertiesPanel.
+  // The company directory is refused to an external collaborator.
+  const collaborator = useIsCollaborator();
   const { data: usersList } = useQuery({
     queryKey: ["entity-users-for-assignee", "directory"],
     queryFn: () => api.users.directory(),
+    enabled: !collaborator,
   });
   const { data: staffList = [] } = useQuery({
     queryKey: ["entity-staff-for-assignee"],
     queryFn: () => api.staff.list(),
+    enabled: !collaborator,
   });
   const { data: workspaceAssignableAgents } = useQuery({
     queryKey: ["workspace-assignable-agents", initialTask.workspace_id],
@@ -1409,7 +1409,6 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
     initialData: initialTask,
   });
   const task: Task = (liveTask as Task) || initialTask;
-  const inputResolution = useTaskInputResolution(task);
   const workspaceAgentIds = task.workspace_id
     ? workspaceAssignableAgents?.agent_ids || []
     : undefined;
@@ -1418,39 +1417,16 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
     queryKey: ["task-logs", task.id],
     queryFn: () => api.tasks.logs(task.id),
   });
-  const { data: taskPlans = [], isSuccess: taskPlansResolved } = useQuery({
-    queryKey: ["task-plans", task.id],
-    queryFn: () => api.plans.list({ task_id: task.id, limit: 5 }),
-  });
-  const latestPlan = taskPlans[0] || null;
-  const { data: planSteps = [], isSuccess: planStepsResolved } = useQuery({
-    queryKey: ["plan-steps", latestPlan?.id],
-    queryFn: () => api.plans.steps(latestPlan!.id),
-    enabled: !!latestPlan?.id,
-  });
-  const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps);
-  const pendingInputCards = pendingTaskInputRequests(task, latestPlan, planSteps);
-  const canRespondToInput = Boolean(pendingPlanInputStep)
-    || canResumeLegacyAgentInput(task, latestPlan, taskPlansResolved);
+  const canRespondToInput = canResumeLegacyAgentInput(task);
   const RECOVERY_EVENT_TYPES = new Set([
     "ai_hitl_requested",
     "step_needs_human",
     "ai_execution_failed",
     "ai_needs_replan",
   ]);
-  const hasTaskRecoveryOrigin = Boolean(latestPlan)
-    || Boolean(currentTaskBlocker(task))
+  const hasTaskRecoveryOrigin = Boolean(currentTaskBlocker(task))
     || canRespondToInput
     || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
-  const hasPendingTypedDecision = hasPendingPlanDecision(
-    planSteps,
-    pendingPlanInputStep?.id,
-  );
-  const planDecisionStateResolved = taskPlansResolved
-    && (!latestPlan || planStepsResolved);
-  const reviewEffectsHref = needsEffectReconciliation(task, latestPlan)
-    ? `/chat?workspace=${encodeURIComponent(task.workspace_id!)}`
-    : undefined;
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.location.hash) return;
@@ -1487,10 +1463,6 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["task", task.id] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", task.id] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", task.id] });
-      if (result.plan_id) {
-        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
-      }
       toast.success(
         result.dispatched ? t("page.tasks.retry_started") : t("page.tasks.retry_queued"),
         `${t("page.tasks.mode")}: ${result.mode}`,
@@ -1500,17 +1472,13 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
   });
 
   const hitlMut = useMutation({
-    mutationFn: ({ stepId, response, fields }: { stepId?: string; response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(task.id, { step_id: stepId, response, fields }),
+    mutationFn: ({ response, fields }: { response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(task.id, { response, fields }),
     onSuccess: (result) => {
       queryClient.setQueryData(["task", task.id], result.task);
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["task", task.id] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", task.id] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", task.id] });
-      if (result.plan_id) {
-        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
-      }
       window.dispatchEvent(new CustomEvent("manor:workspace-actions-refresh", { detail: { workspaceId: result.task.workspace_id } }));
       setComment("");
       toast.success(
@@ -1638,33 +1606,18 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
           {showMore ? t("page.tasks.hide_details") : t("page.tasks.more_details")}
         </button>
 
-        {planDecisionStateResolved && hasTaskRecoveryOrigin && (
-          pendingInputCards.length > 0
-          || task.status !== "waiting_on_customer"
-          || !hasPendingTypedDecision
-          || canRespondToInput
-        ) && (
+        {hasTaskRecoveryOrigin && (
           <TaskRecoveryPanel
             key={`${task.id}:${task.status}`}
             task={task}
             status={task.status}
             logs={logs}
             comment={comment}
-            inputStepId={pendingPlanInputStep?.id}
-            inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
-            inputRequests={pendingInputCards}
-            inputResetToken={inputResolution.resetToken}
-            onResolveInput={inputResolution.resolve}
-            reviewEffectsHref={reviewEffectsHref}
-            isPending={retryMut.isPending || hitlMut.isPending || inputResolution.isPending}
+            isPending={retryMut.isPending || hitlMut.isPending}
             variant="compact"
             onRetry={(note) => retryMut.mutate(note)}
             onRespond={canRespondToInput
-              ? (response, fields) => hitlMut.mutate({
-                  stepId: pendingPlanInputStep?.id,
-                  response,
-                  fields,
-                })
+              ? (response, fields) => hitlMut.mutate({ response, fields })
               : undefined}
           />
         )}
@@ -2389,8 +2342,18 @@ function TaskListView({
 
 /* ── main component ─────────────────────────────────────── */
 
-export default function Tasks() {
+export interface EmbeddedTaskCreate {
+  drafts: SelectedTextTaskDraft[];
+  onCreated: (index: number, task: Task) => void;
+  onClose: () => void;
+  onBusy: (busy: boolean) => void;
+}
+
+export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTaskCreate } = {}) {
   const catalogScope = useCatalogScope();
+  // In the customer-trial frame the company directory and staff are refused;
+  // tasks are assigned from the Workspace's own agents and staff.
+  const collaborator = useIsCollaborator();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const drawerTaskId = searchParams.get("task") || "";
@@ -2409,6 +2372,8 @@ export default function Tasks() {
   const [taskListSort, setTaskListSort] = useState<TaskListSortState>(DEFAULT_TASK_LIST_SORT);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [importDrafts, setImportDrafts] = useState<SelectedTextTaskDraft[]>([]);
+  const importedDraftsRef = useRef(false);
   const [dragOverCol, setDragOverCol] = useState<string | null>(null);
   const [dragOverBoardColumn, setDragOverBoardColumn] = useState<BoardColumnKey | null>(null);
   const [draggingBoardColumn, setDraggingBoardColumn] = useState<BoardColumnKey | null>(null);
@@ -2422,7 +2387,7 @@ export default function Tasks() {
   const { data: storedTaskBoardPreferences } = useQuery({
     queryKey: ["task-board-preferences", currentUser?.id],
     queryFn: () => api.tasks.getBoardPreferences(),
-    enabled: Boolean(currentUser?.id),
+    enabled: !embeddedCreate && Boolean(currentUser?.id),
   });
   useEffect(() => {
     setTaskBoardPreferencesHydrated(false);
@@ -2446,16 +2411,16 @@ export default function Tasks() {
     setTaskBoardPreferencesHydrated(true);
   }, [currentUser?.id, storedTaskBoardPreferences]);
   useEffect(() => {
-    persistVisibleBoardColumns(currentUser?.id, visibleBoardColumns);
+    if (!embeddedCreate) persistVisibleBoardColumns(currentUser?.id, visibleBoardColumns);
   }, [currentUser?.id, visibleBoardColumns]);
   useEffect(() => {
-    persistBoardColumnOrder(currentUser?.id, boardColumnOrder);
+    if (!embeddedCreate) persistBoardColumnOrder(currentUser?.id, boardColumnOrder);
   }, [boardColumnOrder, currentUser?.id]);
   useEffect(() => {
-    persistTaskBoardMode(currentUser?.id, boardMode);
+    if (!embeddedCreate) persistTaskBoardMode(currentUser?.id, boardMode);
   }, [boardMode, currentUser?.id]);
   useEffect(() => {
-    if (!currentUser?.id || !taskBoardPreferencesHydrated) return;
+    if (embeddedCreate || !currentUser?.id || !taskBoardPreferencesHydrated) return;
     const timeout = window.setTimeout(() => {
       void api.tasks.updateBoardPreferences({
         mode: boardMode,
@@ -2486,7 +2451,7 @@ export default function Tasks() {
   const suppressWorkspaceUrlWriteRef = useRef(false);
   const isEntityScopeFilter = workspaceIdParam === ENTITY_LEVEL_WORKSPACE_FILTER;
   const wsFilter = isEntityScopeFilter ? ENTITY_LEVEL_WORKSPACE_FILTER : wsId !== "all" ? wsId : undefined;
-  const apiWorkspaceFilter = wsFilter === ENTITY_LEVEL_WORKSPACE_FILTER ? undefined : wsFilter;
+  const apiWorkspaceFilter = embeddedCreate || wsFilter === ENTITY_LEVEL_WORKSPACE_FILTER ? undefined : wsFilter;
   const statusFocus = searchParams.get("status") || "";
   const statusFocusLabel =
     statusFocus === "overdue"
@@ -2503,13 +2468,16 @@ export default function Tasks() {
     setStatusFilter("all");
     setOwnerFilter("all");
     setDueFilter("all");
-    useWorkspaceFilter.getState().setActiveWorkspaceId("all");
     const next = new URLSearchParams(searchParams);
     next.delete("status");
-    next.delete("workspaceId");
-    next.delete("workspace_id");
+    // A collaborator's list stays on the one Workspace they work in.
+    if (!collaborator) {
+      useWorkspaceFilter.getState().setActiveWorkspaceId("all");
+      next.delete("workspaceId");
+      next.delete("workspace_id");
+    }
     setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams]);
+  }, [collaborator, searchParams, setSearchParams]);
 
   // Create form state
   const [formTitle, setFormTitle] = useState("");
@@ -2532,6 +2500,7 @@ export default function Tasks() {
   // WebSocket task_update events invalidate these queries live. Poll only while
   // a task is actively changing so idle task boards do not keep hitting the API.
   useEffect(() => {
+    if (embeddedCreate) return;
     const previousParam = previousWorkspaceIdParamRef.current;
     previousWorkspaceIdParamRef.current = workspaceIdParam;
     const shouldApplyUrlParam =
@@ -2551,6 +2520,7 @@ export default function Tasks() {
   }, [workspaceIdParam]);
 
   useEffect(() => {
+    if (embeddedCreate) return;
     if (suppressWorkspaceUrlWriteRef.current) {
       if (
         !workspaceIdParam ||
@@ -2650,7 +2620,7 @@ export default function Tasks() {
     queryFn: ({ pageParam, signal }) => api.tasks.board(apiWorkspaceFilter, pageParam, TASK_BOARD_PAGE_SIZE, signal),
     getNextPageParam: (lastPage: TaskBoardPage, _pages: TaskBoardPage[], lastOffset: number) => nextTaskBoardOffset(lastPage, lastOffset),
     refetchInterval: (query) => query.state.data?.pages.some(hasLiveTasks) ? TASK_POLL_INTERVAL_MS : false,
-    enabled: taskBoardQueryEnabled(view, boardMode),
+    enabled: !embeddedCreate && taskBoardQueryEnabled(view, boardMode),
   });
   const boardLoading = boardQuery.isLoading;
   const board = useMemo(() => mergeTaskBoardPages(boardQuery.data?.pages), [boardQuery.data]);
@@ -2664,7 +2634,7 @@ export default function Tasks() {
     queryKey: ["tasks", "all", wsFilter],
     queryFn: () => api.tasks.list({ limit: 200, workspace_id: apiWorkspaceFilter }),
     refetchInterval: (query) => hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : false,
-    enabled: taskListQueryEnabled(view, boardMode),
+    enabled: !embeddedCreate && taskListQueryEnabled(view, boardMode),
   });
 
   const { data: workspaces } = useQuery({
@@ -2685,7 +2655,7 @@ export default function Tasks() {
   const { data: taskDetail } = useQuery({
     queryKey: ["task", drawerTaskId],
     queryFn: () => api.tasks.get(drawerTaskId),
-    enabled: !!drawerTaskId,
+    enabled: !embeddedCreate && !!drawerTaskId,
   });
 
   const { data: agentsList } = useQuery({
@@ -2697,23 +2667,23 @@ export default function Tasks() {
   } = useQuery({
     queryKey: ["workspace-assignable-agents", formWorkspace],
     queryFn: () => api.workspaces.agents.assignable(formWorkspace!),
-    enabled: showCreateModal && formStep === 3 && formAssigneeTab === "agent" && !!formWorkspace,
+    enabled: showCreateModal && (embeddedCreate || formStep === 3) && formAssigneeTab === "agent" && !!formWorkspace,
   });
   const { data: entityUsersForCreate = [], isLoading: entityUsersLoading } = useQuery({
     queryKey: ["entity-users-for-create-task-assignee", "directory"],
     queryFn: () => api.users.directory(),
-    enabled: showCreateModal && formStep === 3 && formAssigneeTab === "staff",
+    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
   });
   const { data: workspaceStaff = [], isLoading: workspaceStaffLoading } = useQuery({
     queryKey: ["workspace-staff-for-task-assignee", formWorkspace],
     queryFn: () => api.workspaces.staff.list(formWorkspace!),
-    enabled: showCreateModal && formStep === 3 && formAssigneeTab === "staff" && !!formWorkspace,
+    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE) && !!formWorkspace,
   });
 
   const { data: entityStaff, isLoading: entityStaffLoading } = useQuery({
     queryKey: ["entity-staff-for-task-assignee"],
     queryFn: () => api.staff.list(),
-    enabled: showCreateModal && formStep === 3 && formAssigneeTab === "staff",
+    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
   });
 
   type StaffAssigneeOption = {
@@ -2786,8 +2756,9 @@ export default function Tasks() {
 
       const expired = !!assignment.expires_at && new Date(assignment.expires_at) < new Date();
       const inactive = assignment.status === "inactive" || staff?.status === "inactive" || user?.status === "inactive";
-      const name = staff?.display_name || staff?.name || user?.display_name || staff?.email || user?.email || t("page.workspace_detail.staff");
-      const meta = [staff?.title, staff?.department, assignment.role, staff?.email || user?.email].filter(Boolean).join(" · ");
+      const name = staff?.display_name || staff?.name || user?.display_name || assignment.display_name
+        || staff?.email || user?.email || assignment.email || t("page.workspace_detail.staff");
+      const meta = [staff?.title, staff?.department, assignment.role, staff?.email || user?.email || assignment.email].filter(Boolean).join(" · ");
       const disabledReason = expired
         ? t("page.tasks.staff_assignment_expired")
         : inactive
@@ -2806,7 +2777,11 @@ export default function Tasks() {
     return options;
   }, [workspaceStaff, assigneeLookupMaps]);
 
-  const staffAssigneeOptions: StaffAssigneeOption[] = formWorkspace ? workspacePeopleOptions : entityPeopleOptions;
+  // A collaborator assigns a task to themselves or to the Workspace's Agents,
+  // never to another person in the customer company.
+  const staffAssigneeOptions: StaffAssigneeOption[] = collaborator
+    ? []
+    : formWorkspace ? workspacePeopleOptions : entityPeopleOptions;
   const interactiveAssigneeOptions: StaffAssigneeOption[] = [];
   const interactiveAssigneeIds = new Set<string>();
   if (currentUser?.id) {
@@ -2878,18 +2853,31 @@ export default function Tasks() {
 
   const createMutation = useMutation({
     mutationFn: (d: Partial<Task>) => api.tasks.create(d),
-    onSuccess: () => {
+    onSuccess: (task) => {
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      setShowCreateModal(false);
-      resetForm();
+      embeddedCreate?.onCreated(embeddedCreate.drafts.length - importDrafts.length, task);
+      if (importDrafts.length > 1) {
+        const remaining = importDrafts.slice(1);
+        setImportDrafts(remaining);
+        openCreateModal(undefined, remaining[0]);
+      } else {
+        setImportDrafts([]);
+        setShowCreateModal(false);
+        resetForm();
+        embeddedCreate?.onClose();
+      }
       toast.success(t("page.tasks.task_created"));
     },
   });
 
+  useEffect(() => {
+    embeddedCreate?.onBusy(createMutation.isPending);
+  }, [embeddedCreate, createMutation.isPending]);
+
   const statusMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) =>
-      api.tasks.updateStatus(id, status),
+      api.tasks.move(id, status),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -2951,6 +2939,29 @@ export default function Tasks() {
   };
 
   useEffect(() => {
+    if (embeddedCreate) {
+      if (!importedDraftsRef.current && embeddedCreate.drafts.length) {
+        importedDraftsRef.current = true;
+        setImportDrafts(embeddedCreate.drafts);
+        openCreateModal(undefined, embeddedCreate.drafts[0]);
+      }
+      return;
+    }
+    if (!importedDraftsRef.current && searchParams.get("importDrafts") === "1") {
+      importedDraftsRef.current = true;
+      const drafts = takeTaskDraftHandoff(sessionStorage);
+      const next = new URLSearchParams(searchParams);
+      next.delete("importDrafts");
+      setSearchParams(next, { replace: true });
+      if (drafts.length) {
+        setImportDrafts(drafts);
+        openCreateModal(undefined, drafts[0]);
+      }
+    }
+  }, [embeddedCreate, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (embeddedCreate) return;
     const consumeStoredDraft = () => {
       const raw = sessionStorage.getItem(SELECTED_TEXT_TASK_DRAFT_KEY);
       if (!raw) return;
@@ -3022,7 +3033,7 @@ export default function Tasks() {
   };
 
   const handleCreate = () => {
-    if (!formTitle.trim()) return;
+    if (taskCreateDisabled) return;
     const payload: Partial<Task> & Record<string, any> = {
       title: formTitle,
       description: formDesc,
@@ -3064,12 +3075,14 @@ export default function Tasks() {
       payload.details = { runtime_context: runtimeContext };
     }
     // "staff" currently leaves assignment empty until the staff picker is wired.
+    embeddedCreate?.onBusy(true);
     createMutation.mutate(payload);
   };
 
   const taskCreateDisabled = !formTitle.trim()
     || createMutation.isPending
     || (formAssigneeTab === "staff" && !formSelectedStaffUserId)
+    || (formAssigneeTab === "agent" && (!formSelectedAgentId || formWorkspaceAssignableAgentsLoading))
     || (
       formTaskType === TaskType.INTERACTIVE
       && (
@@ -3483,14 +3496,358 @@ export default function Tasks() {
     activeTaskCount > 0 ? `${activeTaskCount} ${t("status.in_progress")}` : null,
     attentionTaskCount > 0 ? `${attentionTaskCount} ${t("page.tasks.needs_attention")}` : null,
   ].filter(Boolean).join(" · ");
-  const taskViewTabs = <TabSwitcher tabs={VIEW_TABS} value={view} onChange={setView} wrap className="tasks-view-tabs" />;
+  // The calendar view reads the person's company calendar; a collaborator has the task board only.
+  const taskViewTabs = collaborator
+    ? null
+    : <TabSwitcher tabs={VIEW_TABS} value={view} onChange={setView} wrap className="tasks-view-tabs" />;
+
+  // Share the native controls between the wizard and companion layout.
+  const taskTitleField = (<>
+    <Input label={t("page.tasks.title")} value={formTitle} onChange={(e) => setFormTitle(e.target.value)} placeholder={t("page.tasks.task_title")} />
+  </>);
+
+  const taskDescriptionField = (<>
+    <Textarea id="task-create-description" label={t("page.task_collections.description")} value={formDesc} onChange={(e) => setFormDesc(e.target.value)} rows={embeddedCreate ? 2 : 3} placeholder={t("page.task_collections.optional_description")} />
+  </>);
+
+  const taskModeField = (<>
+    <div>
+      <label className="manor-label">{t("page.tasks.task_mode")}</label>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+        {([
+          {
+            value: TaskType.GENERAL,
+            title: t("page.tasks.deliverable_task"),
+            description: t("page.tasks.deliverable_task_description"),
+          },
+          {
+            value: TaskType.INTERACTIVE,
+            title: t("page.tasks.interactive_session"),
+            description: formWorkspace
+              ? t("page.tasks.interactive_session_description")
+              : t("page.tasks.interactive_session_workspace_required"),
+          },
+        ] as const).map((option) => {
+          const selected = formTaskType === option.value;
+          const disabled = option.value === TaskType.INTERACTIVE && !formWorkspace;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                if (
+                  option.value === TaskType.INTERACTIVE
+                  && formTaskType !== TaskType.INTERACTIVE
+                ) {
+                  setFormSelectedAgentId("");
+                  setFormSelectedAgentSubscriptionId("");
+                }
+                setFormTaskType(option.value);
+                if (option.value === TaskType.INTERACTIVE && !["ai", "agent"].includes(formAssigneeTab)) {
+                  setFormAssigneeTab("agent");
+                }
+              }}
+              style={{
+                padding: 12,
+                borderRadius: 12,
+                border: selected ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                background: selected ? "rgba(79,125,117,0.04)" : "#fff",
+                textAlign: "left",
+                cursor: disabled ? "not-allowed" : "pointer",
+                opacity: disabled ? 0.55 : 1,
+              }}
+            >
+              <span style={{ display: "block", fontSize: 13, fontWeight: 650, color: embeddedCreate ? "var(--text-strong)" : selected ? "#315f57" : "#292524" }}>
+                {option.title}
+              </span>
+              <span style={{ display: "block", marginTop: 3, fontSize: 11, lineHeight: 1.45, color: "#a8a29e" }}>
+                {option.description}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  </>);
+
+  const taskDeadlineField = (<>
+    <div>
+      <label className="manor-label">{t("page.tasks.deadline")}</label>
+      <DateTimePicker ariaLabel={t("page.tasks.deadline")} value={formDeadline} onChange={setFormDeadline} placeholder={t("page.tasks.no_deadline")} />
+    </div>
+  </>);
+
+  const taskPriorityField = (<>
+    {/* Priority chips */}
+    <div>
+      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>{t("page.tasks.priority")}</label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {[5, 4, 3, 2, 1].map((p) => {
+          const cfg = PRIORITY_CONFIG[p];
+          const isActive = formPriority === p;
+          return (
+            <button
+              key={p}
+              onClick={() => setFormPriority(p)}
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 6,
+                padding: "6px 14px", borderRadius: 20,
+                border: isActive ? `2px solid ${cfg.color}` : "1px solid #e7e5e4",
+                background: isActive ? `${cfg.color}10` : "#ffffff",
+                cursor: "pointer", fontSize: 13, fontWeight: 500,
+                color: isActive ? "#292524" : "#78716c", transition: "all 0.2s",
+              }}
+            >
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: cfg.color }} />
+              {cfg.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  </>);
+
+  const taskCategoryField = (<>
+    {/* Category: the company's task categories, not the Workspace's. */}
+    {!collaborator && <div>
+      <label className="manor-label">{t("page.workspaces.category")}</label>
+      <Select
+        ariaLabel={t("page.workspaces.category")}
+        value={formCategory}
+        onChange={setFormCategory}
+        options={[{ value: "", label: t("page.workspace_detail.none") }, ...CATEGORY_OPTIONS.map((c) => ({ value: c.key, label: c.label }))]}
+        placeholder={t("page.tasks.select_category")}
+        filterable
+      />
+    </div>}
+  </>);
+
+  const taskAssigneeFields = (<>
+    {/* Assignee tab switcher */}
+    <div style={{ display: "flex", gap: 4, padding: 3, background: "rgba(245,245,244,0.8)", borderRadius: 12 }}>
+      {([
+        { key: "self" as const, label: t("page.tasks.myself") },
+        { key: "ai" as const, label: t("page.chat_history.manor_ai") },
+        { key: "agent" as const, label: t("page.workspace_detail.agent") },
+        { key: "staff" as const, label: t("page.workspace_detail.staff") },
+      ]).filter((tab) => (
+        !(collaborator && tab.key === "staff")
+        && (formTaskType !== TaskType.INTERACTIVE || tab.key === "ai" || tab.key === "agent")
+      )).map((tab) => {
+        const isActive = formAssigneeTab === tab.key;
+        return (
+          <button
+            key={tab.key}
+            onClick={() => setFormAssigneeTab(tab.key)}
+            style={{
+              flex: 1, padding: "8px 12px", borderRadius: 9, fontSize: 13, fontWeight: 600,
+              border: "none", cursor: "pointer", transition: "all 0.2s",
+              background: isActive ? "#ffffff" : "transparent",
+              color: isActive ? "#1c1917" : "#78716c",
+              boxShadow: isActive ? "0 1px 4px rgba(0,0,0,0.06)" : "none",
+            }}
+          >
+            {tab.label}
+          </button>
+        );
+      })}
+    </div>
+
+    {/* Tab content */}
+    {formAssigneeTab === "self" && (
+      <div className="task-assignee-summary" style={{ display: "flex", alignItems: "center", gap: 12, padding: 20, borderRadius: 14, border: "2px solid #4f7d75", background: "rgba(79,125,117,0.04)" }}>
+        <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #e8eff4, #ddd6fe)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 700, color: "#57534e" }}>
+          {t("page.tasks.me")}
+        </div>
+        <div>
+          <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.tasks.assign_to_myself")}</p>
+          <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.you_will_be_responsible_for_this_task")}</p>
+        </div>
+      </div>
+    )}
+
+    {formAssigneeTab === "ai" && (
+      <div className="task-assignee-summary" style={{ display: "flex", alignItems: "center", gap: 12, padding: 20, borderRadius: 14, border: "2px solid #4f7d75", background: "rgba(79,125,117,0.04)" }}>
+        <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #efedea, #ccded9)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#4f7d75" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z" />
+          </svg>
+        </div>
+        <div>
+          <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.chat_history.manor_ai")}</p>
+          <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.let_ai_handle_and_complete_this_task")}</p>
+        </div>
+      </div>
+    )}
+
+        {formAssigneeTab === "agent" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
+            {formWorkspace && formWorkspaceAssignableAgentsLoading ? (
+              <div role="status" style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+                {t("page.tasks.workspace_agents_loading")}
+              </div>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
+                {formAssignableHostOptions.map((option) => {
+                  const { agent } = option;
+                  const isActive = option.subscriptionId
+                    ? formSelectedAgentSubscriptionId === option.subscriptionId
+                    : formSelectedAgentId === agent.id;
+                  const description = [
+                    option.roleLabel,
+                    getAgentDescription(agent),
+                  ].filter(Boolean).join(" · ");
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => {
+                        setFormSelectedAgentId(agent.id);
+                        setFormSelectedAgentSubscriptionId(option.subscriptionId);
+                      }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
+                        border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                        background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
+                        cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
+                      }}>
+                      <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg, #dceae3, #c4dfd2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        <IconAgent size={16} style={{ color: "#437f6b" }} />
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
+                        {description && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
+                      </div>
+                    </button>
+                  );
+                })}
+                {formAssignableHostOptions.length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
+              </div>
+            )}
+          </div>
+        )}
+
+    {formTaskType === TaskType.INTERACTIVE && (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <label className="manor-label">
+          {t("component.embedded_chat.assignee")} · {t("page.task_detail.runtime.optional")}
+        </label>
+        <Select
+          ariaLabel={t("component.embedded_chat.assignee")}
+          value={formSelectedStaffUserId}
+          onChange={setFormSelectedStaffUserId}
+          options={[
+            { value: "", label: t("component.task_properties_panel.unassigned") },
+            ...interactiveAssigneeOptions.filter((option) => !option.disabled).map((option) => ({
+              value: option.id,
+              label: option.meta ? `${option.name} · ${option.meta}` : option.name,
+            })),
+          ]}
+          placeholder={t("component.task_properties_panel.unassigned")}
+        />
+      </div>
+    )}
+
+    {formAssigneeTab === "staff" && (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_a_staff_member")}</p>
+        <p style={{ fontSize: 11, color: "#a8a29e", margin: "-2px 0 4px" }}>
+          {formWorkspace ? t("page.tasks.workspace_staff_hint") : t("page.tasks.entity_staff_hint")}
+        </p>
+        {staffAssigneeLoading ? (
+          <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+            {t("page.tasks.workspace_staff_loading")}
+          </div>
+        ) : staffAssigneeOptions.length === 0 ? (
+          <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center" }}>
+            <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>{t("page.tasks.no_staff_members_available")}</p>
+            <p style={{ fontSize: 11, color: "#d6d3d1", margin: "4px 0 0" }}>
+              {formWorkspace ? t("page.tasks.add_staff_to_your_workspace_to_assign_tasks") : t("page.tasks.add_people_to_your_team_to_assign_tasks")}
+            </p>
+          </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
+            {staffAssigneeOptions.map((option) => {
+              const isActive = formSelectedStaffUserId === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  disabled={option.disabled}
+                  onClick={() => setFormSelectedStaffUserId(option.id)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
+                    border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                    background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
+                    cursor: option.disabled ? "not-allowed" : "pointer",
+                    textAlign: "left" as const,
+                    opacity: option.disabled ? 0.58 : 1,
+                    transition: "all 0.2s",
+                  }}
+                >
+                  <UserAvatar name={option.name} avatarUrl={option.avatarUrl} size={32} />
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <p style={{ fontSize: 13, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.name}</p>
+                    {option.meta && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.meta}</p>}
+                    {option.disabled && (
+                      <p style={{ fontSize: 11, color: "#936027", margin: "4px 0 0" }}>
+                        {option.disabledReason || t("page.tasks.staff_unavailable")}
+                      </p>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    )}
+  </>);
+
+  const taskRuntimeFields = (<>
+    <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(251,146,60,0.28)", background: "rgba(249,244,236,0.55)", display: "flex", flexDirection: "column", gap: 10 }}>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 800, color: "#7c4a2e" }}>{t("page.tasks.runtime_requirements")}</div>
+        <p style={{ fontSize: 12, color: "#7c4a2e", margin: "3px 0 0", lineHeight: 1.5 }}>
+          {t("page.tasks.task_specific_instructions_and_guardrails_these")}
+        </p>
+      </div>
+      <Textarea
+        id="task-create-runtime-requirement"
+        rows={3}
+        label={t("page.tasks.task_specific_requirement")}
+        value={formRuntimeRequirement}
+        onChange={(e) => setFormRuntimeRequirement(e.target.value)}
+        placeholder={t("page.tasks.example_post")}
+      />
+      <Input
+        label={t("page.tasks.required_knowledge_refs")}
+        value={formRequiredRefs}
+        onChange={(e) => setFormRequiredRefs(e.target.value)}
+        placeholder={t("page.tasks.optional_doc_group_ids_comma_separated")}
+      />
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_social_approval_text"))}>
+          {t("page.tasks.social_post_approval")}
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_add_files_only_text"))}>
+          {t("page.task_detail.runtime.quick_add_files_only")}
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_draft_only_text"))}>
+          {t("page.task_detail.runtime.quick_draft_only")}
+        </Button>
+      </div>
+    </div>
+  </>);
 
   /* ── render ───────────────────────────────────────── */
 
   return (
     <div className="tasks-page" style={{ display: "flex", height: "100%" }}>
       <style>{TASK_CARD_AI_PROCESSING_STYLES}</style>
-      <div className="tasks-page-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      {!embeddedCreate && <div className="tasks-page-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <div className="tasks-page-header" style={{ padding: 0 }}>
             <PageHeader
               title={t("page.tasks.my_tasks")}
@@ -3558,7 +3915,8 @@ export default function Tasks() {
                       onReorderColumn={reorderBoardColumn}
                     />
                   )}
-                  <button
+                  {/* CSV import and export cover the whole company's tasks. */}
+                  {!collaborator && <button
                     type="button"
                     className="btn-manor-outline"
                     onClick={() => fileInputRef.current?.click()}
@@ -3566,8 +3924,8 @@ export default function Tasks() {
                     style={{ width: 34, height: 34, padding: 0, borderRadius: 10, background: "rgba(255,255,255,0.78)" }}
                   >
                     <IconUpload size={13} />
-                  </button>
-                  <button
+                  </button>}
+                  {!collaborator && <button
                     type="button"
                     className="btn-manor-outline"
                     onClick={handleExportCsv}
@@ -3575,11 +3933,11 @@ export default function Tasks() {
                     style={{ width: 34, height: 34, padding: 0, borderRadius: 10, background: "rgba(255,255,255,0.78)" }}
                   >
                     <IconDownload size={13} />
-                  </button>
+                  </button>}
                 </>
               )}
             >
-              <FilterSelect
+              {!collaborator && <FilterSelect
                 label={t("nav.workspaces")}
                 Icon={IconWorkspace}
                 value={wsFilter ?? "all"}
@@ -3588,7 +3946,7 @@ export default function Tasks() {
                 width={204}
                 dropdownMinWidth={240}
                 filterable
-              />
+              />}
               <FilterSelect
                 label={t("page.agent_dashboard.status")}
                 Icon={IconCircleDot}
@@ -3878,8 +4236,9 @@ export default function Tasks() {
         </div>
       </div>
 
+      }
       {/* ── Detail Panel ────────────────────────────── */}
-      {activeDetail && (
+      {!embeddedCreate && activeDetail && (
         <InlineTaskDetail
           task={activeDetail}
           agents={agentsList || []}
@@ -3892,16 +4251,22 @@ export default function Tasks() {
         />
       )}
 
-      {/* ── Create Task Modal (3-Step) ──────────────── */}
+      {/* Native wizard and single-page companion composer share fields and submit. */}
       <Modal
         open={showCreateModal}
-        onClose={() => { setShowCreateModal(false); resetForm(); }}
-        title={t("page.tasks.new_task")}
+        onClose={() => {
+          if (createMutation.isPending) return;
+          setImportDrafts([]); setShowCreateModal(false); resetForm(); embeddedCreate?.onClose();
+        }}
+        overlayClassName={embeddedCreate ? "companion-task-overlay" : undefined}
+        className={embeddedCreate ? "companion-task-modal" : undefined}
+        title={`${t("page.tasks.new_task")}${importDrafts.length > 1 ? ` · ${importDrafts.length} drafts` : ""}`}
         maxWidth="640px"
         footer={
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
-            {/* Step dots */}
-            <div style={{ display: "flex", gap: 6 }}>
+            {embeddedCreate ? <Button variant="outline" disabled={createMutation.isPending} onClick={() => {
+              setImportDrafts([]); setShowCreateModal(false); resetForm(); embeddedCreate.onClose();
+            }}>{t("common.cancel")}</Button> : <div style={{ display: "flex", gap: 6 }}>
               {[1, 2, 3].map((s) => (
                 <span
                   key={s}
@@ -3913,14 +4278,14 @@ export default function Tasks() {
                   }}
                 />
               ))}
-            </div>
+            </div>}
             <div style={{ display: "flex", gap: 8 }}>
-              {formStep > 1 && (
+              {!embeddedCreate && formStep > 1 && (
                 <Button variant="outline" onClick={() => setFormStep(formStep - 1)}>
                   {t("page.onboarding.back")}
                 </Button>
               )}
-              {formStep < 3 ? (
+              {!embeddedCreate && formStep < 3 ? (
                 <button
                   onClick={() => setFormStep(formStep + 1)}
                   disabled={formStep === 2 && !formTitle.trim()}
@@ -3936,6 +4301,7 @@ export default function Tasks() {
                 </button>
               ) : (
                 <button
+                  className={embeddedCreate ? "companion-task-submit" : undefined}
                   onClick={handleCreate}
                   disabled={taskCreateDisabled}
                   style={{
@@ -3954,16 +4320,57 @@ export default function Tasks() {
           </div>
         }
       >
+        {embeddedCreate && <p className="companion-task-account">{[
+          currentUser?.memberships?.find(membership => membership.entity_id === currentUser.entity_id)?.entity_name,
+          currentUser?.email,
+        ].filter(Boolean).join(" · ")}{embeddedCreate.drafts.length > 1 && <span>{embeddedCreate.drafts.length - importDrafts.length + 1} / {embeddedCreate.drafts.length}</span>}</p>}
+        {createMutation.isError && <p role="alert">{createMutation.error instanceof Error ? createMutation.error.message : "Could not create the task. Please check its details."}</p>}
+        {embeddedCreate && <div className="companion-task-fields">
+          {taskTitleField}
+          <div className="companion-task-row">
+            <div>
+              <label className="manor-label" htmlFor="companion-task-workspace">{t("page.app_layout.workspace")}</label>
+              <Select
+                id="companion-task-workspace"
+                ariaLabel={t("page.app_layout.workspace")}
+                value={formWorkspace || ""}
+                onChange={value => setFormWorkspace(value || null)}
+                options={[
+                  ...(!collaborator ? [{ value: "", label: t("page.tasks.entity_level") }] : []),
+                  ...(workspaces ?? []).map((workspace: Workspace) => ({ value: workspace.id, label: workspace.name })),
+                ]}
+                placeholder={t("page.app_layout.workspace")}
+                filterable
+              />
+            </div>
+            {taskDeadlineField}
+          </div>
+          <div className="companion-task-assignee">
+            <label className="manor-label">{t("component.embedded_chat.assignee")}</label>
+            {taskAssigneeFields}
+          </div>
+          {formTaskType === TaskType.INTERACTIVE && !formWorkspace && <p role="alert">{t("page.tasks.interactive_session_workspace_required")}</p>}
+          {taskDescriptionField}
+          <details className="companion-task-options" key={importDrafts.length}>
+            <summary>{t("component.workspace_app_view.data_more_options")}{formTaskType === TaskType.INTERACTIVE ? ` · ${t("page.tasks.interactive_session")}` : ""}</summary>
+            <div className="companion-task-fields">
+              {taskModeField}
+              {taskPriorityField}
+              {taskCategoryField}
+              {taskRuntimeFields}
+            </div>
+          </details>
+        </div>}
         {/* ── Step 1: Scope ── */}
-        {formStep === 1 && (
+        {!embeddedCreate && formStep === 1 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
               <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>1</span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.where_should_this_task_live")}</span>
             </div>
 
-            {/* Entity-level option */}
-            <button
+            {/* Entity-level option: a collaborator's tasks live in their Workspace. */}
+            {!collaborator && <button
               onClick={() => setFormWorkspace(null)}
               style={{
                 display: "flex", alignItems: "center", gap: 12, padding: 16, borderRadius: 14,
@@ -3981,7 +4388,7 @@ export default function Tasks() {
                 <p style={{ fontSize: 14, fontWeight: 600, color: formWorkspace === null ? "#4f7d75" : "#44403c", margin: 0 }}>{t("page.tasks.entity_level")}</p>
                 <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.applies_across_all_workspaces")}</p>
               </div>
-            </button>
+            </button>}
 
             {/* Workspace options */}
             {(workspaces ?? []).map((ws: Workspace) => {
@@ -4013,341 +4420,35 @@ export default function Tasks() {
         )}
 
         {/* ── Step 2: Details ── */}
-        {formStep === 2 && (
+        {!embeddedCreate && formStep === 2 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
               <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>2</span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.task_details")}</span>
             </div>
 
-            <Input label={t("page.tasks.title")} value={formTitle} onChange={(e) => setFormTitle(e.target.value)} placeholder={t("page.tasks.task_title")} />
-            <Textarea label={t("page.task_collections.description")} value={formDesc} onChange={(e) => setFormDesc(e.target.value)} rows={3} placeholder={t("page.task_collections.optional_description")} />
-            <div>
-              <label className="manor-label">{t("page.tasks.task_mode")}</label>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
-                {([
-                  {
-                    value: TaskType.GENERAL,
-                    title: t("page.tasks.deliverable_task"),
-                    description: t("page.tasks.deliverable_task_description"),
-                  },
-                  {
-                    value: TaskType.INTERACTIVE,
-                    title: t("page.tasks.interactive_session"),
-                    description: formWorkspace
-                      ? t("page.tasks.interactive_session_description")
-                      : t("page.tasks.interactive_session_workspace_required"),
-                  },
-                ] as const).map((option) => {
-                  const selected = formTaskType === option.value;
-                  const disabled = option.value === TaskType.INTERACTIVE && !formWorkspace;
-                  return (
-                    <button
-                      key={option.value}
-                      type="button"
-                      disabled={disabled}
-                      onClick={() => {
-                        if (
-                          option.value === TaskType.INTERACTIVE
-                          && formTaskType !== TaskType.INTERACTIVE
-                        ) {
-                          setFormSelectedAgentId("");
-                          setFormSelectedAgentSubscriptionId("");
-                        }
-                        setFormTaskType(option.value);
-                        if (option.value === TaskType.INTERACTIVE && !["ai", "agent"].includes(formAssigneeTab)) {
-                          setFormAssigneeTab("agent");
-                        }
-                      }}
-                      style={{
-                        padding: 12,
-                        borderRadius: 12,
-                        border: selected ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                        background: selected ? "rgba(79,125,117,0.04)" : "#fff",
-                        textAlign: "left",
-                        cursor: disabled ? "not-allowed" : "pointer",
-                        opacity: disabled ? 0.55 : 1,
-                      }}
-                    >
-                      <span style={{ display: "block", fontSize: 13, fontWeight: 650, color: selected ? "#315f57" : "#292524" }}>
-                        {option.title}
-                      </span>
-                      <span style={{ display: "block", marginTop: 3, fontSize: 11, lineHeight: 1.45, color: "#a8a29e" }}>
-                        {option.description}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div>
-              <label className="manor-label">{t("page.tasks.deadline")}</label>
-              <DateTimePicker value={formDeadline} onChange={setFormDeadline} placeholder={t("page.tasks.no_deadline")} />
-            </div>
+            {taskTitleField}
+            {taskDescriptionField}
+            {taskModeField}
+            {taskDeadlineField}
 
-            {/* Priority chips */}
-            <div>
-              <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>{t("page.tasks.priority")}</label>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {[5, 4, 3, 2, 1].map((p) => {
-                  const cfg = PRIORITY_CONFIG[p];
-                  const isActive = formPriority === p;
-                  return (
-                    <button
-                      key={p}
-                      onClick={() => setFormPriority(p)}
-                      style={{
-                        display: "inline-flex", alignItems: "center", gap: 6,
-                        padding: "6px 14px", borderRadius: 20,
-                        border: isActive ? `2px solid ${cfg.color}` : "1px solid #e7e5e4",
-                        background: isActive ? `${cfg.color}10` : "#ffffff",
-                        cursor: "pointer", fontSize: 13, fontWeight: 500,
-                        color: isActive ? "#292524" : "#78716c", transition: "all 0.2s",
-                      }}
-                    >
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: cfg.color }} />
-                      {cfg.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            {taskPriorityField}
 
-            {/* Category */}
-            <div>
-              <label className="manor-label">{t("page.workspaces.category")}</label>
-              <Select
-                value={formCategory}
-                onChange={setFormCategory}
-                options={[{ value: "", label: t("page.workspace_detail.none") }, ...CATEGORY_OPTIONS.map((c) => ({ value: c.key, label: c.label }))]}
-                placeholder={t("page.tasks.select_category")}
-                filterable
-              />
-            </div>
+            {taskCategoryField}
           </div>
         )}
 
         {/* ── Step 3: Assignee ── */}
-        {formStep === 3 && (
+        {!embeddedCreate && formStep === 3 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
               <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>3</span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.who_should_handle_this")}</span>
             </div>
 
-            {/* Assignee tab switcher */}
-            <div style={{ display: "flex", gap: 4, padding: 3, background: "rgba(245,245,244,0.8)", borderRadius: 12 }}>
-              {([
-                { key: "self" as const, label: t("page.tasks.myself") },
-                { key: "ai" as const, label: t("page.chat_history.manor_ai") },
-                { key: "agent" as const, label: t("page.workspace_detail.agent") },
-                { key: "staff" as const, label: t("page.workspace_detail.staff") },
-              ]).filter((tab) => (
-                formTaskType !== TaskType.INTERACTIVE
-                || tab.key === "ai"
-                || tab.key === "agent"
-              )).map((tab) => {
-                const isActive = formAssigneeTab === tab.key;
-                return (
-                  <button
-                    key={tab.key}
-                    onClick={() => setFormAssigneeTab(tab.key)}
-                    style={{
-                      flex: 1, padding: "8px 12px", borderRadius: 9, fontSize: 13, fontWeight: 600,
-                      border: "none", cursor: "pointer", transition: "all 0.2s",
-                      background: isActive ? "#ffffff" : "transparent",
-                      color: isActive ? "#1c1917" : "#78716c",
-                      boxShadow: isActive ? "0 1px 4px rgba(0,0,0,0.06)" : "none",
-                    }}
-                  >
-                    {tab.label}
-                  </button>
-                );
-              })}
-            </div>
+            {taskAssigneeFields}
 
-            {/* Tab content */}
-            {formAssigneeTab === "self" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: 20, borderRadius: 14, border: "2px solid #4f7d75", background: "rgba(79,125,117,0.04)" }}>
-                <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #e8eff4, #ddd6fe)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 700, color: "#57534e" }}>
-                  {t("page.tasks.me")}
-                </div>
-                <div>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.tasks.assign_to_myself")}</p>
-                  <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.you_will_be_responsible_for_this_task")}</p>
-                </div>
-              </div>
-            )}
-
-            {formAssigneeTab === "ai" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: 20, borderRadius: 14, border: "2px solid #4f7d75", background: "rgba(79,125,117,0.04)" }}>
-                <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #efedea, #ccded9)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#4f7d75" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z" />
-                  </svg>
-                </div>
-                <div>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.chat_history.manor_ai")}</p>
-                  <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.let_ai_handle_and_complete_this_task")}</p>
-                </div>
-              </div>
-            )}
-
-                {formAssigneeTab === "agent" && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
-                    {formWorkspace && formWorkspaceAssignableAgentsLoading ? (
-                      <div role="status" style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
-                        {t("page.tasks.workspace_agents_loading")}
-                      </div>
-                    ) : (
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
-                        {formAssignableHostOptions.map((option) => {
-                          const { agent } = option;
-                          const isActive = option.subscriptionId
-                            ? formSelectedAgentSubscriptionId === option.subscriptionId
-                            : formSelectedAgentId === agent.id;
-                          const description = [
-                            option.roleLabel,
-                            getAgentDescription(agent),
-                          ].filter(Boolean).join(" · ");
-                          return (
-                            <button
-                              key={option.key}
-                              type="button"
-                              onClick={() => {
-                                setFormSelectedAgentId(agent.id);
-                                setFormSelectedAgentSubscriptionId(option.subscriptionId);
-                              }}
-                              style={{
-                                display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
-                                border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                                background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
-                                cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
-                              }}>
-                              <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg, #dceae3, #c4dfd2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                                <IconAgent size={16} style={{ color: "#437f6b" }} />
-                              </div>
-                              <div style={{ minWidth: 0 }}>
-                                <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
-                                {description && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
-                              </div>
-                            </button>
-                          );
-                        })}
-                        {formAssignableHostOptions.length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-            {formTaskType === TaskType.INTERACTIVE && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <label className="manor-label">
-                  {t("component.embedded_chat.assignee")} · {t("page.task_detail.runtime.optional")}
-                </label>
-                <Select
-                  value={formSelectedStaffUserId}
-                  onChange={setFormSelectedStaffUserId}
-                  options={[
-                    { value: "", label: t("component.task_properties_panel.unassigned") },
-                    ...interactiveAssigneeOptions.filter((option) => !option.disabled).map((option) => ({
-                      value: option.id,
-                      label: option.meta ? `${option.name} · ${option.meta}` : option.name,
-                    })),
-                  ]}
-                  placeholder={t("component.task_properties_panel.unassigned")}
-                />
-              </div>
-            )}
-
-            {formAssigneeTab === "staff" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_a_staff_member")}</p>
-                <p style={{ fontSize: 11, color: "#a8a29e", margin: "-2px 0 4px" }}>
-                  {formWorkspace ? t("page.tasks.workspace_staff_hint") : t("page.tasks.entity_staff_hint")}
-                </p>
-                {staffAssigneeLoading ? (
-                  <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
-                    {t("page.tasks.workspace_staff_loading")}
-                  </div>
-                ) : staffAssigneeOptions.length === 0 ? (
-                  <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center" }}>
-                    <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>{t("page.tasks.no_staff_members_available")}</p>
-                    <p style={{ fontSize: 11, color: "#d6d3d1", margin: "4px 0 0" }}>
-                      {formWorkspace ? t("page.tasks.add_staff_to_your_workspace_to_assign_tasks") : t("page.tasks.add_people_to_your_team_to_assign_tasks")}
-                    </p>
-                  </div>
-                ) : (
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
-                    {staffAssigneeOptions.map((option) => {
-                      const isActive = formSelectedStaffUserId === option.id;
-                      return (
-                        <button
-                          key={option.id}
-                          type="button"
-                          disabled={option.disabled}
-                          onClick={() => setFormSelectedStaffUserId(option.id)}
-                          style={{
-                            display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
-                            border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                            background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
-                            cursor: option.disabled ? "not-allowed" : "pointer",
-                            textAlign: "left" as const,
-                            opacity: option.disabled ? 0.58 : 1,
-                            transition: "all 0.2s",
-                          }}
-                        >
-                          <UserAvatar name={option.name} avatarUrl={option.avatarUrl} size={32} />
-                          <div style={{ minWidth: 0, flex: 1 }}>
-                            <p style={{ fontSize: 13, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.name}</p>
-                            {option.meta && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.meta}</p>}
-                            {option.disabled && (
-                              <p style={{ fontSize: 11, color: "#936027", margin: "4px 0 0" }}>
-                                {option.disabledReason || t("page.tasks.staff_unavailable")}
-                              </p>
-                            )}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(251,146,60,0.28)", background: "rgba(249,244,236,0.55)", display: "flex", flexDirection: "column", gap: 10 }}>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 800, color: "#7c4a2e" }}>{t("page.tasks.runtime_requirements")}</div>
-                <p style={{ fontSize: 12, color: "#7c4a2e", margin: "3px 0 0", lineHeight: 1.5 }}>
-                  {t("page.tasks.task_specific_instructions_and_guardrails_these")}
-                </p>
-              </div>
-              <Textarea
-                rows={3}
-                label={t("page.tasks.task_specific_requirement")}
-                value={formRuntimeRequirement}
-                onChange={(e) => setFormRuntimeRequirement(e.target.value)}
-                placeholder={t("page.tasks.example_post")}
-              />
-              <Input
-                label={t("page.tasks.required_knowledge_refs")}
-                value={formRequiredRefs}
-                onChange={(e) => setFormRequiredRefs(e.target.value)}
-                placeholder={t("page.tasks.optional_doc_group_ids_comma_separated")}
-              />
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_social_approval_text"))}>
-                  {t("page.tasks.social_post_approval")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_add_files_only_text"))}>
-                  {t("page.task_detail.runtime.quick_add_files_only")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => setFormRuntimeRequirement(t("page.tasks.quick_runtime_draft_only_text"))}>
-                  {t("page.task_detail.runtime.quick_draft_only")}
-                </Button>
-              </div>
-            </div>
+            {taskRuntimeFields}
           </div>
         )}
       </Modal>

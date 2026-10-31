@@ -6,7 +6,7 @@ const actionTitle = "Prepare release materials";
 const runId = "01M480XMPKGANGMCGVMC5K9EC4";
 const olderId = "01M480XMPKGANGMCGVMC5OLDER";
 
-async function installFixture(page: Page, status = "failed", locale = "en") {
+async function installFixture(page: Page, status = "failed", locale = "en", includeUnbound = false) {
   const writes: string[] = [];
   const errors: string[] = [];
   const nodes = [
@@ -33,6 +33,16 @@ async function installFixture(page: Page, status = "failed", locale = "en") {
     } },
     definition_snapshot: { name: actionTitle, nodes },
   }));
+  if (includeUnbound) runs.unshift({
+    ...runs[0], id: "01M480XMPKGANGMCGVDIRECT", binding_id: null, trigger_source: "manual",
+    started_at: "2026-10-07T07:16:42Z", completed_at: "2026-10-07T07:18:42Z",
+    variables: { __result: { title: "Release report", summary: "Direct release materials" } },
+    step_results: { start: { status: "completed" }, campaign: {
+      status: status === "completed" ? "completed" : "failed",
+      error: status === "completed" ? null : "Campaign generation failed",
+      output: { title: "Release report", summary: "Direct release materials" },
+    } },
+  });
   page.on("pageerror", (error) => errors.push(error.message));
   await page.addInitScript((locale) => {
     localStorage.setItem("manor_token", "routes-fixture-token");
@@ -93,6 +103,22 @@ async function installFixture(page: Page, status = "failed", locale = "en") {
   });
   return { writes, errors, runs };
 }
+
+test("App actions open a matching unbound direct run from their history", async ({ page }) => {
+  const fixture = await installFixture(page, "completed", "en", true);
+  await page.goto(`/chat?workspace=${workspaceId}`);
+  await page.getByRole("button", { name: new RegExp(actionTitle) }).click();
+  const history = page.getByRole("region", { name: "Recent runs", exact: true });
+  await expect(history.getByRole("button")).toHaveCount(3);
+  await expect(history.getByRole("button").first()).toContainText("Direct workflow run");
+  await history.getByRole("button").first().click();
+  await expect(page.locator(".workspace-app-flow__panel")).toContainText("Direct release materials");
+  await expect(page.locator(".workspace-app-flow__panel")).toContainText("Direct workflow run");
+  await expect(page.getByRole("link", { name: "Full run details", exact: true }))
+    .toHaveAttribute("href", `/flows/${workflowId}/runs/01M480XMPKGANGMCGVDIRECT`);
+  expect(fixture.writes).toEqual([]);
+  expect(fixture.errors).toEqual([]);
+});
 
 for (const width of [1440, 390]) {
   test(`App recent runs select exact results inline and full details reuse the canvas at ${width}px`, async ({ page }, testInfo) => {
@@ -313,11 +339,15 @@ test("changing definition routes never leaves the previous editor active for a m
   expect(fixture.errors).toEqual([]);
 });
 
-test("retry from run details navigates to the server's new attempt", async ({ page }) => {
-  const fixture = await installFixture(page);
+for (const sourceStatus of ["failed", "cancelled"]) test(`retry from ${sourceStatus} run details navigates to the server's new attempt`, async ({ page }) => {
+  const fixture = await installFixture(page, sourceStatus);
   const nextId = "01M480XMPKGANGMCGVMC5RETRY";
-  const source = { ...fixture.runs[0], lineage_root_run_id: runId, retry_from_step_id: "campaign",
-    capabilities: { can_control: true } };
+  const source = { ...fixture.runs[0], status: sourceStatus, lineage_root_run_id: runId, retry_from_step_id: "campaign",
+    capabilities: { can_control: true }, intervention: {
+      kind: "workflow_retry", workflow_run_id: runId, workflow_binding_id: "routes-binding",
+      step_id: "campaign", retry_from_step_id: "campaign", options: ["retry"],
+      editable_input_schema: { type: "object", properties: {} },
+    } };
   const next = { ...source, id: nextId, status: "running", attempt_number: 3, retry_of_run_id: runId,
     error: null, completed_at: null };
   const retryRequests: unknown[] = [];
@@ -330,15 +360,107 @@ test("retry from run details navigates to the server's new attempt", async ({ pa
     if (path.endsWith(`/${runId}/family`) || path.endsWith(`/${nextId}/family`)) {
       return route.fulfill({ json: retryRequests.length ? [source, next] : [source] });
     }
-    if (path.endsWith(`/${runId}`)) return route.fulfill({ json: source });
+    if (path.endsWith(`/${runId}`)) return route.fulfill({ json: new URL(route.request().url()).searchParams.get("detail") === "false" ? source : { ...source, intervention: undefined } });
     if (path.endsWith(`/${nextId}`)) return route.fulfill({ json: next });
     return route.fallback();
   });
   await page.goto(`/workspaces/${workspaceId}/workflow-runs/${runId}`);
-  await page.getByRole("button", { name: "Retry workflow from the failed node", exact: true }).click();
+  await page.getByRole("button", { name: "Retry", exact: true }).first().click();
+  await page.getByRole("dialog").getByRole("button", { name: "Retry", exact: true }).click();
   await expect(page).toHaveURL(`/flows/${workflowId}/runs/${nextId}`);
   await expect(page.locator(".workflow-editor-header")).toContainText(actionTitle);
-  expect(retryRequests).toEqual([{ from_step_id: "campaign", execute: true }]);
+  expect(retryRequests).toEqual([{ from_step_id: "campaign", variables: {}, execute: true }]);
+  expect(fixture.writes).toEqual([]);
+  expect(fixture.errors).toEqual([]);
+});
+
+for (const decision of ["not_applied", "applied"] as const) test(`run details offer operator review for ${decision} result`, async ({ page }) => {
+  const fixture = await installFixture(page);
+  const source = { ...fixture.runs[0], lineage_root_run_id: runId, capabilities: { can_control: true },
+    intervention: { kind: "workflow_effect_review", workflow_run_id: runId, step_id: "campaign",
+      options: [decision === "applied" ? "review_applied" : "review"], effect_fingerprint: "a".repeat(64),
+      ...(decision === "applied" ? { project_revisions: { "report-project": 4 }, result_schema: { type: "object", required: ["receipt_id"], properties: {
+        receipt_id: { type: "string", title: "Delivery receipt", minLength: 1 },
+        failure_reason: { type: "string", minLength: 1 },
+      } } } : {}),
+    } };
+  const nextId = "01M480XMPKGANGMCGVMC5RETRY";
+  const next = { ...source, id: nextId, status: "running", attempt_number: 3, retry_of_run_id: runId, intervention: null, error: null };
+  const requests: any[] = [];
+  await page.route("**/api/v1/workflows/runs/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith(`/${runId}/retry`) && route.request().method() === "POST") {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: next });
+    }
+    if (path.endsWith("/family")) return route.fulfill({ json: requests.length ? [source, next] : [source] });
+    if (path.endsWith(`/${runId}`)) return route.fulfill({ json: new URL(route.request().url()).searchParams.get("detail") === "false" ? source : { ...source, intervention: undefined } });
+    if (path.endsWith(`/${nextId}`)) return route.fulfill({ json: next });
+    return route.fallback();
+  });
+  await page.goto(`/flows/${workflowId}/runs/${runId}`);
+  await page.getByRole("button", { name: "Review & retry", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Review & retry" });
+  const submit = dialog.getByRole("button", { name: decision === "applied" ? "Use verified result & continue" : "Confirm & retry" });
+  await expect(submit).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Verification evidence (20–2,000 characters)" }).fill(decision === "applied"
+    ? "Verified this exact report in the recipient delivery receipt; no delivery remains pending."
+    : "Verified the account log and pending queue; nothing was published or left in progress.");
+  await dialog.getByRole("checkbox").check();
+  if (decision === "applied") {
+    await expect(dialog.getByText("A later check released this item's execution lock.", { exact: false })).toBeVisible();
+    await submit.click();
+    expect(requests).toHaveLength(0);
+    await dialog.getByRole("textbox", { name: "Delivery receipt" }).fill("report-receipt-42");
+  }
+  await submit.click();
+  await expect(page).toHaveURL(`/flows/${workflowId}/runs/${nextId}`);
+  expect(requests).toHaveLength(1);
+  expect(requests[0].effect_review).toMatchObject({ step_id: "campaign", decision, confirmed: true, effect_fingerprint: "a".repeat(64) });
+  if (decision === "applied") {
+    expect(requests[0].effect_review.result).toEqual({ receipt_id: "report-receipt-42" });
+    expect(requests[0].effect_review.project_revisions).toEqual({ "report-project": 4 });
+  }
+  expect(fixture.writes).toEqual([]);
+  expect(fixture.errors).toEqual([]);
+});
+
+test("failed run keeps a retry entry but requires fresh server permission before submission", async ({ page }) => {
+  const fixture = await installFixture(page);
+  let source = {
+    ...fixture.runs[0],
+    lineage_root_run_id: runId,
+    capabilities: { can_control: true },
+    intervention: null as Record<string, unknown> | null,
+  };
+  await page.route("**/api/v1/workflows/runs/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith(`/${runId}/family`)) return route.fulfill({ json: [source] });
+    if (path.endsWith(`/${runId}`)) return route.fulfill({ json: source });
+    return route.fallback();
+  });
+  await page.goto(`/workspaces/${workspaceId}/workflow-runs/${runId}`);
+  await expect(page.locator(".workflow-run-banner")).toBeVisible();
+  await page.locator(".workflow-run-banner").getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(page.getByRole("dialog").getByRole("button", { name: "Retry", exact: true })).toBeDisabled();
+  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).last().click();
+  source = { ...source, intervention: {
+    kind: "workflow_effect_review", options: [],
+    blocked_reason: "external_effect_requires_reconciliation", deadline_at: "2026-10-15T08:00:00Z",
+  } };
+  await page.reload();
+  await expect(page.locator(".workflow-run-banner")).toContainText("Retry blocked · verify previous action");
+  await page.locator(".workflow-run-banner").getByRole("button", { name: "Retry", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Retry", exact: true });
+  await expect(dialog).toContainText("A browser action was executed or is still pending");
+  await expect(dialog).toContainText("Retrying does not extend it");
+  await expect(dialog.getByRole("button", { name: "Retry", exact: true })).toBeDisabled();
+  source = { ...source, intervention: {
+    kind: "workflow_retry", step_id: "campaign", retry_from_step_id: "campaign", options: ["retry"],
+    editable_input_schema: { type: "object", properties: {} },
+  } };
+  await dialog.getByRole("button", { name: "Check again", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
   expect(fixture.writes).toEqual([]);
   expect(fixture.errors).toEqual([]);
 });

@@ -1,4 +1,5 @@
 """Protocol 3 must upgrade the original Workspace, or leave it untouched."""
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -6,10 +7,12 @@ import pytest
 from sqlalchemy import select
 
 from packages.core.blueprints import reconfigure
+from packages.core.blueprints.exporter import export_workspace
 from packages.core.blueprints.installer import InstallMode, install_blueprint, resolve_install_variables
 from packages.core.blueprints.upgrade import BlueprintUpgradePlanChangedError
 from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
+from packages.core.models.document import DocumentGroup
 from packages.core.models.skill import Skill
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace
@@ -51,6 +54,19 @@ async def apply_reviewed(db, workspace, source, reviewed=None, *, keep=()):
         configuration_resolutions=[{"key": item["key"], "resolution": "keep_yours" if item["key"] in keep else "use_blueprint"}
                                    for item in reviewed["items"]],
     )
+
+
+def _mcp_requirement(source, *, required, install_blocking):
+    source["contract"]["requires"]["mcp_servers"] = [{
+        "slug": "optional-reconfigure-mcp",
+        "required": required,
+        "install_blocking": install_blocking,
+    }]
+
+
+async def _export_mcp_requirement(db, workspace):
+    exported = await export_workspace(db, workspace.id, title="Runtime receipt")
+    return exported["contract"]["requires"]["mcp_servers"]
 
 
 def test_only_consumed_or_materialized_variables_are_requested():
@@ -202,6 +218,165 @@ async def test_second_upgrade_does_not_overwrite_previously_kept_runtime(db_sess
     assert retained["contract"]["requires"]["tools"] == []
 
 
+@pytest.mark.parametrize("keep", [False, True])
+async def test_an_applied_runtime_change_is_reported_as_updated(db_session, keep):
+    workspace, source = await installed(db_session)
+    source["contract"]["requires"]["tools"] = ["new_optional_for_test"]
+    result = await apply_reviewed(db_session, workspace, source, keep=(reconfigure.RUNTIME_KEY,) if keep else ())
+    updated = [item.get("key") for item in result["updated"]]
+    if keep:
+        assert reconfigure.RUNTIME_KEY not in updated
+        assert reconfigure.RUNTIME_KEY in result["kept_yours"]
+    else:
+        assert updated == [reconfigure.RUNTIME_KEY]
+        assert result["kept_yours"] == []
+
+
+async def test_v3_reconfigure_keeps_same_title_knowledge_packs_isolated_by_slug(db_session):
+    source = payload()
+    source["embedded"]["knowledge_packs"] = [
+        {
+            "slug": "workspace-knowledge-2",
+            "title": "Workspace Knowledge",
+            "purpose": "First purpose",
+            "mode": "skeleton",
+            "folder_structure": [],
+            "starter_documents": [],
+            "external_source": None,
+        },
+        {
+            "slug": "workspace-knowledge-3",
+            "title": "Workspace Knowledge",
+            "purpose": "Second purpose",
+            "mode": "skeleton",
+            "folder_structure": [],
+            "starter_documents": [],
+            "external_source": None,
+        },
+    ]
+    install = await install_blueprint(
+        db_session,
+        entity_id=generate_ulid(),
+        payload=source,
+        mode=InstallMode.LIVE,
+        blueprint_id="builtin:upgrade-test",
+    )
+    workspace = await db_session.get(Workspace, install.workspace_id)
+    updated = copy.deepcopy(source)
+    updated["embedded"]["knowledge_packs"][0]["purpose"] = "Updated first purpose"
+
+    await apply_reviewed(db_session, workspace, updated)
+
+    async def purposes_by_slug():
+        groups = list((await db_session.execute(select(DocumentGroup).where(
+            DocumentGroup.workspace_id == workspace.id,
+        ))).scalars().all())
+        return {
+            group.settings["installed_from_blueprint_slug"]: group.settings["purpose"]
+            for group in groups
+        }
+
+    assert await purposes_by_slug() == {
+        "workspace-knowledge-2": "Updated first purpose",
+        "workspace-knowledge-3": "Second purpose",
+    }
+
+    await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
+    assert await purposes_by_slug() == {
+        "workspace-knowledge-2": "First purpose",
+        "workspace-knowledge-3": "Second purpose",
+    }
+
+
+async def test_v3_runtime_use_and_revert_export_the_applied_mcp_policy(db_session):
+    workspace, source = await installed(db_session)
+    _mcp_requirement(source, required=False, install_blocking=False)
+    await reconfigure.capture_install_baseline(db_session, workspace=workspace, payload=source)
+
+    updated = payload()
+    _mcp_requirement(updated, required=True, install_blocking=True)
+    await apply_reviewed(db_session, workspace, updated)
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": True, "install_blocking": True,
+    }]
+
+    await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": False, "install_blocking": False,
+    }]
+
+
+async def test_v3_runtime_keep_yours_exports_the_installed_mcp_policy(db_session):
+    workspace, source = await installed(db_session)
+    _mcp_requirement(source, required=False, install_blocking=False)
+    await reconfigure.capture_install_baseline(db_session, workspace=workspace, payload=source)
+
+    updated = payload()
+    _mcp_requirement(updated, required=True, install_blocking=True)
+    await apply_reviewed(db_session, workspace, updated, keep=(reconfigure.RUNTIME_KEY,))
+
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": False, "install_blocking": False,
+    }]
+
+
+async def test_legacy_partial_upgrade_preserves_mcp_policy_after_v3_invalidation(db_session):
+    from packages.core.blueprints.upgrade import apply as apply_legacy
+
+    workspace, source = await installed(db_session)
+    _mcp_requirement(source, required=False, install_blocking=False)
+    await reconfigure.capture_install_baseline(db_session, workspace=workspace, payload=source)
+
+    updated = payload()
+    _mcp_requirement(updated, required=True, install_blocking=True)
+    result = await apply_legacy(
+        db_session, workspace=workspace, payload=updated, source_payload=updated,
+        current_version="2",
+    )
+    assert result["fully_synchronized"] is False
+    await reconfigure.invalidate_after_legacy_upgrade(db_session, workspace=workspace)
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": False, "install_blocking": False,
+    }]
+
+
+async def test_legacy_full_upgrade_and_revert_preserve_mcp_policy_after_v3_invalidation(db_session):
+    from packages.core.blueprints.upgrade import apply as apply_legacy
+    from packages.core.blueprints.upgrade import revert as revert_legacy
+
+    source = payload()
+    _mcp_requirement(source, required=False, install_blocking=False)
+    result = await install_blueprint(
+        db_session, entity_id=generate_ulid(), payload=source,
+        mode=InstallMode.LIVE, blueprint_id="builtin:upgrade-test",
+    )
+    workspace = await db_session.get(Workspace, result.workspace_id)
+    updated = payload()
+    _mcp_requirement(updated, required=False, install_blocking=False)
+    updated["embedded"]["skills"][0]["system_prompt"] = "Updated writer prompt"
+
+    result = await apply_legacy(
+        db_session, workspace=workspace, payload=updated, source_payload=updated,
+        current_version="2",
+    )
+    assert result["fully_synchronized"] is True
+    await reconfigure.invalidate_after_legacy_upgrade(db_session, workspace=workspace)
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": False, "install_blocking": False,
+    }]
+
+    await revert_legacy(db_session, workspace=workspace)
+    assert await _export_mcp_requirement(db_session, workspace) == [{
+        "slug": "optional-reconfigure-mcp", "purpose": None,
+        "config_fields_to_set": [], "required": False, "install_blocking": False,
+    }]
+
+
 async def test_undo_refuses_later_configuration_edit_without_partial_restore(db_session):
     workspace, source = await installed(db_session)
     source["recipe"]["operating_model"]["context"] = "Upgraded context"
@@ -288,6 +463,7 @@ async def test_missing_new_variable_preview_retains_saved_and_default_values(mon
     monkeypatch.setattr(routes, "_blueprint_payload_for", AsyncMock(return_value=(source, "2", "builtin:upgrade-test")))
     monkeypatch.setattr(reconfigure, "_state", AsyncMock(return_value=SimpleNamespace(baseline={"known": True}, restore_point={"applied_at": "2026-09-10T01:00:00Z", "to_version": "1"})))
     monkeypatch.setattr(reconfigure, "active_runs", AsyncMock(return_value=[]))
+    monkeypatch.setattr(routes, "_release_choice_fields", AsyncMock(return_value={"available_versions": []}))
     result = await routes._preview_blueprint_reconfiguration(workspace_id="ws", variable_values={}, channel_config_ids={}, user=user, db=None)
     assert result["variables_ready"] is False
     assert result["resolved_variable_values"] == {"saved": "Original name", "defaulted": "Ready"}

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from packages.core.models.base import generate_ulid
 from packages.core.models.user import User
 from packages.core.workspace_chat.attention import workspace_attention, mark_workspace_attention_seen
-from test_workspace_chat_pending_count import _register, _workspace, _seed, _card, _page, _sidebar_stats, BASE
+from test_workspace_chat_pending_count import _register, _workspace, _seed, _card, _page, _sidebar_stats, _badge_total, BASE
 
 
 @pytest.mark.asyncio
@@ -156,9 +156,29 @@ async def test_unread_list_is_read_only_scoped_and_excludes_viewed_cards(client,
     await client.post(endpoint + "/seen", headers=headers, json={"keys": [items[0]["key"]]})
     unread = (await client.get(endpoint, headers=headers)).json()["items"]
     assert [item["message_id"] for item in unread] == [cards[0].id]
-    assert (await _page(client, headers, wid))["open_action_count"] == 2
+    # The sidebar opens all outstanding decisions, including already viewed cards.
+    assert (await client.get(endpoint, headers=headers, params={"scope": "open"})).json()["items"] == items
+    await client.post(endpoint + "/seen", headers=headers, json={"keys": [item["key"] for item in items]})
+    assert (await client.get(endpoint, headers=headers)).json()["items"] == []
+    assert (await client.get(endpoint, headers=headers, params={"scope": "open"})).json()["items"] == items
+    assert _badge_total(await _sidebar_stats(client, headers, wid)) == (await _page(client, headers, wid))["open_action_count"] == 2
+    # The App queue lists every pending decision; a read receipt never hides one.
+    queue_endpoint = f"/api/v1/workspaces/{wid}/app-view/sections/queue"
+    queue = await client.get(queue_endpoint, headers=headers)
+    assert queue.status_code == 200, queue.text
+    assert [(item["key"], item["message_id"], item["summary"]) for item in queue.json()["items"]] == [
+        (item["key"], item["message_id"], item["summary"]) for item in items
+    ]
+    # Only resolving the underlying decision removes it from both counts/navigation.
+    cards[0].resolved_at = BASE + timedelta(hours=1)
+    cards[0].resolution = {"action": "submitted"}
+    await db_session.commit()
+    assert (await client.get(endpoint, headers=headers, params={"scope": "open"})).json()["items"] == items[:1]
+    assert _badge_total(await _sidebar_stats(client, headers, wid)) == (await _page(client, headers, wid))["open_action_count"] == 1
     outsider = await _register(client, "attention_list_outsider")
     assert (await client.get(endpoint, headers=outsider)).status_code == 404
+    assert (await client.get(endpoint, headers=outsider, params={"scope": "open"})).status_code == 404
+    assert (await client.get(queue_endpoint, headers=outsider)).status_code == 404
 
 
 @pytest.mark.asyncio
@@ -195,6 +215,9 @@ async def test_unread_list_deduplicates_mirrors_and_preserves_independent_prompt
     assert {item["source_id"] for item in inputs} == set(prompt_ids)
     assert {item["summary"] for item in inputs} == {"Input 0", "Input 1"}
     assert len({item["key"] for item in inputs}) == 2
+    await client.post(endpoint + "/seen", headers=headers, json={"keys": [item["key"] for item in items]})
+    assert (await client.get(endpoint, headers=headers)).json()["items"] == []
+    assert (await client.get(endpoint, headers=headers, params={"scope": "open"})).json()["items"] == items
     await db_session.refresh(request)
     assert request.status == "pending"
     for card in cards:

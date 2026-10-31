@@ -35,6 +35,8 @@ WHISPER_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 _WHISPER_USD_PER_MINUTE = 0.006
 # Groq whisper-large-v3: $0.111 per audio hour ≈ $0.00185/min.
 _GROQ_WHISPER_USD_PER_MINUTE = 0.111 / 60.0
+# OpenAI gpt-4o-mini-transcribe: $0.003 per minute (half of whisper-1).
+_MINI_TRANSCRIBE_USD_PER_MINUTE = 0.003
 
 
 class WhisperError(Exception):
@@ -76,8 +78,12 @@ async def transcribe_blob(
     resolved_model: Optional[str] = None,
     require_timestamps: bool = False,
     reference_transcript: Optional[str] = None,
+    word_timestamps: bool = False,
 ) -> WhisperResult:
     """Send ``blob`` to OpenAI Whisper, return the transcript + duration.
+
+    ``word_timestamps`` asks for per-word times. The Vercel gateway returns
+    either line segments or words, not both; with it, its segments are words.
 
     Does NOT bill — caller is responsible for that step (audio router
     bills against the requesting user; file_context bills against the
@@ -293,6 +299,8 @@ async def transcribe_blob(
                 payload={
                     "audio": base64.b64encode(blob).decode("ascii"),
                     "mediaType": mime or "audio/webm",
+                    **({"providerOptions": {"openai": {"timestampGranularities": ["word"]}}}
+                       if word_timestamps else {}),
                 },
                 auth_method=vercel_auth_method,
                 timeout=120.0,
@@ -329,6 +337,8 @@ async def transcribe_blob(
             duration_seconds=duration,
             model=reported_model or model,
             segments=segments or None,
+            words=[{"start": item["start"], "end": item["end"], "text": item["text"]} for item in segments]
+            if word_timestamps and segments else None,
         )
 
     if use_chat_api:
@@ -622,9 +632,10 @@ def whisper_cost_usd(duration_seconds: float, model: str = "") -> float:
     """Convert audio duration to provider USD cost. Caller multiplies
     through the standard margin via ``record_media_usage``."""
     lowered = str(model or "").lower()
-    per_minute = (
-        _GROQ_WHISPER_USD_PER_MINUTE
-        if ("groq/" in lowered or "large-v3" in lowered)
-        else _WHISPER_USD_PER_MINUTE
-    )
+    if "groq/" in lowered or "large-v3" in lowered:
+        per_minute = _GROQ_WHISPER_USD_PER_MINUTE
+    elif "mini-transcribe" in lowered:
+        per_minute = _MINI_TRANSCRIBE_USD_PER_MINUTE
+    else:
+        per_minute = _WHISPER_USD_PER_MINUTE
     return max(0.0, duration_seconds) / 60.0 * per_minute

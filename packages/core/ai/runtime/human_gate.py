@@ -10,10 +10,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+from packages.core.ai.runtime.approval_classifier import classify_runtime_tool, runtime_call_executes_nothing
 from packages.core.ai.runtime.control import runtime_sequence_child_owner
 from packages.core.ai.runtime.provider_approvals import normalize_provider_approval
-from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
 from packages.core.constants.hitl_envelope import parse_hitl_envelope
 
 
@@ -115,6 +114,26 @@ def runtime_detect_blocking_human_gate(
     }
 
 
+def runtime_tool_always_serial(tool_name: str) -> bool:
+    """Calls that never share a batch, whatever their gate or target.
+
+    They run a child loop, park the turn, drive the user's browser, or
+    mutate a draft/sandbox whose state the next call reads.
+    """
+
+    name = str(tool_name or "")
+    return (
+        name == "invoke_skill"
+        # request_input parks the whole turn on a human answer; tool calls
+        # issued alongside it must not fire side effects past the wait.
+        or name == "request_input"
+        or name.startswith("ws_")
+        or name.startswith("sandbox_")
+        or name.startswith(_SERIAL_BROWSER_TOOL_PREFIXES)
+        or name.endswith("__browser_action")
+    )
+
+
 def runtime_tool_requires_serial_execution(
     tool_name: str,
     arguments: dict[str, Any] | None = None,
@@ -127,16 +146,7 @@ def runtime_tool_requires_serial_execution(
     """
 
     name = str(tool_name or "")
-    if (
-        name == "invoke_skill"
-        # request_input parks the whole turn on a human answer; tool calls
-        # issued alongside it must not fire side effects past the wait.
-        or name == "request_input"
-        or name.startswith("ws_")
-        or name.startswith("sandbox_")
-        or name.startswith(_SERIAL_BROWSER_TOOL_PREFIXES)
-        or name.endswith("__browser_action")
-    ):
+    if runtime_tool_always_serial(name):
         return True
     try:
         classification = classify_runtime_tool(
@@ -145,10 +155,14 @@ def runtime_tool_requires_serial_execution(
         )
     except Exception:
         return True
-    return classification.effect is not RuntimeToolEffect.READ_ONLY
+    # A call that executes nothing (a read, a rejected call_tool, wait_until)
+    # may share a parallel batch; wait_until's siblings keep their batch-time
+    # semantics (each wait resolves its time when its batch ran).
+    return not runtime_call_executes_nothing(name, classification)
 
 
 __all__ = [
     "runtime_detect_blocking_human_gate",
+    "runtime_tool_always_serial",
     "runtime_tool_requires_serial_execution",
 ]

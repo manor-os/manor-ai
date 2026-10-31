@@ -171,10 +171,6 @@
     "upstream": "simple-icons@16.23.0",
     "guidelines": "https://elevenlabs.io/brand"
   },
-  "suno": {
-    "source": "https://suno.com",
-    "upstream": "simple-icons@16.23.0"
-  },
   "claude": {
     "source": "https://claude.ai",
     "upstream": "simple-icons@16.23.0"

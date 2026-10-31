@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
@@ -141,6 +142,29 @@ async def test_optional_blueprint_connection_stays_optional_when_bound(db_sessio
     assert result["requirements"][0]["required"] is False
 
 
+async def test_internal_mcp_binding_is_not_connection_guidance(db_session):
+    db = db_session
+    workspace = await _workspace(db)
+    agent = await _agent(db, workspace)
+    server = (await db.execute(
+        select(MCPServer).where(MCPServer.server_key == "chrome_knowledge_local")
+    )).scalar_one_or_none()
+    if server is None:
+        server = MCPServer(
+            server_key="chrome_knowledge_local",
+            name="Chrome Knowledge Upload Prep",
+            transport="builtin",
+            auth_type="none",
+            status="active",
+        )
+        db.add(server)
+        await db.flush()
+    db.add(AgentMCPBinding(agent_id=agent.id, mcp_server_id=server.id))
+    await db.flush()
+
+    assert (await _status(db, workspace, generate_ulid()))["requirements"] == []
+
+
 async def test_two_hundred_tool_and_skill_dependencies_are_deduplicated(db_session):
     db = db_session
     workspace = await _workspace(db)
@@ -249,22 +273,20 @@ async def test_channel_connection_regression_is_visible_in_both_paths(db_session
     assert (await _status(db, workspace, user_id))["required_issue_count"] == 1
 
 
-async def test_browser_session_regression_is_visible(db_session):
-    from packages.core.models.integration_session import IntegrationSession
-
+async def test_browser_sessions_are_not_asked_for_and_integrations_are_offered_instead(db_session):
+    """Captured browser sessions are not a connection people can add. A site
+    with an integration is offered as that integration (connected in place);
+    a site without one publishes through Chrome and is not listed."""
     db = db_session
-    workspace = await _workspace(db, settings={"_blueprint": {"live_setup_requirements": [{
-        "kind": "browser_session", "payload": {"provider": "notice_browser", "label": "sales"}, "blocking": True,
-    }]}})
-    user_id = generate_ulid()
-    assert (await _status(db, workspace, user_id))["required_issue_count"] == 1
-    session = IntegrationSession(entity_id=workspace.entity_id, provider="notice_browser", label="sales", status="active")
-    db.add(session)
-    await db.flush()
-    assert (await _status(db, workspace, user_id))["required_issue_count"] == 0
-    session.status = "expired"
-    await db.flush()
-    assert (await _status(db, workspace, user_id))["required_issue_count"] == 1
+    workspace = await _workspace(db, settings={"_blueprint": {"live_setup_requirements": [
+        {"kind": "browser_session", "payload": {"provider": provider, "label": "main"}, "blocking": True}
+        for provider in ("medium", "reddit", "instagram")
+    ]}})
+    result = await _status(db, workspace, generate_ulid())
+    assert [item["kind"] for item in result["requirements"]] == ["integration"]
+    assert result["requirements"][0]["provider"] == "facebook"
+    assert result["requirements"][0]["required"] is False
+    assert result["required_issue_count"] == 0
 
 
 async def test_saved_health_failure_is_reported_without_provider_calls(db_session):
@@ -394,3 +416,17 @@ async def test_inferred_platform_integration_falls_back_to_the_browser_extension
     result = await _status(db, declared, user_id)
     assert result["required_issue_count"] == 1
     assert all("covered_by" not in item for item in result["requirements"])
+
+
+def test_no_builtin_blueprint_asks_for_a_browser_session():
+    """Browser sessions cannot be added; Blueprints declare integrations or Chrome."""
+    import json
+    from pathlib import Path
+
+    configs = Path(__file__).resolve().parents[1] / "packages/core/blueprints/configs"
+    offenders = {
+        path.name: sessions
+        for path in sorted(configs.rglob("*.json"))
+        if (sessions := (json.loads(path.read_text()).get("contract") or {}).get("sessions"))
+    }
+    assert not offenders, offenders

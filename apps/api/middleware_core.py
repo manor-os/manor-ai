@@ -57,6 +57,18 @@ _HSTS_INCLUDE_SUBDOMAINS = os.getenv(
     "HSTS_INCLUDE_SUBDOMAINS", "false",
 ).strip().lower() in {"1", "true", "yes", "on"}
 _HEALTH_PATHS = {"/health", "/health/"}
+# Path prefixes the per-IP limiter skips because they authenticate and bound
+# every request themselves.
+# The in-sandbox manor CLI is authenticated per command (a short-lived token
+# minted for one execution, revoked when it ends) and every sandbox of every
+# user on a runner shares that runner's egress IP: per-IP limiting would let
+# one user's busy commands starve everyone else's CLI calls.
+_RATE_LIMIT_EXEMPT_PREFIXES: tuple[str, ...] = ("/api/v1/sandbox-cli/",)
+
+
+def _is_rate_limit_exempt(path: str) -> bool:
+    return bool(_RATE_LIMIT_EXEMPT_PREFIXES) and path.startswith(_RATE_LIMIT_EXEMPT_PREFIXES)
+
 
 def _is_streaming(request: Request) -> bool:
     # BaseHTTPMiddleware buffers StreamingResponse bodies when it wraps call_next.
@@ -73,7 +85,7 @@ def _is_chat_stream_role_guard_path(path: str) -> bool:
 
 
 class ChatStreamRoleGuardMiddleware:
-    """Reject K8s stream traffic if it reaches a non-chat service role.
+    """Reject routed stream traffic if it reaches a non-chat service role.
 
     This is pure ASGI middleware rather than BaseHTTPMiddleware so it can
     short-circuit before auth dependencies without wrapping successful SSE
@@ -305,7 +317,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if not _RATE_LIMIT_ENABLED or request.url.path in _HEALTH_PATHS or _is_streaming(request):
+        if (
+            not _RATE_LIMIT_ENABLED
+            or request.url.path in _HEALTH_PATHS
+            or _is_streaming(request)
+            or _is_rate_limit_exempt(request.url.path)
+        ):
             return await call_next(request)
 
         from apps.api.middleware.rate_limit import (

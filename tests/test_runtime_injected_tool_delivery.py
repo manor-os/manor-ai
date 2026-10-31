@@ -33,6 +33,15 @@ from packages.core.ai.runtime.policies import (
 )
 
 
+# A caller-armed terminal tool: any successful call ends the loop.
+_TERMINAL_TOOL = "submit_result"
+_TERMINAL_POLICY = {
+    "terminal_tool_results": [
+        {"tool_names": [_TERMINAL_TOOL], "stop_reason": "submitted", "notice": "Result submitted."},
+    ],
+}
+
+
 # ── Runtime-injected tools are not surface capabilities ───────────────
 
 
@@ -69,12 +78,6 @@ def test_ordinary_tools_are_still_gated_by_the_allowlist():
     assert decision.code == RuntimeToolPolicyCode.TOOL_NOT_IN_RUNTIME_SURFACE.value
 
 
-def test_submit_result_is_the_worker_tool_the_enum_names():
-    from packages.core.workers.submit_result import SUBMIT_RESULT_TOOL_NAME
-
-    assert SUBMIT_RESULT_TOOL_NAME in RuntimeInjectedTool.names()
-
-
 def test_channel_attachment_is_the_tool_the_enum_names():
     from packages.core.ai.runtime.channel_tools import (
         RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME,
@@ -107,21 +110,17 @@ def test_policy_denial_is_recognized_by_code_not_message_text():
 
 def test_denied_terminal_tool_does_not_end_the_loop():
     from packages.core.ai.agentic_loop import _detect_terminal_tool_result
-    from packages.core.workers.submit_result import (
-        SUBMIT_RESULT_TERMINAL_POLICY,
-        SUBMIT_RESULT_TOOL_NAME,
-    )
 
     denial = RuntimeToolPolicyDecision(
         False,
         code=RuntimeToolPolicyCode.TOOL_NOT_IN_RUNTIME_SURFACE.value,
         reason="denied",
-        tool_name=SUBMIT_RESULT_TOOL_NAME,
+        tool_name=_TERMINAL_TOOL,
     ).to_tool_result()
 
     control = _detect_terminal_tool_result(
-        [({"name": SUBMIT_RESULT_TOOL_NAME, "id": "c1"}, denial)],
-        SUBMIT_RESULT_TERMINAL_POLICY,
+        [({"name": _TERMINAL_TOOL, "id": "c1"}, denial)],
+        _TERMINAL_POLICY,
         "make the video",
     )
     assert control is None, "a refused call must not be recorded as delivery"
@@ -129,74 +128,17 @@ def test_denied_terminal_tool_does_not_end_the_loop():
 
 def test_successful_terminal_tool_still_ends_the_loop():
     from packages.core.ai.agentic_loop import _detect_terminal_tool_result
-    from packages.core.workers.submit_result import (
-        SUBMIT_RESULT_TERMINAL_POLICY,
-        SUBMIT_RESULT_TOOL_NAME,
-    )
 
     control = _detect_terminal_tool_result(
-        [({"name": SUBMIT_RESULT_TOOL_NAME, "id": "c1"}, '{"ok": true}')],
-        SUBMIT_RESULT_TERMINAL_POLICY,
+        [({"name": _TERMINAL_TOOL, "id": "c1"}, '{"ok": true}')],
+        _TERMINAL_POLICY,
         "make the video",
     )
     assert control is not None
     assert control.get("terminal") is True
 
 
-# ── Evidence channel: what the agent DID, not what it said ────────────
-
-
-def test_completed_media_jobs_are_collected_as_artifacts():
-    """The async media pipeline reports finished files inside ``jobs[]``.
-
-    That container was not recognized, so a step that generated 12 videos
-    recorded no artifact at all — nothing for the task output, nothing for
-    the supervisor's delivery gate to check, and no record of where the
-    files landed."""
-    from packages.core.models.media_job import MediaJobStatus
-    from packages.core.workers.internal import _artifact_refs_from_tool_payload
-
-    payload = {
-        "kind": "media_jobs",
-        "status": MediaJobStatus.COMPLETED.value,
-        "jobs": [
-            {
-                "job_id": "j1", "kind": "video",
-                "status": MediaJobStatus.COMPLETED.value,
-                "fs_path": "runs/plan_1/steps/produce/final.mp4",
-                "document_id": "doc_1",
-            },
-            {"job_id": "j2", "kind": "video", "status": MediaJobStatus.PENDING.value},
-            {
-                "job_id": "j3", "kind": "image",
-                "status": MediaJobStatus.FAILED.value,
-                "fs_path": "runs/plan_1/steps/produce/never-made.png",
-            },
-        ],
-    }
-
-    refs = _artifact_refs_from_tool_payload(payload)
-    paths = [ref.get("fs_path") for ref in refs]
-    assert paths == ["runs/plan_1/steps/produce/final.mp4"], (
-        "only completed jobs are deliverables — a pending job has no file "
-        "yet and a failed one never will"
-    )
-
-
-def test_executor_collects_completed_media_jobs_too():
-    from packages.core.models.media_job import MediaJobStatus
-    from packages.core.plans.executor import _artifact_refs_from_result
-
-    refs = _artifact_refs_from_result({
-        "kind": "media_jobs",
-        "jobs": [
-            {"kind": "video", "status": MediaJobStatus.COMPLETED.value,
-             "fs_path": "runs/p/final.mp4"},
-            {"kind": "video", "status": MediaJobStatus.PROCESSING.value,
-             "fs_path": "runs/p/wip.mp4"},
-        ],
-    })
-    assert [ref.get("fs_path") for ref in refs] == ["runs/p/final.mp4"]
+# ── Media job statuses ─────────────────────────────────────────────────
 
 
 def test_media_job_terminal_statuses_have_one_definition():

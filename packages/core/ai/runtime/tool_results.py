@@ -50,6 +50,62 @@ class RuntimeDelegatedPauseToolResult(str):
     """
 
 
+class RuntimeDelegatedSettlementToolResult(str):
+    """Host proof that a durable delegation's children settled into this call.
+
+    The ``delegate_to_agent`` call itself is no effect: every effect of its
+    child runs is in their ledgers, which the loop merges into its own with
+    this result (an unknown last round as an effect-floor marker). Minted
+    only by the AgentLoop when it replays a ``pending_tool_result`` that its
+    durable host wrote with ``child_evidence`` (honoured only with
+    ``hitl_resume_checkpoint=True``); the same JSON without it stays an
+    unconfirmed effect.
+    """
+
+
+class RuntimeSettledEffect(StrEnum):
+    # Values match receipts.EffectState.
+    NONE = "none"
+    CONFIRMED = "confirmed"
+
+
+class RuntimeSettledToolResult(str):
+    """Host proof, minted by a host tool handler at one exact failure branch,
+    of everything this failed call changed.
+
+    ``none``: it changed nothing outside itself. It was refused before it ran
+    (command policy, input validation, an unavailable tool or runtime, a
+    read it was denied), or it ran only inside a throwaway sandbox with no
+    network and no Workspace mount. ``confirmed``: only steps that completed
+    before the failure changed anything (the failure stopped before its
+    output was written).
+
+    A failure without this carrier stays unconfirmed: the call may have
+    crossed I/O. Tool or provider JSON, model text and serialized checkpoints
+    cannot mint it; only handlers that know their own write boundary do.
+    """
+
+    effect: RuntimeSettledEffect
+    reason: str
+
+    def __new__(cls, display_text: str, *, effect: RuntimeSettledEffect, reason: str):
+        instance = super().__new__(cls, display_text)
+        instance.effect = RuntimeSettledEffect(effect)
+        instance.reason = str(reason or "")[:80]
+        return instance
+
+    def __getnewargs_ex__(self):
+        return (str(self),), {"effect": self.effect, "reason": self.reason}
+
+    @classmethod
+    def not_applied(cls, display_text: str, reason: str) -> RuntimeSettledToolResult:
+        return cls(display_text, effect=RuntimeSettledEffect.NONE, reason=reason)
+
+    @classmethod
+    def completed_steps_only(cls, display_text: str, reason: str) -> RuntimeSettledToolResult:
+        return cls(display_text, effect=RuntimeSettledEffect.CONFIRMED, reason=reason)
+
+
 class RuntimeNoEffectReason(StrEnum):
     DOCUMENT_TARGET_EXISTS = "document_target_exists"
     PATCH_TARGET_NOT_FOUND = "patch_target_not_found"
@@ -165,10 +221,13 @@ class RuntimeNoEffectToolResult(str):
                 and payload.get("error") == "file_already_exists"
             )
         if self.reason in self._VIDEO_REFERENCE_ERRORS:
+            operation = str(arguments.get("operation") or "").strip().lower()
             return (
                 tool_name == "video_edit"
-                and str(arguments.get("operation") or "").strip().lower() in {"start", "prepare", "push_assets"}
-                and bool(arguments.get("reference_paths"))
+                and (
+                    (operation in {"start", "prepare", "push_assets"} and bool(arguments.get("reference_paths")))
+                    or (operation == "write_files" and bool(arguments.get("source_paths")))
+                )
                 and payload.get("error") == self._VIDEO_REFERENCE_ERRORS[self.reason]
                 and _proves_unapplied(payload)
             )
@@ -191,6 +250,11 @@ class RuntimeStructuredToolResult(str):
 
     structured_content: Any
     execution_evidence: tuple[dict[str, Any], ...]
+    # The effect state of a whole child ledger (a Skill's agent loop) this
+    # call ran, set only by the host from that ledger; None for any other
+    # result. A call that ran a child loop changed exactly what its child
+    # calls changed, so its own state is the child ledger's (receipts.py).
+    child_effect_state: str | None
 
     def __new__(
         cls,
@@ -198,8 +262,10 @@ class RuntimeStructuredToolResult(str):
         *,
         structured_content: Any,
         execution_evidence: tuple[dict[str, Any], ...] = (),
+        child_effect_state: str | None = None,
     ) -> RuntimeStructuredToolResult:
         instance = super().__new__(cls, display_text)
         instance.structured_content = structured_content
         instance.execution_evidence = execution_evidence
+        instance.child_effect_state = child_effect_state
         return instance

@@ -57,10 +57,14 @@ def test_short_chinese_and_english_keep_the_native_layout(pages, label):
     digest = hashlib.sha256(picture).hexdigest()
     operations = studio._publication_operations(pages, label=label, theme="sage",
         illustration={"path": "fixture.jpg", "expected_sha256": digest})
+    # Each page keeps its own layout's geometry and type sizes, unshrunk.
+    plans = [studio._publication_page_plan(page, index=index, count=len(pages), label=label, accent="000000")
+             for index, page in enumerate(pages)]
+    planned_title = next(item for item in plans[0] if item[0] == "text" and item[1] == "title")
     title = next(op for op in operations if op["op"] == "textbox.insert" and op["text"] == pages[0]["title"])
-    assert title["transform"] == {"x": 48, "y": 86, "width": 530, "height": 100}
+    assert title["transform"] == dict(zip(("x", "y", "width", "height"), planned_title[3:7]))
     sizes = {op["format"]["font_size"] for op in operations if op["op"] == "paragraph.format"}
-    assert sizes == {11, 12, 21, 34}
+    assert sizes == {item[7] for plan in plans for item in plan if item[0] == "text"}
     result = _generate_office_operations_sync("pptx", [normalize_file_patch_operation(op) for op in operations],
                                             resources={("fixture.jpg", digest): picture})
     assert not result.get("error"), result

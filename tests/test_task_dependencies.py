@@ -2,11 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from packages.core.ai.runtime import runtime_task_ticket_prompt
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task
 from packages.core.services.task_dependencies import build_dependency_outputs
-from packages.core.services.task_execution_reconcile import _actual_output_from_steps
+from packages.core.workers.task_agent_loop import task_brief
 
 
 @pytest.mark.asyncio
@@ -89,83 +88,38 @@ async def test_dependency_outputs_dedupe_top_level_and_step_files(db_session):
     ]
 
 
-@pytest.mark.asyncio
-async def test_dependency_outputs_keep_complete_canonical_envelope_text(db_session):
-    entity_id = generate_ulid()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    complete_brief = (
-        "Chosen title\nThe Two-Minute Reset\n\n"
-        "Target viewer\nBusy adults.\n\n"
-        "Core curiosity hook\nCan two minutes rescue the day?\n\n"
-        + "Story beat: make the next tiny action visible.\n" * 45
-        + "Production/script constraints\nUse a faceless stickman and bottom subtitles."
-    )
-    actual_output = _actual_output_from_steps(
-        SimpleNamespace(id=plan_id, entity_id=entity_id, status="completed"),
-        [
-            SimpleNamespace(
-                step_key="select_daily_topic",
-                kind="subagent",
-                step_status="done",
-                result={
-                    "status": "succeeded",
-                    "summary": "Selected today's topic.",
-                    "text": "Selected today's topic.",
-                    "outputs": {"text": complete_brief},
-                },
-                error=None,
-            )
-        ],
-    )
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            title="Select today's topic",
-            status="completed",
-            actual_output=actual_output,
-        )
-    )
-    await db_session.commit()
+def test_task_brief_keeps_predecessor_file_paths_and_schedule_details_for_handoff():
+    brief = task_brief(SimpleNamespace(
+        title="Draft next wave social posts",
+        description="",
+        expected_output=None,
+        details={
+            "execution_script": "1. Read the shortlist. 2. Draft three posts.",
+            "done_when": "Three posts are saved as drafts.",
+            "deliverable": "A draft file per post.",
+            "dep_outputs": [
+                {
+                    "task_title": "Product shortlist",
+                    "result_summary": "Selected one primary product angle.",
+                    "files": [
+                        {
+                            "name": "product-shortlist.md",
+                            "path": "workspace/social_ops/product-shortlist.md",
+                        },
+                        {
+                            "name": "public-preview.md",
+                            "file_url": "https://cdn.example.test/public-preview.md",
+                        },
+                    ],
+                }
+            ],
+        },
+    ))
 
-    outputs = await build_dependency_outputs(
-        db_session,
-        entity_id=entity_id,
-        dependency_ids=[task_id],
-    )
-
-    assert outputs[0]["result_summary"] == complete_brief
-
-
-def test_task_prompt_keeps_predecessor_file_paths_for_handoff():
-    prompt = runtime_task_ticket_prompt(
-        {
-            "title": "Draft next wave social posts",
-            "description": "",
-            "priority": 3,
-            "task_type": "content_ops",
-            "details": {
-                "dep_outputs": [
-                    {
-                        "task_title": "Product shortlist",
-                        "result_summary": "Selected one primary product angle.",
-                        "files": [
-                            {
-                                "name": "product-shortlist.md",
-                                "path": "workspace/social_ops/product-shortlist.md",
-                            },
-                            {
-                                "name": "public-preview.md",
-                                "file_url": "https://cdn.example.test/public-preview.md",
-                            },
-                        ],
-                    }
-                ]
-            },
-        }
-    )
-
-    assert "## Predecessor Task Outputs" in prompt
-    assert "product-shortlist.md (workspace/social_ops/product-shortlist.md)" in prompt
-    assert "public-preview.md (https://cdn.example.test/public-preview.md)" in prompt
+    assert "## Outputs of the Tasks this one depends on" in brief
+    assert "Selected one primary product angle." in brief
+    assert "product-shortlist.md (workspace/social_ops/product-shortlist.md)" in brief
+    assert "public-preview.md (https://cdn.example.test/public-preview.md)" in brief
+    assert "1. Read the shortlist. 2. Draft three posts." in brief
+    assert "Three posts are saved as drafts." in brief
+    assert "A draft file per post." in brief

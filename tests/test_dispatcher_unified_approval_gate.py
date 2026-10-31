@@ -11,9 +11,7 @@ decision and maps its outcomes correctly — by driving real checkouts:
   * re-tripping the gate reuses the one request instead of minting a second
     card (the duplicate-card / inflated-badge fix);
   * a hard block still fails the step and mints no request — approval can
-    never be offered for something policy forbids;
-  * a terminal plan expires its still-open request (the orphaned "no longer
-    attached to a waiting step" card).
+    never be offered for something policy forbids.
 
 Parity with the two gates this replaced is covered by the pre-existing
 dispatcher tests in ``tests/test_runtime_tool_policy.py``.
@@ -32,11 +30,11 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
-from packages.core.models.worker import SubscriptionWorker, Worker, WorkerActivityLog
+from packages.core.models.worker import SubscriptionWorker, Worker
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.task import Task
 from packages.core.models.user import User, UserMembership
-from packages.core.plans.step_reset import step_approval_operation_id
+from packages.core.dispatcher.step_state import step_approval_operation_id
 from tests.approval_settings_test_utils import (
     action_rule, initialize_test_approval_owners, set_workspace_test_approval,
 )
@@ -56,6 +54,7 @@ async def _scenario(
     task_runtime_rules=None,
     attempt_count=0,
     last_execution_error=None,
+    action_key="social_post.publish",
 ):
     """A workspace step parked in front of the gate, plus a worker to claim it."""
     entity_id = generate_ulid()
@@ -205,7 +204,7 @@ async def _scenario(
             kind="subagent",
             service_key="content",
             capability_id=capability_id,
-            action_key="social_post.publish",
+            action_key=action_key,
             params={"prompt": "Publish the approved post."},
             depends_on=[], step_status="pending",
             risk_level=risk_level,
@@ -234,68 +233,6 @@ async def _open_requests(db, entity_id):
             HitlRequest.status == "pending",
         )
     )).scalars().all())
-
-
-@pytest.mark.asyncio
-async def test_setup_regression_blocks_existing_pending_step_before_lease(
-    db_session,
-):
-    s = await _scenario(
-        db_session,
-        requires_approval=False,
-        risk_level="low",
-        mode="automatic",
-    )
-    workspace = await db_session.get(Workspace, s["workspace_id"])
-    workspace.settings = {
-        "_blueprint": {
-            "blueprint_id": "builtin:lease-gate",
-            "live_setup_requirements": [{
-                "kind": "note",
-                "detail": "Restore the required setup.",
-                "payload": {},
-                "blocking": True,
-            }],
-        },
-    }
-    await db_session.flush()
-
-    blocked = await Dispatcher().checkout_steps_for_worker(
-        db_session,
-        s["worker"],
-        max_n=1,
-    )
-    step = await db_session.get(ExecutionStep, s["step_id"])
-
-    assert blocked == []
-    assert step.step_status == "pending"
-    assert step.current_lease_id is None
-
-    workspace.settings = {
-        "_blueprint": {
-            "blueprint_id": "builtin:lease-gate",
-            "live_setup_requirements": [],
-        },
-    }
-    await db_session.flush()
-
-    resumed = await Dispatcher().checkout_steps_for_worker(
-        db_session,
-        s["worker"],
-        max_n=1,
-    )
-
-    assert len(resumed) == 1
-    assert resumed[0][1].id == s["step_id"]
-    admission = (
-        await db_session.execute(
-            select(WorkerActivityLog).where(
-                WorkerActivityLog.lease_id == resumed[0][0].id,
-                WorkerActivityLog.event == "lease_grant",
-            )
-        )
-    ).scalar_one()
-    assert admission.payload_summary["workspace_setup_admission"] == "not_required"
 
 
 def _repark(step):
@@ -698,36 +635,39 @@ async def test_proposal_scope_must_be_active_and_cannot_waive_explicit_approval(
 
 
 @pytest.mark.asyncio
-async def test_terminal_plan_expires_the_open_request(db_session, monkeypatch):
-    """Terminal cleanup closes the request after releasing execution locks."""
-    monkeypatch.setattr(
-        "packages.core.governance.service.post_hitl_card",
-        lambda **kw: _noop(),
-    )
-    from packages.core.plans.executor import PlanExecutor
+async def test_effectless_subagent_step_dispatches_under_default_policy__r2_9(db_session, monkeypatch):
+    """A subagent step with no action and no capability has no effect of its
+    own (its tool calls cross the runtime gate). Default risk_based policy
+    must not mint a card for it; that used to ask as ``unknown`` in every mode."""
+    cards: list[dict] = []
 
-    s = await _scenario(db_session)
-    await Dispatcher().checkout_steps_for_worker(db_session, s["worker"], max_n=1)
+    async def fake_card(**kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr("packages.core.governance.service.post_hitl_card", fake_card)
+    s = await _scenario(db_session, requires_approval=False, capability_id=None, action_key=None,
+                        mode="confirm_changes")
+
+    leases = await Dispatcher().checkout_steps_for_worker(db_session, s["worker"], max_n=1)
+    step = await db_session.get(ExecutionStep, s["step_id"])
+
+    assert len(leases) == 1 and step.step_status == "running"
+    assert cards == []
+    assert (await db_session.execute(select(HitlRequest).where(
+        HitlRequest.entity_id == s["entity_id"]))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_effectless_step_keeps_its_declared_review(db_session, monkeypatch):
+    """``requires_approval`` still applies to an effectless step."""
+    monkeypatch.setattr("packages.core.governance.service.post_hitl_card", lambda **kw: _noop())
+    s = await _scenario(db_session, requires_approval=True, capability_id=None, action_key=None)
+
+    leases = await Dispatcher().checkout_steps_for_worker(db_session, s["worker"], max_n=1)
+    step = await db_session.get(ExecutionStep, s["step_id"])
+
+    assert leases == [] and step.step_status == "waiting_human"
     assert len(await _open_requests(db_session, s["entity_id"])) == 1
-
-    plan = await db_session.get(ExecutionPlan, s["plan_id"])
-    await PlanExecutor._finalize(db_session, plan, "failed")
-
-    # Finalization owns Task/Plan locks; approval decisions own HitlRequest
-    # first. Cleaning here would reverse that order and reintroduce a deadlock.
-    assert len(await _open_requests(db_session, s["entity_id"])) == 1
-    await db_session.commit()
-    await PlanExecutor._cleanup_terminal_approvals_after_commit(
-        db_session, plan_id=plan.id, task_id=plan.task_id, reason="plan_failed",
-    )
-
-    assert await _open_requests(db_session, s["entity_id"]) == []
-    # A redelivered terminal cycle uses the same idempotent cleanup path.
-    await PlanExecutor._cleanup_terminal_approvals_after_commit(
-        db_session, plan_id=plan.id, task_id=plan.task_id, reason="plan_failed",
-    )
-
-    assert await _open_requests(db_session, s["entity_id"]) == []
 
 
 async def _noop():

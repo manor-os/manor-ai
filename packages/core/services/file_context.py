@@ -17,6 +17,7 @@ where ``__str__`` resolves to the text part — so any caller doing
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -46,6 +47,7 @@ from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.text_extraction import extract_text
 from packages.core.services.tool_cache_version import bump_tool_cache_version
 from packages.core.services.image_formats import heif_mime_from_header, register_heif_decoder
+from packages.core.services.image_metadata import ImageMetadataStripError, strip_image_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,22 @@ def _detect_image_mime(data: bytes, declared: str) -> str:
                 return declared
             return mime
     return declared
+
+
+# A referenced video/audio reaches the model as a URL only; its stored
+# description and transcript let the agent answer without probing the file.
+_KB_MEDIA_DESCRIPTION_MAX_CHARS = 6000
+
+
+def _kb_media_description(doc: Document) -> list[str]:
+    from packages.core.services.knowledge_media_analysis import stored_media_text
+
+    text = stored_media_text(doc.metadata_)
+    if not text:
+        return []
+    if len(text) > _KB_MEDIA_DESCRIPTION_MAX_CHARS:
+        text = text[:_KB_MEDIA_DESCRIPTION_MAX_CHARS] + "…"
+    return [f"[Content of {doc.name} (automatic description and transcript)]\n{text}"]
 
 
 def _prepare_inline_image(data: bytes, declared_mime: str) -> tuple[bytes, str] | None:
@@ -319,7 +337,6 @@ async def bind_workspace_knowledge_documents(
     if not isinstance(attachments, list):
         return []
 
-    from packages.core.services.document_file_move import move_document_file_to_folder
     from packages.core.services.document_access import (
         effective_document_capabilities_for_user,
         user_can_read_document,
@@ -895,6 +912,16 @@ async def build_file_context(
 
         # Image branch — pass through as multimodal block.
         if mime.startswith(_IMAGE_MIME_PREFIX):
+            # Location and camera metadata are removed before the bytes are
+            # saved or inlined for the model, so neither copy carries them.
+            try:
+                stripped = await asyncio.to_thread(strip_image_metadata, content, media_type=mime)
+            except ImageMetadataStripError as exc:
+                raise HTTPException(
+                    exc.status_code, detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            if stripped is not None:
+                content = stripped
             # Detect actual format from magic bytes — browsers sometimes
             # send the wrong content_type (e.g. jpeg for a PNG file).
             mime = _detect_image_mime(content, mime)
@@ -1036,12 +1063,15 @@ async def build_file_context(
                     resolve_llm_metadata_for_user,
                     resolve_model_for_user,
                 )
-                stt_model = await resolve_model_for_user("stt", user_id=user_id, entity_id=entity_id, db=db)
+                stt_model = await resolve_model_for_user(
+                    "stt", user_id=user_id, entity_id=entity_id, db=db, workspace_id=workspace_id,
+                )
                 metadata = await resolve_llm_metadata_for_user(
                     "stt",
                     user_id=user_id,
                     entity_id=entity_id,
                     db=db,
+                    workspace_id=workspace_id,
                 )
                 user_key = (metadata or {}).get("llm_api_key")
             except Exception:
@@ -1052,6 +1082,7 @@ async def build_file_context(
                     await runtime_assert_credit_available(
                         entity_id,
                         source=RUNTIME_CHAT_ATTACHMENT_VOICE_SOURCE,
+                        workspace_id=workspace_id,
                     )
                 result = await transcribe_blob(
                     content,
@@ -1214,6 +1245,7 @@ async def build_file_context(
                     video=True,
                 )
                 text_parts.append(f"[Video from KB: {doc.name} → {kb_url}]")
+                text_parts.extend(_kb_media_description(doc))
                 continue
             if doc.file_url:
                 out.video_urls.append(doc.file_url)
@@ -1242,6 +1274,7 @@ async def build_file_context(
                     audio=True,
                 )
                 text_parts.append(f"[Audio from KB: {doc.name} → {kb_url}]")
+                text_parts.extend(_kb_media_description(doc))
                 continue
             if doc.file_url:
                 out.audio_urls.append(doc.file_url)

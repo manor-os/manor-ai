@@ -16,8 +16,10 @@ def _interrupted_result(executed: str) -> str:
 
 
 def _call_is_read_only(name: str, arguments: Any) -> bool:
-    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
-    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+    from packages.core.ai.runtime.approval_classifier import (
+        classify_runtime_tool,
+        runtime_call_executes_nothing,
+    )
 
     if isinstance(arguments, str):
         try:
@@ -27,9 +29,38 @@ def _call_is_read_only(name: str, arguments: Any) -> bool:
     if not name or not isinstance(arguments, dict):
         return False
     try:
-        return classify_runtime_tool(name, arguments).effect is RuntimeToolEffect.READ_ONLY
+        return runtime_call_executes_nothing(name, classify_runtime_tool(name, arguments))
     except Exception:
         return False
+
+
+def runtime_stored_pending_result(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
+    """The result a host wrote for a parked call (``pending_tool_result``), if any.
+
+    ``{"id", "content", "child_evidence"}``: ``child_evidence`` is the list a
+    settled durable delegation stored with it (empty otherwise).
+    """
+
+    parked = checkpoint.get("runtime_checkpoint") if isinstance(checkpoint, dict) else None
+    stored = parked.get("pending_tool_result") if isinstance(parked, dict) else None
+    pending = parked.get("pending_tool_call") if isinstance(parked, dict) else None
+    if (
+        not isinstance(stored, dict)
+        or not isinstance(pending, dict)
+        or not stored.get("id")
+        or str(stored.get("id")) != str(pending.get("id") or "")
+        or stored.get("content") is None
+    ):
+        return None
+    content = stored["content"]
+    evidence = stored.get("child_evidence")
+    return {
+        "id": str(stored["id"]),
+        "name": str(pending.get("name") or ""),
+        "arguments": pending.get("arguments") if isinstance(pending.get("arguments"), dict) else {},
+        "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+        "child_evidence": [item for item in evidence if isinstance(item, dict)] if isinstance(evidence, list) else [],
+    }
 
 
 def runtime_answer_interrupted_calls(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
@@ -51,6 +82,9 @@ def runtime_answer_interrupted_calls(checkpoint: dict[str, Any]) -> list[dict[st
         for call in [parked.get("pending_tool_call"), *(parked.get("remaining_tool_calls") or [])]
         if isinstance(call, dict) and call.get("id")
     }
+    # A result the host already wrote for the parked call (a settled
+    # delegation, an answer) is that call's result, not "did not run".
+    stored = runtime_stored_pending_result(checkpoint)
     last = next((
         index for index in range(len(messages) - 1, -1, -1)
         if messages[index].get("role") == "assistant" and messages[index].get("tool_calls")
@@ -68,6 +102,9 @@ def runtime_answer_interrupted_calls(checkpoint: dict[str, Any]) -> list[dict[st
             continue
         call_id = str(call.get("id") or "")
         if not call_id or call_id in answered:
+            continue
+        if stored is not None and stored["id"] == call_id:
+            answers.append({"role": "tool", "tool_call_id": call_id, "content": stored["content"]})
             continue
         function = call.get("function") if isinstance(call.get("function"), dict) else {}
         name = str(function.get("name") or call.get("name") or "")

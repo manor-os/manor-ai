@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import os
 import shutil
+import tempfile
 import wave
 
 
@@ -17,11 +20,13 @@ _FORMAT_ALIASES = {
     "pcm16": "pcm",
 }
 
+# Formats a generated audio artifact can be stored as: each has its own file
+# extension and MIME type in the artifact writer and a slot in the authorized
+# media output plan.  M4A has neither, so it is never a conversion target.
 SUPPORTED_AUDIO_ARTIFACT_FORMATS = frozenset(
     {
         "aac",
         "flac",
-        "m4a",
         "mp3",
         "ogg",
         "opus",
@@ -33,6 +38,121 @@ SUPPORTED_AUDIO_ARTIFACT_FORMATS = frozenset(
 def normalize_audio_format(value: str) -> str:
     normalized = str(value or "").strip().lower().lstrip(".")
     return _FORMAT_ALIASES.get(normalized, normalized)
+
+
+def sniff_audio_format(audio_bytes: bytes) -> str:
+    """Name the container ``audio_bytes`` actually holds, or ``""`` when unknown.
+
+    Providers do not always honour the requested format (OpenRouter's Lyria
+    returns MP3 whatever is asked for), so the bytes, not the request, decide
+    which format an artifact is labelled with.
+    """
+    head = bytes(audio_bytes[:64]) if isinstance(audio_bytes, (bytes, bytearray)) else b""
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head.startswith(b"fLaC"):
+        return "flac"
+    if head.startswith(b"OggS"):
+        return "opus" if b"OpusHead" in head else "ogg"
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return "m4a"
+    if head.startswith(b"ID3"):
+        return "mp3"
+    if len(head) >= 2 and head[0] == 0xFF:
+        # ADTS (AAC) and MPEG audio share the frame sync; ADTS has layer 00.
+        if head[1] & 0xF6 == 0xF0:
+            return "aac"
+        if head[1] & 0xE0 == 0xE0 and (head[1] >> 1) & 0x03:
+            return "mp3"
+    return ""
+
+
+_WAV_STREAMING_SIZES = frozenset({0, 0xFFFFFFFF})
+
+
+def repair_streamed_wav_header(audio_bytes: bytes) -> bytes:
+    """Fill in the sizes a streaming WAV writer leaves as placeholders.
+
+    A WAV written to a pipe (FFmpeg ``pipe:1``, streamed provider audio) cannot
+    seek back to record its length, so its RIFF and ``data`` sizes stay 0 or
+    0xFFFFFFFF.  The sample data is complete; only the header needs the real
+    size.  A header that already states a size is left untouched, so genuinely
+    truncated audio is still rejected by validation.
+    """
+    if len(audio_bytes) < 12 or audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
+        return audio_bytes
+    offset = 12
+    block_align = 0
+    while offset + 8 <= len(audio_bytes):
+        chunk_id = audio_bytes[offset : offset + 4]
+        size = int.from_bytes(audio_bytes[offset + 4 : offset + 8], "little")
+        body = offset + 8
+        if chunk_id == b"fmt " and size >= 16 and body + 16 <= len(audio_bytes):
+            block_align = int.from_bytes(audio_bytes[body + 12 : body + 14], "little")
+        if chunk_id == b"data":
+            if size not in _WAV_STREAMING_SIZES:
+                return audio_bytes
+            available = len(audio_bytes) - body
+            if block_align > 0:
+                available -= available % block_align
+            repaired = bytearray(audio_bytes[: body + available])
+            repaired[offset + 4 : offset + 8] = available.to_bytes(4, "little")
+            repaired[4:8] = (len(repaired) - 8).to_bytes(4, "little")
+            return bytes(repaired)
+        if size in _WAV_STREAMING_SIZES - {0}:
+            return audio_bytes
+        offset = body + size + (size & 1)
+    return audio_bytes
+
+
+async def probe_audio_duration_seconds(
+    audio_bytes: bytes,
+    audio_format: str,
+    *,
+    timeout_seconds: float = 30.0,
+) -> float | None:
+    """Measure decoded audio length; ``None`` when it cannot be determined.
+
+    WAV is read from its header.  Other containers go through ``ffprobe`` on a
+    temporary file, as the media tools probe Knowledge files: a piped MP3 has
+    no seekable length, so ffprobe reports no duration for stdin.
+    """
+    fmt = normalize_audio_format(audio_format)
+    if fmt == "wav":
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+                frames, rate = wav_file.getnframes(), wav_file.getframerate()
+            if frames > 0 and rate > 0:
+                return round(frames / rate, 3)
+        except Exception:
+            pass
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not audio_bytes:
+        return None
+    suffix = f".{fmt}" if fmt in SUPPORTED_AUDIO_ARTIFACT_FORMATS else ""
+    with tempfile.TemporaryDirectory(prefix="manor-audio-probe-") as temp_dir:
+        path = os.path.join(temp_dir, f"audio{suffix}")
+        with open(path, "wb") as handle:
+            handle.write(audio_bytes)
+        process = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", path,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return None
+    if process.returncode != 0:
+        return None
+    try:
+        duration = float((json.loads(stdout or b"{}").get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return round(duration, 3) if duration > 0 else None
 
 
 def _pcm_has_signal(pcm_bytes: bytes, *, sample_width: int) -> bool:
@@ -190,5 +310,9 @@ async def transcode_audio_bytes(
         raise AudioConversionError(
             f"FFmpeg could not convert generated {source.upper()} audio to {target.upper()}: {detail}"
         )
+    if target == "wav":
+        # FFmpeg cannot seek back on stdout, so its WAV header carries
+        # placeholder sizes that every reader treats as truncated data.
+        converted = repair_streamed_wav_header(converted)
     validate_generated_audio_bytes(converted, target)
     return converted

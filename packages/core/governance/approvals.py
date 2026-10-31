@@ -63,6 +63,18 @@ logger = logging.getLogger(__name__)
 
 ApprovalContextLoader = Callable[[], Awaitable[dict[str, Any]]]
 _APPROVAL_RESOURCE_IDS_CONTEXT_KEY = "_approval_resource_ids"
+#: The policy inputs a request was minted on that its columns do not hold, so
+#: a later policy change can re-run the very same evaluation for it.
+APPROVAL_POLICY_SUBJECT_CONTEXT_KEY = "approval_policy_subject"
+# The subject fields a pending request's snapshot keeps beyond its columns:
+# the declared effect (impact/category/gate) and the keys whose rules judge it
+# (aliases, restrict-only keys, a canonical plan step's raw-resource targets).
+_POLICY_SUBJECT_FIELDS = (
+    "user_id", "room_id", "operation", "kind", "impact", "category", "gate",
+    "action_key_aliases", "restrict_only_keys", "extra_targets",
+)
+# Subject fields stored as JSON lists and restored as tuples.
+_POLICY_SUBJECT_TUPLE_FIELDS = frozenset({"resource_ids", "action_key_aliases", "restrict_only_keys"})
 
 
 class ApprovalAuthorityError(PermissionError):
@@ -71,10 +83,6 @@ class ApprovalAuthorityError(PermissionError):
     def __init__(self, decision: PermissionDecision) -> None:
         self.decision = decision
         super().__init__(decision.reason or "HITL resolution permission denied.")
-
-
-class ApprovalDecisionRequiredError(PermissionError):
-    """The paused origin needs its dedicated decision, not a generic resume."""
 
 
 class ApprovalContinuationBindingError(PermissionError):
@@ -126,390 +134,6 @@ def is_coordinator_owned_nested_approval(request: HitlRequest) -> bool:
     return COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY in context
 
 
-async def is_coordinator_owned_nested_approval_durable(
-    db,
-    request: HitlRequest,
-) -> bool:
-    """Detect a nested approval even before its parent mirror is linked.
-
-    Runtime mints the exact tool-call request before the child loop can attach
-    the outer Task approval. The server-authored child Step identity closes
-    that small crash/race window so no generic Chat/queue surface can grant the
-    request independently.
-    """
-
-    if is_coordinator_owned_nested_approval(request):
-        return True
-    if (
-        request.origin_kind != ApprovalOriginKind.TOOL_CALL.value
-        or not request.origin_step_id
-    ):
-        return False
-    from packages.core.constants.execution import COORDINATOR_CHILD_PARAM_KEY
-    from packages.core.models.execution import ExecutionStep
-
-    step = (await db.execute(
-        select(ExecutionStep).where(
-            ExecutionStep.id == request.origin_step_id,
-            ExecutionStep.entity_id == request.entity_id,
-        )
-    )).scalar_one_or_none()
-    params = step.params if step is not None and isinstance(step.params, dict) else {}
-    return params.get(COORDINATOR_CHILD_PARAM_KEY) is True
-
-
-async def _coordinator_nested_request_for_mirror(
-    db,
-    request: HitlRequest,
-) -> HitlRequest | None:
-    """Return the exact delegated Runtime approval bound to a lease request.
-
-    Coordinator children execute through the ordinary Chat tool guard, which
-    owns a ``tool_call`` HitlRequest.  The parent Task pause owns a second,
-    lease-scoped UI request.  Dispatcher records a server-derived link between
-    the two.  Every resolution surface funnels through ``grant_approval`` /
-    ``deny_approval``; revalidating the link here makes the human verdict
-    atomic across both objects and prevents generic ``confirm=True`` flags from
-    authorizing an unrelated child.
-    """
-
-    from packages.core.constants.execution import (
-        COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY,
-        COORDINATOR_CHILD_ITEM_PARAM_KEY,
-        COORDINATOR_CHILD_PARAM_KEY,
-        COORDINATOR_CHILD_RELEASED_PARAM_KEY,
-        COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
-        COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-        COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY,
-        COORDINATOR_PARAM_KEY,
-        COORDINATOR_PARENT_STEP_PARAM_KEY,
-        COORDINATOR_TYPED_CHILD_PARAM_KEY,
-        COORDINATOR_TYPED_VERSION,
-        COORDINATOR_VERSION_PARAM_KEY,
-        COORDINATOR_WAITING_CHILD_PARAM_KEY,
-        ExecutionStepStatus,
-        WorkLeaseStatus,
-    )
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-    from packages.core.models.worker import WorkLease
-
-    if request.origin_kind != ApprovalOriginKind.LEASE.value:
-        return None
-    context = request.context if isinstance(request.context, dict) else {}
-    binding = context.get(COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY)
-    if binding is None:
-        return None
-    if not isinstance(binding, dict) or binding.get("version") != COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION:
-        raise ApprovalContinuationBindingError(
-            "Coordinator approval continuation has an invalid version."
-        )
-    typed_child_binding = binding.get("typed_child") is True
-
-    exact_origin = {
-        "parent_step_id": request.origin_step_id,
-        "plan_id": request.origin_plan_id,
-        "task_id": request.origin_task_id,
-    }
-    if any(
-        (binding.get(key) is None) != (value is None)
-        or (
-            binding.get(key) is not None
-            and value is not None
-            and str(binding.get(key)) != str(value)
-        )
-        for key, value in exact_origin.items()
-    ):
-        raise ApprovalContinuationBindingError(
-            "Coordinator approval continuation does not match its lease origin."
-        )
-    parent_lease_id = str(binding.get("parent_lease_id") or "").strip()
-    parent_execution_claim_id = str(
-        binding.get("parent_execution_claim_id") or ""
-    ).strip()
-    pending_kind = str(context.get("pending_kind") or "human_input")
-    if (
-        not parent_lease_id
-        or not parent_execution_claim_id
-        or request.dedup_key != f"lease:{parent_lease_id}:{pending_kind}"
-    ):
-        raise ApprovalContinuationBindingError(
-            "Coordinator approval continuation does not match its lease claim."
-        )
-
-    nested_id = str(binding.get("request_id") or "").strip()
-    child_id = str(binding.get("child_step_id") or "").strip()
-    if not nested_id or not child_id:
-        raise ApprovalContinuationBindingError(
-            "Coordinator approval continuation is incomplete."
-        )
-    # The outer approval row is already locked by the decision surface.  Lock
-    # the Task/Plan mutexes *before* the lease so this path cannot deadlock with
-    # Plan cancellation (Workspace -> Task -> Plan -> Lease).  Child
-    # persistence does not acquire Task/Plan after its lease lock, so the
-    # remainder keeps the shared Lease -> parent -> child -> nested order.
-    locked_task = None
-    if request.origin_task_id:
-        locked_task = (await db.execute(
-            select(Task)
-            .where(
-                Task.id == request.origin_task_id,
-                Task.entity_id == request.entity_id,
-                Task.workspace_id == request.workspace_id,
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-        if locked_task is None:
-            raise ApprovalContinuationBindingError(
-                "Coordinator approval Task no longer exists."
-            )
-
-    plan_filters = [
-        ExecutionPlan.id == request.origin_plan_id,
-        ExecutionPlan.entity_id == request.entity_id,
-        ExecutionPlan.workspace_id == request.workspace_id,
-    ]
-    if request.origin_task_id:
-        plan_filters.append(ExecutionPlan.task_id == request.origin_task_id)
-    else:
-        plan_filters.append(ExecutionPlan.task_id.is_(None))
-    locked_plan = (await db.execute(
-        select(ExecutionPlan)
-        .where(*plan_filters)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if locked_plan is None:
-        raise ApprovalContinuationBindingError(
-            "Coordinator approval Plan no longer exists."
-        )
-
-    lease = (await db.execute(
-        select(WorkLease)
-        .where(WorkLease.id == parent_lease_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if (
-        lease is None
-        or lease.step_id != request.origin_step_id
-        or lease.plan_id != request.origin_plan_id
-        or lease.entity_id != request.entity_id
-        or lease.workspace_id != request.workspace_id
-        or lease.status != WorkLeaseStatus.NEEDS_HUMAN.value
-    ):
-        raise ApprovalContinuationBindingError(
-            "Coordinator parent lease is no longer waiting on this approval."
-        )
-    parent = (await db.execute(
-        select(ExecutionStep)
-        .where(ExecutionStep.id == request.origin_step_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    parent_params = parent.params if parent is not None and isinstance(parent.params, dict) else {}
-    if (
-        parent is None
-        or parent.entity_id != request.entity_id
-        or parent.workspace_id != request.workspace_id
-        or parent.plan_id != request.origin_plan_id
-        or parent.step_status != ExecutionStepStatus.WAITING_HUMAN.value
-    ):
-        raise ApprovalContinuationBindingError(
-            "Coordinator parent is no longer waiting on this approval."
-        )
-    if typed_child_binding:
-        coordinator_parent_step_key = str(
-            parent_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) or ""
-        ).strip()
-        if (
-            child_id != parent.id
-            or parent_params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
-            or parent_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is not True
-            or parent_params.get(COORDINATOR_CHILD_RELEASED_PARAM_KEY) is not True
-            or not coordinator_parent_step_key
-            or str(binding.get("coordinator_parent_step_key") or "")
-            != coordinator_parent_step_key
-        ):
-            raise ApprovalContinuationBindingError(
-                "Coordinator typed child is no longer waiting on this approval."
-            )
-        # The Task/Plan mutexes above stabilize lifecycle changes. Read the
-        # V2 root without taking a child -> root row lock (the live release
-        # path uses root -> child) and require it to be parked for this exact
-        # child. This both closes orphan-child approval and preserves the
-        # global lock order under concurrent cancellation/recovery.
-        coordinator_root = (await db.execute(
-            select(ExecutionStep).where(
-                ExecutionStep.plan_id == request.origin_plan_id,
-                ExecutionStep.entity_id == request.entity_id,
-                ExecutionStep.workspace_id == request.workspace_id,
-                ExecutionStep.step_key == coordinator_parent_step_key,
-            ).execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-        root_params = (
-            coordinator_root.params
-            if coordinator_root is not None
-            and isinstance(coordinator_root.params, dict)
-            else {}
-        )
-        waiting_child = root_params.get(COORDINATOR_WAITING_CHILD_PARAM_KEY)
-        if (
-            coordinator_root is None
-            or coordinator_root.id == parent.id
-            or str(binding.get("coordinator_parent_step_id") or "")
-            != coordinator_root.id
-            or coordinator_root.step_status != ExecutionStepStatus.PAUSED.value
-            or root_params.get(COORDINATOR_PARAM_KEY) is not True
-            or root_params.get(COORDINATOR_VERSION_PARAM_KEY)
-            != COORDINATOR_TYPED_VERSION
-            or not isinstance(waiting_child, dict)
-            or waiting_child.get("version") != 1
-            or str(waiting_child.get("child_step_id") or "") != parent.id
-            or str(waiting_child.get("child_step_key") or "") != parent.step_key
-            or str(waiting_child.get("checklist_item_key") or "")
-            != str(parent_params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "")
-        ):
-            raise ApprovalContinuationBindingError(
-                "Coordinator root is no longer parked for this typed child."
-            )
-    elif parent_params.get(COORDINATOR_PARAM_KEY) is not True:
-        raise ApprovalContinuationBindingError(
-            "Coordinator parent is no longer waiting on this approval."
-        )
-
-    # A V2 typed child owns its own lease pause, so parent and child are the
-    # same locked row. Legacy V1 delegated approvals keep the separate root /
-    # dynamic-child rows and their original lock order.
-    child = parent if typed_child_binding else (await db.execute(
-        select(ExecutionStep)
-        .where(ExecutionStep.id == child_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if child is None:
-        raise ApprovalContinuationBindingError(
-            "Coordinator child no longer exists."
-        )
-    child_params = child.params if isinstance(child.params, dict) else {}
-    child_result = child.result if isinstance(child.result, dict) else {}
-    child_idempotency_key = str(
-        child_params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY) or ""
-    ).strip()
-    invalid_child = (
-        child.entity_id != request.entity_id
-        or child.workspace_id != request.workspace_id
-        or child.plan_id != request.origin_plan_id
-        or child.step_status != ExecutionStepStatus.WAITING_HUMAN.value
-        or child_params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
-        or not str(child_params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "").strip()
-        or not child_idempotency_key
-        or str(binding.get("child_step_key") or "") != child.step_key
-        or str(binding.get("service_key") or "") != str(child.service_key or "")
-        or str(binding.get("idempotency_key") or "") != child_idempotency_key
-    )
-    if typed_child_binding:
-        invalid_child = invalid_child or (
-            child.id != parent.id
-            or child_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is not True
-            or child_params.get(COORDINATOR_CHILD_RELEASED_PARAM_KEY) is not True
-        )
-    else:
-        invalid_child = invalid_child or (
-            child_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) != parent.step_key
-            or str(child_result.get("approval_token") or "") != nested_id
-        )
-    if invalid_child:
-        raise ApprovalContinuationBindingError(
-            "Coordinator child is no longer waiting on this exact approval."
-        )
-
-    nested = (await db.execute(
-        select(HitlRequest)
-        .where(HitlRequest.id == nested_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if nested is None:
-        raise ApprovalContinuationBindingError(
-            "Delegated Runtime approval no longer exists."
-        )
-    if (
-        nested.origin_kind != ApprovalOriginKind.TOOL_CALL.value
-        or nested.entity_id != request.entity_id
-        or nested.workspace_id != request.workspace_id
-        or str(nested.origin_task_id or "") != str(request.origin_task_id or "")
-    ):
-        raise ApprovalContinuationBindingError(
-            "Delegated Runtime approval is outside the parent Task scope."
-        )
-    nested_context = nested.context if isinstance(nested.context, dict) else {}
-    resume = nested_context.get("delegation_resume")
-    reverse = nested_context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY)
-    invalid_reverse = (
-        not isinstance(reverse, dict)
-        or reverse.get("version") != COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION
-        or str(reverse.get("request_id") or "") != request.id
-        or str(reverse.get("nested_request_id") or "") != nested.id
-        or str(nested.origin_step_id or "") != child.id
-        or str(reverse.get("child_step_id") or "") != child.id
-        or str(reverse.get("parent_step_id") or "") != parent.id
-        or str(reverse.get("parent_lease_id") or "") != lease.id
-        or str(reverse.get("parent_execution_claim_id") or "")
-        != parent_execution_claim_id
-    )
-    if typed_child_binding:
-        from packages.core.ai.runtime.approval_messages import approval_args_hash
-
-        nested_tool = str(nested_context.get("tool") or "").strip()
-        nested_args_hash = str(nested_context.get("args_hash") or "").strip()
-        continuation = nested_context.get("continuation")
-        continuation_arguments = (
-            continuation.get("arguments")
-            if isinstance(continuation, dict)
-            else None
-        )
-        invalid_continuation = invalid_reverse or (
-            reverse.get("typed_child") is not True
-            or str(reverse.get("coordinator_parent_step_id") or "")
-            != str(binding.get("coordinator_parent_step_id") or "")
-            or str(reverse.get("coordinator_parent_step_key") or "")
-            != str(binding.get("coordinator_parent_step_key") or "")
-            or not nested_tool
-            or not nested_args_hash
-            or not isinstance(continuation, dict)
-            or continuation.get("version") != 1
-            or str(continuation.get("tool") or "").strip() != nested_tool
-            or not isinstance(continuation_arguments, dict)
-            or approval_args_hash(continuation_arguments) != nested_args_hash
-            or str(binding.get("nested_tool") or "") != nested_tool
-            or str(binding.get("nested_args_hash") or "") != nested_args_hash
-            or str(reverse.get("nested_tool") or "") != nested_tool
-            or str(reverse.get("nested_args_hash") or "") != nested_args_hash
-        )
-    else:
-        invalid_continuation = (
-            not isinstance(resume, dict)
-            or resume.get("version") != 1
-            or str(resume.get("approval_token") or "") != nested.id
-            or str(resume.get("entity_id") or "") != str(request.entity_id or "")
-            or str(resume.get("workspace_id") or "") != str(request.workspace_id or "")
-            or str(resume.get("conversation_id") or "")
-            != str(nested.origin_conversation_id or "")
-            or str(resume.get("step_id") or "") != child.id
-            or str(resume.get("task_id") or "") != str(request.origin_task_id or "")
-            or str(resume.get("service_key") or "") != str(child.service_key or "")
-            or str(resume.get("delegation_idempotency_key") or "")
-            != child_idempotency_key
-        )
-    if invalid_reverse or invalid_continuation:
-        raise ApprovalContinuationBindingError(
-            "Delegated Runtime approval lost its exact tool continuation."
-        )
-    return nested
-
-
 @dataclass(frozen=True)
 class ApprovalSubject:
     """WHAT needs approval — plane-agnostic."""
@@ -530,6 +154,99 @@ class ApprovalSubject:
     operation: Optional[str] = None
     impact: Optional[str] = None
     category: Optional[str] = None
+    gate: Optional[str] = None
+    # ``EXEMPT`` (approval_facts) for a subject with no effect of its own;
+    # see ``subject_policy_facts``. ``None`` = compute from the declaration.
+    facts: Any = None
+    # Plan-step data (never facts): the step's provider and arguments let the
+    # subject factory judge a raw tool name by its own factory.
+    provider: Optional[str] = None
+    arguments: Optional[dict] = None
+    # The raw key a canonicalised plan step was named by (rules on it apply).
+    action_key_aliases: tuple[str, ...] = ()
+    # Keys whose explicit rules may only deny/ask (a relay's own key).
+    restrict_only_keys: tuple[str, ...] = ()
+    # The raw step's own resource ((kind, id)), kept as an extra target so
+    # resource rules on the raw key/resource keep matching.
+    extra_targets: tuple[tuple[str, str], ...] = ()
+
+
+def subject_policy_facts(subject: "ApprovalSubject") -> Any:
+    """The one fact builder for an approval subject (``ActionFacts`` or ``EXEMPT``).
+
+    * ``llm``/``subagent`` steps with no action and no capability only think
+      or hand off; every tool call they make crosses the runtime gate itself.
+      They are ``EXEMPT``: only hard constraints and ``requires_approval`` apply.
+    * A runtime subject carries its factory's declared effect.
+    * A plan step naming a raw tool is judged by that tool's factory
+      (``canonical_step_subject``); anything else reads the declaration.
+    """
+    from packages.core.governance.approval_facts import EXEMPT, EFFECTLESS_STEP_KINDS, action_facts
+
+    if subject.facts is not None:
+        return subject.facts
+    if (
+        not subject.action_key and not subject.capability_id
+        and subject.kind in EFFECTLESS_STEP_KINDS
+    ):
+        return EXEMPT
+    subject = canonical_step_subject(subject)
+    facts = action_facts(
+        action_key=subject.action_key, capability_id=subject.capability_id,
+        resource_kind=subject.resource_kind, resource_id=subject.resource_id,
+        resource_ids=subject.resource_ids, account_id=subject.account_id,
+        operation=subject.operation, risk_level=subject.risk_level,
+        impact=subject.impact, category=subject.category, gate=subject.gate,
+        aliases=subject.action_key_aliases, restrict_only_keys=subject.restrict_only_keys,
+    )
+    if subject.extra_targets:
+        from packages.core.governance.approval_policy import ApprovalTarget
+
+        present = {(target.resource_kind, target.resource_id) for target in facts.targets}
+        extra = [ApprovalTarget(account_id=subject.account_id, resource_kind=kind, resource_id=rid)
+                 for kind, rid in subject.extra_targets if (kind, rid) not in present]
+        if extra:
+            facts = facts.model_copy(update={"targets": [*facts.targets, *extra]})
+    return facts
+
+
+def canonical_step_subject(subject: "ApprovalSubject") -> "ApprovalSubject":
+    """A plan step naming a raw tool becomes the action its factory classifies.
+
+    The canonical action key, the classifier's risk, the resource and the
+    declared effect replace the step's own, so facts, hard constraints
+    (``decide``) and task rules all judge the same action. The classifier's
+    risk is the truth in both directions: a planner-declared risk can neither
+    lower nor raise it. The raw key stays an alias and the raw resource an
+    extra target, so explicit rules written against them keep applying.
+    Runtime subjects (which carry their factory's effect), declared keys and
+    unclassifiable steps are returned unchanged.
+    """
+    from packages.core.governance.action_effects import declared_action_effect
+
+    if (
+        subject.facts is not None or subject.impact is not None or not subject.action_key
+        or declared_action_effect(subject.action_key) is not None
+    ):
+        return subject
+    from packages.core.ai.runtime.approval_classifier import runtime_step_policy_action
+
+    action = runtime_step_policy_action(
+        subject.action_key, provider=subject.provider, arguments=subject.arguments,
+    )
+    if action is None:
+        return subject
+    return replace(
+        subject, action_key=action.action_key, risk_level=action.risk_level,
+        resource_kind=action.resource_kind or subject.resource_kind,
+        resource_id=action.resource_id or subject.resource_id,
+        operation=action.operation, impact=action.impact, category=action.category, gate=action.gate,
+        action_key_aliases=(*subject.action_key_aliases, subject.action_key),
+        extra_targets=(
+            (*subject.extra_targets, (subject.resource_kind or "resource", subject.resource_id))
+            if subject.resource_id else subject.extra_targets
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -676,10 +393,44 @@ async def _policy_decision(db, subject: ApprovalSubject, origin: ApprovalOrigin,
         resource_kind=subject.resource_kind, resource_ids=subject.resource_ids,
         risk_level=subject.risk_level, capability_id=subject.capability_id,
         account_id=subject.account_id, operation=subject.operation,
-        impact=subject.impact, category=subject.category,
+        impact=subject.impact, category=subject.category, gate=subject.gate,
+        facts=subject_policy_facts(subject),
         spent_credits_per_kind=spent_credits, task_id=origin.task_id,
-        workflow_run_id=origin.workflow_run_id,
+        workflow_run_id=origin.workflow_run_id, conversation_id=origin.conversation_id,
     )
+
+
+def _stricter_policy_decision(primary, companion):
+    """One decision for an operation that also stands in for a companion operation.
+
+    Deny wins, then ask, then allow; the asks of both stay in the explanation
+    so the consent requirements (and their later changes) cover both.
+    """
+    if not primary.allowed and not primary.pause_for_hitl:
+        return primary
+    if not companion.allowed and not companion.pause_for_hitl:
+        return companion
+    base = companion if companion.pause_for_hitl and not primary.pause_for_hitl else primary
+    targets = [
+        *((primary.explanation or {}).get("target_decisions") or ([primary.explanation] if primary.explanation else [])),
+        *((companion.explanation or {}).get("target_decisions") or ([companion.explanation] if companion.explanation else [])),
+    ]
+    return replace(base, explanation={**(base.explanation or {}), "target_decisions": targets})
+
+
+async def with_companion_policies(
+    db, decision, companion_subjects, *, origin: ApprovalOrigin, spent_credits: Optional[dict] = None,
+):
+    """``decision`` made stricter by each companion subject's own current policy.
+
+    The one place companions are evaluated, for the first decision and for
+    every later recheck of a granted approval's requirements.
+    """
+    for companion in companion_subjects:
+        decision = _stricter_policy_decision(
+            decision, await _policy_decision(db, companion, origin, spent_credits=spent_credits),
+        )
+    return decision
 
 
 def _consent_requirements(decision) -> list[str]:
@@ -704,6 +455,130 @@ def _operation_requirements(decision, subject, *, hitl_type, payload, require_ex
     return sorted(requirements)
 
 
+def _snapshot_value(key: str, value: Any) -> Any:
+    if key == "extra_targets":
+        return [list(item) for item in value or ()]
+    if key in _POLICY_SUBJECT_TUPLE_FIELDS:
+        return list(value or ())
+    return value
+
+
+def _snapshot_subject_fields(data: dict) -> dict:
+    """Stored snapshot fields back into ``ApprovalSubject`` keyword values."""
+    restored = dict(data)
+    for key in _POLICY_SUBJECT_TUPLE_FIELDS & restored.keys():
+        restored[key] = tuple(restored[key] or ())
+    if "extra_targets" in restored:
+        restored["extra_targets"] = tuple(tuple(item) for item in restored["extra_targets"] or ())
+    return restored
+
+
+def _policy_subject_snapshot(subject: ApprovalSubject, companions, origin: ApprovalOrigin) -> dict:
+    """What the gate decided on, with each subject's declared effect.
+
+    A subject's effect is the one its factory declared (``subject_policy_facts``
+    fills it from the declaration when the subject carries none), so a
+    re-decision judges the same facts without re-deriving them.
+    """
+
+    def effect(item: ApprovalSubject) -> dict:
+        facts = subject_policy_facts(item)
+        if not hasattr(facts, "impact"):
+            return {}  # EXEMPT: no effect of its own
+        return {"impact": facts.impact, "category": facts.category, "gate": facts.gate}
+
+    def plain(item: ApprovalSubject) -> dict:
+        data = {key: _snapshot_value(key, value) for key, value in item.__dict__.items() if key != "facts"}
+        return {**data, **effect(item)}
+
+    return {
+        "version": 1,
+        "subject": {
+            **{key: _snapshot_value(key, getattr(subject, key)) for key in _POLICY_SUBJECT_FIELDS},
+            **effect(subject),
+        },
+        "companions": [plain(item) for item in companions],
+        "workflow_run_id": origin.workflow_run_id,
+    }
+
+
+def _policy_subject_from_request(request: HitlRequest) -> tuple[ApprovalSubject, tuple[ApprovalSubject, ...], ApprovalOrigin]:
+    """The subject, companions and origin a pending request was decided on.
+
+    Requests minted before the snapshot existed fall back to their columns,
+    the requester and the effect stored when the card was minted
+    (``approval_facts``); without one, the action key's declaration decides
+    (``subject_policy_facts``), never a guess from the key or a stored
+    evaluation. Whatever the fallback misses is rechecked when the grant is
+    consumed.
+    """
+    context = request.context if isinstance(request.context, dict) else {}
+    snapshot = context.get(APPROVAL_POLICY_SUBJECT_CONTEXT_KEY)
+    snapshot = snapshot if isinstance(snapshot, dict) and snapshot.get("version") == 1 else None
+    if snapshot is not None:
+        extra = _snapshot_subject_fields({
+            key: value for key, value in (snapshot.get("subject") or {}).items() if key in _POLICY_SUBJECT_FIELDS
+        })
+        companions = tuple(
+            ApprovalSubject(**_snapshot_subject_fields(item))
+            for item in snapshot.get("companions") or ()
+        )
+        workflow_run_id = snapshot.get("workflow_run_id")
+    else:
+        stored = context.get("approval_facts") if isinstance(context.get("approval_facts"), dict) else {}
+        extra = {"user_id": context.get("requested_by")}
+        if stored.get("impact"):
+            # The effect the gate judged when it minted the card.
+            extra.update(
+                impact=stored.get("impact"), category=stored.get("category"), gate=stored.get("gate"),
+                action_key_aliases=tuple(stored.get("aliases") or ()),
+                restrict_only_keys=tuple(stored.get("restrict_only_keys") or ()),
+            )
+        companions = ()
+        workflow_run_id = None
+    subject = ApprovalSubject(
+        entity_id=request.entity_id, workspace_id=request.workspace_id,
+        action_key=request.action_key, capability_id=request.capability_id,
+        resource_kind=request.resource_kind, resource_id=request.resource_id,
+        risk_level=request.risk_level or "medium",
+        resource_ids=tuple(context.get(_APPROVAL_RESOURCE_IDS_CONTEXT_KEY) or ()),
+        account_id=context.get("approval_account_id"),
+        **extra,
+    )
+    origin = ApprovalOrigin(
+        kind=request.origin_kind, conversation_id=request.origin_conversation_id,
+        message_id=request.origin_message_id, step_id=request.origin_step_id,
+        plan_id=request.origin_plan_id, task_id=request.origin_task_id,
+        workflow_run_id=workflow_run_id,
+    )
+    return subject, companions, origin
+
+
+def is_human_review_requirement(requirement: Any) -> bool:
+    try:
+        return json.loads(requirement).get("source") == "human_review"
+    except (TypeError, ValueError, AttributeError):
+        return True  # unreadable: never treat it as policy-only consent
+
+
+async def current_policy_for_pending_request(db, request: HitlRequest):
+    """Re-run the gate's own policy evaluation for a pending request.
+
+    The same ``_policy_decision`` + companion evaluation ``resolve_approval``
+    ran when it minted the row, against the policy as it is now.
+    """
+    subject, companions, origin = _policy_subject_from_request(request)
+    spent_credits = None
+    if subject.workspace_id:
+        from packages.core.budget import get_workspace_spent_credits_per_kind
+
+        spent_credits = await get_workspace_spent_credits_per_kind(db, subject.workspace_id)
+    decision = await _policy_decision(db, subject, origin, spent_credits=spent_credits)
+    return await with_companion_policies(
+        db, decision, companions, origin=origin, spent_credits=spent_credits,
+    )
+
+
 async def resolve_approval(
     db,
     *,
@@ -720,8 +595,24 @@ async def resolve_approval(
     require_explicit_approval: bool = False,
     hitl_type: str = HitlType.AUTHORIZE.value,
     payload: Optional[dict] = None,
+    companion_subjects: tuple[ApprovalSubject, ...] = (),
+    preview: bool = False,
 ) -> ApprovalDecision:
     """The one decision. See module docstring.
+
+    ``preview`` answers the same decision without writing anything: no
+    request is minted, expired or claimed. Where the live decision would
+    write (a fresh ask, or a grant whose requirements changed) the preview
+    reports ``NEEDS_HUMAN`` with no request. A schedule may use it to learn
+    which calls of a batch would stop for a human before running any of
+    them; the live decision still runs at each call's execution boundary.
+
+    ``companion_subjects`` are operations this one performs on its own later,
+    with no gate of their own (e.g. the files a delegated run saves). Each is
+    evaluated under the same user's current mode and rules, and the stricter
+    outcome decides: a companion that would auto-pass adds nothing, one that
+    would ask turns this decision into a card covering it, one that is denied
+    denies this operation. Automatic consent is never suspended.
 
     ``intrinsic_rule``/``intrinsic_reason`` let a plane label its own
     intrinsic (non-policy) trigger — e.g. the runtime guard's
@@ -780,7 +671,12 @@ async def resolve_approval(
         if operation_id:
             origin = replace(origin, operation_id=operation_id)
 
+    # One subject for facts, hard constraints, task rules and the request row.
+    subject = canonical_step_subject(subject)
     decision = await _policy_decision(db, subject, origin, spent_credits=spent_credits)
+    decision = await with_companion_policies(
+        db, decision, companion_subjects, origin=origin, spent_credits=spent_credits,
+    )
 
     # 1. Hard block — never approvable, no request minted.
     if not decision.allowed and not decision.pause_for_hitl:
@@ -793,13 +689,24 @@ async def resolve_approval(
     current_requirements = set(_operation_requirements(decision, subject,
         hitl_type=hitl_type, payload=payload, require_explicit_approval=require_explicit_approval))
     # Existing decisions belong to an operation, not to the current mode. A
-    # relaxed default cannot approve an already-pending human decision.
+    # relaxed default never approves a pending request here; a policy write
+    # re-decides pending policy asks through the normal decision path instead
+    # (``approval_policy_reevaluation``).
     key = dedup_key_for(subject, origin)
     req = await _find_operation_request(db, subject.entity_id, key) if origin.operation_id else await _find_open_request(db, subject.entity_id, key)
     if req is not None:
+        # A row minted before canonicalisation keeps the step's raw identity.
+        # (The subject may arrive canonicalised already: its aliases and
+        # extra targets carry the raw step identity.)
+        raw_resources = {rid for _kind, rid in subject.extra_targets}
+        same_identity = (
+            req.action_key == subject.action_key and req.resource_id == subject.resource_id
+        ) or (
+            req.action_key in subject.action_key_aliases
+            and (req.resource_id in raw_resources or (req.resource_id is None and not raw_resources))
+        )
         if origin.operation_id and (
-            req.action_key != subject.action_key
-            or req.resource_id != subject.resource_id
+            not same_identity
             or (req.context or {}).get("args_hash") != origin.args_hash
         ):
             return ApprovalDecision(ApprovalOutcome.DENY, "The operation payload changed", "approval.operation_changed", req)
@@ -812,8 +719,13 @@ async def resolve_approval(
             approved_requirements = set((req.context or {}).get("approval_requirements") or [])
             if current_requirements.issubset(approved_requirements):
                 return ApprovalDecision(ApprovalOutcome.ALLOW, "operator approved", req.matched_rule, req)
+            if preview:
+                # The live decision expires this grant and asks again.
+                return ApprovalDecision(ApprovalOutcome.NEEDS_HUMAN, req.reason, req.matched_rule)
             req.status = ApprovalStatus.EXPIRED.value
             req.resolved_reason = "approval_requirements_changed"
+            from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+            await wake_run_for_closed_request(db, req)
             await db.flush()
             req = None
         if req is not None:
@@ -857,11 +769,18 @@ async def resolve_approval(
         hitl_reason = f"High-risk step needs one-time operator approval before dispatching {subj!r}."
 
     # A human approval needs a surface to render on: for steps that surface is
-    # the workspace chat; for tool calls the conversation itself. A subject
-    # with NEITHER has nowhere to show a card, so signal needs_human with NO
+    # the workspace chat; for tool calls the conversation itself; for an
+    # ad-hoc step (no Workspace) owned by a user, that user's own approval
+    # page, which only they may answer (``requested_by``). A subject with
+    # none of these has nowhere to show a card, so signal needs_human with NO
     # request — the caller fails closed rather than minting an unresolvable,
     # orphaned row.
-    if not subject.workspace_id and not origin.conversation_id:
+    owner_surface = bool(
+        origin.kind == ApprovalOriginKind.STEP.value
+        and subject.user_id
+        and (origin.context or {}).get("requested_by") == subject.user_id
+    )
+    if preview or (not subject.workspace_id and not origin.conversation_id and not owner_surface):
         return ApprovalDecision(
             ApprovalOutcome.NEEDS_HUMAN,
             hitl_reason,
@@ -873,6 +792,9 @@ async def resolve_approval(
         **materialized_origin.context,
         "approval_requirements": sorted(current_requirements),
         "policy_evaluation": decision.explanation,
+        **({"approval_facts": decision.facts.model_dump(mode="json")}
+           if hasattr(decision.facts, "model_dump") else {}),
+        APPROVAL_POLICY_SUBJECT_CONTEXT_KEY: _policy_subject_snapshot(subject, companion_subjects, origin),
     })
     req = await _create_pending_request(
         db,
@@ -1040,29 +962,6 @@ async def _find_open_request(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
-async def _find_live_requests_for_step_origin(
-    db,
-    entity_id: str,
-    step_id: str,
-    *,
-    for_update: bool = False,
-) -> list[HitlRequest]:
-    """Return every live request that pauses this exact execution Step."""
-    stmt = (
-        select(HitlRequest)
-        .where(
-            HitlRequest.entity_id == entity_id,
-            HitlRequest.origin_step_id == step_id,
-            HitlRequest.status.in_([s.value for s in APPROVAL_LIVE_STATUSES]),
-        )
-        .order_by(HitlRequest.created_at.desc())
-        .execution_options(populate_existing=True)
-    )
-    if for_update:
-        stmt = stmt.with_for_update()
-    return list((await db.execute(stmt)).scalars().all())
-
-
 async def _create_pending_request(
     db,
     *,
@@ -1142,7 +1041,6 @@ async def grant_approval(
     standing: bool = False,
     changed_by: Optional[str] = None,
     authority_prechecked: bool = False,
-    _coordinator_mirror: bool = False,
 ) -> HitlRequest:
     """Approve a request.
 
@@ -1165,10 +1063,7 @@ async def grant_approval(
     """
     if standing:
         raise ValueError("Always approval requires a versioned approval-settings command")
-    if (
-        not _coordinator_mirror
-        and await is_coordinator_owned_nested_approval_durable(db, request)
-    ):
+    if is_coordinator_owned_nested_approval(request):
         raise ApprovalContinuationBindingError(
             "Resolve this delegated approval through its canonical Task approval."
         )
@@ -1189,27 +1084,6 @@ async def grant_approval(
         )
         if not authority.allowed:
             raise ApprovalAuthorityError(authority)
-    nested_request = await _coordinator_nested_request_for_mirror(db, request)
-    if nested_request is not None:
-        if nested_request.status != ApprovalStatus.PENDING.value:
-            raise ApprovalContinuationBindingError(
-                "Delegated Runtime approval is no longer available to grant."
-            )
-        # The outer lease card is a Task-resume surface, not authority for an
-        # arbitrary tool. Recheck the actor against the nested tool subject
-        # before mirroring; only the object identity is inherited.
-        from packages.core.services.runtime_authorization import (
-            authorize_hitl_resolution,
-        )
-
-        nested_authority = await authorize_hitl_resolution(
-            db,
-            request=nested_request,
-            by_user_id=by_user_id,
-            standing=standing,
-        )
-        if not nested_authority.allowed:
-            raise ApprovalAuthorityError(nested_authority)
     request.status = ApprovalStatus.GRANTED.value
     request.decided_by_user_id = by_user_id
     request.decided_at = datetime.now(timezone.utc)
@@ -1225,213 +1099,7 @@ async def grant_approval(
         ledger_et.APPROVAL_GRANTED,
         actor_id=by_user_id,
     )
-
-    if nested_request is not None:
-        await grant_approval(
-            db,
-            nested_request,
-            by_user_id=by_user_id,
-            via=f"{via}:coordinator_child",
-            standing=standing,
-            changed_by=changed_by,
-            authority_prechecked=True,
-            _coordinator_mirror=True,
-        )
-        if nested_request.origin_conversation_id:
-            from packages.core.ai.runtime.approval_store import (
-                mark_runtime_hitl_request_resolved,
-            )
-
-            await mark_runtime_hitl_request_resolved(
-                db,
-                conversation_id=nested_request.origin_conversation_id,
-                hitl_id=nested_request.id,
-                choice="always_approve" if standing else "approve",
-            )
-
     return request
-
-
-async def grant_open_request_for_step(
-    db,
-    *,
-    entity_id: str,
-    step_id: str,
-    by_user_id: Optional[str],
-    via: str = "step_resume",
-    expected_hitl_type: Optional[str] = None,
-) -> Optional[HitlRequest]:
-    """Grant the open request a step is paused on, if any.
-
-    Explicit HITL surfaces that "resume" a waiting step call this so that
-    decision is recorded as the approval — without it the
-    dispatcher gate re-pauses the reparked step on its still-pending request,
-    which is exactly the "I already resumed/approved it" loop (#317).
-
-    Generic Task/Plan retry controls must not call this helper: retrying an
-    execution failure is not consent for a pending human decision.
-
-    Request-backed reviews, recovery errors, and non-Step origins stay on their
-    dedicated Chat surfaces. Requestless human Steps are classified by their
-    typed payload: plain input may be answered here, while reviews require an
-    explicit verdict. Resolving an input card preserves the Chat lock order
-    (Message -> Step).
-    """
-    requests = await _find_live_requests_for_step_origin(
-        db,
-        entity_id,
-        step_id,
-        for_update=True,
-    )
-    if expected_hitl_type is not None:
-        expected = str(expected_hitl_type).strip().lower()
-        mismatched_request = next(
-            (
-                candidate
-                for candidate in requests
-                if str(candidate.hitl_type or HitlType.AUTHORIZE.value)
-                .strip()
-                .lower()
-                != expected
-            ),
-            None,
-        )
-        if mismatched_request is not None:
-            actual_hitl_type = str(
-                mismatched_request.hitl_type or HitlType.AUTHORIZE.value
-            ).strip().lower()
-            if actual_hitl_type == HitlType.REVIEW.value:
-                detail = (
-                    "This review requires an explicit approve, request-changes, "
-                    "or reject decision."
-                )
-            elif actual_hitl_type == HitlType.ERROR.value:
-                detail = (
-                    "This failed step requires an explicit retry or cancel "
-                    "decision on its recovery card."
-                )
-            else:
-                detail = (
-                    "This step is waiting for a dedicated Workspace Chat decision; "
-                    "respond to that card to continue."
-                )
-            raise ApprovalDecisionRequiredError(
-                detail
-            )
-    dedicated_request = next(
-        (
-            candidate
-            for candidate in requests
-            if candidate.origin_kind != ApprovalOriginKind.STEP.value
-        ),
-        None,
-    )
-    if dedicated_request is not None:
-        raise ApprovalDecisionRequiredError(
-            "This step is waiting for a dedicated Workspace Chat card; "
-            "respond to that card to continue."
-        )
-    typed_request = next(
-        (
-            candidate
-            for candidate in requests
-            if str(candidate.hitl_type or "").strip().lower()
-            in {HitlType.REVIEW.value, HitlType.ERROR.value}
-        ),
-        None,
-    )
-    if typed_request is not None:
-        typed_hitl_type = str(typed_request.hitl_type or "").strip().lower()
-        if typed_hitl_type == HitlType.REVIEW.value:
-            raise ApprovalDecisionRequiredError(
-                "This review requires an explicit approve, request-changes, "
-                "or reject decision."
-            )
-        raise ApprovalDecisionRequiredError(
-            "This failed step requires an explicit retry or cancel decision "
-            "on its recovery card."
-        )
-    req = requests[0] if requests else None
-    if req is None:
-        # Requestless human Steps still require typed authority. Reviews cannot
-        # be collapsed into a generic resume because that would erase the
-        # user's actual decision; ordinary input can be recorded as answered.
-        from packages.core.models.execution import ExecutionStep
-        from packages.core.services.runtime_authorization import (
-            authorize_hitl_action,
-        )
-
-        origin_step = (await db.execute(
-            select(ExecutionStep).where(
-                ExecutionStep.id == step_id,
-                ExecutionStep.entity_id == entity_id,
-            )
-        )).scalar_one_or_none()
-        if origin_step is not None:
-            from packages.core.services.hitl_options import human_step_hitl_type
-
-            hitl_type = human_step_hitl_type(origin_step.params)
-            if origin_step.requires_approval and hitl_type == HitlType.INPUT.value:
-                hitl_type = HitlType.AUTHORIZE.value
-            if expected_hitl_type is not None and hitl_type != expected:
-                raise ApprovalDecisionRequiredError(
-                    "This step is waiting for a dedicated Workspace Chat decision; "
-                    "respond to that card to continue."
-                )
-            if hitl_type == HitlType.REVIEW.value:
-                raise ApprovalDecisionRequiredError(
-                    "This review requires an explicit approve, request-changes, "
-                    "or reject decision."
-                )
-            authority = await authorize_hitl_action(
-                db,
-                entity_id=entity_id,
-                workspace_id=origin_step.workspace_id,
-                by_user_id=by_user_id,
-                action_key=origin_step.action_key,
-                capability_id=origin_step.capability_id,
-                hitl_type=hitl_type,
-            )
-            if not authority.allowed:
-                raise ApprovalAuthorityError(authority)
-
-        from packages.core.governance.service import resolve_stale_hitl_cards
-
-        await resolve_stale_hitl_cards(
-            db,
-            step_ids=[step_id],
-            reason=f"answered_via_{via}",
-            choice="answered",
-            pending_action_kinds=[PendingActionKind.HUMAN_INPUT.value],
-            for_update=True,
-        )
-        return None
-
-    from packages.core.services.step_resume import (
-        lock_waiting_step_for_decision,
-    )
-
-    waiting_step = await lock_waiting_step_for_decision(
-        db,
-        entity_id=entity_id,
-        workspace_id=req.workspace_id,
-        task_id=req.origin_task_id,
-        plan_id=req.origin_plan_id,
-        step_id=step_id,
-    )
-    if waiting_step is None:
-        return None
-    if req.status == ApprovalStatus.PENDING:
-        await grant_approval(db, req, by_user_id=by_user_id, via=via)
-    from packages.core.governance.service import resolve_stale_hitl_cards
-
-    await resolve_stale_hitl_cards(
-        db,
-        step_ids=[step_id],
-        reason=f"approved_via_{via}",
-        choice="approved",
-    )
-    return req
 
 
 async def deny_approval(
@@ -1442,12 +1110,8 @@ async def deny_approval(
     via: str,
     reason: Optional[str] = None,
     authority_prechecked: bool = False,
-    _coordinator_mirror: bool = False,
 ) -> HitlRequest:
-    if (
-        not _coordinator_mirror
-        and await is_coordinator_owned_nested_approval_durable(db, request)
-    ):
+    if is_coordinator_owned_nested_approval(request):
         raise ApprovalContinuationBindingError(
             "Resolve this delegated approval through its canonical Task approval."
         )
@@ -1465,23 +1129,6 @@ async def deny_approval(
         )
         if not authority.allowed:
             raise ApprovalAuthorityError(authority)
-    nested_request = await _coordinator_nested_request_for_mirror(db, request)
-    if nested_request is not None:
-        if nested_request.status != ApprovalStatus.PENDING.value:
-            raise ApprovalContinuationBindingError(
-                "Delegated Runtime approval is no longer available to deny."
-            )
-        from packages.core.services.runtime_authorization import (
-            authorize_hitl_resolution,
-        )
-
-        nested_authority = await authorize_hitl_resolution(
-            db,
-            request=nested_request,
-            by_user_id=by_user_id,
-        )
-        if not nested_authority.allowed:
-            raise ApprovalAuthorityError(nested_authority)
     request.status = ApprovalStatus.DENIED.value
     request.decided_by_user_id = by_user_id
     request.decided_at = datetime.now(timezone.utc)
@@ -1499,27 +1146,6 @@ async def deny_approval(
         ledger_et.APPROVAL_DENIED,
         actor_id=by_user_id,
     )
-    if nested_request is not None:
-        await deny_approval(
-            db,
-            nested_request,
-            by_user_id=by_user_id,
-            via=f"{via}:coordinator_child",
-            reason=reason,
-            authority_prechecked=True,
-            _coordinator_mirror=True,
-        )
-        if nested_request.origin_conversation_id:
-            from packages.core.ai.runtime.approval_store import (
-                mark_runtime_hitl_request_resolved,
-            )
-
-            await mark_runtime_hitl_request_resolved(
-                db,
-                conversation_id=nested_request.origin_conversation_id,
-                hitl_id=nested_request.id,
-                choice="reject",
-            )
     return request
 
 
@@ -1756,6 +1382,8 @@ async def resolve_origin_requests(
         r.status = ApprovalStatus.EXPIRED.value
         r.resolved_reason = reason
         r.decided_at = now
+        from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+        await wake_run_for_closed_request(db, r)
         # Ledger (M1): an origin-expired request is a workspace fact too.
         await ledger_adapters.record_approval_event(db, r, ledger_et.APPROVAL_EXPIRED)
     return len(rows)
@@ -1772,12 +1400,7 @@ async def count_open_requests(db, *, workspace_id: str) -> int:
             ),
         )
     )).scalars().all())
-    count = 0
-    for request in rows:
-        if await is_coordinator_owned_nested_approval_durable(db, request):
-            continue
-        count += 1
-    return count
+    return len(rows)
 
 
 async def count_open_requests_by_workspace(
@@ -1799,8 +1422,6 @@ async def count_open_requests_by_workspace(
     )).scalars().all())
     counts: dict[str, int] = {}
     for request in rows:
-        if await is_coordinator_owned_nested_approval_durable(db, request):
-            continue
         workspace_key = str(request.workspace_id or "")
         counts[workspace_key] = counts.get(workspace_key, 0) + 1
     return counts

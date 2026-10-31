@@ -18,6 +18,7 @@ from apps.api.routers.chat import (
 )
 from packages.core.ai.tools.generate_file.schema import GENERATE_FILE_SCHEMA
 from packages.core.services.file_context import FileAttachments
+from tests.test_sandbox_session_service import fake_cache  # noqa: F401 - fixture
 
 
 def test_video_chat_mode_all_refs_passes_image_video_and_audio_references():
@@ -360,92 +361,64 @@ def test_auto_follow_up_routes_by_live_video_session_enum_without_keywords():
     ]
 
 
-def test_live_owned_video_skill_sandbox_sets_structured_route_state(monkeypatch):
-    import packages.core.ai.runtime as runtime_module
-    import packages.core.ai.runtime.video_edit_sessions as session_module
+def _bind_video_skill(user_id: str, agent_id: str, *, conversation: str = "conversation-1") -> None:
+    from packages.core.ai.runtime.sandbox import runtime_init_sandbox_binding, runtime_sandbox_scope
 
-    async def no_edit_session(_conversation_id):
-        return None
+    scope = runtime_sandbox_scope(entity_id="entity-1", user_id=user_id, binding_key=conversation)
+    asyncio.run(runtime_init_sandbox_binding(scope, "sandbox-video-1", "video-edit", agent_id=agent_id))
 
-    async def load_skill_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-video-1",
-            "skill_id": "video-edit",
-            "entity_id": "entity-1",
-            "user_id": "user-1",
-        }
 
-    async def live_skill(_sandbox_id, _expected_skill):
-        return True
-
-    monkeypatch.setattr(
-        session_module,
-        "load_conversation_video_edit_session",
-        no_edit_session,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "runtime_load_sandbox_context",
-        load_skill_context,
-    )
-    monkeypatch.setattr(
-        "apps.api.routers.chat._live_video_sandbox_matches_skill",
-        live_skill,
-    )
-
-    state = asyncio.run(
+def _route_state(*, user_id="user-1", agent_id="agent-1", conversation="conversation-1"):
+    return asyncio.run(
         _conversation_video_edit_route_state(
-            "conversation-1",
+            conversation,
             entity_id="entity-1",
-            user_id="user-1",
+            user_id=user_id,
+            agent_id=agent_id,
         )
     )
 
-    assert state is _VideoEditRouteState.SKILL_SANDBOX
 
-
-def test_video_route_rejects_sandbox_owned_by_another_user(monkeypatch):
-    import packages.core.ai.runtime as runtime_module
+def test_live_owned_video_skill_sandbox_sets_structured_route_state(monkeypatch, fake_cache):
     import packages.core.ai.runtime.video_edit_sessions as session_module
 
     async def no_edit_session(_conversation_id):
         return None
 
-    async def load_skill_context(_conversation_id):
-        return {
-            "sandbox_id": "sandbox-video-1",
-            "skill_id": "video-edit",
-            "entity_id": "entity-1",
-            "user_id": "other-user",
-        }
+    probed: list[str] = []
+
+    async def live_skill(sandbox_id, _expected_skill):
+        probed.append(sandbox_id)
+        return True
+
+    monkeypatch.setattr(session_module, "load_conversation_video_edit_session", no_edit_session)
+    monkeypatch.setattr("apps.api.routers.chat._live_video_sandbox_matches_skill", live_skill)
+    _bind_video_skill("user-1", "agent-1")
+
+    assert _route_state() is _VideoEditRouteState.SKILL_SANDBOX
+    # The conversation's sandbox is shared by its agents: a delegate opened
+    # it, and the turn's agent may continue in it.
+    assert _route_state(agent_id="agent-2") is _VideoEditRouteState.SKILL_SANDBOX
+    assert probed == ["sandbox-video-1", "sandbox-video-1"]
+    # Another conversation of the same user never continues it.
+    assert _route_state(conversation="conversation-2") is _VideoEditRouteState.INACTIVE
+
+
+def test_video_route_rejects_sandbox_owned_by_another_user(monkeypatch, fake_cache):
+    import packages.core.ai.runtime.video_edit_sessions as session_module
+
+    async def no_edit_session(_conversation_id):
+        return None
 
     async def must_not_probe(_sandbox_id, _expected_skill):
         raise AssertionError("an unowned sandbox must not be probed")
 
-    monkeypatch.setattr(
-        session_module,
-        "load_conversation_video_edit_session",
-        no_edit_session,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "runtime_load_sandbox_context",
-        load_skill_context,
-    )
-    monkeypatch.setattr(
-        "apps.api.routers.chat._live_video_sandbox_matches_skill",
-        must_not_probe,
-    )
+    monkeypatch.setattr(session_module, "load_conversation_video_edit_session", no_edit_session)
+    monkeypatch.setattr("apps.api.routers.chat._live_video_sandbox_matches_skill", must_not_probe)
+    # Another member of the same conversation drives the video Skill.
+    _bind_video_skill("other-user", "agent-1")
 
-    state = asyncio.run(
-        _conversation_video_edit_route_state(
-            "conversation-1",
-            entity_id="entity-1",
-            user_id="user-1",
-        )
-    )
-
-    assert state is _VideoEditRouteState.INACTIVE
+    assert _route_state() is _VideoEditRouteState.INACTIVE
 
 
 def test_video_chat_mode_ai_video_keeps_direct_generation_and_wait_contract():

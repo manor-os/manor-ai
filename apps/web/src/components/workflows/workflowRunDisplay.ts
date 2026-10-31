@@ -16,8 +16,18 @@ export type WorkflowRunStatusLabelKey = WorkflowRunStatus
 
 export type WorkflowRunStatusMotion = "running" | "waiting" | "static";
 
+/**
+ * The one status a person reads for a whole run, on every surface. Only
+ * "needs_you" asks anything of them; what exactly is the run's own detail.
+ */
+export type WorkflowRunState = "queued" | "running" | "needs_you" | "completed" | "failed" | "cancelled";
+
 export interface WorkflowRunStatusPresentation {
+  /** The specific reason (needs_input, revision_required…), for a detail line. */
   labelKey: WorkflowRunStatusLabelKey;
+  state: WorkflowRunState;
+  /** i18n key of `state`. */
+  stateKey: string;
   iconStatus: WorkflowRunStatus;
   motion: WorkflowRunStatusMotion;
 }
@@ -30,6 +40,133 @@ export interface WorkflowRunNode {
   order?: number;
   subscriptionId?: string | null;
   error?: unknown;
+  /** A check's decision: it finishes either way, so its answer is what to show. */
+  answer?: "yes" | "no";
+  /** A step that finished running but reported it could not do its job, or that it needs the person. */
+  outcome?: WorkflowStepOutcome;
+  /** What the step's long work (a sandbox command, a render) reported while running. */
+  activity?: WorkflowStepActivity;
+}
+
+export interface WorkflowActivityEntry {
+  kind: "progress" | "warning" | "error" | "waiting";
+  code?: string;
+  message?: string;
+  percent?: number;
+  done?: number;
+  total?: number;
+  count?: number;
+  position?: number;
+}
+
+export interface WorkflowStepActivity {
+  current: WorkflowActivityEntry;
+  /** Warnings and errors among the recent entries, oldest first. */
+  notices: WorkflowActivityEntry[];
+}
+
+const ACTIVITY_KINDS = new Set(["progress", "warning", "error", "waiting"]);
+const ACTIVITY_CODES = new Set([
+  "queued", "running", "preparing_machine", "uploading_files", "checking", "preparing",
+  "rendering_frames", "encoding", "retrying", "verifying_output", "saving_outputs", "finished",
+]);
+
+function activityEntry(value: unknown): WorkflowActivityEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const kind = typeof raw.kind === "string" && ACTIVITY_KINDS.has(raw.kind) ? raw.kind as WorkflowActivityEntry["kind"] : "progress";
+  const entry: WorkflowActivityEntry = { kind };
+  if (typeof raw.code === "string" && ACTIVITY_CODES.has(raw.code)) entry.code = raw.code;
+  if (typeof raw.message === "string" && raw.message.trim()) entry.message = raw.message.trim();
+  for (const key of ["percent", "done", "total", "count", "position"] as const) {
+    const number = raw[key];
+    if (typeof number === "number" && Number.isFinite(number) && number >= 0) entry[key] = Math.floor(number);
+  }
+  return entry.code || entry.message ? entry : null;
+}
+
+/** Read a step row's activity from a projected workflow step. */
+export function workflowStepActivity(step: Record<string, unknown> | null | undefined): Pick<WorkflowRunNode, "activity"> {
+  const raw = step?.activity;
+  if (!raw || typeof raw !== "object") return {};
+  const record = raw as Record<string, unknown>;
+  const current = activityEntry(record.current);
+  // Work that ended has nothing more to show; the step's own status takes over.
+  if (!current || current.code === "finished") return {};
+  const events = Array.isArray(record.events) ? record.events.map(activityEntry) : [];
+  // A wait that ended (a place in line, a request answered) is no longer news.
+  const notices = events.filter((entry): entry is WorkflowActivityEntry => entry?.kind === "warning" || entry?.kind === "error").slice(-3);
+  return { activity: { current, notices } };
+}
+
+/**
+ * An activity entry as words: progress reads as its shared phase in the viewer's
+ * language; a warning or error says what went wrong, as the work put it.
+ */
+export function workflowActivityText(
+  entry: WorkflowActivityEntry,
+  translate: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if ((entry.kind === "warning" || entry.kind === "error") && entry.message) return entry.message;
+  if (entry.code) {
+    return translate(`component.workflow_run.activity.${entry.code}`, {
+      position: entry.position ?? "", count: entry.count ?? "",
+    });
+  }
+  return entry.message || "";
+}
+
+/** The counts beside an activity's words, e.g. "120/300 · 45%". */
+export function workflowActivityCounts(entry: WorkflowActivityEntry): string {
+  const parts: string[] = [];
+  if (entry.total) parts.push(`${Math.min(entry.done ?? 0, entry.total)}/${entry.total}`);
+  if (typeof entry.percent === "number") parts.push(`${Math.min(100, entry.percent)}%`);
+  return parts.join(" · ");
+}
+
+/** What a step that finished running said of its work, when not plain success. */
+export type WorkflowStepOutcome = "blocked" | "needs_input" | "revision_required";
+
+const STEP_OUTCOME_KEYS: Record<WorkflowStepOutcome, string> = {
+  blocked: "component.workflow_run.step_blocked",
+  // The same words the run uses for the same outcome.
+  needs_input: "component.workflow_run.status.needs_input",
+  revision_required: "component.workflow_run.status.revision_required",
+};
+
+/** A step outcome that waits on the person rather than reporting a failure. */
+export function workflowStepNeedsPerson(node: Pick<WorkflowRunNode, "status" | "outcome">): boolean {
+  return node.status === "completed" && (node.outcome === "needs_input" || node.outcome === "revision_required");
+}
+
+/** How a finished step reads: a check's Yes/No, Blocked, Input needed, or its run status. */
+export function workflowNodeOutcomeKey(node: Pick<WorkflowRunNode, "status" | "answer" | "outcome">): string | null {
+  if (node.status !== "completed") return null;
+  if (node.answer) return node.answer === "no" ? "component.workspace_app_view.check_no" : "component.workspace_app_view.check_yes";
+  return node.outcome ? STEP_OUTCOME_KEYS[node.outcome] : null;
+}
+
+/**
+ * What a step's row says: its outcome when it reported one; once the run has
+ * ended, a step it never got to is "Not reached", not still waiting.
+ */
+export function workflowStepStatusKey(
+  node: Pick<WorkflowRunNode, "status" | "answer" | "outcome">,
+  runActive: boolean,
+): string {
+  const outcome = workflowNodeOutcomeKey(node);
+  if (outcome) return outcome;
+  if (node.status === "pending" && !runActive) return "component.workflow_run.step_not_reached";
+  return `component.workflow_run.status.${node.status}`;
+}
+
+/** Read a step row's answer / outcome from a projected workflow step. */
+export function workflowStepOutcome(step: Record<string, unknown> | null | undefined): Pick<WorkflowRunNode, "answer" | "outcome"> {
+  const answer = step?.answer === "yes" || step?.answer === "no" ? step.answer : undefined;
+  const outcome = typeof step?.outcome === "string" && Object.hasOwn(STEP_OUTCOME_KEYS, step.outcome)
+    ? step.outcome as WorkflowStepOutcome
+    : undefined;
+  return { ...(answer ? { answer } : {}), ...(outcome ? { outcome } : {}) };
 }
 
 export interface WorkflowRunActionInput {
@@ -42,6 +179,10 @@ export interface WorkflowRunActionInput {
   hidden?: boolean;
   default?: unknown;
   schema?: WorkflowInputSchema;
+  suggestions?: string[];
+  /** The form page this input is on; inputs sharing a step are asked together. */
+  step?: string;
+  step_label?: string;
 }
 
 export interface WorkflowRunAction {
@@ -55,9 +196,12 @@ export interface WorkflowRunAction {
   inputs?: WorkflowRunActionInput[];
   input_schema?: WorkflowInputSchema;
   editable_input_schema?: WorkflowInputSchema;
+  result_schema?: WorkflowInputSchema;
+  project_revisions?: Record<string, number>;
   values?: Record<string, unknown>;
   step_id?: string;
   retry_from_step_id?: string;
+  retry_from_step_name?: string;
   observed_problem?: unknown;
   required_change?: unknown;
   preserved_receipts?: unknown[];
@@ -70,6 +214,9 @@ export interface WorkflowRunView {
   title: string;
   status: WorkflowRunStatus;
   nodes: WorkflowRunNode[];
+  // The server's stage counts against the whole Flow, when it sent them.
+  processedCount?: number | null;
+  totalCount?: number | null;
   workflowId?: string;
   currentNodeId?: string | null;
   retryFromStepId?: string | null;
@@ -147,6 +294,8 @@ export interface WorkflowTraceEntry {
 
 export interface WorkflowHistoryRun {
   id: string;
+  /** A newer run has made this run's project since; it is not continued. */
+  superseded?: boolean;
   workflow_id?: string;
   binding_id?: string;
   workspace_id?: string;
@@ -226,6 +375,14 @@ const PROCESSED_STATUSES = new Set<WorkflowRunStatus>([
   "cancelled",
   "skipped",
 ]);
+// Steps that route or shape data rather than do work. They are not stages, so
+// they never move a run's progress. Mirrors _CONTROL_STEP_TYPES in
+// packages/core/services/workflow_run_trace.py, which sets the server's totals.
+const CONTROL_STEP_TYPES = new Set([
+  "trigger", "webhook", "end", "condition", "switch", "merge", "stop", "split", "parallel", "loop",
+  "filter", "limit", "sort", "dedupe", "aggregate", "transform", "note", "datetime",
+  "workflow_action_grant", "unsupported",
+]);
 const EDITABLE_SCHEMA_TYPES = new Set(["string", "number", "integer", "boolean", "array", "object"]);
 const EDITABLE_SCHEMA_COMMON_KEYS = [
   "$schema",
@@ -256,6 +413,7 @@ const EDITABLE_SCHEMA_UI_KEYS = new Set([
   "order",
   "project_type",
   "allowed_stages",
+  "record_source",
 ]);
 const EDITABLE_SCHEMA_MAX_DEPTH = 12;
 const ERROR_TEXT_BYTES = 8 * 1024;
@@ -352,7 +510,7 @@ function editableSchemaUiIsCompatible(
   ) return false;
   if (
     ui.control !== undefined
-    && !["textarea", "line_list", "workflow_project_select", "documents"].includes(String(ui.control))
+    && !["textarea", "line_list", "workflow_project_select", "documents", "record_select"].includes(String(ui.control))
   ) return false;
   if (ui.control === "line_list" && schemaType !== "array") return false;
   if (ui.control === "documents" && schemaType !== "array") return false;
@@ -368,6 +526,16 @@ function editableSchemaUiIsCompatible(
       || new Set(ui.allowed_stages).size !== ui.allowed_stages.length
     ) return false;
   } else if (ui.project_type !== undefined || ui.allowed_stages !== undefined) {
+    return false;
+  }
+  if (ui.control === "record_select") {
+    const source = asRecord(ui.record_source);
+    const items = asRecord(schema.items);
+    const multiple = schemaType === "array" && Boolean(items) && editableSchemaType(items!) === "string";
+    if (!multiple && schemaType !== "string") return false;
+    if (schema.enum !== undefined || items?.enum !== undefined) return false;
+    if (!source || typeof source.ledger !== "string" || !source.ledger.trim()) return false;
+  } else if (ui.record_source !== undefined) {
     return false;
   }
   if (
@@ -774,10 +942,26 @@ function boundedUtf8(text: string, truncationText: string): string {
   return `${characters.slice(0, low).join("")}${truncationMarker}`;
 }
 
+/** A run error's lead-in lines, then its "- " items (one per line from a list-valued stop message). */
+export function splitWorkflowErrorItems(text: string): { lead: string[]; items: string[] } {
+  const lead: string[] = [];
+  const items: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("- ")) items.push(line.slice(2).trim());
+    else lead.push(line);
+  }
+  return { lead, items };
+}
+
 export function formatWorkflowError(value: unknown, truncationText: string): string {
   if (value == null || value === "") return "";
-  if (value instanceof Error) return boundedUtf8(redactSensitiveText(value.message || value.name), truncationText);
-  if (typeof value === "string") return boundedUtf8(redactSensitiveText(value.trim()), truncationText);
+  const explain = (text: string) => text === "workflow_effect_deadline_expired"
+    ? "The allowed time window has ended, so this action was not executed. Arrange a new window before retrying. (workflow_effect_deadline_expired)"
+    : text;
+  if (value instanceof Error) return boundedUtf8(redactSensitiveText(explain(value.message || value.name)), truncationText);
+  if (typeof value === "string") return boundedUtf8(redactSensitiveText(explain(value.trim())), truncationText);
 
   const record = asRecord(value);
   if (record) {
@@ -791,7 +975,7 @@ export function formatWorkflowError(value: unknown, truncationText: string): str
       ? readableJson(compactArtifactRefs(record.artifact_refs))
       : "";
     const extracted = [
-      message,
+      explain(message),
       code ? `[${code}]` : "",
       path,
       requiredChange,
@@ -828,27 +1012,59 @@ export function canCancelWorkflowRun(run: {
     && ACTIONABLE_COMPLETED_OUTCOMES.has(businessOutcome as WorkflowRunStatusLabelKey);
 }
 
-export function workflowRunStatusPresentation(
-  run: Pick<WorkflowRunView, "status" | "businessOutcome">,
+const RUN_STATES: Record<WorkflowRunStatusLabelKey, WorkflowRunState> = {
+  pending: "queued",
+  running: "running",
+  paused: "needs_you",
+  needs_input: "needs_you",
+  revision_required: "needs_you",
+  ready_for_acceptance: "needs_you",
+  completed: "completed",
+  skipped: "completed",
+  failed: "failed",
+  cancelled: "cancelled",
+};
+
+function withState(
+  presentation: Omit<WorkflowRunStatusPresentation, "state" | "stateKey">,
+  state: WorkflowRunState = RUN_STATES[presentation.labelKey] || "queued",
 ): WorkflowRunStatusPresentation {
+  return { ...presentation, state, stateKey: `component.workflow_run.state.${state}` };
+}
+
+/** i18n key of the shown status for a bare run status (no outcome known). */
+export function workflowRunStateKey(status: string): string {
+  return `component.workflow_run.state.${RUN_STATES[status as WorkflowRunStatus] || "queued"}`;
+}
+
+export function workflowRunStatusPresentation(
+  run: Pick<WorkflowRunView, "status" | "businessOutcome"> & Partial<Pick<WorkflowRunView, "nodes" | "currentNodeId">>,
+): WorkflowRunStatusPresentation {
+  // A run paused only for background work (an automatic retry, a render, a
+  // timer) needs nobody: it is queued and continues on its own.
+  const current = run.status === "paused" && run.currentNodeId
+    ? run.nodes?.find((node) => node.id === run.currentNodeId) : undefined;
+  if (current?.status === "running") {
+    return withState({ labelKey: "running", iconStatus: "running", motion: "running" }, "queued");
+  }
   const businessOutcome = String(run.businessOutcome || "").trim().toLowerCase();
   if (
     run.status === "completed"
-    && ACTIONABLE_COMPLETED_OUTCOMES.has(businessOutcome as WorkflowRunStatusLabelKey)
+   && ACTIONABLE_COMPLETED_OUTCOMES.has(businessOutcome as WorkflowRunStatusLabelKey)
   ) {
-    return {
+    return withState({
       labelKey: businessOutcome as WorkflowRunStatusLabelKey,
       iconStatus: "paused",
       motion: "waiting",
-    };
+    });
   }
-  return {
+  return withState({
     labelKey: run.status,
     iconStatus: run.status,
     motion: ACTIVE_STATUSES.has(run.status)
       ? "running"
       : run.status === "paused" ? "waiting" : "static",
-  };
+  });
 }
 
 export interface WorkflowRunFailure {
@@ -861,9 +1077,14 @@ export interface WorkflowRunFailure {
   detail: string;
   /** Short "what to change" hint before retrying, when the cause is known. */
   hint: string;
+  /** Raw technical details, shown collapsed; never the headline. */
+  technicalDetails: string;
 }
 
 const INSUFFICIENT_CREDITS = /insufficient credits:\s*required\s*([\d.,]+)\s*,\s*available\s*([\d.,-]+)/i;
+// A client delivery trial runs on its provider's credits; the server's
+// message names no amounts (TRIAL_CREDIT_MESSAGE).
+const TRIAL_CREDITS_USED_UP = /provider['’]s credits for this trial are used up/i;
 
 function formatCredits(raw: string): string {
   const value = Number(raw.replace(/,/g, ""));
@@ -888,7 +1109,12 @@ export function workflowNodeDisplayStatus(result: {
   const status = String(result.status || "");
   if (status !== "paused") return status;
   const waitType = String(result.wait_type || "");
-  if (waitType === "media_job" || waitType === "timer" || (!waitType && result.subrun_id)) return "running";
+  if (
+    waitType === "media_job"
+    || waitType === "timer"
+    || waitType === "transient_retry"
+    || (!waitType && result.subrun_id)
+  ) return "running";
   return status;
 }
 
@@ -897,15 +1123,64 @@ export function workflowNodeDisplayStatus(result: {
  * a timer, or a child flow. Null when the pause waits for a person.
  */
 export function workflowRunBackgroundWait(
-  run: { status?: string; current_step_id?: string | null; step_results?: Record<string, unknown> | null } | null | undefined,
+  run: {
+    status?: string;
+    current_step_id?: string | null;
+    step_results?: Record<string, unknown> | null;
+    workflow_steps?: Array<{ id: string; status: string }> | null;
+  } | null | undefined,
 ): string | null {
   if (!run || run.status !== "paused") return null;
   const result = asRecord((run.step_results || {})[String(run.current_step_id || "")]);
-  if (!result || workflowNodeDisplayStatus(result) !== "running") return null;
+  if (!result) {
+    // A run summary carries no step results, but its step list already says
+    // a paused step that waits on background work (a timer, a render, an
+    // automatic retry) is still running; only a wait for a person is paused.
+    const step = (run.workflow_steps || []).find((item) => item.id === run.current_step_id);
+    return step?.status === "running" ? "Waiting on background work · continues on its own" : null;
+  }
+  if (workflowNodeDisplayStatus(result) !== "running") return null;
   const waitType = String(result.wait_type || "");
   if (waitType === "media_job") return "Rendering media · continues on its own";
   if (waitType === "timer") return "Waiting on a timer · continues on its own";
+  if (waitType === "transient_retry") {
+    // e.g. "Retrying (1/3): the model provider stopped responding."
+    const message = typeof result.output === "string" && result.output.trim()
+      ? result.output.trim()
+      : "Retrying after a temporary problem.";
+    return `${message} · continues on its own`;
+  }
   return "Waiting on a sub-flow · continues on its own";
+}
+
+type FailedRun = {
+  status?: string;
+  error?: unknown;
+  current_step_id?: string | null;
+  step_results?: Record<string, unknown> | null;
+} | null | undefined;
+
+function failedStepIdOf(run: NonNullable<FailedRun>): string {
+  const results = run.step_results || {};
+  return String(run.current_step_id || "").trim()
+    || Object.entries(results).reverse().find(([, value]) => asRecord(value)?.status === "failed")?.[0]
+    || "";
+}
+
+/**
+ * Technical details behind a failed run's headline: the raw tool error of a
+ * platform failure, or the raw text the server lifted out of the headline.
+ * Shown collapsed, never as the headline itself. Empty when there are none.
+ */
+export function workflowRunTechnicalDetails(run: FailedRun, truncatedLabel = "…"): string {
+  if (!run || run.status !== "failed") return "";
+  const result = asRecord((run.step_results || {})[failedStepIdOf(run)]);
+  const platformFailure = asRecord(result?.platform_failure);
+  const details = platformFailure
+    ? { code: platformFailure.code, ...(asRecord(platformFailure.details) || {}) }
+    : result?.error_details;
+  if (details === undefined || details === null || details === "") return "";
+  return formatWorkflowValue(details, truncatedLabel);
 }
 
 export function workflowRunFailure(
@@ -919,20 +1194,20 @@ export function workflowRunFailure(
 ): WorkflowRunFailure | null {
   if (!run || run.status !== "failed") return null;
   const results = run.step_results || {};
-  const failedStepId = String(run.current_step_id || "").trim()
-    || Object.entries(results).reverse().find(([, value]) => asRecord(value)?.status === "failed")?.[0]
-    || "";
+  const failedStepId = failedStepIdOf(run);
   const stepResult = asRecord(results[failedStepId]);
   const stepName = steps.find((step) => step.id === failedStepId)?.name?.trim() || failedStepId;
   const rawError = formatWorkflowError(run.error, "…")
     || formatWorkflowError(stepResult?.error, "…");
   const retryFromStepId = String(stepResult?.retry_from_step_id || "").trim() || failedStepId;
+  const technicalDetails = workflowRunTechnicalDetails(run);
   const credits = INSUFFICIENT_CREDITS.exec(rawError);
   if (credits) {
     return {
       stepId: failedStepId,
       stepName,
       retryFromStepId,
+      technicalDetails,
       title: "Not enough credits",
       detail: `${stepName ? `“${stepName}” needs` : "This step needs"} ${formatCredits(credits[1])} credits, `
         + `but your balance is ${formatCredits(credits[2])}.`,
@@ -940,13 +1215,27 @@ export function workflowRunFailure(
         + "or edit the inputs, for example a shorter video, and run again.",
     };
   }
+  if (TRIAL_CREDITS_USED_UP.test(rawError)) {
+    return {
+      stepId: failedStepId,
+      stepName,
+      retryFromStepId,
+      technicalDetails,
+      title: "Trial credits used up",
+      detail: `${stepName ? `“${stepName}” stopped: the` : "The"} provider pays for AI usage during this trial, `
+        + "and its credits are used up.",
+      hint: "Ask the provider to add credits, or accept the delivery to continue on your own plan, "
+        + "then retry from this step (earlier results are kept).",
+    };
+  }
   return {
     stepId: failedStepId,
     stepName,
     retryFromStepId,
+    technicalDetails,
     title: stepName ? `“${stepName}” failed` : "Run failed",
     detail: rawError || "The run stopped without reporting an error.",
-    hint: failedStepId ? "Retry from this step to keep the earlier results." : "",
+    hint: failedStepId ? "Review this failed run before retrying." : "",
   };
 }
 
@@ -1297,12 +1586,34 @@ export function resolveWorkflowFinalResult(
   return null;
 }
 
+function isStageType(type: string | undefined): boolean {
+  return !CONTROL_STEP_TYPES.has(String(type || "").toLowerCase());
+}
+
+/**
+ * The percentage a Workflow run shows for its stages. It moves as stages finish
+ * and reads 100 only once the run has completed. A run that failed, was cancelled,
+ * or is still going shows the share it reached, below 100, so it never looks done.
+ */
+export function workflowRunProgressPercent(
+  processed: number | null | undefined,
+  total: number | null | undefined,
+  status: string | null | undefined,
+): number | null {
+  if (
+    typeof processed !== "number" || typeof total !== "number"
+    || !Number.isFinite(processed) || !Number.isFinite(total) || total <= 0
+  ) return null;
+  if (String(status || "").toLowerCase() === "completed") return 100;
+  return Math.min(99, Math.max(0, (processed / total) * 100));
+}
+
 export function workflowEditorRunProgress(
   steps: Pick<WorkflowEditorStep, "id" | "type">[],
   statusById: Record<string, string>,
   run?: { status?: string; processed_count?: number | null } | null,
 ): { processed: number; total: number } {
-  const executableSteps = steps.filter((step) => step.type !== "note");
+  const executableSteps = steps.filter((step) => isStageType(step.type));
   const observed = executableSteps.reduce(
     (count, step) => count + (PROCESSED_STATUSES.has(statusById[step.id] as WorkflowRunStatus) ? 1 : 0),
     0,
@@ -1321,6 +1632,26 @@ export function workflowEditorRunProgress(
   };
 }
 
+/**
+ * A run's stage counts for its progress bar. The server counts the whole Flow,
+ * so the total holds while the run moves; the nodes drawn are only the path
+ * reached so far, and count only when the server sent no figure.
+ */
+export function workflowRunStageCounts(
+  run: Pick<WorkflowRunView, "processedCount" | "totalCount">,
+  nodes: WorkflowRunNode[],
+): { processed: number; total: number } {
+  const stages = workflowProgressNodes(nodes);
+  return {
+    processed: Number.isInteger(run.processedCount)
+      ? Number(run.processedCount)
+      : processedNodeCount(stages),
+    total: Number.isInteger(run.totalCount)
+      ? Number(run.totalCount)
+      : progressNodeCount(stages),
+  };
+}
+
 export function processedNodeCount(nodes: WorkflowRunNode[]): number {
   return nodes.reduce(
     (count, node) => count + (PROCESSED_STATUSES.has(node.status) ? 1 : 0),
@@ -1329,7 +1660,7 @@ export function processedNodeCount(nodes: WorkflowRunNode[]): number {
 }
 
 export function workflowProgressNodes(nodes: WorkflowRunNode[]): WorkflowRunNode[] {
-  return nodes;
+  return nodes.filter((node) => isStageType(node.type));
 }
 
 export function progressNodeCount(nodes: WorkflowRunNode[]): number {
@@ -1358,12 +1689,23 @@ export function workflowRunNeedsInput(
     && (run.businessOutcome || run.action?.business_outcome) === "needs_input";
 }
 
-/** Readable input guidance; structured error payloads belong in run details. */
+/**
+ * Readable input guidance: what the run found missing, in its own words, then
+ * the Flow's general instruction. The general line alone ("add what is missing
+ * to the brief") left people resubmitting the same brief.
+ */
 export function workflowInputGuidance(action: WorkflowRunAction): string[] {
-  const value = action.required_change || action.observed_problem || action.prompt || action.description;
-  const items = Array.isArray(value) ? value : [value];
-  return items.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
-    .map((item) => action.editable_input_schema?.properties?.[item]?.title || item);
+  const lines: string[] = [];
+  for (const value of [action.observed_problem, action.required_change]) {
+    for (const item of Array.isArray(value) ? value : [value]) {
+      if (typeof item !== "string" || !item.trim()) continue;
+      const line = action.editable_input_schema?.properties?.[item]?.title || item.trim();
+      if (!lines.includes(line)) lines.push(line);
+    }
+  }
+  if (lines.length) return lines;
+  const fallback = action.prompt || action.description;
+  return typeof fallback === "string" && fallback.trim() ? [fallback.trim()] : [];
 }
 
 export function workflowRunActionLabelKey(
@@ -1862,34 +2204,12 @@ export function buildWorkflowSnapshotNodes(
   });
 }
 
-function hasCorrectionRequirement(value: unknown, depth = 0): boolean {
-  if (depth > 4 || value == null) return false;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
-    try {
-      return hasCorrectionRequirement(JSON.parse(trimmed), depth + 1);
-    } catch {
-      return false;
-    }
-  }
-  if (Array.isArray(value)) return value.some((item) => hasCorrectionRequirement(item, depth + 1));
-  const record = asRecord(value);
-  if (!record) return false;
-  if (record.required_change != null && record.required_change !== "") return true;
-  const schema = asRecord(record.editable_input_schema);
-  const properties = asRecord(schema?.properties);
-  if (properties && Object.keys(properties).length > 0) return true;
-  return Object.entries(record).some(([key, item]) => (
-    !SENSITIVE_JSON_KEY.test(key) && hasCorrectionRequirement(item, depth + 1)
-  ));
-}
-
 export function canRetryWithoutCorrection(run: WorkflowHistoryRun): boolean {
   return run.capabilities?.can_control === true
+    && !run.superseded
     && run.status === "failed"
-    && Boolean(run.retry_from_step_id || run.current_step_id)
-    && !hasCorrectionRequirement(run.error);
+    && typeof run.retry_from_step_id === "string"
+    && Boolean(run.retry_from_step_id.trim());
 }
 
 export function canShowDirectWorkflowRetry(
@@ -1897,4 +2217,54 @@ export function canShowDirectWorkflowRetry(
   hasVisibleIntervention: boolean,
 ): boolean {
   return !hasVisibleIntervention && canRetryWithoutCorrection(run);
+}
+
+/* File patch operations in an approval, as a person reads them. */
+
+export interface WorkflowPatchSummary {
+  /** An i18n key for a known verb, or the operation itself in lowercase words. */
+  verbKey?: string;
+  verb?: string;
+  target: string;
+  value?: unknown;
+}
+
+const JSON_PATCH_VERBS: Record<string, string> = {
+  "json.add": "component.workflow_review.patch_add",
+  "json.replace": "component.workflow_review.patch_change",
+  "json.remove": "component.workflow_review.patch_remove",
+};
+// Where an operation acts; everything else it carries is what it writes.
+const PATCH_TARGET_FIELDS = ["pointer", "path_in_file", "sheet", "cell", "range", "row", "index", "slide", "slide_index", "paragraph_index", "table_index", "name"];
+const PATCH_IGNORED_FIELDS = new Set(["op", "operation", "old_text", "new_text"]);
+
+/** "/bounded_recovery/retry_plan" → "bounded_recovery › retry_plan". */
+function jsonPointerLabel(pointer: string): string {
+  return pointer.split("/").filter(Boolean)
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .join(" › ") || "/";
+}
+
+/** A file patch operation as a person reads it; text edits are shown as a diff instead. */
+export function workflowPatchSummary(operation: Record<string, any>): WorkflowPatchSummary | null {
+  const op = String(operation.op || operation.operation || "").trim();
+  if (!op || typeof operation.old_text === "string" || typeof operation.new_text === "string") return null;
+  const targets = PATCH_TARGET_FIELDS.flatMap((field) => {
+    const where = operation[field];
+    // A target is a name or a position; anything structured belongs in the value shown below.
+    if (typeof where !== "string" && typeof where !== "number") return [];
+    const text = `${where}`.trim();
+    if (!text) return [];
+    return [field === "pointer" ? jsonPointerLabel(text) : text];
+  });
+  const rest = Object.fromEntries(Object.entries(operation).filter(([key]) => (
+    !PATCH_IGNORED_FIELDS.has(key) && !PATCH_TARGET_FIELDS.includes(key)
+  )));
+  const value = "value" in rest && Object.keys(rest).length === 1 ? rest.value : Object.keys(rest).length ? rest : undefined;
+  const verbKey = JSON_PATCH_VERBS[op];
+  return {
+    ...(verbKey ? { verbKey } : { verb: op.replace(/[._]/g, " ") }),
+    target: targets.join(" · "),
+    ...(value !== undefined ? { value } : {}),
+  };
 }

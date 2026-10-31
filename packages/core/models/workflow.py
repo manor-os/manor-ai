@@ -4,9 +4,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.orm import Mapped, mapped_column, query_expression
+from sqlalchemy.orm import Mapped, Session, mapped_column, query_expression
 
 from packages.core.constants.workflow import WorkflowRunStatus
 
@@ -238,6 +238,9 @@ class WorkflowRun(Base, TimestampMixin):
     started_by: Mapped[Optional[str]] = mapped_column(String(26))
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cancel_source: Mapped[Optional[str]] = mapped_column(String(16))
+    """CancelSource when status is cancelled; NULL on older rows and while
+    the run is not cancelled."""
     continuation_token: Mapped[Optional[str]] = mapped_column(String(26))
     continuation_due_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
@@ -253,6 +256,7 @@ class WorkflowRun(Base, TimestampMixin):
     )
     summary_workflow_name: Mapped[Optional[str]] = query_expression()
     summary_current_step_name: Mapped[Optional[str]] = query_expression()
+    summary_display_i18n: Mapped[Optional[dict]] = query_expression()
     summary_history_state: Mapped[Optional[dict]] = query_expression()
     summary_legacy_retry_of_run_id: Mapped[Optional[str]] = query_expression()
     summary_legacy_retry_from_step_id: Mapped[Optional[str]] = query_expression()
@@ -318,6 +322,20 @@ class WorkflowRun(Base, TimestampMixin):
         if self.lineage_is_legacy is not False or not self.lineage_root_run_id:
             return "legacy_untrusted_incomplete"
         return "canonical"
+
+
+@event.listens_for(Session, "before_flush")
+def _refresh_workflow_run_summaries(session, _flush_context, _instances) -> None:
+    """Refresh each changed run's display summary before it is saved.
+
+    Registered beside the model so it is active wherever a run can be saved,
+    not only where the projection module happens to be imported.
+    """
+    if not any(isinstance(obj, WorkflowRun) for obj in session.dirty):
+        return
+    from packages.core.services.workflow_run_trace import refresh_history_summaries_before_flush
+
+    refresh_history_summaries_before_flush(session)
 
 
 class WorkflowProject(Base, TimestampMixin):

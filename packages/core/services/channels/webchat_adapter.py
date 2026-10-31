@@ -49,11 +49,6 @@ class WebchatAdapter(ChannelAdapter):
             "status": "sent",
         }
 
-    async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
-        # Public endpoint — no signature verification.
-        # Rate limiting and session validation happen at the router layer.
-        return True
-
     async def parse_inbound(
         self, cc: ChannelConfig, *, headers, query, body,
     ) -> Optional[NormalizedInbound]:

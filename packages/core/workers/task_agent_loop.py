@@ -1,15 +1,16 @@
 """Task agent loop: one durable AgentLoop owns a Workspace Task end to end.
 
-A ``TaskCoordinatorRun`` whose frozen engine is ``agent_loop`` runs here
-instead of the Plan/Step DAG coordinator. The Task brief is the query. The
+Every Workspace Task's ``TaskCoordinatorRun`` runs here. The Task brief is
+the query. The
 loop plans (``update_task_plan``), works with the Agent's own tools or hands
 parts to Workspace agents (``delegate_to_agent``), verifies its deliverables
 and finishes only by calling ``complete_task``.
 
-The host mechanics are the coordinator's: admit and claim the exact wake,
-renew the claim, fence every model call, CAS-checkpoint every round, and
-settle/release in ``finally``. Long Tasks yield at a time slice and re-stage
-their own wake; the next delivery resumes from the round checkpoint.
+The host mechanics: admit and claim the exact wake,
+then a ``TaskLoopHost`` (``workers.task_loop_host``) renews the claim, fences
+every model call, CAS-checkpoints every round, parks, re-stages and releases
+in ``finally``. Long Tasks yield at a time slice and re-stage their own wake;
+the next delivery resumes from the round checkpoint.
 """
 from __future__ import annotations
 
@@ -20,9 +21,8 @@ import hashlib
 import json
 import logging
 import os
-import time
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -36,11 +36,10 @@ from packages.core.ai.runtime.human_input import (
 )
 from packages.core.ai.runtime.media_job_scope import runtime_media_jobs_detached_scope
 from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
+from packages.core.ai.runtime.host_tools import runtime_check_host_tools
 from packages.core.ai.runtime.run_state import (
-    RUN_STATE_VERSION_KEY,
     RuntimeRunState,
     RuntimeRunStateVersionError,
-    runtime_run_state_persistable,
 )
 from packages.core.ai.runtime.sources import RUNTIME_PLAN_AND_RUN_TASK_SOURCE
 from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
@@ -61,7 +60,8 @@ from packages.core.models.task_coordinator import (
     TaskCoordinatorPhase,
     TaskCoordinatorRun,
 )
-from packages.core.plans.task_constraints import (
+from packages.core.models.task_run_journal import TaskRunJournalKind
+from packages.core.services.task_constraints import (
     extract_binding_constraints,
     render_constraints_block,
 )
@@ -77,11 +77,20 @@ from packages.core.services.task_coordinator_wakeup import (
     stage_task_coordinator_wake,
 )
 from packages.core.services.task_requester_identity import (
+    TASK_STEERING_ENDED_CODE,
+    TASK_STEERING_ENDED_MESSAGE,
     TaskRequesterIdentityError,
-    resolve_task_execution_user_id,
+    TaskSteeringEndedError,
+    resolve_task_run_user_id,
 )
 from packages.core.services import task_agent_loop_hitl as loop_hitl
+from packages.core.services import task_agent_child_settlement as delegation_settlement
+from packages.core.services import task_agent_delegation as delegation
+from packages.core.services.task_agent_child_wakeup import WAITING_CHILD_WAIT_KIND
 from packages.core.services.task_agent_loop_state import (
+    DELEGATION_MODE_DURABLE,
+    DELEGATION_MODE_INLINE,
+    DELEGATION_MODE_KEY,
     INSPECTION_KEY,
     NON_SUBMIT_RETRIES_KEY,
     POSTED_WORK_KEY,
@@ -93,15 +102,27 @@ from packages.core.services.task_agent_loop_state import (
     task_loop_initial_state,
     task_loop_run_state_slots,
 )
+from packages.core.services.task_platform_block import (
+    BLOCKED_BY_AGENT,
+    BLOCKED_BY_PLATFORM,
+    TASK_PLATFORM_BLOCK_MESSAGE,
+    report_task_platform_block,
+)
+from packages.core.services.task_run_journal import append_run_journal, terminal_payload
 from packages.core.services.task_service import add_task_log
 from packages.core.services.task_state_machine import apply_task_status_transition
 from packages.core.services.workspace_access import lock_workspace_access_boundary
 from packages.core.workers import task_run_host
 from packages.core.workers import task_agent_loop_waits as waits
+from packages.core.workers.task_loop_host import DurableRunWrites, TaskLoopHost
 from packages.core.workers.task_agent_loop_completion import (
+    acceptance_exceptions,
     acceptance_problems,
     delivered_files,
+    delivery_problems,
     describe_unconfirmed,
+    describe_unconfirmed_effect,
+    has_verified_delivery,
     effect_label,
     inspection_problems,
     ledger_file_refs,
@@ -113,6 +134,7 @@ from packages.core.workers.task_agent_loop_completion import (
     resolve_deliverables,
     running_work_problems,
     unconfirmed_call_ids,
+    unconfirmed_effects,
 )
 
 
@@ -169,6 +191,9 @@ _DELIVERABLE_MAX_CHARS = 500
 _MAX_ACCEPTANCE = 50
 _CRITERION_MAX_CHARS = 500
 _EVIDENCE_MAX_CHARS = 1000
+# A declared structured result (``details["result_schema"]``), serialized.
+_RESULT_MAX_CHARS = 64_000
+RESULT_SCHEMA_KEY = "result_schema"
 
 UPDATE_TASK_PLAN_TOOL = {
     "type": "function",
@@ -210,7 +235,11 @@ UPDATE_TASK_PLAN_TOOL = {
                     "minItems": 1,
                     "maxItems": _MAX_CRITERIA,
                     "items": {"type": "string"},
-                    "description": "Concrete, checkable conditions the delivery must meet.",
+                    "description": (
+                        "Conditions the delivery must meet, taken from the Task brief and "
+                        "checkable with your tools. Do not invent requirements or exact "
+                        "thresholds the brief does not ask for."
+                    ),
                 },
             },
             "required": ["items", "acceptance_criteria"],
@@ -224,10 +253,17 @@ COMPLETE_TASK_TOOL = {
     "function": {
         "name": COMPLETE_TASK_TOOL_NAME,
         "description": (
-            "Finish this Task. Call it only after you verified the delivered work "
-            "yourself against every acceptance criterion. outcome=completed means "
-            "every criterion is met; outcome=blocked means the Task cannot be "
-            "finished and blocked_reason says why. This is the only way to end the Task."
+            "Finish this Task. Call it only after you checked the delivered work "
+            "yourself against every acceptance criterion. outcome=completed means the "
+            "work is delivered: report each criterion honestly, met=false for one you "
+            "could not meet or could not verify, with the evidence. Unmet or unverified "
+            "criteria are shown to the person as exceptions to the delivery; they are not "
+            "a reason to report blocked. Likewise, tool calls whose effect the host could "
+            "not confirm are listed as exceptions of a verified delivery, never as done. "
+            "outcome=blocked means no usable deliverable could "
+            "be produced, or the Task cannot go on without input, material, permission or "
+            "a decision from someone; blocked_reason names what is needed and from whom. "
+            "This is the only way to end the Task."
         ),
         "parameters": {
             "type": "object",
@@ -262,14 +298,26 @@ COMPLETE_TASK_TOOL = {
                         "type": "object",
                         "properties": {
                             "criterion": {"type": "string"},
-                            "met": {"type": "boolean"},
-                            "evidence": {"type": "string"},
+                            "met": {
+                                "type": "boolean",
+                                "description": "false when it is not met or you could not verify it.",
+                            },
+                            "evidence": {
+                                "type": "string",
+                                "description": "What you checked and observed, or why it could not be checked.",
+                            },
                         },
                         "required": ["criterion", "met", "evidence"],
                         "additionalProperties": False,
                     },
                 },
-                "blocked_reason": {"type": "string"},
+                "blocked_reason": {
+                    "type": "string",
+                    "description": (
+                        "Required when outcome is blocked: what is needed to go on, and from "
+                        "whom (the user, an approver, an outside party)."
+                    ),
+                },
             },
             "required": ["outcome", "summary", "deliverables", "acceptance"],
             "additionalProperties": False,
@@ -326,6 +374,15 @@ def _render_kept_plan(plan: Any) -> str:
 
 
 def _retry_note(retried: dict[str, Any]) -> str:
+    note = _stop_note(retried)
+    reason = retried.get("note")
+    if isinstance(reason, str) and reason.strip():
+        # What the person who retried the Task wrote with the retry.
+        note = f"Note from the person who retried this Task:\n{reason.strip()}\n\n{note}"
+    return note
+
+
+def _stop_note(retried: dict[str, Any]) -> str:
     crash = ""
     if retried.get("exception") or retried.get("error"):
         crash = f" ({retried.get('exception') or 'error'}: {retried.get('error') or 'no message'})"
@@ -372,7 +429,13 @@ def _text(value: Any) -> str:
 
 
 def task_brief(task: Any) -> str:
-    """The Task as the loop's query: title, description, expected output, constraints."""
+    """The Task as the loop's query: title, description, expected output, constraints.
+
+    What the Task's creator put in its details is part of the brief too: a
+    procedure to follow, instructions, the expected deliverable and when it
+    is done (a schedule writes these), runtime requirements and the outputs
+    of the Tasks it depends on.
+    """
 
     parts = [f"# Task\n{_text(getattr(task, 'title', None)) or 'Untitled Task'}"]
     description = _text(getattr(task, "description", None))
@@ -384,13 +447,85 @@ def task_brief(task: Any) -> str:
             "## Expected output\n"
             + (expected if isinstance(expected, str) else json.dumps(expected, ensure_ascii=False, default=str))
         )
-    constraints = render_constraints_block(extract_binding_constraints(getattr(task, "details", None)))
+    details = getattr(task, "details", None)
+    parts.extend(_detail_sections(details if isinstance(details, dict) else {}, description=description))
+    constraints = render_constraints_block(extract_binding_constraints(details))
     if constraints:
         parts.append(constraints)
     return "\n\n".join(parts)
 
 
-def _task_section(brief: str, *, can_delegate: bool) -> str:
+def task_runtime_metadata(task: Any) -> dict[str, Any] | None:
+    """Task-owned metadata every tool call of this Task's runs inherits.
+
+    A Strategist Proposal's pre-authorized external action rides the run's
+    envelope, where the approval gate matches it against the exact request.
+    Nothing else is forwarded and nothing is widened.
+    """
+
+    details = getattr(task, "details", None)
+    authorization = details.get("proposal_external_authorization") if isinstance(details, dict) else None
+    if not isinstance(authorization, dict):
+        return None
+    return {"proposal_external_authorization": dict(authorization)}
+
+
+_MAX_PREDECESSORS = 10
+_MAX_PREDECESSOR_FILES = 10
+
+
+def _detail_sections(details: dict[str, Any], *, description: str) -> list[str]:
+    from packages.core.ai.runtime.task_requirements import task_runtime_requirements_prompt
+
+    sections: list[str] = []
+    procedure = _text(details.get("execution_script"))
+    if procedure:
+        sections.append(f"## Procedure (follow these steps)\n{procedure}")
+    instructions = _text(details.get("payload_message"))
+    if instructions and instructions != description:
+        sections.append(f"## Instructions\n{instructions}")
+    deliverable = _text(details.get("deliverable"))
+    if deliverable:
+        sections.append(f"## Expected deliverable\n{deliverable}")
+    done_when = _text(details.get("done_when"))
+    if done_when:
+        sections.append(f"## Done when\n{done_when}")
+    requirements = task_runtime_requirements_prompt(details.get("runtime_context"))
+    if requirements:
+        sections.append(requirements)
+    predecessors = details.get("dep_outputs")
+    lines: list[str] = []
+    for dep in (predecessors if isinstance(predecessors, list) else [])[:_MAX_PREDECESSORS]:
+        if not isinstance(dep, dict):
+            continue
+        lines.append(f"### {_text(dep.get('task_title')) or 'Earlier Task'}")
+        summary = _text(dep.get("result_summary"))
+        if summary:
+            lines.append(f"Summary: {summary}")
+        files = dep.get("files")
+        for file in (files if isinstance(files, list) else [])[:_MAX_PREDECESSOR_FILES]:
+            if not isinstance(file, dict):
+                continue
+            label = next((
+                _text(file.get(key)) for key in ("name", "filename", "fs_path", "url") if _text(file.get(key))
+            ), "file")
+            ref = next((
+                _text(file.get(key))
+                for key in ("fs_path", "path", "file_url", "url", "document_id") if _text(file.get(key))
+            ), "")
+            lines.append(f"- {label}" + (f" ({ref})" if ref and ref != label else ""))
+    if lines:
+        sections.append("## Outputs of the Tasks this one depends on\n" + "\n".join(lines))
+    return sections
+
+
+def _task_section(
+    brief: str,
+    *,
+    can_delegate: bool,
+    durable_delegation: bool = False,
+    required_skills: tuple[str, ...] = (),
+) -> str:
     work_line = (
         "- Do the work yourself with your tools, or hand parts to Workspace agents "
         "with delegate_to_agent. A delegated agent does not see this Task: give it "
@@ -398,6 +533,21 @@ def _task_section(brief: str, *, can_delegate: bool) -> str:
         if can_delegate
         else "- Do the work yourself with your tools."
     )
+    if can_delegate and durable_delegation:
+        work_line += (
+            "\n- Delegated agents work in the background: this Task pauses until all of "
+            "them have finished, without holding a worker. Their results come back as the "
+            "result of your delegate_to_agent call; read a cut answer in full with "
+            "read_delegation_result. A delegated agent that needs the user's answer or an "
+            "approval stops and reports what it needed; ask or decide it here."
+        )
+    if required_skills:
+        work_line += (
+            "\n- This Task requires the Skill(s) "
+            + ", ".join(f"`{ref}`" for ref in required_skills)
+            + ": run each with invoke_skill. The tools they declare that you may use are "
+            "already loaded in this loop; use them directly instead of searching for them."
+        )
     create_task_line = (
         "- create_task creates a separate Task that is not part of this run and does no "
         "work here"
@@ -407,8 +557,10 @@ def _task_section(brief: str, *, can_delegate: bool) -> str:
         "## Task agent loop\n"
         "You own this Workspace Task from start to finish in this one loop.\n"
         "- First plan with update_task_plan, including acceptance_criteria that a "
-        "finished delivery must meet. Revise the plan when the work changes; the "
-        "plan records your intent and executes nothing.\n"
+        "finished delivery must meet. Take them from the brief and make them checkable "
+        "with your tools; do not invent requirements or exact thresholds it does not ask "
+        "for. Revise the plan when the work changes; the plan records your intent and "
+        "executes nothing.\n"
         f"{work_line}\n"
         f"{create_task_line}\n"
         "- Verify every deliverable yourself (read the files and results) against "
@@ -421,6 +573,11 @@ def _task_section(brief: str, *, can_delegate: bool) -> str:
         "report completed over a tool call whose effect you could not confirm. A sent "
         "message, an external link or a record is not a deliverable file: describe it "
         "in summary or in the acceptance evidence.\n"
+        "- Delivered work whose check falls short on a criterion (not met, or you could not "
+        "verify it) is still a delivery: report outcome=completed with that criterion "
+        "met=false and the evidence; the person sees it as an exception. Report "
+        "outcome=blocked only when nothing usable could be delivered, or when going on "
+        "needs input, material, permission or a decision from someone; say what and from whom.\n"
         "- Never claim an effect, file or delivery you did not observe in a tool result.\n"
         "- A Task may run for days. To wait for something outside it (a reply, a "
         "scheduled time, an update), call wait_until; to wait for media jobs, call "
@@ -431,12 +588,30 @@ def _task_section(brief: str, *, can_delegate: bool) -> str:
         "cannot continue without a fact, decision or material that only the user can "
         "give, call request_input with one precise question (related questions go in "
         "fields). The Task pauses without holding a worker and continues here with the "
-        "answer.\n"
+        "answer. An internal Manor error (a tool result with internal_error) is never a "
+        "question for the user: if no other call gets past it, finish with "
+        "complete_task(outcome=blocked) naming it.\n"
         "- Some actions need a person's approval first. The Task then pauses until they "
         "decide and continues here: an approved action runs, a rejected one did not run "
         "and must not be retried.\n"
         "- Finish ONLY by calling complete_task. A prose reply does not complete the Task.\n\n"
         f"{brief}"
+    )
+
+
+def _no_acquisition_section(*, can_delegate: bool) -> str:
+    """Missing-capability guidance for a wake that cannot acquire new capabilities."""
+    delegate = (
+        "hand the work to a Workspace agent that has the tool with delegate_to_agent, or "
+        if can_delegate else ""
+    )
+    return (
+        "\n\n## Missing capabilities\n"
+        "- If a tool you need is not loaded, load it with search_tools. This run cannot "
+        f"acquire new capabilities: if the tool is still missing, {delegate}finish with "
+        "complete_task(outcome=blocked) naming the missing capability and what it is for.\n"
+        "- Never use request_input to ask a person for tool access or Agent configuration; "
+        "their answer cannot add a tool."
     )
 
 
@@ -519,10 +694,86 @@ def cap_submission(submission: dict[str, Any]) -> dict[str, Any]:
         })
     if _text(submission.get("blocked_reason")):
         capped["blocked_reason"] = _cap(submission.get("blocked_reason"), _SUMMARY_MAX_CHARS)
+    result = submission.get("result")
+    if isinstance(result, dict) and _result_size(result) <= _RESULT_MAX_CHARS:
+        capped["result"] = copy.deepcopy(result)
     return capped
 
 
-def _parse_submission(arguments: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _result_size(result: Any) -> int:
+    return len(json.dumps(result, ensure_ascii=False, default=str))
+
+
+def task_result_schema(task: Any) -> dict[str, Any] | None:
+    """The JSON Schema a Task declares for its structured result, if any.
+
+    Whoever creates the Task declares it (``details["result_schema"]``); a
+    completed run must then submit a ``result`` object that validates, and
+    that object becomes the Task's ``actual_output["result"]``.
+    """
+
+    details = getattr(task, "details", None)
+    schema = details.get(RESULT_SCHEMA_KEY) if isinstance(details, dict) else None
+    return copy.deepcopy(schema) if isinstance(schema, dict) and schema else None
+
+
+# Schema keywords not every provider accepts in a function's parameters. The
+# advertised schema drops them; the host still validates the full schema.
+_UNPORTABLE_SCHEMA_KEYS = frozenset({"allOf", "anyOf", "oneOf", "not", "if", "then", "else"})
+
+
+def _portable_schema(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _portable_schema(child) for key, child in value.items() if key not in _UNPORTABLE_SCHEMA_KEYS}
+    if isinstance(value, list):
+        return [_portable_schema(child) for child in value]
+    return value
+
+
+def _complete_task_tool(result_schema: dict[str, Any] | None) -> dict[str, Any]:
+    tool = copy.deepcopy(COMPLETE_TASK_TOOL)
+    if result_schema is None:
+        return tool
+    function = tool["function"]
+    function["description"] += (
+        " This Task declares a structured result: with outcome=completed, pass it as "
+        "result, exactly matching its schema."
+    )
+    function["parameters"]["properties"]["result"] = {
+        **_portable_schema(result_schema),
+        "description": "The Task's structured result (required when outcome is completed).",
+    }
+    return tool
+
+
+def _result_error(result: Any, schema: dict[str, Any]) -> str | None:
+    from jsonschema import Draft202012Validator
+
+    if not isinstance(result, dict):
+        return "result is required when outcome is completed: an object matching the Task's result schema."
+    if _result_size(result) > _RESULT_MAX_CHARS:
+        return f"result is larger than {_RESULT_MAX_CHARS} characters."
+    try:
+        errors = sorted(
+            Draft202012Validator(schema).iter_errors(result),
+            key=lambda error: [str(part) for part in error.absolute_path],
+        )
+    except Exception:
+        # A schema the host cannot apply must not trap the run in refusals;
+        # the result's consumer validates what it reads.
+        logger.warning("Task result schema could not be applied; result accepted unchecked", exc_info=True)
+        return None
+    if not errors:
+        return None
+    first = errors[0]
+    where = "/".join(str(part) for part in first.absolute_path) or "result"
+    return f"result does not match the Task's result schema at {where}: {first.message}"[:1_000]
+
+
+def _parse_submission(
+    arguments: dict[str, Any],
+    result_schema: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
     outcome = _text(arguments.get("outcome"))
     if outcome not in {"completed", "blocked"}:
         return None, "outcome must be completed or blocked."
@@ -543,6 +794,13 @@ def _parse_submission(arguments: dict[str, Any]) -> tuple[dict[str, Any] | None,
             return None, f"acceptance[{index}] needs criterion, met (boolean) and evidence."
     if outcome == "blocked" and not _text(arguments.get("blocked_reason")):
         return None, "blocked_reason is required when outcome is blocked."
+    if result_schema is not None and outcome == "completed":
+        error = _result_error(arguments.get("result"), result_schema)
+        if error is not None:
+            return None, error
+    elif "result" in arguments:
+        # Only a declared result is carried; a blocked report has none.
+        arguments = {key: value for key, value in arguments.items() if key != "result"}
     return cap_submission(arguments), None
 
 
@@ -639,7 +897,7 @@ async def _delegation_authorized(
     *,
     entity_id: str,
     user_id: str | None,
-    workspace_id: str,
+    workspace_id: str | None,
     conversation_id: str | None,
     task_id: str | None,
 ) -> bool:
@@ -696,13 +954,16 @@ async def _loop_tools(
     ctx: Any,
     *,
     entity_id: str,
-    workspace_id: str,
+    workspace_id: str | None,
     agent_id: str | None,
     user_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    result_schema: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str] | None, Any, bool]:
     """The Agent's own tools plus delegation and the two loop controls.
+
+    ``complete_task`` carries the Task's declared result schema, if any.
 
     A Workspace Task's scheduled surface normally already carries
     ``delegate_to_agent``. When it does not, it is added for this loop only,
@@ -780,11 +1041,19 @@ async def _loop_tools(
     tools.extend([
         copy.deepcopy(waits.WAIT_UNTIL_TOOL),
         copy.deepcopy(UPDATE_TASK_PLAN_TOOL),
-        copy.deepcopy(COMPLETE_TASK_TOOL),
+        _complete_task_tool(result_schema),
     ])
     if allowed is not None:
         allowed.update(loop_tools)
+    # Host-owned schemas this loop adds must be enumerable by the guard.
+    runtime_check_host_tools("task_agent_loop", loop_tools | {REQUEST_INPUT_TOOL_NAME})
     return tools, allowed, envelope, can_delegate
+
+
+def _task_loop_handlers(handlers: dict[str, Any]) -> dict[str, Any]:
+    """The loop's own handlers; each is listed for the effect-contract guard."""
+    runtime_check_host_tools("task_agent_loop", handlers)
+    return handlers
 
 
 def _deadline_passed(value: Any) -> bool:
@@ -872,13 +1141,18 @@ _DELEGATED_APPROVAL_CODE = "agent_loop_delegated_hitl_unsupported"
 _UNRESUMABLE_APPROVAL_CODE = "agent_loop_approval_unresumable"
 
 
-def _approval_park_target(control: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]] | str:
+def _approval_park_target(
+    control: dict[str, Any], *, durable_delegation: bool = False,
+) -> tuple[str, dict[str, Any], dict[str, Any]] | str:
     """(request id, HITL envelope, pre-call checkpoint) of a resumable approval stop.
 
     Otherwise the block code. Only a Manor approval request on the very call
     the loop made can be parked on: re-executing that call is exactly what
-    was approved. A delegated agent's approval, a gate inside a Prompt Skill
-    or browser sequence, or a provider-side approval cannot resume that way.
+    was approved. A gate inside a Prompt Skill or browser sequence, or a
+    provider-side approval cannot resume that way. With durable delegation a
+    ``delegate_to_agent`` stop is the user's own rule on that call (its
+    agents park on their own cards), an ordinary resumable approval; with
+    inline delegation it is a nested agent's approval, which cannot resume.
     """
 
     from packages.core.constants.hitl_envelope import parse_hitl_envelope
@@ -886,7 +1160,9 @@ def _approval_park_target(control: dict[str, Any]) -> tuple[str, dict[str, Any],
     checkpoint = control.get("checkpoint")
     pending = checkpoint.get("pending_tool_call") if isinstance(checkpoint, dict) else None
     pending_name = str((pending or {}).get("name") or "") if isinstance(pending, dict) else ""
-    if pending_name == DELEGATE_TO_AGENT_TOOL_NAME or control.get("tool_name") == DELEGATE_TO_AGENT_TOOL_NAME:
+    if not durable_delegation and (
+        pending_name == DELEGATE_TO_AGENT_TOOL_NAME or control.get("tool_name") == DELEGATE_TO_AGENT_TOOL_NAME
+    ):
         return _DELEGATED_APPROVAL_CODE
     envelope = parse_hitl_envelope(control.get("blocking_result"))
     hitl = envelope.get("hitl") if isinstance(envelope, dict) and isinstance(envelope.get("hitl"), dict) else {}
@@ -975,6 +1251,9 @@ def _question_from_payload(payload: Any) -> dict[str, Any] | None:
             options=payload.get("options"),
             fields=payload.get("fields"),
             context=payload.get("context"),
+            # Host-owned (a screen hand-over): request_input never sets it.
+            action_link=payload.get("action_link"),
+            action_to_take=payload.get("action_to_take"),
         )
     except ValueError:
         return None
@@ -1015,31 +1294,186 @@ def _delegated_question(messages: list[dict[str, Any]], control: dict[str, Any])
     return None
 
 
-async def _record_wake_failure(
+async def wait_media_jobs_call(
+    arguments: dict[str, Any],
+    *,
+    resumed: Any,
     session_factory: Any,
-    claim: TaskCoordinatorClaim,
-    exc: BaseException,
-) -> tuple[int, dict[str, Any]]:
-    """Count a crash against this exact wake; 0 when this owner was superseded.
+    entity_id: str,
+    task_id: str,
+) -> Any:
+    """A Task-hosted loop's wait_media_jobs: one read, then park instead of blocking.
 
-    The counter lives in the checkpoint and is keyed by wake generation, so a
-    successful round (which rewrites the checkpoint) or a new wake resets it.
+    The result JSON is the registered tool's, unchanged (receipts are
+    projected from it); only this Task's own jobs are read. ``resumed`` is
+    the wait this wake resumes, if any. Shared by the root loop and its
+    delegated child runs.
     """
 
+    from packages.core.ai.tools.media_tools import _string_list, _wait_media_jobs_handler
+
+    now = waits.utcnow()
+    call_id = waits.tool_call_id(arguments)
+    parked = waits.resumed_wait(resumed, call_id, waits.WAITING_JOB_KIND)
+    if parked is not None:
+        job_ids = list(parked.get("requested_job_ids") or parked["job_ids"])
+        dropped = list(parked.get("dropped_job_ids") or [])
+        deadline = waits.parse_time(parked.get("deadline_at")) or now
+        requested_at = waits.parse_time(parked.get("requested_at")) or now
+    else:
+        job_ids, dropped = waits.cap_job_ids(_string_list(arguments.get("job_ids")))
+        deadline = waits.job_wait_deadline(arguments, now)
+        requested_at = now
+    if not job_ids:
+        return await _wait_media_jobs_handler(entity_id=entity_id, job_ids=[])
     async with session_factory() as db:
-        count, checkpoint = await durable_run.record_run_wake_failure(
-            db, TASK_COORDINATOR_RUN_SPEC,
-            key=claim.task_id,
-            claim_token=claim.claim_token,
-            claim_generation=claim.wake_generation,
-            error=exc,
-            failures_key=_WAKE_FAILURES_KEY,
+        owned = await waits.task_owned_job_ids(
+            db, entity_id=entity_id, task_id=task_id, job_ids=job_ids,
         )
-        if not count:
-            await db.rollback()
-            return 0, {}
-        await db.commit()
-        return count, checkpoint
+        await db.rollback()
+    if not owned:
+        return waits.no_owned_jobs_result(job_ids, dropped)
+    foreign = [job_id for job_id in job_ids if job_id not in owned]
+    raw = await _wait_media_jobs_handler(entity_id=entity_id, job_ids=owned, timeout_seconds=0)
+    deadline_passed = waits.wait_is_due(deadline, now)
+    if waits.pending_job_ids(raw) and not deadline_passed and not call_id:
+        # Without the runtime's call id the wait cannot be resumed,
+        # and this loop never blocks its worker on a wait.
+        return _argument_error(
+            waits.WAIT_MEDIA_JOBS_TOOL_NAME,
+            "Waiting for media jobs is unavailable in this run; the jobs are still "
+            "running. Continue without their results or report the Task blocked.",
+            code="wait_unavailable",
+            pending_job_ids=waits.pending_job_ids(raw),
+        )
+    if not waits.pending_job_ids(raw) or deadline_passed:
+        # Every job is terminal, or the wait is over (timed_out).
+        return waits.job_wait_result(
+            raw, foreign=foreign, total=len(job_ids),
+            waited_seconds=(deadline - requested_at).total_seconds() if parked else None,
+            dropped=dropped,
+        )
+    return waits.job_suspension(
+        call_id=call_id, job_ids=owned, deadline_at=deadline,
+        requested_at=requested_at, now=now,
+        requested_job_ids=job_ids, dropped_job_ids=dropped,
+    )
+
+
+async def _park_delegation(
+    host: TaskLoopHost,
+    *,
+    control: dict[str, Any],
+    final_checkpoint: dict[str, Any],
+    scope: Any,
+    task_id: str,
+    reason_prefix: str = "task_agent_loop_",
+) -> dict[str, Any]:
+    """Park a durable ``delegate_to_agent`` call on its child runs (root and child hosts).
+
+    A busy race the park found is replayed to the model as the call's gate
+    result on the next wake: nothing ran, the model corrects in place.
+    """
+
+    parked_call = control["checkpoint"].get("pending_tool_call") or {}
+    call_id = str(parked_call.get("id") or "")
+    payload = control.get("payload") if isinstance(control.get("payload"), dict) else {}
+    parked_checkpoint = {**final_checkpoint, RUNTIME_CHECKPOINT_KEY: copy.deepcopy(control["checkpoint"])}
+    if payload.get("resume"):
+        # The call re-ran while its batch is still open: park on it again.
+        wait = delegation.waiting_child_wait(call_id=call_id, child_ids=list(payload.get("child_ids") or []))
+        resumed = await host.resume_children_wait(
+            scope=scope, checkpoint={**parked_checkpoint, waits.TASK_LOOP_WAIT_KEY: wait}, wait=wait,
+        )
+        if resumed is None:
+            return {"status": "stale", "task_id": task_id}
+        if resumed["status"] == "continue":
+            # Settled meanwhile: the next wake replays the batch's result.
+            if not await host.restage(
+                reason_code=f"{reason_prefix}delegation_settled", delay_seconds=0,
+                checkpoint=resumed["checkpoint"],
+            ):
+                return {"status": "stale", "task_id": task_id}
+        return {"status": resumed["status"], "task_id": task_id}
+    specs = payload.get("children")
+    if not call_id or not isinstance(specs, list) or not specs:
+        raise RuntimeError("delegate_to_agent suspended without its children")
+    parked = await host.park_children(
+        scope=scope, call_id=call_id, specs=specs, parked_checkpoint=parked_checkpoint,
+    )
+    if parked is None:
+        return {"status": "stale", "task_id": task_id}
+    if parked["status"] == "busy":
+        busy_checkpoint = {
+            **parked_checkpoint,
+            RUNTIME_CHECKPOINT_KEY: {
+                **parked_checkpoint[RUNTIME_CHECKPOINT_KEY],
+                "pending_tool_result": {
+                    "id": call_id,
+                    "content": json.dumps(parked["error"], ensure_ascii=False),
+                    "gate": True,
+                },
+            },
+        }
+        if not await host.restage(
+            reason_code=f"{reason_prefix}delegation_busy", delay_seconds=0, checkpoint=busy_checkpoint,
+        ):
+            return {"status": "stale", "task_id": task_id}
+        return {"status": "delegation_busy", "task_id": task_id}
+    return {"status": WAITING_CHILD_WAIT_KIND, "task_id": task_id, "child_ids": parked["child_ids"]}
+
+
+class _TaskCoordinatorRunWrites(DurableRunWrites):
+    """The root run's host writes, through the named Task coordinator wrappers.
+
+    Each wrapper is looked up in this module when it is called, so patching
+    ``checkpoint_task_coordinator_run`` (and the others) here still reaches
+    every write the host makes. Arguments and results are the wrappers'.
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(TASK_COORDINATOR_RUN_SPEC, task_id)
+
+    async def checkpoint(self, db: Any, **kwargs: Any) -> int | None:
+        return await checkpoint_task_coordinator_run(db, task_id=self.key, **kwargs)
+
+    async def stage(self, db: Any, **kwargs: Any) -> Any | None:
+        return await stage_task_coordinator_wake(db, task_id=self.key, **kwargs)
+
+    async def settle(self, db: Any, **kwargs: Any) -> bool:
+        return await settle_task_coordinator_wake(db, task_id=self.key, **kwargs)
+
+    async def release(self, db: Any, **kwargs: Any) -> bool:
+        return await release_task_coordinator_claim(db, task_id=self.key, **kwargs)
+
+
+def _task_loop_host(
+    claim: TaskCoordinatorClaim,
+    *,
+    state: dict[str, Any],
+    session_factory: Any,
+) -> TaskLoopHost:
+    """The host of this Task's root run for one claimed wake.
+
+    Lease, fence, slice and the park's Task log and status writes are
+    resolved from this module at call time (the names tests patch).
+    """
+
+    return TaskLoopHost(
+        claim=claim,
+        writes=_TaskCoordinatorRunWrites(claim.task_id),
+        task_id=claim.task_id,
+        state=state,
+        session_factory=session_factory,
+        is_current=lambda current: _claim_is_current(current),
+        heartbeat=lambda current, lost: _heartbeat(current, lost),
+        slice_seconds=lambda: TASK_AGENT_LOOP_SLICE_SECONDS,
+        label=_LABEL,
+        add_log=lambda db, task_id, log_type, message, *, actor, **kwargs: add_task_log(
+            db, task_id, log_type, message, actor=actor, **kwargs,
+        ),
+        transition_status=lambda *args, **kwargs: apply_task_status_transition(*args, **kwargs),
+    )
 
 
 async def _write_terminal(
@@ -1070,11 +1504,12 @@ async def _write_terminal(
         scope = (await db.execute(
             select(Task.entity_id, Task.workspace_id).where(Task.id == claim.task_id)
         )).one_or_none()
-        if scope is None or not scope.workspace_id:
+        if scope is None:
             return False
-        await lock_workspace_access_boundary(
-            db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
-        )
+        if scope.workspace_id:
+            await lock_workspace_access_boundary(
+                db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
+            )
         task = (await db.execute(
             select(Task).where(Task.id == claim.task_id).with_for_update()
             .execution_options(populate_existing=True)
@@ -1099,6 +1534,11 @@ async def _write_terminal(
         )
         if actual_output is not None:
             task.actual_output = actual_output
+        # Delegated children live only while this run waits on them; a run
+        # that ends stops any that are open (Task -> Run -> child locks).
+        checkpoint = await delegation_settlement.cancel_root_delegation(
+            db, task=task, run=run, checkpoint=checkpoint, error_code=f"root_run_{run_phase}",
+        )
         run.checkpoint = checkpoint
         run.phase = run_phase
         if run_phase == TaskCoordinatorPhase.COMPLETED.value:
@@ -1127,16 +1567,34 @@ async def _write_terminal(
             db, task_id=claim.task_id, claim_token=claim.claim_token,
             claim_generation=claim.wake_generation,
         )
+        posted: dict[str, Any] = {}
         task_event = await _terminal_side_effects(
             db, task, agent_id=agent_id, started_at=started_at,
-            files=files or [], comment=comment, failure=failure,
+            files=files or [], comment=comment, failure=failure, posted=posted,
+            subscription_id=run.root_subscription_id,
+        )
+        # After the summary comment, so the row can name it (the W4c
+        # projector links it instead of posting the summary twice).
+        await append_run_journal(
+            db, run=run, kind=TaskRunJournalKind.TERMINAL,
+            payload=terminal_payload(
+                status=task_status, phase=run_phase,
+                error_code=failure[0] if failure else None, files=files,
+                summary=(comment or {}).get("summary") or log_message,
+                comment_log_id=posted.get("comment_log_id"),
+                acceptance_exceptions=len((comment or {}).get("exceptions") or []),
+                unconfirmed_effects=(
+                    len((comment or {}).get("unconfirmed_effects") or [])
+                    if (comment or {}).get("accepted") else 0
+                ),
+            ),
         )
         await db.commit()
-    from packages.core.plans.executor import PlanExecutor
+    from packages.core.services.task_terminal_events import emit_task_event
 
-    # After commit, as the V3 coordinator does: this drives notifications.
+    # After commit: this drives notifications.
     try:
-        await PlanExecutor._emit_task_event(task_event)
+        await emit_task_event(task_event)
     except Exception:
         logger.exception("Task %s terminal event delivery failed", claim.task_id)
     return True
@@ -1147,7 +1605,7 @@ def _aware(value: datetime) -> datetime:
 
 
 async def _config_versions(db: Any, agent_id: str | None) -> dict[str, Any] | None:
-    from packages.core.plans.executor import resolve_config_versions
+    from packages.core.services.task_terminal_events import resolve_config_versions
 
     try:
         async with db.begin_nested():
@@ -1170,15 +1628,51 @@ async def _best_effort(db: Any, label: str, task_id: str, work: Any) -> None:
 def _comment_body(comment: dict[str, Any], files: list[dict[str, Any]], *, locale: str) -> str:
     from packages.core.i18n import t
 
-    heading = t(
-        "plan.log.completed_heading" if comment.get("accepted") else "plan.log.partial_heading",
-        locale=locale,
-    )
+    exceptions = [
+        item for item in comment.get("exceptions") or []
+        if isinstance(item, dict) and item.get("criterion")
+    ]
+    uncertain = [
+        item for item in comment.get("unconfirmed_effects") or []
+        if isinstance(item, dict) and item.get("tool")
+    ]
+    if not comment.get("accepted"):
+        heading_key = "plan.log.partial_heading"
+    elif exceptions:
+        # Delivered, but the heading never claims full acceptance.
+        heading_key = "plan.log.delivered_with_exceptions_heading"
+    elif uncertain:
+        # Delivered, but the heading never claims every change was confirmed.
+        heading_key = "plan.log.delivered_with_unconfirmed_effects_heading"
+    else:
+        heading_key = "plan.log.completed_heading"
+    heading = t(heading_key, locale=locale)
     summary = comment.get("summary") or (
         t(comment["summary_key"], locale=locale) if comment.get("summary_key") else ""
     )
     body = f"{heading}\n\n{summary}".rstrip()
-    links = [f"- {ref['markdown_link']}" for ref in files if ref.get("markdown_link")]
+    if exceptions:
+        lines = [
+            f"- {item['criterion']}" + (f" — {item['evidence']}" if item.get("evidence") else "")
+            for item in exceptions
+        ]
+        body += (
+            f"\n\n{t('plan.log.acceptance_exceptions_heading', locale=locale)}\n" + "\n".join(lines)
+        )
+    if uncertain:
+        lines = [
+            "- " + t(
+                "plan.log.unconfirmed_effect_line", locale=locale,
+                call=describe_unconfirmed_effect({k: v for k, v in item.items() if k != "targets"}),
+                targets=", ".join(str(target) for target in item.get("targets") or [])
+                or t("plan.log.unconfirmed_effect_unknown_target", locale=locale),
+            )
+            for item in uncertain
+        ]
+        body += (
+            f"\n\n{t('plan.log.unconfirmed_effects_heading', locale=locale)}\n" + "\n".join(lines)
+        )
+    links =[f"- {ref['markdown_link']}" for ref in files if ref.get("markdown_link")]
     if links:
         body += "\n\n" + "\n".join(links)
     changes = []
@@ -1200,6 +1694,25 @@ def _comment_body(comment: dict[str, Any], files: list[dict[str, Any]], *, local
     return body
 
 
+def _announces_completion_in_chat(task: Task) -> bool:
+    """A Workspace Task someone asked for reports its result in the Workspace chat.
+
+    Initiative, scheduled and automation-created Tasks are delivered by their
+    own owners (the Initiative's decision, the schedule's occurrence, the
+    Workflow or parent Task that created them).
+    """
+    from packages.core.services.agent_initiative_decision import initiative_task_marker
+
+    if not task.workspace_id:
+        return False
+    details = task.details if isinstance(task.details, dict) else {}
+    return not (
+        initiative_task_marker(details)
+        or details.get("scheduled_run_id")
+        or details.get("automation_origin")
+    )
+
+
 async def _terminal_side_effects(
     db: Any,
     task: Task,
@@ -1209,8 +1722,13 @@ async def _terminal_side_effects(
     files: list[dict[str, Any]],
     comment: dict[str, Any] | None,
     failure: tuple[str, str] | None,
+    posted: dict[str, Any] | None = None,
+    subscription_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """_finalize's terminal side effects without a Plan or Steps; returns the task event."""
+    """_finalize's terminal side effects without a Plan or Steps; returns the task event.
+
+    ``posted["comment_log_id"]`` is set to the summary comment's Task log id.
+    """
 
     from packages.core.ai.runtime.task_evidence import runtime_record_task_agent_loop_evidence
     from packages.core.ledger.adapters import record_task_artifacts
@@ -1253,7 +1771,7 @@ async def _terminal_side_effects(
         )
 
     async def post_comment() -> None:
-        from packages.core.plans.response_language import resolve_task_response_locale
+        from packages.core.services.task_response_language import resolve_task_response_locale
         from packages.core.services.task_service import agent_log_authorship
 
         locale = await resolve_task_response_locale(db, task)
@@ -1261,16 +1779,42 @@ async def _terminal_side_effects(
         # A host-forced stop has no verified deliverables: it links the files
         # its receipt ledger confirms were produced instead.
         shown = files or ledger_file_refs(comment.get("ledger_files"), entity_id=task.entity_id)
-        await add_task_log(
+        log = await add_task_log(
             db, task.id, TaskLogType.COMMENT, _comment_body(comment, shown, locale=locale),
             actor=author_actor, created_by=author,
             metadata={"auto_summary": True, **(author_meta or {})},
+        )
+        await db.flush()
+        if posted is not None and getattr(log, "id", None):
+            posted["comment_log_id"] = str(log.id)
+
+    async def announce_completion() -> None:
+        from packages.core.models.workspace import AgentSubscription
+        from packages.core.services.task_response_language import resolve_task_response_locale
+        from packages.core.workspace_chat.notifiers import notify_task_completed
+
+        agent_name = (await db.execute(
+            select(AgentSubscription.name).where(AgentSubscription.id == subscription_id)
+        )).scalar_one_or_none() if subscription_id else None
+        await notify_task_completed(
+            db,
+            entity_id=task.entity_id,
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+            task_title=task.title,
+            summary=(comment or {}).get("summary"),
+            files=files,
+            subscription_id=subscription_id,
+            agent_name=agent_name,
+            locale=await resolve_task_response_locale(db, task),
         )
 
     await _best_effort(db, "workspace state refresh", task.id, refresh_workspace)
     await _best_effort(db, "runtime evidence", task.id, record_evidence)
     if comment is not None:
         await _best_effort(db, "summary comment", task.id, post_comment)
+    if task.status == TaskStatus.COMPLETED.value and _announces_completion_in_chat(task):
+        await _best_effort(db, "workspace chat completion", task.id, announce_completion)
     if task.status in TERMINAL_STATUSES:
         async def check_batch() -> None:
             from packages.core.services.workspace_operation_service import check_work_batch_completion
@@ -1288,21 +1832,26 @@ async def _terminal_side_effects(
     else:
         return None
     code, message = failure or (None, None)
-    return {
-        "entity_id": task.entity_id,
-        "event_type": event_type,
-        "payload": {
-            "task_id": task.id,
-            "title": task.title,
-            "workspace_id": task.workspace_id,
-            "task_status": task.status,
-            "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
-            "error_type": code,
-            "error_message": (message or "")[:1000] or None,
-            "prompt": (message or "")[:1000] or None,
-            "issue": (message or "")[:1000] or None,
-        },
+    payload: dict[str, Any] = {
+        "task_id": task.id,
+        "title": task.title,
+        "workspace_id": task.workspace_id,
+        "task_status": task.status,
+        "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
+        "error_type": code,
+        "error_message": (message or "")[:1000] or None,
+        "prompt": (message or "")[:1000] or None,
+        "issue": (message or "")[:1000] or None,
     }
+    exceptions = (task.actual_output or {}).get("acceptance_exceptions") if isinstance(task.actual_output, dict) else None
+    if event_type == "task.succeeded" and isinstance(exceptions, list) and exceptions:
+        # The notification says the delivery has exceptions, not "successfully".
+        payload["acceptance_exceptions"] = len(exceptions)
+    uncertain = (task.actual_output or {}).get("unconfirmed_effects") if isinstance(task.actual_output, dict) else None
+    if event_type == "task.succeeded" and isinstance(uncertain, list) and uncertain:
+        # Nor does it claim changes the host could not confirm.
+        payload["unconfirmed_effects"] = len(uncertain)
+    return {"entity_id": task.entity_id, "event_type": event_type, "payload": payload}
 
 
 def _host_stop_comment(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
@@ -1399,9 +1948,67 @@ async def _summary_with_openable_file_links(session_factory: Any, task_id: str, 
     )
 
 
+def _refusal_calls(evidence: Any) -> list[dict[str, Any]]:
+    """The unconfirmed calls as the refusal lists them: each with the files it
+    may have changed, and (``verify``) those a host read can still confirm."""
+
+    out = []
+    for call in getattr(evidence, "unconfirmed_calls", None) or ():
+        if not isinstance(call, dict):
+            continue
+        entry = {k: call.get(k) for k in ("call_id", "tool", "operation")}
+        pending = [
+            target for target in call.get("targets") or ()
+            if isinstance(target, dict) and not target.get("observed_by")
+        ]
+        identities = [
+            {k: target[k] for k in ("document_id", "fs_path") if target.get(k)} for target in pending
+        ]
+        verify = [identity for identity, target in zip(identities, pending) if target.get("sha256")]
+        if verify:
+            entry["verify"] = verify
+        if len(verify) < len(identities):
+            entry["may_have_changed"] = identities
+        out.append(entry)
+    return out
+
+
+def _unconfirmed_guidance(evidence: Any) -> str:
+    calls = _refusal_calls(evidence)
+    checkable = sum(1 for call in calls if call.get("verify"))
+    if not checkable:
+        return (
+            "None of them reported a file the host can check, so the host cannot confirm them "
+            "afterwards; verify the outcome yourself before deciding how to report."
+        )
+    text = (
+        "Re-read each file listed under verify with read_file: when the bytes the host reads "
+        "match what the call reported, the host confirms that call."
+    )
+    if checkable < len(calls):
+        text += " Calls without verify reported nothing the host can check and stay unconfirmed."
+    return text
+
+
+def _unconfirmed_consequence(delivered: bool) -> str:
+    """What a completed claim over still-unconfirmed calls leads to (W1a)."""
+    if delivered:
+        return (
+            "If the work is not done, report outcome=blocked. Otherwise completing delivers the "
+            "verified work, and calls still unconfirmed are listed on the Task as unconfirmed "
+            "exceptions (never as confirmed); do not claim a criterion met that depends on them."
+        )
+    return (
+        "If the work is not done, report outcome=blocked. Nothing verified was delivered, so a "
+        "completed claim over calls that are still unconfirmed is recorded as not confirmed and "
+        "the Task is blocked for review."
+    )
+
+
 def _claimed_not_confirmed(submission: dict[str, Any]) -> list[str]:
-    """completed_non_success is only a downgrade (a completed claim needs every
-    criterion met), so every criterion is claimed met and none is confirmed."""
+    """completed_non_success is only a downgrade of a completed claim over an
+    unconfirmed effect: the criteria it claimed met are none of them confirmed
+    (the ones it reported unmet were never claimed)."""
 
     return [
         str(entry["criterion"]) for entry in submission.get("acceptance") or []
@@ -1416,8 +2023,10 @@ def _non_success_message(
     lines = [
         "The Task agent reported the work complete, but the effect of "
         f"{len(calls) or 'an earlier'} tool call(s) could not be confirmed "
-        f"({describe_unconfirmed(calls)}). The Task is blocked for review instead of "
-        "being marked completed.",
+        f"({describe_unconfirmed(calls)}) and nothing verified was delivered. The Task is "
+        "blocked for review instead of being marked completed.",
+        "Needed: confirm whether those calls took effect (re-read what they changed), or "
+        "deliver a verified file, then retry the Task.",
         f"Summary: {submission['summary']}",
     ]
     if criteria:
@@ -1464,7 +2073,8 @@ async def _finish_submission(
         **result,
         # Scheduled settlement (_task_terminal_result) reads response/result.
         "response": submission["summary"],
-        "result": copy.deepcopy(result),
+        # A result the Task declared a schema for is the Task's result.
+        "result": copy.deepcopy(submission["result"] if "result" in submission else result),
         "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
         "outcome": copy.deepcopy(decision),
         "receipts": output_receipts(checkpoint.get(_TOOL_EVIDENCE_KEY)),
@@ -1480,28 +2090,44 @@ async def _finish_submission(
     checkpoint = {**checkpoint, TASK_COMPLETION_KEY: copy.deepcopy(completion)}
     if submission["outcome"] == "blocked":
         reason = str(submission.get("blocked_reason") or "").strip()
-        return await _block(
+        # The ledger, not the agent's wording, says a platform fault stopped
+        # it: the customer reads a plain status and Manor staff get the report.
+        fault = completion.get("platform_fault") if isinstance(completion.get("platform_fault"), dict) else None
+        headline = TASK_PLATFORM_BLOCK_MESSAGE if fault is not None else reason
+        blocked = await _block(
             session_factory, claim,
-            code="agent_loop_reported_blocked",
-            message=submission.get("blocked_reason") or submission["summary"],
+            code="platform_fault" if fault is not None else "agent_loop_reported_blocked",
+            message=headline or submission["summary"],
             checkpoint=checkpoint,
             details={
                 "submission": submission,
                 "outcome": decision,
                 "unverified_deliverables": completion.get("unverified_deliverables") or [],
+                "blocked_by": BLOCKED_BY_PLATFORM if fault is not None else BLOCKED_BY_AGENT,
+                **({"platform_error": fault["code"], "tool": fault.get("tool"),
+                    "operation": fault.get("operation"), "platform_reason": reason} if fault is not None else {}),
             },
             actual_output=actual_output,
             files=actual_output["files"],
             # Why it stopped and the verified work so far, under the heading
             # that does not claim completion (dropped deliverables excluded).
             comment={
-                "summary": f"{reason}\n\n{submission['summary']}" if reason else submission["summary"],
+                "summary": f"{headline}\n\n{submission['summary']}" if headline else submission["summary"],
                 "accepted": False,
                 **effect_lines,
             },
         )
+        if fault is not None and blocked.get("status") == "blocked":
+            await report_task_platform_block(
+                task_id=claim.task_id, entity_id=None, workspace_id=None,
+                code="platform_fault", cause=reason or submission["summary"],
+                details={"platform_error": fault["code"], "tool": fault.get("tool"),
+                         "operation": fault.get("operation")},
+            )
+        return blocked
     if decision.get("outcome") != "completed":
-        # W1a: success over an unconfirmed effect is never reported.
+        # W1a: a completed claim over an unconfirmed effect with nothing
+        # verified delivered is never reported as success.
         claimed = _claimed_not_confirmed(submission)
         return await _block(
             session_factory, claim,
@@ -1520,6 +2146,21 @@ async def _finish_submission(
             # not claim completion (as _finalize does for a withheld verdict).
             comment={"summary": submission["summary"], "accepted": False, **effect_lines},
         )
+    # A delivery: the Task completes. Criteria the agent reported unmet or
+    # unverified stay in its acceptance report and are surfaced as the
+    # delivery's exceptions (never marked met, never turned into a block).
+    exceptions = acceptance_exceptions(submission)
+    if exceptions:
+        actual_output["acceptance_exceptions"] = copy.deepcopy(exceptions)
+    # W1a, "delivered + exceptions": calls whose effect is still unconfirmed
+    # ride on the delivery as exceptions of their own, never as confirmed.
+    uncertain = (
+        copy.deepcopy(completion.get("unconfirmed_effects") or [{"tool": "earlier tool call"}])
+        if decision.get("effect_state") == "unconfirmed"
+        else []
+    )
+    if uncertain:
+        actual_output["unconfirmed_effects"] = uncertain
     written = await _write_terminal(
         session_factory, claim,
         task_status=TaskStatus.COMPLETED.value,
@@ -1534,10 +2175,17 @@ async def _finish_submission(
             "acceptance_criteria": (task_plan or {}).get("acceptance_criteria") or [],
             "outcome": decision,
             "files": actual_output["files"],
+            **({"acceptance_exceptions": exceptions} if exceptions else {}),
+            **({"unconfirmed_effects": uncertain} if uncertain else {}),
         },
         actual_output=actual_output,
         files=actual_output["files"],
-        comment={"summary": submission["summary"], "accepted": True, **effect_lines},
+        comment={
+            "summary": submission["summary"], "accepted": True,
+            **({"exceptions": exceptions} if exceptions else {}),
+            **({"unconfirmed_effects": uncertain} if uncertain else {}),
+            **effect_lines,
+        },
     )
     if not written:
         return {"status": "stale", "task_id": claim.task_id}
@@ -1560,311 +2208,11 @@ async def run_task_agent_loop_once(
     )
     if claim is None:
         return {"status": "deferred", "reason": claim_reason}
-    lost = asyncio.Event()
-    heartbeat = asyncio.create_task(_heartbeat(claim, lost))
-    started = time.monotonic()
     state = _initial_state(claim.state_version)
     slots = _run_state_slots(state)
-    mutation_lock = asyncio.Lock()
     session_factory = create_worker_session()
-
-    async def _restage(*, reason_code: str, delay_seconds: float, checkpoint: dict[str, Any] | None) -> bool:
-        """Owner re-stage: optional checkpoint, new wake and release in one commit."""
-
-        async with mutation_lock:
-            async with session_factory() as db:
-                if checkpoint is not None:
-                    version = await checkpoint_task_coordinator_run(
-                        db,
-                        task_id=task_id,
-                        claim_token=claim.claim_token,
-                        claim_generation=claim.wake_generation,
-                        expected_state_version=state["version"],
-                        checkpoint=checkpoint,
-                    )
-                    if version is None:
-                        await db.rollback()
-                        return False
-                    state["version"] = version
-                try:
-                    wake = await stage_task_coordinator_wake(
-                        db,
-                        task_id=task_id,
-                        reason=reason_code,
-                        delay_seconds=delay_seconds,
-                        expected_state_version=state["version"],
-                        claim_token=claim.claim_token,
-                        claim_generation=claim.wake_generation,
-                    )
-                except ValueError:
-                    await db.rollback()
-                    return False
-                if wake is None:
-                    await db.rollback()
-                    return False
-                # The successor wake can be delivered at once; do not make it
-                # wait for this owner's claim to lapse.
-                await release_task_coordinator_claim(
-                    db, task_id=task_id, claim_token=claim.claim_token,
-                    claim_generation=claim.wake_generation,
-                )
-                await db.commit()
-                return True
-
-    async def _park(*, wait: dict[str, Any], parked_checkpoint: dict[str, Any]) -> str | None:
-        """Park the pending wait call: checkpoint, phase, delayed wake, release.
-
-        One transaction under the Task -> Run locks. The Task stays
-        IN_PROGRESS (every wake gate requires it) and the wake is not settled:
-        staging replaces the row this owner claimed. Returns the wake time.
-        """
-
-        kind = wait["kind"]
-        phase = (
-            TaskCoordinatorPhase.WAITING_TIMER.value
-            if kind == waits.WAITING_TIMER_KIND
-            else TaskCoordinatorPhase.WAITING_JOB.value
-        )
-        async with mutation_lock:
-            async with session_factory() as db:
-                await db.execute(select(Task.id).where(Task.id == task_id).with_for_update())
-                version = await checkpoint_task_coordinator_run(
-                    db,
-                    task_id=task_id,
-                    claim_token=claim.claim_token,
-                    claim_generation=claim.wake_generation,
-                    expected_state_version=state["version"],
-                    checkpoint=parked_checkpoint,
-                    phase=phase,
-                )
-                if version is None:
-                    await db.rollback()
-                    return None
-                state["version"] = version
-                now = waits.utcnow()
-                if kind == waits.WAITING_TIMER_KIND:
-                    available_at = waits.parse_time(wait["wake_at"])
-                else:
-                    # Read under the Run lock: a job that finished just before
-                    # this park (its hook saw no WAITING_JOB run) wakes at once.
-                    deadline = waits.parse_time(wait["deadline_at"]) or now
-                    settled = await waits.media_jobs_settled(
-                        db, entity_id=entity_id, job_ids=wait["job_ids"],
-                    )
-                    available_at = (
-                        now
-                        if settled or deadline <= now
-                        else min(deadline, now + timedelta(seconds=waits.JOB_POLL_MAX_SECONDS))
-                    )
-                try:
-                    wake = await stage_task_coordinator_wake(
-                        db,
-                        task_id=task_id,
-                        reason=f"task_agent_loop_{kind}",
-                        available_at=available_at,
-                        expected_state_version=state["version"],
-                        claim_token=claim.claim_token,
-                        claim_generation=claim.wake_generation,
-                    )
-                except ValueError:
-                    wake = None
-                if wake is None:
-                    await db.rollback()
-                    return None
-                if state["resumed_wait"] is None or state["resumed_wait"].get("tool_call_id") != wait["tool_call_id"]:
-                    # Only a new wait is logged; an early wake re-parks quietly.
-                    await add_task_log(
-                        db, task_id, TaskLogType.AI_AGENT_TURN, waits.wait_log_line(wait),
-                        actor=TaskActor.SYSTEM,
-                        metadata={
-                            "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
-                            waits.TASK_LOOP_WAIT_KEY: wait,
-                        },
-                    )
-                await release_task_coordinator_claim(
-                    db, task_id=task_id, claim_token=claim.claim_token,
-                    claim_generation=claim.wake_generation,
-                )
-                await db.commit()
-                return waits.iso(wake.available_at)
-
-    async def _park_human(
-        *,
-        kind: str,
-        base_checkpoint: dict[str, Any],
-        runtime_checkpoint: dict[str, Any] | None,
-        tool_call_id: str,
-        tool_name: str,
-        summary: str,
-        question: dict[str, Any] | None = None,
-        hitl_id: str | None = None,
-        hitl_data: dict[str, Any] | None = None,
-        reuse_wait: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        """Park on a person: the existing card, WAITING_HUMAN, Task WAITING_ON_CUSTOMER.
-
-        One transaction under the approval-boundary -> HitlRequest -> Task ->
-        Run locks. The wake is settled: only the person's decision (or a
-        Task resume) wakes the run again. ``reuse_wait`` re-parks a run woken
-        while its card is still open, without a new card or log line.
-        Returns the stored wait, or None when this owner was superseded or the
-        request can no longer be parked on.
-        """
-
-        from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
-        from packages.core.models.hitl_request import HitlRequest
-
-        async with mutation_lock:
-            async with session_factory() as db:
-                request = None
-                if kind == loop_hitl.APPROVAL_WAIT_KIND:
-                    from packages.core.services.task_runtime_approvals import (
-                        lock_task_runtime_approval_boundary,
-                    )
-
-                    await lock_task_runtime_approval_boundary(db, task_id=task_id)
-                    request = (await db.execute(
-                        select(HitlRequest).where(
-                            HitlRequest.id == (reuse_wait or {}).get("hitl_request_id", hitl_id),
-                            HitlRequest.entity_id == entity_id,
-                            HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
-                            HitlRequest.origin_task_id == task_id,
-                        ).with_for_update().execution_options(populate_existing=True)
-                    )).scalar_one_or_none()
-                    if request is None or request.status != ApprovalStatus.PENDING.value:
-                        await db.rollback()
-                        return None
-                task_row = (await db.execute(
-                    select(Task).where(Task.id == task_id).with_for_update()
-                    .execution_options(populate_existing=True)
-                )).scalar_one()
-                if task_row.status != TaskStatus.IN_PROGRESS.value or (
-                    request is not None and request.origin_conversation_id != task_row.conversation_id
-                ):
-                    await db.rollback()
-                    return None
-                digest = (
-                    loop_hitl.runtime_checkpoint_digest(runtime_checkpoint)
-                    if runtime_checkpoint is not None
-                    else None
-                )
-                if reuse_wait is not None:
-                    wait = reuse_wait
-                else:
-                    if request is not None:
-                        request_id = request.id
-                    else:
-                        from packages.core.services.task_chat_hitl import ensure_task_input_hitl
-
-                        card = await ensure_task_input_hitl(db, task_row, question=question or {})
-                        action = card.pending_action if card is not None and isinstance(card.pending_action, dict) else {}
-                        request_id = str(action.get("approval_request_id") or "")
-                        if not request_id:
-                            await db.rollback()
-                            return None
-                    wait = loop_hitl.human_wait(
-                        kind=kind, tool_call_id=tool_call_id, tool_name=tool_name,
-                        hitl_request_id=request_id, checkpoint_digest=digest, summary=summary,
-                    )
-                parked_checkpoint = {
-                    key: value for key, value in base_checkpoint.items()
-                    if key not in {RUNTIME_CHECKPOINT_KEY, loop_hitl.HUMAN_NOTE_KEY, _WAKE_FAILURES_KEY}
-                }
-                parked_checkpoint[waits.TASK_LOOP_WAIT_KEY] = wait
-                if runtime_checkpoint is not None:
-                    parked_checkpoint[RUNTIME_CHECKPOINT_KEY] = runtime_checkpoint
-                version = await checkpoint_task_coordinator_run(
-                    db,
-                    task_id=task_id,
-                    claim_token=claim.claim_token,
-                    claim_generation=claim.wake_generation,
-                    expected_state_version=state["version"],
-                    checkpoint=parked_checkpoint,
-                    phase=TaskCoordinatorPhase.WAITING_HUMAN.value,
-                )
-                if version is None:
-                    await db.rollback()
-                    return None
-                state["version"] = version
-                if reuse_wait is None and request is not None:
-                    from packages.core.services.task_runtime_approvals import (
-                        project_task_runtime_approval_card,
-                    )
-
-                    request.context = {
-                        **(request.context or {}),
-                        loop_hitl.TASK_AGENT_LOOP_HITL_CONTEXT_KEY: loop_hitl.approval_tag(
-                            run_id=claim.run_id, task_id=task_id, tool_call_id=tool_call_id,
-                            hitl_request_id=request.id, checkpoint_digest=digest or "",
-                        ),
-                    }
-                    await project_task_runtime_approval_card(
-                        db, task=task_row, hitl_data=hitl_data or {}, hitl_id=request.id,
-                    )
-                if question is not None and reuse_wait is None:
-                    from packages.core.services.task_input_resume import TASK_INPUT_QUESTION_KEY
-
-                    # What the Task page renders while the Task waits on it.
-                    task_row.details = {
-                        **(task_row.details or {}),
-                        TASK_INPUT_QUESTION_KEY: question,
-                        "_hitl_response": None,
-                    }
-                await apply_task_status_transition(
-                    task_row, TaskStatus.WAITING_ON_CUSTOMER.value, db=db, actor_kind="system",
-                )
-                if reuse_wait is None:
-                    from packages.core.services.task_input_resume import task_input_log_meta
-
-                    metadata = {
-                        "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
-                        waits.TASK_LOOP_WAIT_KEY: wait,
-                    }
-                    if question is not None:
-                        await add_task_log(
-                            db, task_id, TaskLogType.AI_HITL_REQUESTED,
-                            f"Waiting for an answer: {question.get('question')}",
-                            actor=TaskActor.SYSTEM,
-                            metadata={**task_input_log_meta(question), **metadata},
-                        )
-                    else:
-                        await add_task_log(
-                            db, task_id, TaskLogType.AI_AGENT_TURN,
-                            f"Waiting for approval of {tool_name}: {summary}".rstrip(": "),
-                            actor=TaskActor.SYSTEM, metadata=metadata,
-                        )
-                if not await settle_task_coordinator_wake(
-                    db,
-                    task_id=task_id,
-                    event_id=claim.event_id,
-                    wake_generation=claim.wake_generation,
-                    claim_token=claim.claim_token,
-                ):
-                    await db.rollback()
-                    return None
-                await release_task_coordinator_claim(
-                    db, task_id=task_id, claim_token=claim.claim_token,
-                    claim_generation=claim.wake_generation,
-                )
-                await db.commit()
-                return wait
-
-    async def _human_wait_still_open(wait: dict[str, Any]) -> bool:
-        """Whether the card a woken human wait parked on is still undecided."""
-
-        from packages.core.constants.approvals import ApprovalStatus
-        from packages.core.models.hitl_request import HitlRequest
-
-        async with session_factory() as db:
-            status = (await db.execute(
-                select(HitlRequest.status).where(
-                    HitlRequest.id == wait.get("hitl_request_id"),
-                    HitlRequest.origin_task_id == task_id,
-                )
-            )).scalar_one_or_none()
-            await db.rollback()
-        return status == ApprovalStatus.PENDING.value
-
+    host = _task_loop_host(claim, state=state, session_factory=session_factory)
+    host.start()
     try:
         async with session_factory() as db:
             task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one()
@@ -1882,15 +2230,41 @@ async def run_task_agent_loop_once(
             if isinstance(checkpoint.get(waits.TASK_LOOP_WAIT_KEY), dict):
                 state["resumed_wait"] = checkpoint[waits.TASK_LOOP_WAIT_KEY]
             entity_id = str(task.entity_id)
-            workspace_id = str(task.workspace_id)
+            host.entity_id = entity_id
+            # None for a Task assigned directly to an Agent.
+            workspace_id = str(task.workspace_id) if task.workspace_id else None
             root_agent_id = run.root_agent_id
             root_subscription_id = run.root_subscription_id
             brief = task_brief(task)
+            result_schema = task_result_schema(task)
+            # Tools the Task's creator excluded from this run (an Initiative
+            # never delivers by itself); the envelope carries them to every gate.
+            declared_blocked = (task.details or {}).get("blocked_tool_names") if isinstance(task.details, dict) else None
+            blocked_tool_names = sorted({
+                str(name).strip() for name in declared_blocked if str(name or "").strip()
+            }) if isinstance(declared_blocked, list) else []
+            runtime_metadata = task_runtime_metadata(task)
+            required_skills = tuple(dict.fromkeys(
+                str(value).strip() for value in (task.required_skills or []) if str(value or "").strip()
+            ))
+            # The run carries out these Skills: their declared work tools load
+            # with it (re-authorized by exact discovery in the harness), as
+            # they do for an invoke_skill child, instead of one search per tool.
+            skill_tool_names: list[str] = []
+            if required_skills:
+                from packages.core.ai.runtime.skills import runtime_skill_refs_instruction_tool_names
+
+                skill_tool_names = await runtime_skill_refs_instruction_tool_names(
+                    db, required_skills, entity_id=entity_id,
+                )
             identity_error = None
+            steering_ended = False
             try:
-                user_id = await resolve_task_execution_user_id(db, task)
+                # A system Task (Strategist, scheduler) runs as the Workspace owner.
+                user_id = await resolve_task_run_user_id(db, task)
             except TaskRequesterIdentityError as exc:
                 user_id, identity_error = None, str(exc)
+                steering_ended = isinstance(exc, TaskSteeringEndedError)
             await db.commit()
 
         if state["submission"] is not None:
@@ -1901,12 +2275,20 @@ async def run_task_agent_loop_once(
                 submission=state["submission"], checkpoint=checkpoint,
                 task_plan=state["task_plan"], completion=state["completion"],
             )
+        if steering_ended:
+            return await _block(
+                session_factory, claim,
+                code=TASK_STEERING_ENDED_CODE,
+                message=TASK_STEERING_ENDED_MESSAGE,
+                checkpoint=checkpoint,
+                details={"reason": identity_error},
+            )
         if not user_id:
             return await _block(
                 session_factory, claim,
                 code="agent_loop_requester_unavailable",
                 message=(
-                    "No current workspace member can own this Task's model, billing "
+                    "No current member can own this Task's model, billing "
                     "and tool calls. Reassign the Task to an active member and retry."
                 ),
                 checkpoint=checkpoint,
@@ -1921,9 +2303,9 @@ async def run_task_agent_loop_once(
         ):
             # Woken while its person has not decided (the Task was paused and
             # resumed): wait on the same card again, without a model call.
-            if await _human_wait_still_open(human):
+            if await host.human_wait_still_open(human):
                 parked_runtime = checkpoint.get(RUNTIME_CHECKPOINT_KEY)
-                again = await _park_human(
+                again = await host.park_human(
                     kind=human["kind"],
                     base_checkpoint=checkpoint,
                     runtime_checkpoint=parked_runtime if isinstance(parked_runtime, dict) else None,
@@ -1939,6 +2321,28 @@ async def run_task_agent_loop_once(
             # parked call runs again and asks again if it still needs to.
             checkpoint = {key: value for key, value in checkpoint.items() if key != waits.TASK_LOOP_WAIT_KEY}
             state["resumed_wait"] = None
+
+        delegation_scope = delegation.DelegationScope(
+            task_id=task_id, entity_id=entity_id, workspace_id=workspace_id,
+            root_run_id=claim.run_id, run_id=claim.run_id, parent_child_id=None,
+            depth=0, agent_id=root_agent_id,
+        )
+        waiting = checkpoint.get(waits.TASK_LOOP_WAIT_KEY)
+        if delegation.unresolved_waiting_child(waiting):
+            # Woken while its delegated children's batch is open (a Task
+            # resume, the backstop): never a model round. A finished or
+            # broken batch settles here and the run continues; otherwise it
+            # parks again on the same children.
+            resumed = await host.resume_children_wait(
+                scope=delegation_scope, checkpoint=checkpoint, wait=waiting,
+            )
+            if resumed is None:
+                return {"status": "stale", "task_id": task_id}
+            if resumed["status"] != "continue":
+                return {"status": resumed["status"], "task_id": task_id}
+            checkpoint = copy.deepcopy(resumed["checkpoint"])
+            state["last_checkpoint"] = checkpoint
+            state["resumed_wait"] = checkpoint.get(waits.TASK_LOOP_WAIT_KEY)
 
         conversation_id = await _ensure_task_conversation(session_factory, claim)
         if conversation_id is None:
@@ -1956,11 +2360,16 @@ async def run_task_agent_loop_once(
             # The same surface plan-step workers run on, so approval and
             # automated-run semantics are unchanged.
             runtime_surface=ChatSurface.SCHEDULED_AGENT_RUN,
+            blocked_tool_names=blocked_tool_names,
+            # The run's transcript lives in its checkpoint; the Task's
+            # conversation (for a schedule, the chat it came from) is not it.
+            load_history=False,
+            runtime_metadata=runtime_metadata,
         )
         loop_tools_kwargs: dict[str, Any] = dict(
             entity_id=entity_id, workspace_id=workspace_id,
             user_id=user_id, conversation_id=conversation_id, task_id=task_id,
-            agent_id=root_agent_id,
+            agent_id=root_agent_id, result_schema=result_schema,
         )
         acquisition = None
         async with session_factory() as db:
@@ -1968,6 +2377,15 @@ async def run_task_agent_loop_once(
             tools, allowed_tool_names, envelope, can_delegate = await _loop_tools(
                 db, ctx, **loop_tools_kwargs,
             )
+            if can_delegate and state[DELEGATION_MODE_KEY] is None:
+                # Frozen for this run at the first wake that can delegate. A
+                # run in flight at rollout that already delegated inline keeps
+                # inline delegation.
+                state[DELEGATION_MODE_KEY] = (
+                    DELEGATION_MODE_INLINE
+                    if delegation.inline_delegation_started(checkpoint)
+                    else await delegation.resolve_delegation_mode(db, entity_id=entity_id, user_id=user_id)
+                )
             await db.commit()
 
         # The loop observes every tool result into this instance (the harness
@@ -1986,27 +2404,24 @@ async def run_task_agent_loop_once(
             })
             # Persisted with this round's strict checkpoint.
             state["task_plan"] = plan
+
+            async def _log(db: Any) -> None:
+                await add_task_log(
+                    db, task_id, TaskLogType.AI_AGENT_TURN,
+                    f"Plan revision {revision}: {len(plan['items'])} items, "
+                    f"{len(plan['acceptance_criteria'])} acceptance criteria.",
+                    actor=TaskActor.AGENT,
+                    metadata={
+                        "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
+                        TASK_PLAN_KEY: plan,
+                    },
+                )
+
             try:
-                async with session_factory() as db:
-                    # Task -> Run lock order, as admission and _write_terminal.
-                    await db.execute(
-                        select(Task.id).where(Task.id == task_id).with_for_update()
-                    )
-                    if not await _claim_held(db, claim):
-                        # The round checkpoint will fail on the same fence.
-                        await db.rollback()
-                        return json.dumps({"status": "ok", "revision": revision})
-                    await add_task_log(
-                        db, task_id, TaskLogType.AI_AGENT_TURN,
-                        f"Plan revision {revision}: {len(plan['items'])} items, "
-                        f"{len(plan['acceptance_criteria'])} acceptance criteria.",
-                        actor=TaskActor.AGENT,
-                        metadata={
-                            "engine": TaskCoordinatorEngine.AGENT_LOOP.value,
-                            TASK_PLAN_KEY: plan,
-                        },
-                    )
-                    await db.commit()
+                # Journaled with the log line under this exact claim; a
+                # superseded owner writes neither (its round checkpoint then
+                # fails on the same fence).
+                await host.record_plan_revision(plan, log=_log)
             except Exception:
                 logger.exception("Task %s plan log write failed", task_id)
             return json.dumps({"status": "ok", "revision": revision})
@@ -2042,68 +2457,20 @@ async def run_task_agent_loop_once(
             )
 
         async def _wait_media_jobs(arguments: dict[str, Any]) -> Any:
-            """The loop's wait_media_jobs: one read, then park instead of blocking.
-
-            The result JSON is the registered tool's, unchanged (receipts are
-            projected from it); only this Task's own jobs are read.
-            """
-
-            from packages.core.ai.tools.media_tools import _string_list, _wait_media_jobs_handler
-
-            now = waits.utcnow()
-            call_id = waits.tool_call_id(arguments)
-            parked = waits.resumed_wait(state["resumed_wait"], call_id, waits.WAITING_JOB_KIND)
-            if parked is not None:
-                job_ids = list(parked.get("requested_job_ids") or parked["job_ids"])
-                dropped = list(parked.get("dropped_job_ids") or [])
-                deadline = waits.parse_time(parked.get("deadline_at")) or now
-                requested_at = waits.parse_time(parked.get("requested_at")) or now
-            else:
-                job_ids, dropped = waits.cap_job_ids(_string_list(arguments.get("job_ids")))
-                deadline = waits.job_wait_deadline(arguments, now)
-                requested_at = now
-            if not job_ids:
-                return await _wait_media_jobs_handler(entity_id=entity_id, job_ids=[])
-            async with session_factory() as db:
-                owned = await waits.task_owned_job_ids(
-                    db, entity_id=entity_id, task_id=task_id, job_ids=job_ids,
-                )
-                await db.rollback()
-            if not owned:
-                return waits.no_owned_jobs_result(job_ids, dropped)
-            foreign = [job_id for job_id in job_ids if job_id not in owned]
-            raw = await _wait_media_jobs_handler(entity_id=entity_id, job_ids=owned, timeout_seconds=0)
-            deadline_passed = waits.wait_is_due(deadline, now)
-            if waits.pending_job_ids(raw) and not deadline_passed and not call_id:
-                # Without the runtime's call id the wait cannot be resumed,
-                # and this loop never blocks its worker on a wait.
-                return _argument_error(
-                    waits.WAIT_MEDIA_JOBS_TOOL_NAME,
-                    "Waiting for media jobs is unavailable in this run; the jobs are still "
-                    "running. Continue without their results or report the Task blocked.",
-                    code="wait_unavailable",
-                    pending_job_ids=waits.pending_job_ids(raw),
-                )
-            if not waits.pending_job_ids(raw) or deadline_passed:
-                # Every job is terminal, or the wait is over (timed_out).
-                return waits.job_wait_result(
-                    raw, foreign=foreign, total=len(job_ids),
-                    waited_seconds=(deadline - requested_at).total_seconds() if parked else None,
-                    dropped=dropped,
-                )
-            return waits.job_suspension(
-                call_id=call_id, job_ids=owned, deadline_at=deadline,
-                requested_at=requested_at, now=now,
-                requested_job_ids=job_ids, dropped_job_ids=dropped,
+            return await wait_media_jobs_call(
+                arguments, resumed=state["resumed_wait"], session_factory=session_factory,
+                entity_id=entity_id, task_id=task_id,
             )
 
         def _observe_tool_end(name: str, result: Any, _duration: Any = None, arguments: Any = None) -> None:
             # After the ledger observed the call: which files were written
             # and read, in order (the inspection check).
             state["inspection"].observe(name, result, arguments, evidence)
+            # This round's journal row: the call, redacted on the spot.
+            host.observe_tool_end(name, result, arguments)
 
         async def _complete_task(arguments: dict[str, Any]) -> str:
-            submission, error = _parse_submission(arguments)
+            submission, error = _parse_submission(arguments, result_schema)
             if error is not None:
                 return _argument_error(COMPLETE_TASK_TOOL_NAME, error)
             completed = submission["outcome"] == "completed"
@@ -2132,6 +2499,9 @@ async def run_task_agent_loop_once(
             if completed:
                 problems += [item["reason"] for item in unresolved]
                 problems += inspection_problems(resolved, state["inspection"])
+                # Exceptions ride on a delivery; with nothing delivered the
+                # report is a block (host fact, not the model's label).
+                problems += delivery_problems(submission, resolved, {"effects": evidence.effects})
             else:
                 # An honest blocked report is never refused over its partial
                 # files: in the tool-error lane reads are not even possible.
@@ -2152,10 +2522,16 @@ async def run_task_agent_loop_once(
                 {k: call.get(k) for k in ("call_id", "tool", "operation")}
                 for call in evidence.unconfirmed_calls if isinstance(call, dict)
             ]
+            # W1a, "delivered + exceptions": host facts that something was
+            # delivered (a verified deliverable, a confirmed people-facing
+            # effect), never the model's own "met".
+            delivered = completed and has_verified_delivery(resolved, {"effects": evidence.effects})
             if completed and ledger_state == "unconfirmed":
-                # Rule 1.4: refuse once per set of unconfirmed calls. A second
-                # completed claim over calls already shown is accepted as
-                # completed_non_success (never success).
+                # Rule 1.4: refuse once per set of unconfirmed calls, so the
+                # agent can verify (a host read reconciles a call). A second
+                # completed claim over calls already shown is a delivery with
+                # those calls as unconfirmed exceptions when something verified
+                # was delivered, otherwise completed_non_success (blocked).
                 shown = state["unconfirmed_refusal"]
                 current = unconfirmed_call_ids(evidence)
                 if shown is None or set(current) - set(shown):
@@ -2163,15 +2539,12 @@ async def run_task_agent_loop_once(
                     return _argument_error(
                         COMPLETE_TASK_TOOL_NAME,
                         "These tool calls may or may not have taken effect: "
-                        f"{describe_unconfirmed(calls)}. Verify their effects (for example "
-                        "re-read the target) before completing. If the work is not done, report "
-                        "outcome=blocked. The host cannot confirm them afterwards, so a "
-                        "completed claim over them is recorded as not confirmed and the Task "
-                        "is blocked for review.",
+                        f"{describe_unconfirmed(calls)}. {_unconfirmed_guidance(evidence)} "
+                        f"{_unconfirmed_consequence(delivered)}",
                         code="unconfirmed_effects",
-                        unconfirmed_calls=calls[:50],
+                        unconfirmed_calls=_refusal_calls(evidence)[:50],
                     )
-            decision = outcome_decision(ledger_state, submission["outcome"])
+            decision = outcome_decision(ledger_state, submission["outcome"], verified_delivery=delivered)
             state["completion"] = {
                 "files": delivered_files(resolved, entity_id=entity_id),
                 "deliverables": [
@@ -2180,57 +2553,33 @@ async def run_task_agent_loop_once(
                 ],
                 "outcome": decision.as_control(),
                 "unconfirmed_calls": calls[:50],
+                # What the person sees: per call, what it may have changed.
+                "unconfirmed_effects": unconfirmed_effects(evidence) if ledger_state == "unconfirmed" else [],
                 "unverified_deliverables": unverified,
             }
+            fault = None if completed else evidence.unresolved_platform_error()
+            if fault is not None:
+                state["completion"]["platform_fault"] = {
+                    key: fault.get(key) for key in ("code", "tool", "operation", "call_id")
+                }
             state["submission"] = submission
             return json.dumps({"status": "submitted", "outcome": submission["outcome"]})
 
-        async def _checkpoint(
-            rounds: int,
-            messages: list[dict[str, Any]],
-            usage: dict[str, Any],
-            tool_calls: list[str],
-            runtime_state: dict[str, Any] | None = None,
-        ) -> None:
-            async with mutation_lock:
-                if lost.is_set():
-                    raise RuntimeError(f"{_LABEL} claim heartbeat was lost")
-                # The harness hands over the round's RuntimeRunState snapshot
-                # with this loop's slots already captured; persist it without
-                # the ephemeral loop signals.
-                if not isinstance(runtime_state, dict) or RUN_STATE_VERSION_KEY not in runtime_state:
-                    raise RuntimeError(f"{_LABEL} round end came without the harness run state")
-                payload = runtime_run_state_persistable(runtime_state)
-                async with session_factory() as db:
-                    version = await checkpoint_task_coordinator_run(
-                        db,
-                        task_id=task_id,
-                        claim_token=claim.claim_token,
-                        claim_generation=claim.wake_generation,
-                        expected_state_version=state["version"],
-                        checkpoint=payload,
-                        **(
-                            {}
-                            if state["phase_running"]
-                            else {"phase": TaskCoordinatorPhase.RUNNING.value}
-                        ),
-                    )
-                    if version is None:
-                        lost.set()
-                        raise RuntimeError(f"{_LABEL} round checkpoint lost its claim")
-                    state["version"] = version
-                    await db.commit()
-                state["phase_running"] = True
-                state["last_checkpoint"] = payload
-                if time.monotonic() - started >= TASK_AGENT_LOOP_SLICE_SECONDS:
-                    # Yield at this round boundary; the cancel checker stops
-                    # the loop before its next model call.
-                    state["yield"] = True
+        durable_delegation = state[DELEGATION_MODE_KEY] == DELEGATION_MODE_DURABLE
 
-        async def _before_model(*_args: Any) -> None:
-            await task_run_host.fence_before_model(claim, lost, _claim_is_current, label=_LABEL)
+        async def _delegate_to_agent(arguments: dict[str, Any]) -> Any:
+            # Parks this loop on child runs (or refuses in place); never runs
+            # an agent in this worker.
+            return await delegation.delegate_to_agent_call(
+                arguments, scope=delegation_scope, resumed_wait=state["resumed_wait"],
+                session_factory=session_factory,
+            )
 
-        system_prompt = f"{ctx.system_prompt}\n\n{_task_section(brief, can_delegate=can_delegate)}"
+        task_section = _task_section(
+            brief, can_delegate=can_delegate, durable_delegation=durable_delegation,
+            required_skills=required_skills,
+        )
+        system_prompt = f"{ctx.system_prompt}\n\n{task_section}"
         loop_kwargs: dict[str, Any] = {
             "runtime_envelope": envelope,
             "system_prompt": system_prompt,
@@ -2251,7 +2600,7 @@ async def run_task_agent_loop_once(
             "max_rounds": _MAX_ROUNDS,
             # The live ledger: complete_task judges the run against it.
             "tool_evidence": evidence,
-            "dynamic_tool_handlers": {
+            "dynamic_tool_handlers": _task_loop_handlers({
                 waits.WAIT_UNTIL_TOOL_NAME: _wait_until,
                 # Overrides the registered wait for this loop only (also the
                 # forced call after a pending generate_file): it parks instead
@@ -2259,13 +2608,13 @@ async def run_task_agent_loop_once(
                 waits.WAIT_MEDIA_JOBS_TOOL_NAME: _wait_media_jobs,
                 UPDATE_TASK_PLAN_TOOL_NAME: _update_task_plan,
                 COMPLETE_TASK_TOOL_NAME: _complete_task,
-            },
+            }),
             "terminal_tool_result_policy": copy.deepcopy(_TERMINAL_POLICY),
-            "on_round_end": _checkpoint,
+            "on_round_end": host.checkpoint,
             "on_round_end_strict": True,
-            "on_llm_call_before": _before_model,
+            "on_llm_call_before": host.before_model,
             "on_tool_end": _observe_tool_end,
-            "runtime_cancel_checker": lambda: lost.is_set() or state["yield"],
+            "runtime_cancel_checker": host.cancel_requested,
             # request_input parks this loop; the answer is its call's result.
             "human_input_suspension": True,
             # An approval stop carries its pre-call checkpoint: this loop parks
@@ -2273,8 +2622,15 @@ async def run_task_agent_loop_once(
             "hitl_resume_checkpoint": True,
             # Every round snapshot carries these; nothing is listed by hand.
             "run_state_slots": slots,
+            # The required Skills' declared tools, loaded as if discovered.
+            "preloaded_tool_names": skill_tool_names,
         }
-        parked = checkpoint.get(RUNTIME_CHECKPOINT_KEY)
+        if durable_delegation and can_delegate:
+            # Chat keeps the registered (nested) delegation.
+            loop_kwargs["dynamic_tool_handlers"][DELEGATE_TO_AGENT_TOOL_NAME] = _delegate_to_agent
+        if acquisition is None:
+            loop_kwargs["system_prompt"] += _no_acquisition_section(can_delegate=can_delegate)
+        parked =checkpoint.get(RUNTIME_CHECKPOINT_KEY)
         wait = checkpoint.get("resource_wait")
         if (
             isinstance(parked, dict)
@@ -2324,7 +2680,7 @@ async def run_task_agent_loop_once(
             with runtime_media_jobs_detached_scope(task_id=task_id, run_id=claim.run_id), capability_scope:
                 result = await runtime_execute_agentic_loop(**loop_kwargs)
         except (RuntimeError, ValueError):
-            if not await _claim_is_current(claim):
+            if not await host.is_current():
                 return {"status": "superseded", "task_id": task_id}
             raise
 
@@ -2338,7 +2694,7 @@ async def run_task_agent_loop_once(
                 task_plan=state["task_plan"],
                 completion=state["completion"],
             )
-        if lost.is_set():
+        if host.lost.is_set():
             # A lost claim or failed fence: never write, the wake survives
             # for redelivery to the current owner.
             return {"status": "superseded", "task_id": task_id}
@@ -2361,7 +2717,7 @@ async def run_task_agent_loop_once(
             # snapshot: a round bounds its web source text, the final state
             # keeps all of it. A yield is not a failed attempt, so it does not
             # spend the continuation budget.
-            if not await _restage(
+            if not await host.restage(
                 reason_code="task_agent_loop_yield", delay_seconds=0, checkpoint=final_checkpoint,
             ):
                 return {"status": "superseded", "task_id": task_id}
@@ -2378,7 +2734,7 @@ async def run_task_agent_loop_once(
             # release the worker. Not a failure, so neither the continuation
             # budget nor the crash counter is spent; the next wake re-runs the
             # call, which parks again or returns its result.
-            wake_at = await _park(
+            wake_at = await host.park_wait(
                 wait=wait,
                 parked_checkpoint={
                     **final_checkpoint,
@@ -2391,6 +2747,15 @@ async def run_task_agent_loop_once(
             return {"status": wait["kind"], "task_id": task_id, "wake_at": wake_at}
         if (
             result.stop_reason == "waiting_resource"
+            and control.get("kind") == WAITING_CHILD_WAIT_KIND
+            and isinstance(control.get("checkpoint"), dict)
+        ):
+            return await _park_delegation(
+                host, control=control, final_checkpoint=final_checkpoint,
+                scope=delegation_scope, task_id=task_id,
+            )
+        if (
+            result.stop_reason == "waiting_resource"
             and control.get("kind") == loop_hitl.INPUT_WAIT_KIND
             and isinstance(control.get("checkpoint"), dict)
         ):
@@ -2400,7 +2765,7 @@ async def run_task_agent_loop_once(
             question = _question_from_payload(control.get("payload"))
             call_id = str(parked_call.get("id") or "")
             if question is not None and call_id:
-                human = await _park_human(
+                human = await host.park_human(
                     kind=loop_hitl.INPUT_WAIT_KIND,
                     base_checkpoint=final_checkpoint,
                     runtime_checkpoint=copy.deepcopy(control["checkpoint"]),
@@ -2423,7 +2788,7 @@ async def run_task_agent_loop_once(
             # the Task input card and continues from its transcript with the
             # answer, delegating to the same agent again.
             question, agent, call_id = delegated
-            human = await _park_human(
+            human = await host.park_human(
                 kind=loop_hitl.DELEGATED_INPUT_WAIT_KIND,
                 base_checkpoint=final_checkpoint,
                 runtime_checkpoint=None,
@@ -2469,7 +2834,7 @@ async def run_task_agent_loop_once(
                 RUNTIME_CHECKPOINT_KEY: copy.deepcopy(control["checkpoint"]),
                 "resource_wait": wait,
             }
-            if not await _restage(
+            if not await host.restage(
                 reason_code="task_agent_loop_resource_wait",
                 delay_seconds=delay,
                 checkpoint=parked_checkpoint,
@@ -2490,14 +2855,14 @@ async def run_task_agent_loop_once(
             )
         if result.stop_reason == "hitl_required":
             approval = _approval_summary(control)
-            target = _approval_park_target(control)
+            target = _approval_park_target(control, durable_delegation=durable_delegation)
             if not isinstance(target, str):
                 # Park on the Task-thread approval card. Approved: the wake
                 # re-executes this exact call and its guard spends the grant.
                 # Rejected: the wake replays a host-written "did not run".
                 hitl_id, envelope, pre_call = target
                 pending = pre_call["pending_tool_call"]
-                human = await _park_human(
+                human = await host.park_human(
                     kind=loop_hitl.APPROVAL_WAIT_KIND,
                     base_checkpoint=final_checkpoint,
                     runtime_checkpoint=copy.deepcopy(pre_call),
@@ -2509,13 +2874,12 @@ async def run_task_agent_loop_once(
                 )
                 if human is not None:
                     return {"status": "waiting_human", "task_id": task_id, "kind": human["kind"]}
-                if not await _claim_is_current(claim):
+                if not await host.is_current():
                     return {"status": "stale", "task_id": task_id}
                 # The request is no longer parkable (decided or gone): stop
                 # honestly below rather than wait on nothing.
                 target = _UNRESUMABLE_APPROVAL_CODE
-            # Never leave a live card that nothing can resume: approving it
-            # later must not reach TaskRunner's checkpoint path.
+            # Never leave a live card that nothing can resume.
             withdrawn = await _withdraw_approval_card(
                 session_factory, task_id=task_id, control=control, reason=target,
             )
@@ -2549,7 +2913,7 @@ async def run_task_agent_loop_once(
         ):
             state["non_submit_retries"] += 1
             final_checkpoint[_NON_SUBMIT_RETRIES_KEY] = state["non_submit_retries"]
-            if not await _restage(
+            if not await host.restage(
                 reason_code="task_agent_loop_completion_missing",
                 delay_seconds=30 * state["non_submit_retries"],
                 checkpoint=final_checkpoint,
@@ -2589,9 +2953,9 @@ async def run_task_agent_loop_once(
             # Connection-level and timeout failures say nothing about this
             # Task; never count them toward blocking it.
             raise
-        if lost.is_set() or not await _claim_is_current(claim):
+        if host.lost.is_set() or not await host.is_current():
             raise
-        failures, current = await _record_wake_failure(session_factory, claim, exc)
+        failures, current = await host.record_wake_failure(exc)
         if failures < _MAX_WAKE_FAILURES:
             raise
         logger.exception("Task %s agent loop failed %d times on one wake", task_id, failures)
@@ -2612,17 +2976,4 @@ async def run_task_agent_loop_once(
             },
         )
     finally:
-        lost.set()
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-        async with session_factory() as db:
-            await release_task_coordinator_claim(
-                db,
-                task_id=task_id,
-                claim_token=claim.claim_token,
-                claim_generation=wake_generation,
-            )
-            await db.commit()
+        await host.close()

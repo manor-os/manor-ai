@@ -86,6 +86,11 @@ async def test_workspace_delegation_uses_durable_per_call_billing_with_attempt_n
         )
 
     monkeypatch.setattr(database_module, "async_session", fake_session)
+
+    async def owner_pays(_db, *, entity_id, workspace_id):
+        return entity_id  # the fake session has no delivery rows to look up
+
+    monkeypatch.setattr("packages.core.services.billing_payer.resolve_run_payer", owner_pays)
     monkeypatch.setattr(actions, "_resolve_workspace_service_agent", fake_resolve_service)
     monkeypatch.setattr(context_module, "build_agent_context", fake_build_context)
     monkeypatch.setattr(

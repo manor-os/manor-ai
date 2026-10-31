@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
+from starlette.datastructures import Headers, UploadFile
 
 from packages.core.ai.runtime import file_actions, generated_files
 from packages.core.ai.tools import file_tools
@@ -16,6 +17,7 @@ from packages.core.ai.tools.generate_file import document, tool
 from packages.core.contracts.file_engine import file_type_capability
 from packages.core.models.base import generate_ulid
 from packages.core.services import file_context, file_conversion, upload_security
+from packages.core.services.entity_fs import get_entity_root
 from packages.core.services.image_formats import heif_mime_from_header
 from packages.core.services.office_editing import OfficeConversionLimitError
 from tests.test_knowledge_file_consistency import _doc_for, _seed_workspace, fs_enabled  # noqa: F401
@@ -111,6 +113,95 @@ async def test_heic_still_fails_closed_without_required_scanner(monkeypatch):
     assert error.value.status_code == 503
 
 
+def _gps_exif() -> Image.Exif:
+    """EXIF with GPS coordinates and an orientation that rotates the picture 90 degrees."""
+    exif = Image.Exif()
+    exif[274] = 6
+    gps = exif.get_ifd(0x8825)
+    gps[1], gps[2] = "N", (37.0, 46.0, 30.0)
+    gps[3], gps[4] = "W", (122.0, 25.0, 0.0)
+    exif[0x8825] = gps
+    return exif
+
+
+def _photo_with_gps_and_orientation() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (12, 8), (240, 20, 40)).save(output, format="JPEG", exif=_gps_exif().tobytes())
+    return output.getvalue()
+
+
+async def _store_through_knowledge_upload(client, photo: bytes) -> bytes:
+    registered = await client.post(
+        "/api/v1/auth/register",
+        json={"username": "photo_privacy", "email": "photo-privacy@test.com", "password": "pass123"},
+    )
+    headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+    entity_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["entity_id"]
+    upload = await client.post(
+        "/api/v1/documents/upload", headers=headers,
+        files={"file": ("IMG_0001.jpg", photo, "image/jpeg")},
+    )
+    assert upload.status_code == 201, upload.text
+    stored = (Path(get_entity_root(entity_id)) / upload.json()["fs_path"]).read_bytes()
+    assert upload.json()["file_size"] == len(stored)
+    return stored
+
+
+async def _store_through_chat_attachment(photo: bytes) -> bytes:
+    entity_id = generate_ulid()
+    attachment = UploadFile(
+        filename="IMG_0001.jpg", file=io.BytesIO(photo), headers=Headers({"content-type": "image/jpeg"}),
+    )
+    attachments = await file_context.build_file_context([attachment], [], entity_id, db=None)
+    reference = attachments.attachment_refs[0]["path"]
+    stored = (Path(get_entity_root(entity_id)) / reference).read_bytes()
+    # Chat files are named by the digest of the bytes actually saved.
+    assert reference == f"uploads/chat/{hashlib.sha256(stored).hexdigest()[:16]}.jpg"
+    return stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fs_enabled")
+@pytest.mark.parametrize("entry", ["knowledge", "chat"])
+async def test_stored_photo_drops_gps_metadata_and_keeps_orientation(client, entry):
+    photo = _photo_with_gps_and_orientation()
+    if entry == "knowledge":
+        stored = await _store_through_knowledge_upload(client, photo)
+    else:
+        stored = await _store_through_chat_attachment(photo)
+    assert b"Exif\x00\x00" not in stored
+    with Image.open(io.BytesIO(stored)) as photo_out:
+        assert photo_out.format == "JPEG"
+        assert photo_out.size == (8, 12)  # the orientation was applied to the pixels
+        assert 0x8825 not in photo_out.getexif()
+        assert not photo_out.getexif().get(274)
+
+
+@pytest.mark.parametrize("format_name,media_type", [
+    ("JPEG", "image/jpeg"), ("PNG", "image/png"), ("WEBP", "image/webp"), ("HEIF", "image/heic"),
+])
+def test_every_supported_photo_format_drops_embedded_exif(format_name, media_type):
+    # HEIF is the iPhone default and carries EXIF in info, which encoders can
+    # write back out; each format must come out without its GPS tags.
+    from packages.core.services.image_formats import register_heif_decoder
+    from packages.core.services.image_metadata import strip_image_metadata
+
+    register_heif_decoder()
+    source = io.BytesIO()
+    kwargs = {"exif": _gps_exif().tobytes()}
+    if format_name == "WEBP":
+        kwargs["lossless"] = True
+    if format_name == "HEIF":
+        kwargs["quality"] = 90
+    Image.new("RGB", (12, 8), (240, 20, 40)).save(source, format=format_name, **kwargs)
+
+    stored = strip_image_metadata(source.getvalue(), media_type=media_type)
+
+    with Image.open(io.BytesIO(stored)) as photo_out:
+        assert 0x8825 not in photo_out.getexif()
+        assert not photo_out.info.get("exif")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind,nested", [("image", False), ("image", True), ("document", False)])
 async def test_source_conversion_never_calls_an_image_model(monkeypatch, kind, nested):
@@ -186,7 +277,9 @@ async def test_large_uploaded_png_retains_source_hash_and_converts(db_session, a
     args = {"entity_id": user.entity_id, "user_id": user.id, "conversation_id": conv.id}
     read = json.loads(await file_tools._read_file(**args, path=path, include_image=include_image))
     assert read["read_mode"] == "metadata" and "error" not in read
-    assert "image" not in read
+    # Never silently metadata: the reason the pixels were withheld is explicit.
+    assert read["image"]["delivered"] is False and "data_url" not in read["image"]
+    assert read["image"]["reason"] == ("include_image_false" if include_image is False else "image_too_large")
     assert read["source_sha256"] == hashlib.sha256(original).hexdigest()
     assert read["size"] == len(original)
     monkeypatch.setattr(file_actions, "runtime_guard_file_mutation", AsyncMock(return_value=None))

@@ -116,7 +116,7 @@ function DeliveryForm({ onClose, client, workspace, initialWorkspace, identity }
   return <Modal open onClose={() => { if (!busy) onClose(); }} title={c(receipt ? (receipt.email_delivery?.status === "sent" ? "email_sent_title" : "invite_ready") : "deliver")}>
     {receipt ? <div className="space-y-4">
       <p role="status" className="text-sm">{t("page.clients.delivery_ready", { name: receipt.title })}</p>
-      <p className="text-sm text-stone-500">{receipt.recipient_email} · {t(`page.collaboration.${receipt.phase === "delivered" ? "direct_delivery" : "phase_trial"}`)}</p>
+      <p className="text-sm text-stone-500">{receipt.recipient_email}</p>
       <p role={receipt.email_delivery?.status === "sent" ? "status" : "alert"} className="text-sm">{t(`page.clients.email_${receipt.email_delivery?.status || "not_sent"}`, { email: receipt.recipient_email })}</p>
       {receipt.email_delivery?.status !== "sent" && <Button loading={busy} onClick={() => void resend()}>{c("resend_email")}</Button>}
       <p className="text-sm text-stone-500">{c("link_policy")}</p>
@@ -161,11 +161,18 @@ function DeliveryForm({ onClose, client, workspace, initialWorkspace, identity }
             aria-label={document.path}
             checked={knowledgeDocumentIds.includes(document.id)}
             disabled={busy || (!knowledgeDocumentIds.includes(document.id) && knowledgeDocumentIds.length >= KNOWLEDGE_SELECTION_LIMIT)}
-            onChange={checked => setKnowledgeDocumentIds(current => checked
-              ? [...new Set([...current, document.id])].slice(0, KNOWLEDGE_SELECTION_LIMIT)
-              : current.filter(id => id !== document.id))}
+            onChange={checked => {
+              setKnowledgeDocumentIds(current => checked
+                ? [...new Set([...current, document.id])].slice(0, KNOWLEDGE_SELECTION_LIMIT)
+                : current.filter(id => id !== document.id));
+              setError("");
+            }}
             style={{ width: "100%", alignItems: "flex-start" }}
-            label={<span className="break-all text-sm">{document.path}</span>}
+            label={<span className="break-all text-sm">
+              {document.path}
+              {document.content_source === "initial_template" && <span className="block text-xs text-stone-500">{c("starter_initial_template")}</span>}
+              {!!document.required_by_workflows?.length && <span className="block text-xs text-stone-500">{t("page.clients.starter_required_by", { workflows: document.required_by_workflows.join(", ") })}</span>}
+            </span>}
           />)}
         </div>}
         {(knowledgeOffset > 0 || knowledgeDocuments.length === KNOWLEDGE_PAGE_SIZE) && <div className="flex flex-wrap gap-2">

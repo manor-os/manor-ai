@@ -25,6 +25,8 @@ declare module "@novnc/novnc" {
     qualityLevel: number;
     compressionLevel: number;
     showDotCursor: boolean;
+    focusOnClick: boolean;
     disconnect(): void;
+    sendKey(keysym: number, code: string | null, down?: boolean): void;
   }
 }

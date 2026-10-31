@@ -343,8 +343,7 @@ Minutes 工具通过所连接的账号读取会议、转写、摘要和行动项
 | `TWILIO_ALLOW_UNSIGNED_LOCAL` | 仅用于本地 Twilio webhook 调试；staging/production 保持 `false`。Twilio Account SID、Auth Token 和电话号码在每个 Integration 中配置。 |
 | `OPENAI_REALTIME_MODEL` | Browser 与 Twilio Voice 共用的原生 OpenAI Realtime 模型，默认 `gpt-realtime`。 |
 
-在“账户 → 模型”为**语音合成**配置提供商凭据；使用 `suno/music` 时，为
-**音乐与配乐**配置原生 Suno BYOK 密钥。这些角色级凭据遵循 Entity 的模型配置。
+在“账户 → 模型”为**语音合成**配置提供商 BYOK 凭据。这些角色级凭据遵循 Entity 的模型配置。
 缺少密钥或密钥与模型不匹配时，生成会在供应商请求前被拒绝；自托管音频不会
 使用部署级托管凭据兜底。
 
@@ -410,7 +409,7 @@ docker compose --profile nango up -d nango-server
 | `NANGO_PUBLIC_URL` | 未设置 | OAuth 回调与 SaaS webhook 的公网主机名。本地开发可留空;生产应在反向代理后使用 `https://nango.<你的域名>`。 |
 | `NANGO_SECRET_KEY` | 未设置 | 来自 Nango 管理界面。留空则完全禁用 Nango。 |
 | `NANGO_PUBLIC_KEY` | 未设置 | Nango 管理界面中的 public key。 |
-| `NANGO_CONNECT_HMAC_KEY` | 未设置 | 独立的 64 位小写十六进制密钥，用于 Nango Connect HMAC 和派生 webhook URL 凭据。DOKS Nango bundle 与浏览器 OAuth 必填；仅 webhook 接收器在未改动的本地 Compose 中回退使用 `NANGO_SECRET_KEY`。 |
+| `NANGO_CONNECT_HMAC_KEY` | 未设置 | 独立的 64 位小写十六进制密钥，用于 Nango Connect HMAC 和派生 webhook URL 凭据。浏览器 OAuth 必填；仅 webhook 接收器在未改动的本地 Compose 中回退使用 `NANGO_SECRET_KEY`。 |
 | `NANGO_WEBHOOK_SECRET` | 未设置 | Compose 兼容保留变量。Nango 0.36 不会使用它为外发 webhook 请求添加签名，不能依赖它进行 webhook 认证。 |
 | `NANGO_WEBHOOK_URL` | 未设置 | Nango POST webhook 的目标 URL。Manor 会追加派生的 `nango_webhook_token` 查询参数，因为 Nango 0.36 不发送签名头。默认 Compose 内部地址为 `http://manor-api:8000/api/v1/nango/webhook`；生产环境需覆盖。 |
 

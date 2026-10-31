@@ -28,6 +28,7 @@ import docker from "react-syntax-highlighter/dist/esm/languages/prism/docker";
 import { resolveDisplayMediaUrl } from "../lib/api";
 import { t } from "../lib/i18n";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
+import ChatFilePreview, { FoldedPreview, previewName } from "./ChatFilePreview";
 import InlineTaskReferenceCard from "./InlineTaskReferenceCard";
 import InlineIntegrationLink from "./InlineIntegrationLink";
 import SourceCitation from "./SourceCitation";
@@ -357,7 +358,7 @@ const markdownComponents: Components = {
                 isOpenableFileReference(targetReference)
               )
             ) {
-              return (
+              const chip = (
                 <InlineFileReferenceCard
                   reference={targetReference}
                   label={label || undefined}
@@ -365,8 +366,14 @@ const markdownComponents: Components = {
                   compact
                 />
               );
+              // A reply shows the image, video or document it links to, folded on request.
+              if (isUser) return chip;
+              return (
+                <ChatFilePreview reference={targetReference} label={label || undefined} returnTo={returnTo}
+                  fallback={chip} />
+              );
             }
-            return (
+            const anchor = (
               <a
                 href={href}
                 target="_blank"
@@ -381,10 +388,15 @@ const markdownComponents: Components = {
                 {children}
               </a>
             );
+            return anchor;
           },
 
           img({ src, alt }) {
-            return <ProtectedMarkdownImage src={src || ""} alt={alt || ""} />;
+            const { isUser } = useContext(MarkdownRenderContext);
+            const image = <ProtectedMarkdownImage src={src || ""} alt={alt || ""} />;
+            // A reply's image folds away like the files it links to.
+            if (isUser || !src) return image;
+            return <FoldedPreview label={alt?.trim() || previewName(src)}>{image}</FoldedPreview>;
           },
 
           table({ children }) {

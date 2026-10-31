@@ -8,7 +8,13 @@ import { useEmailAccounts } from "../lib/emailAccounts";
 import IntegrationLogo from "../components/IntegrationLogo";
 import { getIntegrationBrandColor as getLogoColor, resolveIntegrationBrand } from "../lib/brands/catalog";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, type HealthStatus, type WorkerResponse } from "../lib/api";
+import {
+  api,
+  type ConnectionShareSummary,
+  type HealthStatus,
+  type WorkerResponse,
+} from "../lib/api";
+import ShareConnectionDialog, { ShareBadge, hasConnectionShares } from "../components/integrations/ShareConnectionDialog";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import { MANOR_AGENT_ID } from "../lib/constants";
@@ -69,6 +75,7 @@ import {
   IconExternalLink,
   type IconProps,
 } from "../components/icons";
+import { getPreferredTimeZone } from "../lib/format";
 
 /* ------------------------------------------------------------------ */
 /*  Types & constants                                                  */
@@ -167,7 +174,6 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
   webhook: "developer_tools",
   replicate: "ai_media",
   elevenlabs: "ai_media",
-  suno: "ai_media",
   jimeng: "ai_media",
   remotion: "ai_media",
 };
@@ -759,14 +765,14 @@ function BindingRow({
       ? {
           key: "in",
           label: `${t("page.integrations.in")} ${_relTime(binding.last_inbound_at)}`,
-          title: new Date(binding.last_inbound_at).toLocaleString(),
+          title: new Date(binding.last_inbound_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }),
         }
       : null,
     binding.last_outbound_at
       ? {
           key: "out",
           label: `${t("page.integrations.out")} ${_relTime(binding.last_outbound_at)}`,
-          title: new Date(binding.last_outbound_at).toLocaleString(),
+          title: new Date(binding.last_outbound_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }),
         }
       : null,
   ].filter(Boolean) as Array<{ key: string; label: string; title: string }>;
@@ -1391,6 +1397,7 @@ type McpServerRow = {
     owner_display_name: string | null;
     can_manage: boolean;
     can_share: boolean;
+    share_summary?: ConnectionShareSummary | null;
     runtime_callable: boolean;
     availability:
       | "callable"
@@ -1414,6 +1421,7 @@ type McpServerRow = {
     owner_display_name: string | null;
     can_manage: boolean;
     can_share: boolean;
+    share_summary?: ConnectionShareSummary | null;
     runtime_callable: boolean;
     availability:
       | "callable"
@@ -3298,17 +3306,6 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     ],
     docs_hint: t("page.integrations.docs_hint_14"),
   },
-  suno: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.api_keys.api_key"),
-        type: "password",
-        placeholder: "sk_live_…",
-        required: true,
-      },
-    ],
-  },
   tavily: {
     fields: [
       {
@@ -3321,17 +3318,6 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
       },
     ],
     docs_hint: t("page.integrations.docs_hint_16"),
-  },
-  apify: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.api_keys.api_key"),
-        type: "password",
-        placeholder: "apify_api_…",
-        required: true,
-      },
-    ],
   },
   jimeng: {
     fields: [
@@ -4384,6 +4370,7 @@ function EntityAccountRow({
     ownership: "mine" | "shared";
     owner_display_name: string | null;
     can_share: boolean;
+    share_summary?: ConnectionShareSummary | null;
     runtime_callable: boolean;
     availability:
       | "callable"
@@ -4402,10 +4389,10 @@ function EntityAccountRow({
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
-  const ownedEmailAccount = ["email", "gmail", "outlook"].includes(serverKey) && account.ownership === "mine";
-  const emailSettings = useEmailAccounts(ownedEmailAccount);
+  const emailAccount = ["email", "gmail", "outlook"].includes(serverKey);
+  const emailSettings = useEmailAccounts(emailAccount);
   const senderId = account.id;
-  const isDefault = ownedEmailAccount
+  const isDefault = emailAccount
     ? emailSettings.data?.default_sender_id === senderId
     : account.is_default;
   const [shareOpen, setShareOpen] = useState(false);
@@ -4492,7 +4479,7 @@ function EntityAccountRow({
   const wiringBroken = hasWiring && account.health?.wiring?.ok === false;
   const unavailable = !account.runtime_callable;
   const canSetDefault = account.runtime_callable && !isDefault
-    && (!ownedEmailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
+    && (!emailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
 
   const items = [
     ...(showActions
@@ -4614,10 +4601,15 @@ function EntityAccountRow({
             )}
         </span>
         {isDefault && <DefaultBadge />}
-        {canShare && !unavailable && (
-          <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
-            Share
-          </Button>
+        {(canShare ||
+          (account.ownership === "mine" &&
+            hasConnectionShares(account.share_summary))) && (
+          <>
+            <ShareBadge summary={account.share_summary} />
+            <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
+              {t("page.integrations.sharing_share")}
+            </Button>
+          </>
         )}
         {(showActions || canSetDefault) && (
           <MoreMenu
@@ -4645,7 +4637,7 @@ function EntityAccountRow({
           />
         )}
       </div>
-      {ownedEmailAccount && emailSettings.error && (
+      {emailAccount && emailSettings.error && (
         <div className="flex flex-wrap items-center gap-2">
           <p role="alert" className="m-0 text-xs text-[var(--text-muted)]">{t("email_accounts.load_error")}</p>
           <Button variant="ghost" size="sm" onClick={() => void emailSettings.refetch()}>{t("email_accounts.retry")}</Button>
@@ -4684,7 +4676,7 @@ function EntityAccountRow({
       )}
       {account.ownership === "shared" && account.owner_display_name && (
         <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
-          Shared by {account.owner_display_name}
+          {t("page.integrations.sharing_shared_by").replace("{name}", account.owner_display_name)}
         </div>
       )}
       <ShareConnectionDialog
@@ -4908,7 +4900,7 @@ function ConnectionStatusPip({
     if (health?.checked_at)
       lines.push(
         `  ${t("page.integrations.last_check_label")} ` +
-          new Date(health.checked_at).toLocaleString(),
+          new Date(health.checked_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }),
       );
   }
 
@@ -4974,6 +4966,7 @@ function ConnectionRow({
     ownership: "mine" | "shared";
     owner_display_name: string | null;
     can_share: boolean;
+    share_summary?: ConnectionShareSummary | null;
     runtime_callable: boolean;
     availability:
       | "callable"
@@ -4989,10 +4982,10 @@ function ConnectionRow({
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
-  const ownedEmailAccount = ["email", "gmail", "outlook"].includes(serverKey) && connection.ownership === "mine";
-  const emailSettings = useEmailAccounts(ownedEmailAccount);
+  const emailAccount = ["email", "gmail", "outlook"].includes(serverKey);
+  const emailSettings = useEmailAccounts(emailAccount);
   const senderId = `oauth:${connection.id}`;
-  const isDefault = ownedEmailAccount
+  const isDefault = emailAccount
     ? emailSettings.data?.default_sender_id === senderId
     : connection.is_default;
   const [shareOpen, setShareOpen] = useState(false);
@@ -5036,7 +5029,7 @@ function ConnectionRow({
   const authFailed = connection.health?.ok === false;
   const unavailable = !connection.runtime_callable;
   const canSetDefault = connection.runtime_callable && !isDefault
-    && (!ownedEmailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
+    && (!emailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
   const reconnectUnavailable =
     connection.availability === "reconnect_required"
     || connection.availability === "load_failed";
@@ -5130,10 +5123,15 @@ function ConnectionRow({
         </span>
         {isDefault && <DefaultBadge />}
         {expired && <ExpiredBadge />}
-        {canShare && !unavailable && (
-          <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
-            Share
-          </Button>
+        {(canShare ||
+          (connection.ownership === "mine" &&
+            hasConnectionShares(connection.share_summary))) && (
+          <>
+            <ShareBadge summary={connection.share_summary} />
+            <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
+              {t("page.integrations.sharing_share")}
+            </Button>
+          </>
         )}
         {showActions && needsReconnect && (
           <Button
@@ -5168,7 +5166,7 @@ function ConnectionRow({
           />
         )}
       </div>
-      {ownedEmailAccount && emailSettings.error && (
+      {emailAccount && emailSettings.error && (
         <div className="flex flex-wrap items-center gap-2">
           <p role="alert" className="m-0 text-xs text-[var(--text-muted)]">{t("email_accounts.load_error")}</p>
           <Button variant="ghost" size="sm" onClick={() => void emailSettings.refetch()}>{t("email_accounts.retry")}</Button>
@@ -5190,7 +5188,7 @@ function ConnectionRow({
       )}
       {connection.ownership === "shared" && connection.owner_display_name && (
         <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
-          Shared by {connection.owner_display_name}
+          {t("page.integrations.sharing_shared_by").replace("{name}", connection.owner_display_name)}
         </div>
       )}
       <ShareConnectionDialog
@@ -5199,129 +5197,5 @@ function ConnectionRow({
         connection={{ id: connection.id, kind: connection.kind, label }}
       />
     </div>
-  );
-}
-
-function ShareConnectionDialog({
-  open,
-  onClose,
-  connection,
-}: {
-  open: boolean;
-  onClose: () => void;
-  connection: {
-    id: string;
-    kind: "integration" | "oauth_account";
-    label: string;
-  };
-}) {
-  const queryClient = useQueryClient();
-  const toast = useToastStore();
-  const [recipientId, setRecipientId] = useState("");
-  const { data: users = [] } = useQuery({
-    queryKey: ["users", "directory"],
-    queryFn: () => api.users.directory(),
-    enabled: open,
-  });
-  const { data: grants = [] } = useQuery({
-    queryKey: ["connection-grants", connection.kind, connection.id],
-    queryFn: () => api.integrations.listConnectionGrants(connection.kind, connection.id),
-    enabled: open,
-  });
-  const share = useMutation({
-    mutationFn: () => api.integrations.createConnectionGrant(
-      connection.kind,
-      connection.id,
-      { user_id: recipientId },
-    ),
-    onSuccess: () => {
-      setRecipientId("");
-      queryClient.invalidateQueries({
-        queryKey: ["connection-grants", connection.kind, connection.id],
-      });
-      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
-      toast.success("Connection shared");
-    },
-    onError: (error: any) =>
-      toast.error("Could not share connection", error?.message || ""),
-  });
-  const revoke = useMutation({
-    mutationFn: (grantId: string) => api.integrations.deleteConnectionGrant(
-      connection.kind,
-      connection.id,
-      grantId,
-    ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["connection-grants", connection.kind, connection.id],
-      });
-      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
-    },
-  });
-  const usersById = new Map(users.map((user) => [user.id, user]));
-  const grantedUserIds = new Set(grants.map((grant) => grant.user_id));
-  const recipientOptions = users
-    .filter((user) => !grantedUserIds.has(user.id))
-    .map((user) => ({
-      value: user.id,
-      label: user.display_name || user.email,
-    }));
-
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title="Share connection"
-      footer={
-        <>
-          <Button variant="outline" onClick={onClose}>Close</Button>
-          <Button
-            variant="primary"
-            disabled={!recipientId}
-            loading={share.isPending}
-            onClick={() => share.mutate()}
-          >
-            Share
-          </Button>
-        </>
-      }
-    >
-      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div style={{ fontSize: 13, color: "#57534e" }}>{connection.label}</div>
-        <Select
-          value={recipientId}
-          onChange={setRecipientId}
-          options={recipientOptions}
-          placeholder="Select a member"
-          filterable
-          ariaLabel="Select a member to share with"
-        />
-        {grants.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {grants.map((grant) => {
-              const user = usersById.get(grant.user_id);
-              return (
-                <div
-                  key={grant.id}
-                  style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
-                >
-                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {user?.display_name || user?.email || grant.user_id}
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    loading={revoke.isPending}
-                    onClick={() => revoke.mutate(grant.id)}
-                  >
-                    Remove
-                  </Button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </Modal>
   );
 }

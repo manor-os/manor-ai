@@ -1,6 +1,7 @@
 """Private delivery must preserve customer ownership without a provider Staff grant."""
 
 from datetime import datetime, timedelta, timezone
+import copy
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -33,7 +34,7 @@ async def register(client, db, name, *, verified=True):
     return {"Authorization": f"Bearer {response.json()['access_token']}"}, user
 
 
-async def prepared(client, db):
+async def prepared(client, db, *, phase="trial"):
     provider_headers, provider = await register(client, db, "provider")
     recipient_headers, recipient = await register(client, db, "recipient")
     c = await client.post("/api/v1/clients", headers=provider_headers, json={"name": "Customer"})
@@ -54,7 +55,7 @@ async def prepared(client, db):
     create = await client.post(
         f"/api/v1/clients/{cid}/deliveries",
         headers=provider_headers,
-        json={"workspace_id": ws.json()["id"], "contact_id": contact.json()["id"]},
+        json={"workspace_id": ws.json()["id"], "contact_id": contact.json()["id"], "phase": phase},
     )
     assert create.status_code == 201, create.text
     token = create.json()["invite_path"].rsplit("/", 1)[-1]
@@ -63,6 +64,11 @@ async def prepared(client, db):
 
 @pytest.mark.asyncio
 async def test_accept_is_idempotent_and_customer_owned_without_staff_or_marketplace(client, db_session):
+    # Catches: a repeat acceptance issuing a second trial grant or seat; the
+    # provider's trial access becoming Staff or a real company membership; the
+    # provider's home-company token reaching the customer's Workspace.
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+
     ph, p, rh, r, cid, source, receipt, token = await prepared(client, db_session)
     before = (await db_session.execute(select(func.count()).select_from(Staff).where(Staff.user_id == r.id))).scalar()
     preview = await client.get(f"/api/v1/client-deliveries/invites/{token}", headers=rh)
@@ -79,10 +85,25 @@ async def test_accept_is_idempotent_and_customer_owned_without_staff_or_marketpl
     owners = (
         (await db_session.execute(select(WorkspaceStaff).where(WorkspaceStaff.workspace_id == target))).scalars().all()
     )
-    assert [(m.user_id, m.role, m.staff_id) for m in owners] == [(r.id, "owner", None)]
+    # The trial provider co-works through one seat derived from one grant.
+    grants = (await db_session.scalars(select(WorkspaceCollaboration))).all()
+    assert [(g.role, g.status, g.user_id, g.workspace_id, g.expires_at) for g in grants] == [
+        ("provider_trial", "active", p.id, target, None)
+    ]
+    assert sorted((m.user_id, m.role, m.staff_id, m.collaboration_id) for m in owners) == sorted(
+        [(r.id, "owner", None, None), (p.id, "owner", None, grants[0].id)]
+    )
+    provider_membership = (
+        await db_session.scalars(
+            select(UserMembership).where(UserMembership.user_id == p.id, UserMembership.entity_id == r.entity_id)
+        )
+    ).all()
+    assert [(m.role, m.status, m.is_primary) for m in provider_membership] == [("collaborator", "active", False)]
+    assert (await client.get(f"/api/v1/clients/{cid}/deliveries", headers=ph)).json()[0]["provider_access"] == "trial"
     assert (
         await db_session.execute(select(func.count()).select_from(Staff).where(Staff.user_id == r.id))
     ).scalar() == before
+    assert not (await db_session.scalars(select(Staff).where(Staff.user_id == p.id, Staff.entity_id == r.entity_id))).all()
     assert (
         not (await db_session.execute(select(Staff).where(Staff.entity_id == p.entity_id, Staff.user_id == r.id)))
         .scalars()
@@ -225,7 +246,7 @@ async def test_delivery_rejects_unavailable_document_selection(client, db_sessio
     assert (await db_session.execute(select(func.count()).select_from(ClientWorkspaceDelivery))).scalar() == 1
 
 
-async def _template_delivery_source(client, db_session, monkeypatch):
+async def _template_delivery_source(client, db_session, monkeypatch, *, initial_files=False):
     from packages.core.blueprints.installer import InstallMode, install_blueprint
     from test_blueprint_knowledge_workflow_refs import payload
 
@@ -238,6 +259,9 @@ async def _template_delivery_source(client, db_session, monkeypatch):
         {"key": "guide", "path": "research/guide.md", "body_md": "# Research guide\nAdd your own creators and evidence.\n"},
         {"key": "output", "path": "research/generated-output.md", "body_md": "Private run evidence must not be copied automatically.\n"},
     ])
+    if initial_files:
+        for starter in starters[:2]:
+            starter["template"] = {"id": starter["key"], "mode": "initial_file", "version": 1}
     steps = data["recipe"]["workflows"][0]["steps"]
     steps[0]["next"] = ["read-guide"]
     steps.insert(1, {"id": "read-guide", "type": "tool", "config": {"tool": "read_file", "arguments": {"knowledge_document_key": "guide"}}, "next": ["done"]})
@@ -276,20 +300,35 @@ async def test_delivery_without_selection_never_copies_eligible_knowledge(
 
 @pytest.mark.asyncio
 async def test_delivery_selected_starters_install_native_files_and_preserve_app(
-    client, db_session, monkeypatch, tmp_path,
+    client, db_session, monkeypatch, tmp_path, isolated_test_redis,
 ):
     from packages.core.config import get_settings
     import packages.core.database as database
     from packages.core.ai.tools.file_tools import _read_file
     from packages.core.services import email_service
+    from packages.core.services.entity_fs import write_entity_file_atomic
 
     settings = get_settings()
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
     monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
     monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
     monkeypatch.setattr(database, "async_session", async_sessionmaker(db_session.bind, expire_on_commit=False))
-    parties, source, docs = await _template_delivery_source(client, db_session, monkeypatch)
+    parties, source, docs = await _template_delivery_source(client, db_session, monkeypatch, initial_files=True)
     ph, provider, rh, recipient, cid, _old_source, receipt, _old_token = parties
+    current_bodies = {
+        "watchlist.csv": "creator_key,handle,status\nprivate-creator,@existing-customer,tracked\n",
+        "guide.md": "# Research guide\nPrivate research collected during a source run.\n",
+    }
+    for name, current in current_bodies.items():
+        document = docs[name]
+        document.metadata_ = {
+            **document.metadata_, "content_text": current,
+            "artifact": {"storage_scope": "artifact", "workspace_id": source},
+        }
+        write_entity_file_atomic(provider.entity_id, document.fs_path, current.encode())
+    await db_session.commit()
+    source_metadata = {name: copy.deepcopy(docs[name].metadata_) for name in current_bodies}
+    source_bytes = {name: Path(tmp_path, provider.entity_id, docs[name].fs_path).read_bytes() for name in current_bodies}
     mail = AsyncMock(return_value=True)
     monkeypatch.setattr(email_service, "is_email_delivery_enabled", lambda: True)
     monkeypatch.setattr(email_service, "send_client_delivery_email", mail)
@@ -307,10 +346,19 @@ async def test_delivery_selected_starters_install_native_files_and_preserve_app(
     starters = [doc for pack in frozen.payload["embedded"]["knowledge_packs"] for doc in pack["starter_documents"]]
     assert {doc["path"] for doc in starters} == {"research/watchlist.csv", "research/guide.md"}
     assert "Private run evidence" not in json.dumps(frozen.payload)
+    assert "private-creator" not in json.dumps(frozen.payload)
+    assert "Private research collected" not in json.dumps(frozen.payload)
     assert not any(doc.id in json.dumps(frozen.payload) for doc in docs.values())
+    for name in current_bodies:
+        await db_session.refresh(docs[name])
+        assert docs[name].metadata_ == source_metadata[name]
+        assert Path(tmp_path, provider.entity_id, docs[name].fs_path).read_bytes() == source_bytes[name]
     # Acceptance uses the reviewed snapshot, not the source's subsequent edits.
     docs["guide.md"].metadata_ = {**docs["guide.md"].metadata_, "content_text": "A later source edit."}
+    write_entity_file_atomic(provider.entity_id, docs["guide.md"].fs_path, b"A later source edit.")
     await db_session.commit()
+    source_metadata["guide.md"] = copy.deepcopy(docs["guide.md"].metadata_)
+    source_bytes["guide.md"] = b"A later source edit."
     token = invitation["invite_path"].rsplit("/", 1)[-1]
     accepted = await client.post(f"/api/v1/client-deliveries/invites/{token}/accept", headers=rh, json={})
     assert accepted.status_code == 200, accepted.text
@@ -319,7 +367,10 @@ async def test_delivery_selected_starters_install_native_files_and_preserve_app(
     ws = await db_session.get(Workspace, target)
     assert ws.entity_id == recipient.entity_id and ws.status == "paused"
     owners = list((await db_session.scalars(select(WorkspaceStaff).where(WorkspaceStaff.workspace_id == target))).all())
-    assert [(member.user_id, member.role, member.staff_id) for member in owners] == [(recipient.id, "owner", None)]
+    # The trial provider's seat is derived from the grant; the customer still owns the Workspace.
+    assert sorted((member.user_id, member.role, member.staff_id) for member in owners if member.collaboration_id is None) == [
+        (recipient.id, "owner", None)
+    ]
     workflow = (await db_session.scalars(select(WorkflowDefinition).where(WorkflowDefinition.workspace_id == target))).one()
     expected_by_step = {"read": "creator_key,handle,status\n", "read-guide": "# Research guide\nAdd your own creators and evidence.\n"}
     for step_id, expected in expected_by_step.items():
@@ -330,10 +381,20 @@ async def test_delivery_selected_starters_install_native_files_and_preserve_app(
         assert Path(tmp_path, recipient.entity_id, doc.fs_path).read_text() == expected
         read = json.loads(await _read_file(recipient.entity_id, workspace_id=target, **args))
         assert read["content"] == expected and read["document_id"] == doc.id
+        assert doc.metadata_["blueprint_initial_body_md"] == expected
+        customer_body = expected + "Customer-only operational data.\n"
+        doc.metadata_ = {**doc.metadata_, "content_text": customer_body}
+        write_entity_file_atomic(recipient.entity_id, doc.fs_path, customer_body.encode())
+    await db_session.commit()
     roundtrip = await export_workspace(db_session, target, title=ws.name, context=ExportContext(knowledge_pack_mode="inline_text"))
     assert roundtrip["recipe"]["workflows"] == frozen.payload["recipe"]["workflows"]
     assert roundtrip["recipe"]["operating_model"]["app_view"] == frozen.payload["recipe"]["operating_model"]["app_view"]
     assert roundtrip["embedded"]["knowledge_packs"] == frozen.payload["embedded"]["knowledge_packs"]
+    assert "Customer-only operational data" not in json.dumps(roundtrip)
+    for name in current_bodies:
+        await db_session.refresh(docs[name])
+        assert docs[name].metadata_ == source_metadata[name]
+        assert Path(tmp_path, provider.entity_id, docs[name].fs_path).read_bytes() == source_bytes[name]
     assert (await client.get(f"/api/v1/workspaces/{target}", headers=ph)).status_code == 404
     assert provider.entity_id != recipient.entity_id
 
@@ -451,7 +512,10 @@ async def test_client_delivery_migration_upgrades_legacy_membership_and_repeats(
             assert inspect(connection).get_columns("workspace_staff")[0]["nullable"]
             for model in (ClientContact, ClientWorkspaceDelivery):
                 columns = {column["name"]: column for column in inspect(connection).get_columns(model.__tablename__)}
-                later = {"phase", "acceptance", "email_delivery"} if model is ClientWorkspaceDelivery else {"locale"}
+                later = (
+                    {"phase", "acceptance", "email_delivery", "content_release"}
+                    if model is ClientWorkspaceDelivery else {"locale"}
+                )
                 assert set(columns) == set(model.__table__.columns.keys()) - later
                 for expected in model.__table__.columns:
                     if expected.name in columns:
@@ -481,6 +545,42 @@ async def test_simultaneous_acceptance_installs_one_customer_workspace(client, d
     assert (
         await db_session.execute(select(func.count()).select_from(Workspace).where(Workspace.entity_id == r.entity_id))
     ).scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_one_providers_concurrent_trial_acceptances_both_grant_access(client, db_session):
+    # Catches: two customers accepting the same provider's trials at once
+    # deadlocking, as each held SHARE on the provider's User row and upgraded
+    # it to grant trial access.
+    import asyncio
+
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+
+    ph, p, rh, r, cid, source, receipt, token = await prepared(client, db_session)
+    other_headers, other = await register(client, db_session, "second-recipient")
+    c = await client.post("/api/v1/clients", headers=ph, json={"name": "Second customer"})
+    contact = await client.post(
+        f"/api/v1/clients/{c.json()['id']}/contacts", headers=ph, json={"name": "Owner", "email": other.email}
+    )
+    ws = await client.post(
+        "/api/v1/workspaces", headers=ph, json={"name": "Second source", "kind": "campaign", "primary_work": "Ads"}
+    )
+    second = await client.post(
+        f"/api/v1/clients/{c.json()['id']}/deliveries",
+        headers=ph,
+        json={"workspace_id": ws.json()["id"], "contact_id": contact.json()["id"], "phase": "trial"},
+    )
+    assert second.status_code == 201, second.text
+    other_token = second.json()["invite_path"].rsplit("/", 1)[-1]
+    results = await asyncio.gather(
+        client.post(f"/api/v1/client-deliveries/invites/{token}/accept", headers=rh, json={}),
+        client.post(f"/api/v1/client-deliveries/invites/{other_token}/accept", headers=other_headers, json={}),
+    )
+    assert [response.status_code for response in results] == [200, 200], [response.text for response in results]
+    grants = (await db_session.scalars(select(WorkspaceCollaboration))).all()
+    assert sorted((g.role, g.status, g.user_id, g.entity_id) for g in grants) == sorted(
+        [("provider_trial", "active", p.id, r.entity_id), ("provider_trial", "active", p.id, other.entity_id)]
+    )
 
 
 async def restrict_company_role(db, user, role):

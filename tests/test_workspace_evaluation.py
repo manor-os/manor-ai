@@ -21,6 +21,7 @@ from packages.core.constants.execution import (
     COORDINATOR_PARENT_STEP_PARAM_KEY,
 )
 from packages.core.services.workspace_evaluation import (
+    _build_execution_health,
     build_workspace_evaluation,
     format_workspace_evaluation_for_prompt,
     record_workspace_evaluation_snapshot,
@@ -578,3 +579,24 @@ def test_strategist_prompt_includes_workspace_evaluation_scorecard() -> None:
     assert "# Workspace evaluation scorecard" in text
     assert "Overall score: 88%" in text
     assert "Execution health: 92%" in text
+
+
+def test_execution_health_counts_blocked_as_failed_and_not_cancellations() -> None:
+    tasks = [SimpleNamespace(id=f"task-{index}", status=status) for index, status in enumerate((
+        "completed", "blocked", "cancelled", "in_progress", "proposed", "blocked",
+    ))]
+    steps = [
+        SimpleNamespace(step_status=status, kind="action", step_key=status, depends_on=[])
+        for status in ("done", "failed", "cancelled")
+    ]
+
+    # The platform's runtime migration stopped the last blocked Task.
+    health = _build_execution_health(tasks, [], steps, platform_stopped={"task-5"})
+
+    assert health["completed_task_count"] == 1
+    assert health["failed_task_count"] == 1
+    assert health["cancelled_task_count"] == 2
+    # A proposal nobody accepted is not work.
+    assert health["open_task_count"] == 1
+    assert health["task_completion_rate"] == 1 / 5
+    assert health["failed_step_count"] == 1

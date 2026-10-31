@@ -13,18 +13,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select, update
 
 from packages.core.blueprints.exporter import ExportContext, export_workspace
+from packages.core.blueprints.freshness import (
+    BLUEPRINT_ID_KEY,
+    BLUEPRINT_SETTINGS_KEY,
+    FIRST_CONTENT_VERSION,
+    blueprint_content_fingerprint,
+    installed_blueprint_record,
+)
 from packages.core.blueprints.installer import InstallMode, install_blueprint
-from packages.core.models.client_delivery import ClientContact, ClientWorkspaceDelivery
+from packages.core.blueprints.registry import next_release_version, record_release
+from packages.core.models.base import generate_ulid
+from packages.core.models.client_delivery import (
+    DELIVERY_BLUEPRINT_ID_PREFIX,
+    ClientContact,
+    ClientWorkspaceDelivery,
+)
 from packages.core.models.people import Client
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.permissions import Permission, check_effective_permission
+from packages.core.services.external_collaboration_access import (
+    PROVIDER_TRIAL_ROLE,
+    TRIAL_PHASES,
+    sync_external_access,
+)
 from packages.core.services.user_email_proof import email_is_verified
 from packages.core.services.workspace_access import (
     lock_workspace_access_boundary,
     lock_workspace_recipient_authorization,
     user_can_manage_workspace,
 )
+from packages.core.services.scheduler_service import pause_workspace_automations
 
 
 def token_digest(token):
@@ -47,8 +66,10 @@ async def client_record(db, entity_id, client_id, *, lock=False, allow_inactive=
     return row
 
 
-async def require_source(db, row):
+async def require_source(db, row, *, lock_author=False):
     # Revoke implicitly when the company/client/source or issuing authority goes away.
+    # lock_author: the caller will write the author's derived access later in
+    # this transaction, which needs their User row FOR UPDATE.
     entity = (
         await db.execute(
             select(Entity.id).where(Entity.id == row.entity_id, Entity.deleted_at.is_(None)).with_for_update(read=True)
@@ -77,8 +98,17 @@ async def require_source(db, row):
     ws = await lock_workspace_access_boundary(db, workspace_id=row.source_workspace_id, entity_id=row.entity_id)
     if ws is None or ws.deleted_at is not None:
         raise HTTPException(410, "The source Workspace is no longer available")
+    # lock_author takes the author's User row exclusively from its first touch,
+    # in the documented authorization lock order: two transactions that both
+    # held SHARE on it and then upgraded would deadlock. This also serializes
+    # one provider's concurrent trial acceptances.
+    # The provider's own requests that share-lock their User wait while an acceptance installs.
     await lock_workspace_recipient_authorization(
-        db, workspace_id=ws.id, entity_id=row.entity_id, user_id=row.created_by
+        db,
+        workspace_id=ws.id,
+        entity_id=row.entity_id,
+        user_id=row.created_by,
+        user_lock="update" if lock_author else "share",
     )
     member_role = (
         await db.execute(
@@ -138,21 +168,11 @@ async def create_delivery(
         raise HTTPException(404, "Workspace not found")
     if not await user_can_manage_workspace(db, workspace_id=ws.id, user_id=user.id, entity_role=user.role):
         raise HTTPException(403, "Only the Workspace owner can prepare its delivery")
-    # Content is opt-in by exact document identity; never infer selection from
-    # workflow dependencies or from everything currently stored in Knowledge.
-    selected_document_ids = frozenset(knowledge_document_ids)
-    payload = await export_workspace(
-        db,
-        ws.id,
-        title=ws.name,
-        context=ExportContext(
-            knowledge_pack_mode="inline_text" if selected_document_ids else "skeleton",
-            knowledge_document_ids=selected_document_ids,
-        ),
-    )
+    payload = await export_source(db, ws, knowledge_document_ids)
     # Pin the configuration. No Marketplace record, public share token, or live grants.
     token = secrets.token_urlsafe(32)
     row = ClientWorkspaceDelivery(
+        id=generate_ulid(),
         entity_id=user.entity_id,
         client_id=client_id,
         contact_id=contact_id,
@@ -167,11 +187,99 @@ async def create_delivery(
         phase=phase,
         acceptance={},
         email_delivery={"status": "pending"},
-        payload=payload,
+        content_release={"knowledge_document_ids": sorted(set(knowledge_document_ids))},
     )
     db.add(row)
-    await db.flush()
+    await record_release(
+        db, delivery_blueprint_id(row.id), payload, FIRST_CONTENT_VERSION,
+        delivery=row, published_by=user.id,
+    )
     return row, token
+
+
+async def export_source(db, ws, knowledge_document_ids):
+    # Content is opt-in by exact document identity; never infer selection from
+    # workflow dependencies or from everything currently stored in Knowledge.
+    selected_document_ids = frozenset(knowledge_document_ids)
+    return await export_workspace(
+        db,
+        ws.id,
+        title=ws.name,
+        context=ExportContext(
+            knowledge_pack_mode="inline_text" if selected_document_ids else "skeleton",
+            knowledge_document_ids=selected_document_ids,
+        ),
+    )
+
+
+def delivery_blueprint_id(delivery_id):
+    """The update source a delivered Workspace records, in place of a Marketplace id."""
+    return f"{DELIVERY_BLUEPRINT_ID_PREFIX}{delivery_id}"
+
+
+def content_version(row):
+    return (row.content_release or {}).get("version") or FIRST_CONTENT_VERSION
+
+
+async def publish_update(db, *, user, client_id, delivery_id, knowledge_document_ids=None, release_notes=None):
+    """Re-export the source Workspace as the delivery's next release.
+
+    The customer's Workspace takes it through the ordinary Blueprint upgrade
+    (plan, apply, revert); nothing is written to it here. A pending invitation
+    simply installs the newer release when accepted.
+    """
+    row = await db.scalar(
+        select(ClientWorkspaceDelivery)
+        .where(
+            ClientWorkspaceDelivery.id == delivery_id,
+            ClientWorkspaceDelivery.entity_id == user.entity_id,
+            ClientWorkspaceDelivery.client_id == client_id,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(404, "Delivery not found")
+    await client_record(db, user.entity_id, client_id, lock=True)
+    await require_delivery_management(db, user, row)
+    status = delivery_status(row)
+    if status == "pending":
+        # The invitation itself must still be valid to carry a new release.
+        await require_source(db, row)
+    elif status not in ("delivered", "needs_setup"):
+        raise HTTPException(409, "Only a pending or accepted delivery can receive an update")
+    if row.target_workspace_id:
+        target = await db.get(Workspace, row.target_workspace_id)
+        if target is None or target.deleted_at is not None:
+            raise HTTPException(410, "The customer's Workspace is no longer available")
+        if installed_blueprint_record(target.settings).get(BLUEPRINT_ID_KEY) != delivery_blueprint_id(row.id):
+            raise HTTPException(409, "This Workspace was delivered before updates were supported; deliver it again")
+    release = dict(row.content_release or {})
+    if knowledge_document_ids is None:
+        selected = release.get("knowledge_document_ids") or []
+    else:
+        selected = knowledge_document_ids
+    ws = await db.get(Workspace, row.source_workspace_id)
+    payload = await export_source(db, ws, selected)
+    if release_notes:
+        payload["manifest"]["release_notes"] = release_notes
+    previous = content_version(row)
+    version = await next_release_version(
+        db, delivery_blueprint_id(row.id), payload,
+        current_version=previous, stored_fingerprint=blueprint_content_fingerprint(row.payload),
+    )
+    await record_release(
+        db, delivery_blueprint_id(row.id), payload, version, delivery=row,
+        changelog=release_notes or None, published_by=user.id,
+    )
+    row.content_release = {
+        **release,
+        "version": version,
+        "knowledge_document_ids": sorted(set(selected)),
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "published_by": user.id,
+    }
+    await db.flush()
+    return {**receipt(row, can_manage=True), "published": version != previous}
 
 
 async def prepare_delivery(db, **kwargs):
@@ -272,7 +380,8 @@ async def recipient_delivery(db, token, user, *, lock=False):
         return row
     if delivery_status(row) != "pending":
         raise HTTPException(410, "Invitation expired or revoked")
-    await require_source(db, row)
+    # Only acceptance (lock=True) of a trial goes on to grant the provider access.
+    await require_source(db, row, lock_author=lock and row.phase in TRIAL_PHASES)
     return row
 
 
@@ -309,13 +418,27 @@ async def accept_delivery(db, *, token, user, variable_values=None, channel_conf
         payload=deepcopy(row.payload),
         mode=InstallMode.LIVE,
         user_id=user.id,
+        # The delivery is the update source: later releases the provider
+        # publishes reach this Workspace through the Blueprint upgrade.
+        blueprint_id=delivery_blueprint_id(row.id),
+        blueprint_version=content_version(row),
         create_missing_agents=True,
         variable_values=variable_values or {},
         channel_config_ids=channel_config_ids or {},
     )
     ws = await db.get(Workspace, result.workspace_id)
+    ws.settings = {
+        **ws.settings,
+        BLUEPRINT_SETTINGS_KEY: {**installed_blueprint_record(ws.settings), "source": "client_delivery"},
+    }
+    # A delivered Workspace is configuration only until the customer starts it.
+    # Unlike an ordinary Strategist pause, delivery must disable every installed
+    # deployment so independent configured Flows and collectors cannot run.
     # Paused before the enclosing transaction commits: no job can run on delivery.
+    await pause_workspace_automations(db, ws.id, user.entity_id)
+    # provider_access is the install marker only; live access is the grant.
     ws.status = "paused"
+    ws.heartbeat_enabled = False
     ws.settings = {**ws.settings, "client_delivery": {"delivery_id": row.id, "provider_access": "none"}}
     row.target_entity_id = user.entity_id
     row.target_workspace_id = ws.id
@@ -326,7 +449,39 @@ async def accept_delivery(db, *, token, user, variable_values=None, channel_conf
     if contact:
         contact.user_id = user.id
     await db.flush()
+    if row.phase in TRIAL_PHASES:
+        await grant_provider_trial(db, row, ws, user)
     return row
+
+
+async def grant_provider_trial(db, row, ws, user):
+    """The provider co-works in the installed Workspace until the customer accepts.
+
+    Issued once, in the installing transaction; a repeat acceptance returns
+    before reaching here and the partial unique index forbids a second grant.
+    """
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+    from packages.core.services.workspace_collaboration import issuer_fingerprint
+
+    provider_email = await db.scalar(select(User.email).where(User.id == row.created_by))
+    grant = WorkspaceCollaboration(
+        entity_id=ws.entity_id,
+        workspace_id=ws.id,
+        delivery_id=row.id,
+        email=provider_email.casefold(),
+        role=PROVIDER_TRIAL_ROLE,
+        status="active",
+        authorized_by=user.id,
+        user_id=row.created_by,
+        expires_at=None,
+        accepted_at=row.accepted_at,
+        # The installer's owner seat is flushed, so this matches live_boundary's later read.
+        authority_fingerprint=await issuer_fingerprint(db, ws, user.id),
+        snapshot={},
+    )
+    db.add(grant)
+    await db.flush()
+    await sync_external_access(db, grant)
 
 
 class ContactRequest(BaseModel):
@@ -338,7 +493,7 @@ class ContactRequest(BaseModel):
     is_primary: bool = False
 
 
-def receipt(row, *, can_manage=False, status=None):
+def receipt(row, *, can_manage=False, status=None, provider_access="none"):
     return {
         "id": row.id,
         "client_id": row.client_id,
@@ -351,8 +506,10 @@ def receipt(row, *, can_manage=False, status=None):
         "target_workspace_id": row.target_workspace_id,
         "target_entity_id": row.target_entity_id,
         "accepted_at": row.accepted_at,
-        "provider_access": "none",
+        "provider_access": provider_access,
         "phase": row.phase,
+        "content_version": content_version(row),
+        "published_at": (row.content_release or {}).get("published_at"),
         "acceptance": row.acceptance or {},
         "email_delivery": row.email_delivery or {},
         "can_manage": can_manage,
@@ -470,8 +627,19 @@ async def deliveries(client_id: str, user: User = None, db: AsyncSession = None)
         WorkspaceCollaboration.delivery_id.in_([row.id for row in rows]), WorkspaceCollaboration.requested_by == user.id,
     ).order_by(WorkspaceCollaboration.created_at))).all() if rows else []
     maintenance = {grant.delivery_id: public_grant(grant) for grant in maintenance_rows}
+    from packages.core.services.client_trial_access import access_label, team_access_many
+
+    # The provider team's access, shown to everyone who manages the source
+    # Workspace: each of them can open the customer trial from their company.
+    managed_sources = {}
+    for row in rows:
+        if row.source_workspace_id not in managed_sources:
+            managed_sources[row.source_workspace_id] = await can_manage_delivery(db, user, row)
+    team_roles = await team_access_many(db, [row for row in rows if managed_sources[row.source_workspace_id]])
     result = []
     for row in rows:
+        source_manager = managed_sources[row.source_workspace_id]
+        team = team_roles.get(row.id)
         contact = contacts.get(row.contact_id)
         changed = (
             client.status != "active"
@@ -484,9 +652,10 @@ async def deliveries(client_id: str, user: User = None, db: AsyncSession = None)
         result.append(
             {**receipt(
                 row,
-                can_manage=client.status == "active" and await can_manage_delivery(db, user, row),
+                can_manage=client.status == "active" and source_manager,
                 status="revoked" if row.status == "pending" and changed else None,
-            ), "maintenance": maintenance.get(row.id)}
+                provider_access=access_label(team) if team else "none",
+            ), "maintenance": maintenance.get(row.id), "can_open_trial": team is not None}
         )
     return result
 

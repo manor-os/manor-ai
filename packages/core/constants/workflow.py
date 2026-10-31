@@ -28,6 +28,15 @@ class WorkflowRunStatus(str, Enum):
 # never copy it into a new attempt.
 WORKFLOW_TERMINAL_EFFECTS_TRIGGER_FIELD = "_workflow_terminal_effects"
 
+# Republishing a run whose dispatch no worker claimed. Internal to one attempt
+# like the field above: a retry starts with no recovery history.
+WORKFLOW_DISPATCH_RECOVERY_TRIGGER_FIELD = "_workflow_dispatch_recovery"
+#: Quiet time before an unclaimed open run counts as lost; doubles per republish.
+WORKFLOW_DISPATCH_GRACE_SECONDS = 300
+WORKFLOW_DISPATCH_MAX_BACKOFF_SECONDS = 3600
+#: Older unclaimed runs predate execution claims or were abandoned long ago.
+WORKFLOW_DISPATCH_RECOVERY_WINDOW_SECONDS = 24 * 3600
+
 
 #: Runs that still represent one live execution lineage. A paused run remains
 #: open because it can resume from its checkpoint and must block a duplicate.

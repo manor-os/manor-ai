@@ -5,7 +5,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import type { Agent, Workspace } from "../lib/types";
-import { relativeTime } from "../lib/format";
+import { getPreferredTimeZone, relativeTime } from "../lib/format";
 import { MANOR_AGENT_ID, MANOR_AGENT_NAME, isMasterAgent } from "../lib/constants";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
@@ -24,11 +24,15 @@ import { t } from "../lib/i18n";
 import { formatUserFacingText } from "../lib/taskDisplay";
 import { stringifyJobRunResult, summarizeJobRunResult } from "../lib/jobRunResult";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
+import {
+  automationRunView, matchesAutomationStatusFilter, workspaceBlocksConfiguredWork,
+} from "../lib/automationRunState";
 import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
 import Button from "../components/ui/Button";
 import {
   formatWorkflowValue, resolveWorkflowFinalResult, workflowFinalArtifactRefs,
   workflowFinalHeadline, workflowArtifactLabel, type WorkflowHistoryNode,
+  workflowRunStateKey,
 } from "../components/workflows/workflowRunDisplay";
 import {
   IconEdit, IconTrash, IconClock, IconChevronRight, IconPlay, IconFlow, IconWorkspace,
@@ -38,6 +42,9 @@ import {
 interface ScheduledJob {
   id: string; job_id: string; entity_id: string; name: string; job_type: string;
   workspace_id?: string;
+  workspace_status?: string | null;
+  /** Server-projected: the Workspace lifecycle stops this job; `enabled` already reflects it. */
+  workspace_blocked?: boolean;
   can_manage?: boolean;
   schedule_kind?: string; cron_expr?: string; interval_seconds?: number; every_seconds?: number;
   run_at?: string; payload?: Record<string, any>; payload_message?: string;
@@ -193,7 +200,7 @@ function fmtSchedule(job: ScheduledJob): string {
     if (opt) return `Every ${opt.label}`;
     return s < 60 ? `Every ${s}s` : s < 3600 ? `Every ${Math.floor(s / 60)} min` : `Every ${Math.floor(s / 3600)}h`;
   }
-  if (job.job_type === "once" && job.run_at) return `${new Date(job.run_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}${tz}`;
+  if (job.job_type === "once" && job.run_at) return `${new Date(job.run_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() })}${tz}`;
   return "--";
 }
 
@@ -221,7 +228,7 @@ function AutomationWorkflowResult({ runId }: { runId: string }) {
   const artifacts = workflowFinalArtifactRefs(result?.output ?? run.step_results, 50);
   const output = result ? formatWorkflowValue(result.output, t("component.workflow_run.error_truncated")) : "";
   return <section aria-label={t("page.scheduled_jobs.execution_result")} style={{ marginTop: 12, color: "var(--text-default)", overflowWrap: "anywhere" }}>
-    <span className="manor-label">{t("component.workflow_run_history.run_detail")} · {t(`component.workflow_run.status.${run.status}`)}</span>
+    <span className="manor-label">{t("component.workflow_run_history.run_detail")} · {t(workflowRunStateKey(run.status))}</span>
     {headline?.title && <h3 style={{ fontSize: 14 }}>{headline.title}</h3>}
     {headline?.summary && <p style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{headline.summary}</p>}
     {run.error && <p role="alert">{formatWorkflowValue(run.error, t("component.workflow_run.error_truncated"))}</p>}
@@ -543,11 +550,17 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
     ),
     [availableWorkspaces],
   );
-  const isAutomationEnabled = (job: ScheduledJob) => {
-    const sourceWorkspace = job.workspace_id ? workspaceById.get(job.workspace_id) : undefined;
-    const status = workspaceId ? workspaceStatus : sourceWorkspace?.status;
-    return Boolean(job.enabled && (!status || status === "active"));
-  };
+  const jobRunView = (job: ScheduledJob) => automationRunView({
+    enabled: job.enabled,
+    workspaceBlocked: job.workspace_blocked,
+    workspaceStatus: job.workspace_status
+      ?? (workspaceId ? workspaceStatus : workspaceById.get(job.workspace_id || "")?.status),
+  });
+  const bindingRunView = (binding: WorkflowBinding) => automationRunView({
+    enabled: binding.enabled && binding.status === "active",
+    workspaceBlocked: workspaceBlocksConfiguredWork(workspaceStatus),
+    workspaceStatus,
+  });
   const workspaceFilterOptions = useMemo(
     () => [
       { key: "all", label: t("page.scheduled_jobs.all_workspaces") },
@@ -699,17 +712,15 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
     if (page !== 1 || agentFilter !== "all") return [];
     const query = deferredSearch.toLowerCase();
     return workflowBindings.filter((binding) => {
-      const enabled = binding.enabled && binding.status === "active";
-      if (statusFilter === "enabled" && !enabled) return false;
-      if (statusFilter === "paused" && enabled) return false;
       if (statusFilter === "attention") return false;
+      if (!matchesAutomationStatusFilter(bindingRunView(binding), statusFilter)) return false;
       const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
       return !query
         || `${binding.name || ""} ${workflow?.name || ""} ${binding.trigger_config?.event || ""}`
           .toLowerCase()
           .includes(query);
     });
-  }, [agentFilter, deferredSearch, page, statusFilter, workflowBindings, workflows]);
+  }, [agentFilter, deferredSearch, page, statusFilter, workflowBindings, workflows, workspaceStatus]);
   const bindingSummary = useMemo(() => {
     if (agentFilter !== "all") return { total: 0, enabled: 0 };
     const query = deferredSearch.toLowerCase();
@@ -722,9 +733,9 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
     });
     return {
       total: matching.length,
-      enabled: matching.filter((binding) => binding.enabled && binding.status === "active").length,
+      enabled: matching.filter((binding) => bindingRunView(binding).state === "enabled").length,
     };
-  }, [agentFilter, deferredSearch, workflowBindings, workflows]);
+  }, [agentFilter, deferredSearch, workflowBindings, workflows, workspaceStatus]);
   const automationCount = (jobsData?.summary_total ?? 0) + bindingSummary.total;
   const enabledN = (jobsData?.enabled_total ?? 0) + bindingSummary.enabled;
   const attentionN = jobsData?.attention_total ?? 0;
@@ -960,7 +971,8 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
       {/* Workspace-event workflow bindings share this tab with scheduled jobs. */}
       {!isLoading && !bindingsLoading && filteredBindings.map((binding) => {
         const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
-        const enabled = binding.enabled && binding.status === "active" && (!workspaceId || workspaceStatus === "active");
+        const runView = bindingRunView(binding);
+        const enabled = runView.state === "enabled";
         const eventName = String(binding.trigger_config?.event || "workspace event");
         return (
           <div
@@ -975,7 +987,7 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
               <div className="scheduled-job-info">
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
                   <span className="scheduled-job-title">{formatUserFacingText(binding.name || workflow?.name || "Workflow automation")}</span>
-                  {!enabled && <span className="workspace-workflow-automation-state">Paused</span>}
+                  {runView.labelKey && <span className="workspace-workflow-automation-state">{t(runView.labelKey)}</span>}
                 </div>
                 <div className="scheduled-job-meta">
                   <span className="workspace-workflow-automation-kind">Workspace event</span>
@@ -994,10 +1006,10 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
               <div className="scheduled-job-actions scheduled-automation-controls" onClick={(event) => event.stopPropagation()}>
                 <span className="scheduled-automation-linked-slot" />
                 <Toggle
-                  checked={enabled}
-                  onChange={() => toggleBindingMut.mutate({ id: binding.id, enabled: !enabled })}
-                  disabled={!canWriteWorkspace || (!!workspaceId && workspaceStatus !== "active")}
-                  aria-label={`${enabled ? "Pause" : "Enable"} ${binding.name || workflow?.name || "workflow automation"}`}
+                  checked={runView.checked}
+                  onChange={() => toggleBindingMut.mutate({ id: binding.id, enabled: runView.nextEnabled })}
+                  disabled={!canWriteWorkspace || !runView.canToggle}
+                  aria-label={`${runView.checked ? "Pause" : "Enable"} ${binding.name || workflow?.name || "workflow automation"}`}
                 />
                 <button
                   type="button"
@@ -1046,7 +1058,8 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
         const jobWorkflow = job.execution_type === "workflow"
           ? (workflows as WorkflowSummary[]).find((item) => item.id === job.execution_target?.workflow_id)
           : null;
-        const effectiveEnabled = isAutomationEnabled(job);
+        const runView = jobRunView(job);
+        const effectiveEnabled = runView.state === "enabled";
         const canManageJob = job.can_manage !== false && (!job.workspace_id || canWriteWorkspace);
 
         return (
@@ -1073,10 +1086,8 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
               <div className="scheduled-job-info" style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
                   <span className="scheduled-job-title" style={{ fontSize: 14, fontWeight: 600, color: "#0f172a" }}>{formatUserFacingText(job.name)}</span>
-                  {!effectiveEnabled && (
-                    <span className="workspace-workflow-automation-state">
-                      {t("page.workspaces.filter_paused")}
-                    </span>
+                  {runView.labelKey && (
+                    <span className="workspace-workflow-automation-state">{t(runView.labelKey)}</span>
                   )}
                 </div>
                 <div className="scheduled-job-meta" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#78716c" }}>
@@ -1169,10 +1180,10 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
                   )}
                 </span>
                 <Toggle
-                  checked={effectiveEnabled}
-                  onChange={() => toggleMut.mutate({ id: job.id, enabled: !effectiveEnabled })}
-                  disabled={!canManageJob || (!!workspaceId && workspaceStatus !== "active")}
-                  aria-label={`${effectiveEnabled ? "Pause" : "Enable"} ${job.name}`}
+                  checked={runView.checked}
+                  onChange={() => toggleMut.mutate({ id: job.id, enabled: runView.nextEnabled })}
+                  disabled={!canManageJob || !runView.canToggle}
+                  aria-label={`${runView.checked ? "Pause" : "Enable"} ${job.name}`}
                 />
                 <button
                   onClick={() => runNowMut.mutate(job.id)}

@@ -229,7 +229,7 @@ PYEOF
         python3 scripts/init_db.py || echo "[entrypoint] WARNING: init_db seed step failed (non-fatal)"
     fi
 
-    # K8s API/Chat/Worker replicas deliberately skip startup side effects.
+    # Multi-replica API/Chat/Worker deployments deliberately skip startup side effects.
     # Its single migration owner must apply IdP client policy after schema
     # upgrades, and a configured client failure must stop the rollout.
     if [ "$MANOR_SERVICE_ROLE" = "migration" ]; then

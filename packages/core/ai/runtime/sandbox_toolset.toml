@@ -1,0 +1,411 @@
+# Sandbox toolset: the single source of truth for what the sandbox image
+# (docker/Dockerfile.sandbox) installs beyond the shipped Skills' own
+# dependency manifests, and for what the Agent is told is installed.
+#
+# Every [[tool]] entry is
+#   installed  by exactly the sources it lists:
+#                apt  = Debian bookworm packages (--no-install-recommends)
+#                pip  = requirement specifiers, resolved together with every
+#                       shipped Skill's requirements.txt in one pip run
+#                npm  = global npm packages (name@range)
+#                dockerfile = a marker string that must appear in
+#                       Dockerfile.sandbox, for components the Dockerfile
+#                       installs itself (base Python, Node, hyperframes)
+#   verified   by every probe it lists, in the built image, as the
+#              unprivileged sandbox user under the runner's limits:
+#                probe  = shell commands that must exit 0 (sh -c)
+#                import = Python modules that must import
+#   described  to the Agent by `label`, grouped by category, unless
+#              `listed = false` (plumbing nobody would ask for by name).
+#
+# sandbox_toolset.py reads this file: `export` writes the per-kind package
+# lists the Dockerfile installs, `verify` runs the probes, `describe` prints
+# the Agent-visible summary. tests/test_sandbox_toolset.py guards the wiring.
+#
+# Deliberately not shipped (runtime `pip install` / `npm install` into the
+# sandbox's disk-backed install dir covers them when a task needs one):
+#   TeX Live           ~0.8-1.5 GB; LaTeX -> PDF stays outside the sandbox
+#   torch/tensorflow   1-4 GB of wheels; small ML uses scikit-learn
+#   xgboost            ~300 MB manylinux wheel (bundled NCCL); scikit-learn's
+#                      HistGradientBoosting covers tabular boosting
+#   polars             ~170 MB, overlaps pandas + duckdb + pyarrow
+#   playwright/puppeteer browsers  Chromium is already installed; drive it
+#                      with `chromium --headless` or install the Python
+#                      package and point it at /usr/bin/chromium
+#   moviepy/imageio-ffmpeg  bundle a second ~60 MB ffmpeg; use the ffmpeg CLI
+#   mermaid-cli        downloads its own Chrome at install time
+#   unrar / p7zip-rar  non-free licence (7z still lists/extracts many formats)
+#   yt-dlp             media scraping is a policy decision, not a default
+#   inkscape           ~200 MB with GTK; rsvg-convert / cairosvg render SVG
+
+[meta]
+schema = 1
+
+[categories]
+runtime = "Runtimes"
+documents = "Documents & PDF"
+data = "Data & analysis"
+images = "Images"
+media = "Audio & video"
+web = "Web & parsing"
+archives = "Archives"
+dev = "Dev tools"
+fonts = "Fonts"
+
+# ── Runtimes ────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "python"
+category = "runtime"
+label = "Python 3.12"
+dockerfile = ["FROM python:3.12-slim-bookworm"]
+probe = ["python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'", "pip --version"]
+
+[[tool]]
+id = "node"
+category = "runtime"
+label = "Node 22 (npm/npx)"
+dockerfile = ["FROM node:22-bookworm-slim AS node-runtime", "COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node"]
+probe = ["node -e 'process.exit(process.versions.node.split(\".\")[0] === \"22\" ? 0 : 1)'", "npm --version", "npx --version"]
+
+[[tool]]
+id = "typescript"
+category = "runtime"
+label = "TypeScript (tsc, tsx)"
+npm = ["typescript@^5", "tsx@^4"]
+probe = ["tsc --version", "tsx --version"]
+
+[[tool]]
+id = "shell-basics"
+category = "runtime"
+label = "bash"
+listed = false
+apt = ["bash", "ca-certificates", "procps", "less", "patch", "bc", "file", "tree"]
+probe = ["bash --version", "ps --version", "bc --version", "file --version", "tree --version", "patch --version"]
+
+# ── Documents & PDF ─────────────────────────────────────────────────────
+
+[[tool]]
+id = "libreoffice"
+category = "documents"
+label = "LibreOffice (soffice)"
+apt = ["libreoffice-writer", "libreoffice-calc", "libreoffice-impress"]
+probe = ["soffice --version"]
+
+[[tool]]
+id = "pandoc"
+category = "documents"
+label = "pandoc"
+apt = ["pandoc"]
+probe = ["pandoc --version"]
+
+[[tool]]
+id = "poppler"
+category = "documents"
+label = "poppler-utils (pdftotext, pdftoppm, pdfinfo)"
+apt = ["poppler-utils", "poppler-data"]
+probe = ["pdftotext -v", "pdftoppm -v", "pdfinfo -v"]
+
+[[tool]]
+id = "qpdf"
+category = "documents"
+label = "qpdf"
+apt = ["qpdf"]
+probe = ["qpdf --version"]
+
+[[tool]]
+id = "ghostscript"
+category = "documents"
+label = "ghostscript (gs)"
+apt = ["ghostscript"]
+probe = ["gs --version"]
+
+[[tool]]
+id = "tesseract"
+category = "documents"
+label = "tesseract OCR (eng, chi_sim, chi_tra)"
+apt = ["tesseract-ocr", "tesseract-ocr-chi-sim", "tesseract-ocr-chi-tra"]
+probe = ["tesseract --list-langs 2>&1 | grep -qx chi_sim", "tesseract --list-langs 2>&1 | grep -qx chi_tra", "tesseract --list-langs 2>&1 | grep -qx eng"]
+
+[[tool]]
+id = "ocrmypdf"
+category = "documents"
+label = "ocrmypdf"
+pip = ["ocrmypdf>=16,<18"]
+import = ["ocrmypdf", "pikepdf"]
+probe = ["ocrmypdf --version"]
+
+[[tool]]
+id = "img2pdf"
+category = "documents"
+label = "img2pdf (lossless images -> PDF)"
+pip = ["img2pdf>=0.5,<1"]
+import = ["img2pdf"]
+probe = ["img2pdf --version"]
+
+[[tool]]
+id = "py-office"
+category = "documents"
+label = "python-docx, python-pptx, openpyxl, xlsxwriter, xlrd"
+pip = ["python-docx>=1.1,<2", "python-pptx>=1.0.2,<2", "openpyxl>=3.1,<4", "xlsxwriter>=3.2,<4", "xlrd>=2.0,<3"]
+import = ["docx", "pptx", "openpyxl", "xlsxwriter", "xlrd"]
+
+[[tool]]
+id = "py-pdf"
+category = "documents"
+label = "pypdf, pdfplumber, PyMuPDF, reportlab, fpdf2, pdf2image, pytesseract"
+pip = ["pypdf>=6.0,<7", "pdfplumber>=0.11,<1", "PyMuPDF>=1.24,<2", "reportlab>=4.2,<6", "fpdf2>=2.8,<3", "pdf2image>=1.17,<2", "pytesseract>=0.3,<1"]
+import = ["pypdf", "pdfplumber", "fitz", "reportlab", "fpdf", "pdf2image", "pytesseract"]
+
+[[tool]]
+id = "weasyprint"
+category = "documents"
+label = "weasyprint (HTML/CSS->PDF; pandoc --pdf-engine=weasyprint)"
+apt = ["libpango-1.0-0", "libpangoft2-1.0-0"]
+pip = ["weasyprint>=62,<70"]
+import = ["weasyprint"]
+probe = ["weasyprint --version"]
+
+[[tool]]
+id = "py-markup"
+category = "documents"
+label = "markdown, markdownify"
+pip = ["markdown>=3.6,<4", "markdownify>=0.13,<2"]
+import = ["markdown", "markdownify"]
+
+# ── Data & analysis ─────────────────────────────────────────────────────
+
+[[tool]]
+id = "py-dataframes"
+category = "data"
+label = "numpy, pandas, pyarrow, duckdb"
+pip = ["numpy>=1.26,<3", "pandas>=2.2,<4", "pyarrow>=17,<26", "duckdb>=1.1,<2"]
+import = ["numpy", "pandas", "pyarrow", "duckdb"]
+
+[[tool]]
+id = "py-science"
+category = "data"
+label = "scipy, statsmodels, scikit-learn, sympy, networkx"
+pip = ["scipy>=1.13,<2", "statsmodels>=0.14,<1", "scikit-learn>=1.5,<2", "sympy>=1.13,<2", "networkx>=3.3,<4"]
+import = ["scipy", "statsmodels.api", "sklearn", "sympy", "networkx"]
+
+[[tool]]
+id = "py-charts"
+category = "data"
+label = "matplotlib, seaborn, plotly + kaleido"
+pip = ["matplotlib>=3.8,<4", "seaborn>=0.13,<1", "plotly>=6.1,<8", "kaleido>=1.0,<2"]
+import = ["matplotlib.pyplot", "seaborn", "plotly", "kaleido"]
+
+[[tool]]
+id = "py-data-utils"
+category = "data"
+label = "tabulate, tqdm, jieba (Chinese segmentation)"
+pip = ["tabulate>=0.9,<1", "tqdm>=4.66,<5", "jieba>=0.42,<1"]
+import = ["tabulate", "tqdm", "jieba"]
+
+[[tool]]
+id = "sqlite"
+category = "data"
+label = "sqlite3 CLI"
+apt = ["sqlite3"]
+probe = ["sqlite3 --version"]
+
+# ── Images ──────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "imagemagick"
+category = "images"
+label = "ImageMagick 6 (convert, identify; HEIC)"
+apt = ["imagemagick"]
+probe = ["convert -version", "identify -list format | grep -q HEIC"]
+
+[[tool]]
+id = "libheif"
+category = "images"
+label = "libheif (heif-convert, heif-info)"
+apt = ["libheif-examples"]
+probe = ["command -v heif-convert", "command -v heif-info"]
+
+[[tool]]
+id = "exiftool"
+category = "images"
+label = "exiftool"
+apt = ["libimage-exiftool-perl"]
+probe = ["exiftool -ver"]
+
+[[tool]]
+id = "webp"
+category = "images"
+label = "cwebp/dwebp"
+apt = ["webp"]
+probe = ["cwebp -version", "dwebp -version"]
+
+[[tool]]
+id = "svg-render"
+category = "images"
+label = "rsvg-convert, cairosvg"
+apt = ["librsvg2-bin", "libcairo2"]
+pip = ["cairosvg>=2.7,<3"]
+import = ["cairosvg"]
+probe = ["rsvg-convert --version"]
+
+[[tool]]
+id = "graphviz"
+category = "images"
+label = "graphviz (dot)"
+apt = ["graphviz"]
+pip = ["graphviz>=0.20,<1"]
+import = ["graphviz"]
+probe = ["dot -V"]
+
+[[tool]]
+id = "zbar"
+category = "images"
+label = "zbarimg (QR/barcode decode)"
+apt = ["zbar-tools"]
+probe = ["zbarimg --version"]
+
+[[tool]]
+id = "py-images"
+category = "images"
+label = "Pillow + pillow-heif, opencv-python-headless, scikit-image, imageio, qrcode"
+pip = ["Pillow>=10.4,<13", "pillow-heif>=0.18,<2", "opencv-python-headless>=4.10,<6", "scikit-image>=0.24,<1", "imageio>=2.34,<3", "qrcode>=7.4,<9"]
+import = ["PIL.Image", "pillow_heif", "cv2", "skimage", "imageio", "qrcode"]
+# HEIC round trip through both decoders: pillow-heif encodes, libheif and
+# ImageMagick decode.
+probe = [
+  "python3 -c 'import pillow_heif, PIL.Image as I; pillow_heif.register_heif_opener(); I.new(\"RGB\", (16, 8), (200, 10, 10)).save(\"/tmp/.toolset-probe.heic\"); assert I.open(\"/tmp/.toolset-probe.heic\").size == (16, 8)'",
+  "heif-convert /tmp/.toolset-probe.heic /tmp/.toolset-probe.png >/dev/null && identify /tmp/.toolset-probe.png | grep -q '16x8'",
+  "convert /tmp/.toolset-probe.heic /tmp/.toolset-probe.jpg && identify /tmp/.toolset-probe.jpg | grep -q '16x8'",
+]
+
+# ── Audio & video ───────────────────────────────────────────────────────
+
+[[tool]]
+id = "ffmpeg"
+category = "media"
+label = "ffmpeg/ffprobe"
+apt = ["ffmpeg"]
+probe = ["ffmpeg -hide_banner -version", "ffprobe -hide_banner -version"]
+
+[[tool]]
+id = "sox"
+category = "media"
+label = "sox (incl. mp3)"
+apt = ["sox", "libsox-fmt-mp3"]
+probe = ["sox --version", "sox -h 2>&1 | grep -q 'AUDIO FILE FORMATS:.* mp3'"]
+
+[[tool]]
+id = "pydub"
+category = "media"
+label = "pydub"
+pip = ["pydub>=0.25,<1"]
+import = ["pydub"]
+
+[[tool]]
+id = "hyperframes"
+category = "media"
+label = "hyperframes (HTML->video)"
+dockerfile = ["\"hyperframes@${HYPERFRAMES_VERSION}\"", "\"gsap@${GSAP_VERSION}\""]
+probe = ["hyperframes --version", "test -f \"$HYPERFRAMES_GSAP_PATH\""]
+
+# ── Web & parsing ───────────────────────────────────────────────────────
+
+[[tool]]
+id = "chromium"
+category = "web"
+label = "Chromium (headless)"
+apt = ["chromium"]
+probe = ["chromium --version"]
+
+[[tool]]
+id = "http-cli"
+category = "web"
+label = "curl, wget"
+apt = ["curl", "wget"]
+probe = ["curl --version", "wget --version"]
+
+[[tool]]
+id = "json-yaml-cli"
+category = "web"
+label = "jq, yq"
+apt = ["jq"]
+# yq from PyPI, not Debian: the Debian package drags in a second Python (3.11).
+pip = ["yq>=3.2,<4"]
+import = ["yq"]
+probe = ["jq --version", "echo 'a: 1' | yq -e '.a == 1'"]
+
+[[tool]]
+id = "py-web"
+category = "web"
+label = "requests, httpx, beautifulsoup4, lxml, html5lib, PyYAML, chardet"
+pip = ["requests>=2.32,<3", "httpx>=0.27,<1", "beautifulsoup4>=4.12,<5", "lxml>=5.0,<7", "html5lib>=1.1,<2", "PyYAML>=6.0,<7", "chardet>=5.2,<8"]
+import = ["requests", "httpx", "bs4", "lxml.etree", "html5lib", "yaml", "chardet"]
+
+# ── Archives ────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "archives"
+category = "archives"
+label = "zip/unzip, 7z, xz, bzip2, zstd"
+apt = ["zip", "unzip", "p7zip-full", "xz-utils", "bzip2", "zstd"]
+probe = ["zip -v", "unzip -v", "7z i", "xz --version", "bzip2 --help", "zstd --version"]
+
+# ── Dev tools ───────────────────────────────────────────────────────────
+
+[[tool]]
+id = "git"
+category = "dev"
+label = "git"
+apt = ["git"]
+probe = ["git --version"]
+
+[[tool]]
+id = "build-tools"
+category = "dev"
+label = "gcc/g++, make"
+apt = ["gcc", "g++", "make"]
+probe = ["gcc --version", "g++ --version", "make --version"]
+
+[[tool]]
+id = "search-tools"
+category = "dev"
+label = "ripgrep (rg), fd (fdfind)"
+apt = ["ripgrep", "fd-find"]
+probe = ["rg --version", "fdfind --version"]
+
+[[tool]]
+id = "pytest"
+category = "dev"
+label = "pytest"
+pip = ["pytest>=8,<10"]
+import = ["pytest"]
+
+[[tool]]
+id = "manor-command"
+category = "dev"
+label = "manor CLI (your Manor files from bash: ls, cat, grep, search, mv, cp, rm)"
+# Installed by the Dockerfile's own block (stdlib-only script on PATH); it
+# needs a bash command's short-lived token to reach the API, but `--help`
+# runs anywhere.
+dockerfile = ["COPY packages/core/services/sandbox_cli/manor_cli.py /usr/local/lib/manor/manor_cli.py"]
+probe = ["command -v manor", "manor --help >/dev/null"]
+
+# ── Fonts ───────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "fonts"
+category = "fonts"
+label = "Noto (incl. CJK + color emoji), Liberation, Carlito/Caladea, Lato, Roboto"
+apt = [
+  "fontconfig", "fonts-crosextra-caladea", "fonts-crosextra-carlito", "fonts-lato",
+  "fonts-liberation", "fonts-noto-core", "fonts-noto-cjk",
+  "fonts-noto-color-emoji", "fonts-roboto",
+]
+probe = [
+  "fc-list | grep -q 'Noto Sans CJK SC'",
+  "fc-list | grep -q 'Noto Color Emoji'",
+  "fc-list | grep -q 'Liberation Sans'",
+  "fc-list | grep -q 'Carlito'",
+  "fc-match Aptos | grep -q Carlito",
+]

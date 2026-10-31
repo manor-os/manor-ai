@@ -6,7 +6,10 @@ from typing import Any
 
 from sqlalchemy import select
 
-from packages.core.ai.runtime.profiles import RuntimeProfile
+from packages.core.ai.runtime.profiles import (
+    EXTERNAL_CHAT_SURFACES,
+    EXTERNAL_RUNTIME_PROFILES,
+)
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.tool_context import RuntimeToolCallContext
 from packages.core.database import async_session
@@ -21,14 +24,8 @@ _BACKGROUND_WRITE_SURFACES = {
     ChatSurface.SCHEDULED_AGENT_RUN.value,
     ChatSurface.WORKFLOW_AGENT_STEP.value,
 }
-_EXTERNAL_SURFACES = {
-    ChatSurface.EXTERNAL_CHANNEL_CHAT.value,
-    ChatSurface.PUBLIC_CUSTOMER_CHAT.value,
-}
-_EXTERNAL_PROFILES = {
-    RuntimeProfile.EXTERNAL_CHANNEL_SAFE.value,
-    RuntimeProfile.EXTERNAL_CUSTOMER_SAFE.value,
-}
+_EXTERNAL_SURFACES = {surface.value for surface in EXTERNAL_CHAT_SURFACES}
+_EXTERNAL_PROFILES = {profile.value for profile in EXTERNAL_RUNTIME_PROFILES}
 
 
 class WorkspaceLedgerConfigurationError(ValueError):

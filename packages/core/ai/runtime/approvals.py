@@ -51,7 +51,6 @@ _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
     "sandbox_save_result": "sandbox.execute",
     "sandbox_destroy": "sandbox.execute",
     "video_edit": "sandbox.execute",
-    "coding_based_video": "sandbox.execute",
     "query_entity_agents": "automation.manage",
     "create_scheduled_job": "automation.manage",
     "list_scheduled_jobs": "automation.manage",
@@ -118,6 +117,8 @@ class RuntimeApprovalRequest:
     entity_id: str
     user_id: str
     workspace_id: str | None = None
+    # The run's real conversation, None for a conversation-less Task worker
+    # or Workflow run. Anything that means "this chat" reads this field.
     conversation_id: str | None = None
     task_id: str | None = None
     step_id: str | None = None
@@ -127,6 +128,33 @@ class RuntimeApprovalRequest:
     workspace_file_scope: "RuntimeWorkspaceFileScope | None" = None
     operation_id: str | None = None
     account_id: str | None = None
+    # Set only for sandbox-bound tools: the sandbox binding the call runs in
+    # (see ``runtime_authorization_sandbox_binding_key``).
+    sandbox_binding_key: str | None = None
+
+    @property
+    def approval_scope_id(self) -> str | None:
+        """The scope this call's approvals are minted and spent under.
+
+        A sandbox-bound tool is authorized against its sandbox binding, so a
+        conversation-less run still has a scope the binding check and its
+        approval origin can find. Every other tool uses the conversation.
+        """
+
+        return self.sandbox_binding_key or self.conversation_id
+
+
+@dataclass(frozen=True)
+class RuntimeApprovalPreview:
+    """A gate decision made without side effects.
+
+    ``clear`` means the live gate would let the call run (or refuse it)
+    without stopping for a human. ``request`` carries the same file scope and
+    classification the live gate would use.
+    """
+
+    clear: bool
+    request: RuntimeApprovalRequest
 
 
 @dataclass(frozen=True)
@@ -139,18 +167,48 @@ class RuntimeApprovalAction:
     operation: str | None = None
     resource_id: str | None = None
     capability_id: str | None = None
+    # Declared effect (governance.action_effects). Dynamic families whose
+    # factory knows the effect (MCP) pass it; everything else is filled from
+    # the declaration table, never guessed. ``None`` impact = undeclared.
+    impact: str | None = None
+    category: str | None = None
+    gate: str | None = None
+    # Further keys whose explicit rules judge this action: a relay judged by
+    # the operation it guards also answers to that operation's rules.
+    aliases: tuple[str, ...] = ()
+    # Keys whose explicit rules may only deny/ask: a relay's own key once it
+    # is judged as the operation it guards.
+    restrict_only_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.capability_id:
-            return
-        object.__setattr__(
-            self,
-            "capability_id",
-            runtime_capability_id_for_action_key(
-                self.action_key,
-                resource_kind=self.resource_kind,
-            ),
-        )
+        if not self.capability_id:
+            object.__setattr__(
+                self,
+                "capability_id",
+                runtime_capability_id_for_action_key(
+                    self.action_key,
+                    resource_kind=self.resource_kind,
+                ),
+            )
+        from packages.core.governance.action_effects import declared_action_effect
+
+        declared = declared_action_effect(self.action_key)
+        if self.impact is None and declared is not None:
+            object.__setattr__(self, "impact", declared.impact)
+        if self.category is None and declared is not None:
+            object.__setattr__(self, "category", declared.category)
+        if self.impact == "read":
+            # A basic browser read keeps its declared browser category.
+            browser = self.category == "browser" or (declared is not None and declared.category == "browser")
+            object.__setattr__(self, "category", "browser" if browser else "read")
+        if self.gate is None:
+            object.__setattr__(
+                self, "gate", declared.gate.value if declared is not None else "policy",
+            )
+
+    def policy_effect(self) -> dict[str, str | None]:
+        """The declared effect keywords every policy evaluation of this action uses."""
+        return {"impact": self.impact, "category": self.category, "gate": self.gate}
 
 
 def runtime_capability_id_for_action_key(
@@ -322,6 +380,19 @@ class LegacyWorkspaceApprovalPolicyAdapter:
         self,
         request: RuntimeApprovalRequest,
     ) -> str | None:
+        return await self._guard(request, preview=False)
+
+    async def preview_request(
+        self,
+        request: RuntimeApprovalRequest,
+    ) -> bool:
+        """True when the live gate would let this call run with no human stop."""
+        from packages.core.ai.runtime.approval_service import RUNTIME_GATE_PREVIEW_UNDECIDED
+
+        result = await self._guard(replace(request, arguments=dict(request.arguments)), preview=True)
+        return result != RUNTIME_GATE_PREVIEW_UNDECIDED
+
+    async def _guard(self, request: RuntimeApprovalRequest, *, preview: bool) -> str | None:
         from packages.core.ai.runtime.approval_service import guard_runtime_tool_action
         from packages.core.ai.runtime.media_outputs import runtime_media_output_approval_scope
 
@@ -333,12 +404,13 @@ class LegacyWorkspaceApprovalPolicyAdapter:
                 entity_id=request.entity_id,
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
-                conversation_id=request.conversation_id,
+                conversation_id=request.approval_scope_id,
                 task_id=request.task_id,
                 step_id=request.step_id,
                 runtime_envelope=request.envelope,
                 classification=request.classification,
                 operation_id=request.operation_id, account_id=request.account_id,
+                preview=preview,
             )
 
 
@@ -359,6 +431,36 @@ class RuntimeApprovalMiddleware:
         request: RuntimeApprovalRequest,
     ) -> RuntimeApprovalDecision:
         """Run approval policy and return a structured runtime decision."""
+        guarded_request = await self._classified_request(request)
+        classification = guarded_request.classification
+        blocked = await self.policy_adapter.guard_request(guarded_request)
+        if blocked:
+            return RuntimeApprovalDecision.block(
+                request.tool_name,
+                blocked,
+                classification,
+                guarded_request,
+            )
+        return RuntimeApprovalDecision.allow(classification, guarded_request)
+
+    async def preview_request(
+        self,
+        request: RuntimeApprovalRequest,
+    ) -> RuntimeApprovalPreview:
+        """The gate's answer for this call, decided without writing anything.
+
+        Same file scope, classification and policy decision as
+        ``guard_request``. An adapter that cannot preview is never clear.
+        """
+        guarded_request = await self._classified_request(request)
+        preview = getattr(self.policy_adapter, "preview_request", None)
+        clear = bool(await preview(guarded_request)) if callable(preview) else False
+        return RuntimeApprovalPreview(clear=clear, request=guarded_request)
+
+    async def _classified_request(
+        self,
+        request: RuntimeApprovalRequest,
+    ) -> RuntimeApprovalRequest:
         from packages.core.ai.runtime.tool_effect_classification import (
             RuntimeToolClassification,
         )
@@ -384,16 +486,7 @@ class RuntimeApprovalMiddleware:
             raise TypeError(
                 "Runtime approval adapters must return RuntimeToolClassification"
             )
-        guarded_request = replace(resolved_request, classification=classification)
-        blocked = await self.policy_adapter.guard_request(guarded_request)
-        if blocked:
-            return RuntimeApprovalDecision.block(
-                request.tool_name,
-                blocked,
-                classification,
-                guarded_request,
-            )
-        return RuntimeApprovalDecision.allow(classification, guarded_request)
+        return replace(resolved_request, classification=classification)
 
     def classify_request(
         self,

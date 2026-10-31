@@ -5,9 +5,10 @@ const catalog = [
   { action_key: "content.publish", category: "publishing", label: "Publish content", impact: "external" },
 ];
 const rootRule = { id: "account-ban", effect: "deny", selector: { kind: "category", category: "publishing" }, source_kind: "user" };
+const workspaceRule = { id: "workspace-review", effect: "ask", selector: { kind: "category", category: "communication" }, source_kind: "workspace_rule", source_link: "/workspaces/approval-workspace?tab=rules", editable: false };
 function snapshot(kind = "account", version = "saved", mode: string | null = kind === "account" ? "risk_based" : null, rules: any[] = kind === "account" ? [rootRule] : []) {
   const scope = { kind, id: kind === "account" ? "approval-account" : kind === "personal" ? "approval-user" : "approval-workspace", entity_id: "approval-account" };
-  return { scope, revision: 1, version, policy: { mode, rules }, effective_policy: { mode: mode || "risk_based", rules }, root_scope: kind === "account" ? null : { kind: "account", id: "approval-account", entity_id: "approval-account" }, policy_versions: [], inheritance: kind === "account" ? "root" : mode || rules.length ? "custom" : "following", capabilities: { can_view: true, can_edit_root: true, can_edit_local: true, can_save_rule: true }, action_catalog: catalog, effective_rows: [], saved_rules: rules, inherited_rules: kind === "account" ? [] : [{ ...rootRule, scope: { kind: "account", id: "approval-account" }, editable: false }], rule_sources: [] };
+  return { scope, revision: 1, version, policy: { mode, rules }, effective_policy: { mode: mode || "risk_based", rules }, root_scope: kind === "account" ? null : { kind: "account", id: "approval-account", entity_id: "approval-account" }, policy_versions: [], inheritance: kind === "account" ? "root" : mode || rules.length ? "custom" : "following", capabilities: { can_view: true, can_edit_root: true, can_edit_local: true, can_save_rule: true }, action_catalog: catalog, effective_rows: [], saved_rules: kind === "workspace" ? [...rules, workspaceRule] : rules, inherited_rules: kind === "account" ? [] : [{ ...rootRule, scope: { kind: "account", id: "approval-account" }, editable: false }], rule_sources: [] };
 }
 async function mock(page: Page, options: { conflict?: boolean; readOnly?: boolean; unavailable?: boolean; saveFailure?: number; deferSave?: boolean } = {}) {
   let root = snapshot();
@@ -88,6 +89,17 @@ for (const triggerName of ["Personal chat settings", "Workspace settings"]) {
     expect(writes).toHaveLength(1);
   });
 }
+
+test("the workspace drawer links a derived rule to the rule that produced it", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await mock(page);
+  await page.getByRole("button", { name: "Workspace settings", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Execution & approvals", exact: true });
+  await dialog.getByText("Advanced", { exact: false }).first().click();
+  await expect(dialog.getByRole("link", { name: "Edit source rule", exact: true })).toHaveAttribute("href", "/workspaces/approval-workspace?tab=rules");
+  expect(errors).toEqual([]);
+});
 
 test("a failed dialog save preserves the draft and closes after a successful retry", async ({ page }) => {
   const { writes } = await mock(page, { saveFailure: 503 });

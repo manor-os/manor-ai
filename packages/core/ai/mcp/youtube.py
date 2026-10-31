@@ -385,7 +385,11 @@ async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
     from becoming an internal-network proxy. The temporary file lets the
     subsequent YouTube upload retry by chunk while keeping memory bounded.
     """
+    if isinstance(source_url, dict):
+        return await _stage_workspace_video(source_url)
     file_ref = parse_file_reference(source_url)
+    if file_ref is not None and file_ref.document_id and _call_ctx_var.get().get("workspace_id"):
+        return await _stage_workspace_video({"source_kind": "workspace_document", "document_id": file_ref.document_id})
     if source_url.startswith("uploads/") or (file_ref is not None and file_ref.entity_id):
         return await _stage_chat_video(source_url)
     try:
@@ -443,6 +447,48 @@ async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
     except Exception:
         path.unlink(missing_ok=True)
         raise
+
+
+async def _stage_workspace_video(reference: Dict[str, Any]) -> tuple[Path, int, str]:
+    """Copy the pinned bytes of a Workspace Knowledge video the actor may read."""
+    from packages.core.services.workspace_document_media import (
+        WorkspaceDocumentMediaError, inspect_workspace_document_media,
+    )
+
+    ctx = _call_ctx_var.get()
+    staged: dict[str, Path] = {}
+
+    def copy_snapshot(descriptor_path: str) -> dict[str, Any]:
+        fd, raw_path = tempfile.mkstemp(prefix="manor-youtube-", suffix=".mp4")
+        os.close(fd)
+        staged["path"] = Path(raw_path)
+        with open(descriptor_path, "rb") as source, staged["path"].open("wb") as output:
+            while chunk := source.read(_UPLOAD_CHUNK_BYTES):
+                output.write(chunk)
+        return {}
+
+    try:
+        media = await inspect_workspace_document_media(
+            reference,
+            entity_id=str(ctx.get("entity_id") or ""),
+            user_id=str(ctx.get("user_id") or ""),
+            conversation_id=ctx.get("conversation_id") or None,
+            workspace_id=str(ctx.get("workspace_id") or ""),
+            tool_name="mcp__youtube__upload_video",
+            allowed_suffixes={".mp4", ".mov", ".webm", ".m4v"},
+            max_bytes=_MAX_VIDEO_BYTES,
+            inspect_snapshot=copy_snapshot,
+        )
+    except WorkspaceDocumentMediaError as exc:
+        if staged.get("path"):
+            staged["path"].unlink(missing_ok=True)
+        raise _YouTubeError(str(exc)) from exc
+    except BaseException:
+        if staged.get("path"):
+            staged["path"].unlink(missing_ok=True)
+        raise
+    media_type = mimetypes.guess_type(media["rel_path"])[0] or "video/mp4"
+    return staged["path"], int(media["size_bytes"]), media_type
 
 
 async def _stage_chat_video(reference: str) -> tuple[Path, int, str]:
@@ -514,6 +560,20 @@ def _upload_error(response: httpx.Response) -> str:
     return f"YouTube upload error ({response.status_code}): {response.text[:300]}"
 
 
+def _made_for_kids(value: Any) -> bool | None:
+    """A boolean, or a rendered template value such as "false" or "not_made_for_kids"."""
+    if value is None or isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none"}:
+        return None
+    if text in {"true", "1", "yes", "made_for_kids"}:
+        return True
+    if text in {"false", "0", "no", "not_made_for_kids"}:
+        return False
+    raise _YouTubeError("made_for_kids must be true/false or made_for_kids/not_made_for_kids.")
+
+
 async def _upload_video(token: str, args: Dict) -> str:
     """Upload an authorized source with YouTube's resumable upload protocol."""
     privacy = str(args.get("privacy", "private")).lower()
@@ -533,8 +593,9 @@ async def _upload_video(token: str, args: Dict) -> str:
         snippet["tags"] = tags
 
     status: Dict[str, Any] = {"privacyStatus": privacy}
-    if args.get("made_for_kids") is not None:
-        status["selfDeclaredMadeForKids"] = bool(args["made_for_kids"])
+    made_for_kids = _made_for_kids(args.get("made_for_kids"))
+    if made_for_kids is not None:
+        status["selfDeclaredMadeForKids"] = made_for_kids
     if args.get("publish_at"):
         if privacy != "private":
             raise _YouTubeError(
@@ -679,15 +740,36 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     },
     # ── Publish / engagement ──
     "upload_video": {
-        "description": "Upload a new YouTube video from a public HTTPS URL or an exact current-conversation chat attachment using resumable upload",
+        "description": "Upload a new YouTube video from a public HTTPS URL, an exact current-conversation chat attachment, or a Workspace Knowledge video, using resumable upload",
         "properties": {
-            "video_url": _prop("Public standard-port HTTPS video URL, or exact uploads/chat/<hash>.mp4 or /api/v1/fs/<entity>/uploads/chat/<hash>.mp4 attachment reference from this conversation"),
+            "video_url": {
+                "description": (
+                    "Public standard-port HTTPS video URL; an exact uploads/chat/<hash>.mp4 or "
+                    "/api/v1/fs/<entity>/uploads/chat/<hash>.mp4 attachment from this conversation; "
+                    "or an active Workspace Knowledge video as "
+                    "{source_kind: workspace_document, document_id}."
+                ),
+                "oneOf": [
+                    {"type": "string", "minLength": 1},
+                    {
+                        "type": "object", "required": ["source_kind", "document_id"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "source_kind": {"type": "string", "enum": ["workspace_document"]},
+                            "document_id": {"type": "string", "minLength": 1},
+                        },
+                    },
+                ],
+            },
             "title": _prop("Video title"),
             "description": _prop("Video description (optional)"),
             "tags": _prop("Tags (comma-separated or array)"),
             "category_id": _prop("YouTube category id (default: 22)"),
             "privacy": _prop("private, unlisted, or public (default: private)"),
-            "made_for_kids": _prop("User-attested Made for Kids setting", "boolean"),
+            "made_for_kids": {
+                "description": "User-attested Made for Kids setting: true/false, or made_for_kids/not_made_for_kids",
+                "type": ["boolean", "string"],
+            },
             "publish_at": _prop("Optional RFC 3339 scheduled publish time; requires privacy=private"),
             "notify_subscribers": _prop("Notify subscribers (default: false)", "boolean"),
         },

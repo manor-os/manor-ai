@@ -120,6 +120,10 @@ async def test_stream_preserves_language_choice_in_deltas_and_persisted_blocks(
         return "assistant_1"
 
     monkeypatch.setattr(database, "async_session", Session)
+    # The fake session holds no delivery rows; the Workspace owner pays.
+    monkeypatch.setattr(
+        chat_service, "resolve_run_payer", AsyncMock(side_effect=lambda _db, *, entity_id, workspace_id: entity_id),
+    )
     monkeypatch.setattr(chat_service, "resolve_runtime_chat_context", context)
     monkeypatch.setattr(chat_service, "runtime_execute_chat_agent_loop", loop)
     monkeypatch.setattr(chat_service, "save_or_update_assistant_stream_message", save)

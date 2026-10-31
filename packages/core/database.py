@@ -27,11 +27,18 @@ from packages.core.database_runtime import (
     DatabaseSession,
     configure_database_runtime,
 )
+from packages.core.database_values import dumps_storable_json, install_storable_text
+from packages.core.services.collaborator_steering import install as _install_collaborator_steering
 from packages.core.services.integration_availability_cache import install as _install_integration_availability_invalidation
+from packages.core.services.workspace_change_events import install as _install_workspace_change_events
 
 # Every session's committed writes invalidate discovery's cached integration
 # availability (subclass listeners such as admission release run first).
 _install_integration_availability_invalidation(Session)
+# Tasks a Workspace collaborator writes record that collaborator's steering.
+_install_collaborator_steering(Session)
+# Committed Workspace configuration writes tell that Workspace's viewers to refetch.
+_install_workspace_change_events(Session)
 settings = get_settings()
 
 
@@ -64,7 +71,7 @@ def _build_engine_kwargs(settings, *, is_test_database: bool) -> dict:
     }
     if getattr(settings, "DATABASE_POOL_MODE", "sqlalchemy") == "pgbouncer":
         # PgBouncer pools server connections, but every new client connection
-        # is still a TCP + TLS + SCRAM handshake (~105ms p50 on DOKS against
+        # is still a TCP + TLS + SCRAM handshake (~105ms p50 on managed Postgres against
         # ~3ms per query on an open one). API/chat run one long-lived event
         # loop, so keep a bounded client pool; transaction pooling stays safe
         # because prepared statements are disabled. Workers keep NullPool:
@@ -105,7 +112,10 @@ def create_database_engine(settings, *, kind: DatabaseEngineKind, is_test_databa
         if kind is DatabaseEngineKind.WORKER
         else _build_engine_kwargs(settings, is_test_database=is_test_database)
     )
-    engine = create_async_engine(settings.DATABASE_URL, **kwargs)
+    engine = create_async_engine(
+        settings.DATABASE_URL, json_serializer=dumps_storable_json, **kwargs,
+    )
+    install_storable_text(engine.sync_engine)
     configure_database_runtime(engine, settings, kind)
     return engine
 

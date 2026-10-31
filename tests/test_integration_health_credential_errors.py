@@ -58,6 +58,12 @@ class _FakeOAuthAccount:
     token_expires_at = object()
 
 
+def _own_errors(caplog) -> list:
+    # asyncio reports another test's leaked connection whenever it is
+    # garbage-collected, which can be during this test; that is not ours.
+    return [r for r in caplog.records if r.levelno >= logging.ERROR and r.name != "asyncio"]
+
+
 def _set_whatsapp_deployment_config(monkeypatch) -> None:
     monkeypatch.setenv("NANGO_PROVIDER_WHATSAPP_CLIENT_ID", "meta-app-id")
     monkeypatch.setenv("NANGO_PROVIDER_WHATSAPP_CLIENT_SECRET", "meta-app-secret")
@@ -244,7 +250,7 @@ async def test_decrypt_failure_marks_integration_needs_reconnect(monkeypatch, ca
     assert result["needs_reconnect"] is True
     assert "reconnect" in result["detail"].lower()
     # Expected, recurring state — must not spam a full traceback at ERROR level.
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not _own_errors(caplog)
 
 
 @pytest.mark.asyncio
@@ -286,7 +292,7 @@ async def test_decrypt_failure_marks_oauth_needs_reconnect(monkeypatch, caplog):
     assert row.profile["last_health_check"]["ok"] is False
     assert row.token_expires_at is None
     assert db.flush_count == 1
-    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert not _own_errors(caplog)
 
 
 @pytest.mark.asyncio

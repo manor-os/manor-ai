@@ -163,7 +163,6 @@ def _quiet_side_effects(monkeypatch):
         return None
 
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop)
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
 
 
 async def _seed_open_proposal(db, workspace: Workspace, *, review_id: str) -> Task:
@@ -215,7 +214,8 @@ async def _seed_open_workflow_proposal(
     return item
 
 
-async def _skip_notices(db, workspace: Workspace) -> list[Message]:
+async def _chat_lines(db, workspace: Workspace) -> list[Message]:
+    """Workspace chat messages other than the in-place Strategist progress row."""
     conv_id = (await db.execute(
         select(Conversation.id).where(Conversation.workspace_id == workspace.id)
     )).scalars().first()
@@ -226,7 +226,7 @@ async def _skip_notices(db, workspace: Workspace) -> list[Message]:
         .where(Message.conversation_id == conv_id)
         .order_by(Message.id.asc())
     )).scalars().all()
-    return [m for m in rows if (m.meta or {}).get("strategist_review_skip")]
+    return [m for m in rows if m.message_kind != "strategist_activity"]
 
 
 # ── 1. every call site's kind mapping ─────────────────────────────────
@@ -590,9 +590,9 @@ async def test_supersede_rejects_open_cohort_then_runs_the_review(
     assert [t.title for t in new_proposals] == ["Ship the next thing"]
 
 
-# ── 4. SCHEDULED still suppressed; notice posted once ─────────────────
+# ── 4. SCHEDULED still suppressed; nothing posted to chat ────────────
 
-async def test_scheduled_review_with_open_proposals_is_suppressed_and_announced_once(
+async def test_scheduled_review_with_open_proposals_is_suppressed_without_a_chat_notice(
     db_session, monkeypatch,
 ):
     workspace = await _seed_workspace(db_session)
@@ -602,6 +602,7 @@ async def test_scheduled_review_with_open_proposals_is_suppressed_and_announced_
     _install_llm(monkeypatch, llm_calls)
     _quiet_side_effects(monkeypatch)
     await _seed_open_proposal(db_session, workspace, review_id="rv_prev")
+    before = [m.id for m in await _chat_lines(db_session, workspace)]
 
     first = await _execute_strategist_review_cycle(
         db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
@@ -611,28 +612,46 @@ async def test_scheduled_review_with_open_proposals_is_suppressed_and_announced_
     assert first.get("needs_decision") is None
     assert llm_calls == []
 
-    notices = await _skip_notices(db_session, workspace)
-    assert len(notices) == 1
-    assert "still awaiting your decision" in notices[0].content
-    assert notices[0].message_kind == "proposal"
-    assert notices[0].pending_action is None
-
-    # The next cadence tick trips over the same blocked state: still
-    # suppressed, and it does NOT post the same line again.
+    # An undecided card holds only its own decision: the skipped review
+    # does not add a line to Workspace chat, on this tick or the next.
     second = await _execute_strategist_review_cycle(
         db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
     )
     assert second["skipped"] is True
     assert second["reason"] == "open_proposals"
-    assert len(await _skip_notices(db_session, workspace)) == 1
+    assert [m.id for m in await _chat_lines(db_session, workspace)] == before
 
-    # A different blocking state earns a fresh line.
-    await _seed_open_proposal(db_session, workspace, review_id="rv_prev")
-    third = await _execute_strategist_review_cycle(
-        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
-    )
-    assert third["skipped"] is True
-    assert len(await _skip_notices(db_session, workspace)) == 2
+
+@pytest.mark.parametrize("kind,replies", [
+    (ReviewTriggerKind.SCHEDULED, False),
+    (ReviewTriggerKind.HUMAN_REQUESTED, True),
+])
+async def test_review_with_nothing_to_decide_only_answers_the_person_who_asked(
+    db_session, monkeypatch, kind, replies,
+):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, True)
+
+    async def fake(system_prompt, user_prompt, **kwargs):
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review({
+            "summary": "Everything is on track, nothing needs you right now.",
+            "notes": "Considered another recovery pass; the briefing does not justify it.",
+            "tasks": [],
+        }, user_prompt)))
+
+    monkeypatch.setattr("packages.core.strategist.prompt.runtime_execute_strategist_completion", fake)
+    posted = []
+
+    async def capture(workspace, proposal, task_ids, **kwargs):
+        posted.append(proposal)
+
+    monkeypatch.setattr(strategist_service, "_post_proposal_chat", capture)
+
+    result = await _execute_strategist_review_cycle(db_session, workspace.id, kind)
+
+    assert result["task_count"] == 0
+    assert bool(posted) is replies
 
 
 # ── 5. legacy bare-string wire payload ───────────────────────────────

@@ -64,6 +64,12 @@ class IntegrationProviderReadiness:
     setup_kind: str | None = None
 
 
+def is_user_facing_integration_provider(provider: object) -> bool:
+    """Whether a provider should create user setup work."""
+    key = canonical_provider_key(provider)
+    return bool(key) and key not in _NON_USER_FACING_PROVIDER_KEYS
+
+
 async def integration_provider_readiness(
     db: AsyncSession,
     *,

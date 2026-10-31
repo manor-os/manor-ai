@@ -102,6 +102,7 @@ async def _publish_site_handler(
         from packages.core.services.code_projects import get_profile
         from packages.core.services.workspace_access import user_can_manage_workspace
         from packages.core.services.auth_service import get_user_membership
+        from packages.core.services.external_collaboration_access import COLLABORATOR_MEMBERSHIP_ROLE
         from packages.core.services.site_access import (
             SitePublishAccessDenied,
             require_site_publish_access,
@@ -147,6 +148,12 @@ async def _publish_site_handler(
             if membership is None or membership.status != "active":
                 raise SitePublishAccessDenied(
                     "An active entity membership is required to publish this site"
+                )
+            if membership.role == COLLABORATOR_MEMBERSHIP_ROLE:
+                # A public site is published under the company's name, outside
+                # any Workspace an external collaborator works in.
+                raise SitePublishAccessDenied(
+                    "External collaborators cannot publish sites for this company"
                 )
             actor = SimpleNamespace(
                 id=user.id,

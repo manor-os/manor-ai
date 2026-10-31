@@ -189,6 +189,8 @@ class WorkspaceFileResourceMatchKind(str, Enum):
     EXACT = "exact"
     ENTITY_EXACT = "entity_exact"
     TREE = "tree"
+    # A literal entity directory and everything under it (bash destinations).
+    ENTITY_TREE = "entity_tree"
     COLLISION_SAFE_FILE = "collision_safe_file"
 
 
@@ -213,6 +215,23 @@ def _workspace_file_mutation_kind(
         "workspace.file.write": WorkspaceFileMutationKind.WRITE,
         "workspace.file.delete": WorkspaceFileMutationKind.DELETE,
     }.get(key)
+
+
+def _mutation_kind_covers(
+    granted: WorkspaceFileMutationKind,
+    requested: WorkspaceFileMutationKind | None,
+) -> bool:
+    """Whether a receipt's kind covers one write; matches the atomic commit check.
+
+    ``write`` means create-or-replace, so it covers a create and a modify,
+    exactly as ``authorizes_workspace_file_commit`` lets it commit both.
+    """
+
+    if requested is None:
+        return False
+    if granted is requested:
+        return True
+    return granted is WorkspaceFileMutationKind.WRITE and requested is not WorkspaceFileMutationKind.DELETE
 
 
 def _workspace_logical_file_path(
@@ -253,17 +272,40 @@ def _file_resource_matches(
     approved = _file_resource_id(approved_resource.resource_id)
     if approved_resource.match_kind is WorkspaceFileResourceMatchKind.ENTITY_EXACT:
         return approved is not None and approved == _file_resource_id(actual_path)
+    if approved_resource.match_kind is WorkspaceFileResourceMatchKind.ENTITY_TREE:
+        actual = _file_resource_id(actual_path)
+        return approved is not None and actual is not None and (
+            actual == approved or actual.startswith(f"{approved}/")
+        )
     normalized_base = _file_resource_id(artifact_base_dir)
-    if approved is not None and normalized_base is not None:
-        if approved == normalized_base:
-            approved = None
-        elif approved.startswith(f"{normalized_base}/"):
-            approved = approved[len(normalized_base) + 1 :] or None
+    if (
+        approved is not None and normalized_base is not None and "/" in approved
+        and not approved.startswith(f"{normalized_base}/")
+    ):
+        # Every writer scopes a nested name the same way (a run-relative
+        # workflow/<run>/technical/x lands in that run's folder). Compare in
+        # the writer's namespace, but only where that stays in this base.
+        from packages.core.services.generated_media_naming import scope_workspace_artifact_path
+
+        scoped = _file_resource_id(scope_workspace_artifact_path(
+            approved, normalized_base, preserve_leaf_default=True,
+        ))
+        if scoped and (scoped == normalized_base or scoped.startswith(f"{normalized_base}/")):
+            approved = scoped
     logical_path = _workspace_logical_file_path(
         actual_path,
         task_id,
         artifact_base_dir,
     )
+    if approved is not None and approved == normalized_base:
+        # A tree may name the artifact base itself (narration's parent is the
+        # run folder): it covers that folder's children, never the base path.
+        return (
+            approved_resource.match_kind is WorkspaceFileResourceMatchKind.TREE
+            and logical_path is not None
+        )
+    if approved is not None and normalized_base is not None and approved.startswith(f"{normalized_base}/"):
+        approved = approved[len(normalized_base) + 1 :] or None
     if approved is None or logical_path is None:
         return False
     if logical_path == approved:
@@ -409,7 +451,13 @@ class WorkspaceFileAuthorizationResourceFactory:
         "compose_creative_publication": (
             WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
         ),
+        "compose_creative_deck": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
         "compose_creative_dub": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "compose_creative_video": (
             WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
         ),
         "render_recording": (
@@ -610,6 +658,11 @@ class WorkspaceFileAuthorizationResourceFactory:
         return specs[0] if specs else None
 
     @classmethod
+    def media_output_argument_names(cls, tool_name: str) -> tuple[str, ...]:
+        """The arguments a media tool names its outputs by (e.g. a timeline's manifest_name)."""
+        return tuple(spec.argument_name for spec in cls._MEDIA_OUTPUT_SPECS.get(tool_name, ()))
+
+    @classmethod
     def media_tool_resources(
         cls,
         tool_name: str,
@@ -623,9 +676,23 @@ class WorkspaceFileAuthorizationResourceFactory:
             raw_path = str(
                 arguments.get(spec.argument_name) or spec.fallback_path
             ).strip()
-            if spec.argument_name == "output_directory" and artifact_base_dir is not None:
-                from packages.core.services.generated_media_naming import execution_output_directory
-                raw_path = execution_output_directory(raw_path, artifact_base_dir)
+            if artifact_base_dir is not None:
+                from packages.core.services.generated_media_naming import (
+                    execution_output_directory,
+                    scope_workspace_artifact_path,
+                )
+
+                if spec.argument_name == "output_directory":
+                    raw_path = execution_output_directory(raw_path, artifact_base_dir)
+                elif spec.kind is WorkspaceFileOutputArgumentKind.DIRECTORY:
+                    # Directory writers derive child files at execution time.
+                    # Authorize that same Workspace-scoped directory so the
+                    # atomic commit guard sees the identical namespace.
+                    raw_path = scope_workspace_artifact_path(
+                        raw_path,
+                        artifact_base_dir,
+                        preserve_leaf_default=True,
+                    )
             resource = _file_resource_id(raw_path)
             if spec.kind is WorkspaceFileOutputArgumentKind.FILE:
                 if (
@@ -652,6 +719,13 @@ class WorkspaceFileAuthorizationResourceFactory:
                         target.rel_path, WorkspaceFileResourceMatchKind.EXACT,
                     ))
                     continue
+                if resource and "/" in resource and artifact_base_dir is not None:
+                    # The writer scopes a nested name (e.g. a run-relative
+                    # workflow/<run>/technical/x.json) into the Workspace;
+                    # authorize the directory it will actually write.
+                    resource = _file_resource_id(scope_workspace_artifact_path(
+                        raw_path, artifact_base_dir, preserve_leaf_default=True,
+                    ))
                 resource = (
                     posixpath.dirname(resource)
                     if resource and "/" in resource
@@ -721,43 +795,50 @@ class WorkspaceFileAuthorizationResourceFactory:
         arguments: dict[str, object],
         *, artifact_base_dir: str | None = None, entity_id: str | None = None,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
-        from packages.core.ai.runtime.approval_classifier import bash_write_targets
+        """What one bash command may change, as literal entity paths.
 
+        A command's operands are entity paths (relative to the entity root),
+        never paths relative to an artifact base, so they always match
+        literally (``ENTITY_*``). Directory destinations match their whole
+        tree: ``cp a b fonts/`` writes ``fonts/a`` and ``fonts/b``.
+        """
         command = str(arguments.get("command") or "").strip()
-        if artifact_base_dir and entity_id:
-            from packages.core.ai.runtime.bash_output_paths import BashOutputPathError, scope_bash_output_command
+        entity_root: str | None = None
+        if entity_id:
             from packages.core.services.entity_fs import get_entity_root
+
+            entity_root = get_entity_root(entity_id)
+        if artifact_base_dir and entity_root:
+            from packages.core.ai.runtime.bash_output_paths import BashOutputPathError, scope_bash_output_command
             try:
                 command = scope_bash_output_command(
-                    command, artifact_base_dir=artifact_base_dir, entity_root=get_entity_root(entity_id),
+                    command, artifact_base_dir=artifact_base_dir, entity_root=entity_root,
                 ).command
             except BashOutputPathError:
                 return ()
-        targets = bash_write_targets(command)
-        try:
-            import shlex
+        from packages.core.ai.runtime.bash_command_specs import BashCommandSpecFactory
 
-            parts = shlex.split(command)
-        except ValueError:
-            parts = []
-        if parts and parts[0].rsplit("/", 1)[-1] in {"mv", "cp"}:
-            targets = [part for part in parts[1:] if not part.startswith("-")]
-        resources = []
-        for target in targets:
-            resource = _file_resource_id(target)
-            if artifact_base_dir and resource and resource.startswith("Workspaces/"):
+        resources: dict[str, WorkspaceFileAuthorizationResource] = {}
+        for target in BashCommandSpecFactory.write_resources(command, entity_root=entity_root):
+            resource = _file_resource_id(target.path)
+            if resource is None:
+                continue
+            if artifact_base_dir and resource.startswith("Workspaces/"):
                 from packages.core.services.generated_media_naming import workspace_storage_root
                 if not resource.startswith(workspace_storage_root(artifact_base_dir) + "/"):
                     return ()
-            if resource is None or any(
-                item.resource_id == resource for item in resources
-            ):
+            match_kind = (
+                WorkspaceFileResourceMatchKind.ENTITY_TREE
+                if target.tree
+                else WorkspaceFileResourceMatchKind.ENTITY_EXACT
+            )
+            if resource in resources and match_kind is not WorkspaceFileResourceMatchKind.ENTITY_TREE:
                 continue
-            resources.append(WorkspaceFileAuthorizationResource(
+            resources[resource] = WorkspaceFileAuthorizationResource(
                 resource_id=resource,
-                match_kind=WorkspaceFileResourceMatchKind.ENTITY_EXACT if artifact_base_dir else WorkspaceFileResourceMatchKind.EXACT,
-            ))
-        return tuple(resources)
+                match_kind=match_kind,
+            )
+        return tuple(resources.values())
 
     @classmethod
     def generate_file_destination(
@@ -1015,6 +1096,35 @@ class RuntimeToolAuthorizationReceipt:
     def resource_ids(self) -> tuple[str, ...]:
         return tuple(resource.resource_id for resource in self.file_resources)
 
+    @property
+    def file_mutation_kind(self) -> WorkspaceFileMutationKind | None:
+        """What a write under this receipt may do to its approved paths.
+
+        The bash classifier calls every non-delete write whose targets are not
+        all provably new ``workspace.file.modify`` ("modify files in this
+        workspace"). For a shell command that is a ceiling, not a claim that
+        the files already exist: ``mkdir -p d && cp f d/`` creates. A bash
+        modify receipt therefore lets its named paths be created or replaced.
+        """
+
+        kind = _workspace_file_mutation_kind(self.action_key)
+        if kind is WorkspaceFileMutationKind.MODIFY and self.tool_name == "bash":
+            return WorkspaceFileMutationKind.WRITE
+        return kind
+
+    def names_workspace_file(self, path: str) -> bool:
+        """Whether one of this receipt's approved resources is (or contains) ``path``."""
+
+        return any(
+            _file_resource_matches(
+                approved_resource=resource,
+                actual_path=path,
+                task_id=self.task_id,
+                artifact_base_dir=self.workspace_artifact_base_dir,
+            )
+            for resource in self.file_resources
+        )
+
     def authorizes_workspace_file_mutation(
         self,
         *,
@@ -1029,14 +1139,14 @@ class RuntimeToolAuthorizationReceipt:
     ) -> bool:
         """Match the exact Workspace scope, mutation kind, and file targets."""
 
-        receipt_kind = _workspace_file_mutation_kind(self.action_key)
+        receipt_kind = self.file_mutation_kind
         requested_kind = _workspace_file_mutation_kind(action_key)
         if not (
             self.access is RuntimeAuthorizationAccess.ACTION
             and self.capability_id == capability_id
             and self.resource_kind in {"file", "workspace_file"}
             and receipt_kind is not None
-            and receipt_kind is requested_kind
+            and _mutation_kind_covers(receipt_kind, requested_kind)
             and self.entity_id == str(entity_id or "").strip()
             and self.user_id == _scope(user_id)
             and self.workspace_id == _scope(workspace_id)
@@ -1076,7 +1186,7 @@ class RuntimeToolAuthorizationReceipt:
     ) -> bool:
         """Revalidate action kind and exact target inside the atomic write lock."""
 
-        mutation_kind = _workspace_file_mutation_kind(self.action_key)
+        mutation_kind = self.file_mutation_kind
         if not (
             self.access is RuntimeAuthorizationAccess.ACTION
             and self.entity_id == str(entity_id or "").strip()
@@ -1156,17 +1266,6 @@ class RuntimeToolAuthorizationReceiptFactory:
             else WorkspaceFileScopeBinding.UNBOUND
         )
 
-        from packages.core.ai.runtime.sandbox import runtime_is_task_binding_key
-
-        # A conversation-less task worker authorizes sandbox-bound tools under
-        # its synthetic binding key (see runtime_authorization_conversation_id).
-        # That key identifies the sandbox binding, not a conversation: the
-        # inner file mutation is checked against the real conversation (none),
-        # so the receipt must record none too or every save would mismatch.
-        receipt_conversation_id = _scope(authoritative_request.conversation_id)
-        if receipt_conversation_id and runtime_is_task_binding_key(receipt_conversation_id):
-            receipt_conversation_id = None
-
         from packages.core.ai.runtime.surfaces import ChatSurface
 
         surface = getattr(authoritative_request.envelope, "surface", None)
@@ -1182,7 +1281,8 @@ class RuntimeToolAuthorizationReceiptFactory:
             entity_id=str(authoritative_request.entity_id or "").strip(),
             user_id=_scope(authoritative_request.user_id),
             workspace_id=_scope(authoritative_request.workspace_id),
-            conversation_id=receipt_conversation_id,
+            # The real conversation: inner file guards check against it.
+            conversation_id=_scope(authoritative_request.conversation_id),
             task_id=_scope(authoritative_request.task_id),
             action_key=authorization.action_key,
             capability_id=authorization.capability_id,

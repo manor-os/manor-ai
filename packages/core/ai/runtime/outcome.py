@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from packages.core.ai.runtime.receipts import EffectState
+from packages.core.ai.runtime.receipts import EffectState, runtime_aggregate_effect_state
 
 
 class RunOutcome(StrEnum):
@@ -102,13 +102,20 @@ def replay_fields_from_control(control: Any) -> dict[str, Any]:
 def attempt_forbids_replay(result: Any) -> bool:
     """True when an automatic retry of this attempt could repeat an effect.
 
-    Only ``do_not_replay`` says that. ``retryable=False`` on its own is what
-    loop controls set when their in-loop budget is spent (e.g.
+    A host receipt that says an external effect was confirmed or remains
+    unconfirmed is equally authoritative, even when an older result omitted
+    the derived ``do_not_replay`` marker. ``retryable=False`` on its own is
+    what loop controls set when their in-loop budget is spent (e.g.
     ``retry_budget_exhausted``); a later, separate attempt is still safe.
     """
     if not isinstance(result, dict):
         return False
-    return result.get("do_not_replay") is True
+    if result.get("do_not_replay") is True:
+        return True
+    return result.get("effect_state") in {
+        EffectState.CONFIRMED.value,
+        EffectState.UNCONFIRMED.value,
+    }
 
 
 def _ledger_is_unconfirmed(evidence: Any) -> bool:
@@ -128,6 +135,25 @@ def _ledger_is_unconfirmed(evidence: Any) -> bool:
     return effect_state == EffectState.UNCONFIRMED.value or bool(unconfirmed_calls)
 
 
+def _ledger_effect_state(evidence: Any) -> str | None:
+    """Return a valid host ledger state without inventing one for old results."""
+    if isinstance(evidence, dict):
+        value = evidence.get("effect_state")
+    elif evidence is not None:
+        value = getattr(evidence, "effect_state", None)
+    else:
+        return None
+    try:
+        return EffectState(str(value)).value
+    except ValueError:
+        return None
+
+
+def ledger_is_unconfirmed(evidence: Any) -> bool:
+    """Public: whether a run's receipt ledger holds an effect nobody confirmed."""
+    return _ledger_is_unconfirmed(evidence)
+
+
 def replay_fields_from_result(result: Any) -> dict[str, Any]:
     """Replay-safety fields of a finished attempt: its control plus its ledger.
 
@@ -144,6 +170,14 @@ def replay_fields_from_result(result: Any) -> dict[str, Any]:
         control = control or result.get("control")
         evidence = evidence or result.get("tool_evidence")
     out = replay_fields_from_control(control)
+    control_effect_state = _ledger_effect_state({"effect_state": out.get("effect_state")})
+    ledger_effect_state = _ledger_effect_state(evidence)
+    if control_effect_state is not None and ledger_effect_state is not None:
+        effect_state = runtime_aggregate_effect_state((control_effect_state, ledger_effect_state)).value
+    else:
+        effect_state = control_effect_state or ledger_effect_state
+    if effect_state is not None:
+        out["effect_state"] = effect_state
     if _ledger_is_unconfirmed(evidence):
         out["do_not_replay"] = True
         out["effect_state"] = EffectState.UNCONFIRMED.value

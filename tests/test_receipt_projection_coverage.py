@@ -23,10 +23,6 @@ RECEIPT_EXEMPT = {
         "async provider job: success is status=pending + job_id with no file identity; "
         "the file receipt is projected by wait_media_jobs when the job completes"
     ),
-    "coding_based_video": (
-        "no handler registered in this repo (classifier + capability alias only); "
-        "there is no success payload to project"
-    ),
 }
 
 # Schema arguments whose enum values change what a call does; each value is

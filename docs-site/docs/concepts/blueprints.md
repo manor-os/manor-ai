@@ -98,8 +98,11 @@ must be resolved in the target installation; a JSON file does not copy their
 permissions, credentials, execution grants or live consent.
 Built-in Skill references resolve to the exact packaged source identity, not
 just a matching slug. Customer delivery carries only selected configuration
-and opted-in starters; recipient workspaces remain paused with
-`provider_access: none` until configured locally.
+and opted-in starters; recipient workspaces install paused until configured
+locally. A direct delivery gives the provider no access. A trial delivery lets
+the sender co-work as an owner inside that one workspace, and only there,
+until the customer accepts the delivery and chooses to keep the provider as a
+maintainer or remove them.
 
 
 ## Versioning and Upgrades

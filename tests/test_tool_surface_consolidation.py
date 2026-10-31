@@ -62,6 +62,10 @@ def test_tool_pool_keeps_undiscoverable_compatibility_aliases_executable() -> No
     )
 
 
+
+async def _allow_sandbox_access(**_kwargs):
+    return None
+
 @pytest.mark.asyncio
 async def test_sandbox_composite_routes_action_and_context(monkeypatch) -> None:
     seen: dict = {}
@@ -143,6 +147,9 @@ async def test_sandbox_read_file_honors_provider_pagination(monkeypatch) -> None
         return FakeClient()
 
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", fake_client)
+    # Paging is under test, not the binding check (covered in
+    # tests/test_sandbox_binding_scope.py).
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", _allow_sandbox_access)
 
     result = json.loads(
         await sandbox_tools._sandbox_read_file(
@@ -182,6 +189,9 @@ async def test_sandbox_read_file_pages_at_the_context_budget(monkeypatch) -> Non
         return FakeClient()
 
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", fake_client)
+    # Paging is under test, not the binding check (covered in
+    # tests/test_sandbox_binding_scope.py).
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", _allow_sandbox_access)
 
     whole = json.loads(await sandbox_tools._sandbox_read_file(sandbox_id="sandbox-1", path="/skill/SKILL.md"))
     assert whole["returned_chars"] == sandbox_tools.READ_FILE_PAGE_MAX_CHARS
@@ -224,6 +234,9 @@ async def test_sandbox_read_file_does_not_advertise_unservable_service_page(
         return FakeClient()
 
     monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", fake_client)
+    # Paging is under test, not the binding check (covered in
+    # tests/test_sandbox_binding_scope.py).
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", _allow_sandbox_access)
 
     result = json.loads(
         await sandbox_tools._sandbox_read_file(

@@ -88,9 +88,10 @@ def _run(
     *,
     occurrence: str,
     created_at: datetime,
+    run_id: str | None = None,
 ) -> AgentInitiativeRun:
     return AgentInitiativeRun(
-        id=generate_ulid(),
+        id=run_id or generate_ulid(),
         initiative_id=initiative.id,
         occurrence_key=occurrence,
         trigger_type="scheduled",
@@ -323,13 +324,18 @@ async def test_delivery_sweep_backoff_prevents_old_poison_rows_from_starving_new
     )
     await db_session.commit()
     initiative = await _seed_initiative(db_session, "fair-sweep")
+    # The sweep breaks equal due times by run id. ULIDs minted within one
+    # millisecond do not reliably sort in generation order, so fix the order
+    # explicitly: every poison run sorts before the newer healthy run.
+    *poison_ids, healthy_id = sorted(generate_ulid() for _ in range(102))
     poison_run_ids: list[str] = []
     deliveries: list[AgentInitiativeDelivery] = []
-    for index in range(101):
+    for index, run_id in enumerate(poison_ids):
         run = _run(
             initiative,
             occurrence=f"poison-{index}",
             created_at=now - timedelta(days=1) + timedelta(microseconds=index),
+            run_id=run_id,
         )
         poison_run_ids.append(run.id)
         db_session.add(run)
@@ -339,7 +345,9 @@ async def test_delivery_sweep_backoff_prevents_old_poison_rows_from_starving_new
             due_at=now,
             status="error",
         ))
-    healthy = _run(initiative, occurrence="healthy", created_at=now)
+    healthy = _run(
+        initiative, occurrence="healthy", created_at=now, run_id=healthy_id,
+    )
     db_session.add(healthy)
     deliveries.append(_delivery(healthy, kind="conversation", due_at=now))
     await db_session.flush()

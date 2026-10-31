@@ -34,7 +34,7 @@ def test_extension_is_latched_once_per_skill_per_turn():
     # The latch is bound before the resume/live branch split, so a resumed
     # turn (checkpoint present) reads a bound name.
     init = source.index("sandbox_budget_extended_for: set[str] = set()")
-    assert init < source.index("if checkpoint is not None:")
+    assert init < source.index("resume_calls = [checkpoint.pending_tool_call")
 
     assert agentic_loop._sandbox_handoff_skill_name({"status": "sandbox_ready", "skill": "DOCX"}) == "docx"
     assert agentic_loop._sandbox_handoff_skill_name({"status": "sandbox_ready"}) == "<unnamed>"
@@ -56,3 +56,50 @@ def test_loop_extends_the_budget_on_both_handoff_paths():
     live = source.index('if tc["name"] in _SANDBOX_HANDOFF_TOOL_NAMES')
     resume = source.index("in _SANDBOX_HANDOFF_TOOL_NAMES\n")
     assert resume < live, "the resume block precedes the live tool loop"
+
+
+async def test_a_turn_keeps_its_handed_off_sandbox_alive_until_it_ends(monkeypatch):
+    """A workflow agent spent four ~100 s model rounds writing a manifest; the
+    staging runner reclaims a sandbox idle for 300 s, so the turn came back to
+    sandbox_expired and lost every file in it."""
+    import asyncio
+
+    from packages.core.ai.runtime import sandbox as runtime_sandbox
+    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+
+    touched: list[str] = []
+
+    class FakeClient:
+        async def touch(self, sandbox_id):
+            if sandbox_id == "sb_gone":
+                raise SandboxNotFoundError("gone")
+            touched.append(sandbox_id)
+
+        async def close(self):
+            return None
+
+    async def fake_client(_sandbox_id):
+        return FakeClient()
+
+    async def fake_turn(*_args, **_kwargs):
+        agentic_loop._note_turn_sandbox({"status": "sandbox_ready", "sandbox_id": "sb_live"})
+        agentic_loop._note_turn_sandbox({"status": "sandbox_ready", "sandbox_id": "sb_gone"})
+        agentic_loop._note_turn_sandbox({"status": "failed", "sandbox_id": "sb_not_handed"})
+        await asyncio.sleep(0.35)  # a long model round with no sandbox call
+        return "done"
+
+    monkeypatch.setattr(runtime_sandbox, "runtime_sandbox_client", fake_client)
+    monkeypatch.setattr(agentic_loop, "SANDBOX_KEEPALIVE_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(agentic_loop, "_agentic_loop", fake_turn)
+
+    assert await agentic_loop.agentic_loop("system", "user") == "done"
+    beats = len(touched)
+    assert beats >= 3 and set(touched) == {"sb_live"}
+    await asyncio.sleep(0.2)
+    assert len(touched) == beats, "the keepalive stops when the turn ends"
+    assert agentic_loop._TURN_SANDBOXES.get() is None
+
+
+def test_both_handoff_paths_register_the_turn_sandbox():
+    source = Path("packages/core/ai/agentic_loop.py").read_text(encoding="utf-8")
+    assert source.count("_note_turn_sandbox(tool_result)") == 2

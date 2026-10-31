@@ -21,6 +21,7 @@ from packages.core.governance.approval_policy_migration import (
 )
 from packages.core.models.audit import AuditLog
 from packages.core.models.user import Entity, User
+from tests.approval_settings_test_utils import POLICY_WRITE_SIDE_EFFECT_MODELS
 
 
 @compiles(JSONB, 'sqlite')
@@ -136,8 +137,9 @@ def test_live_migration_never_silently_weakens_legacy_patterns(value):
         normalize_legacy_workspace_policy({'never_allow_actions': [value]}, root_entity_id='e')
 
 
-def test_import_is_explicit_review_projection():
-    converted = normalize_legacy_workspace_policy(None, safe_import=True)
+def test_import_grants_nothing_and_reviews_unrepresentable_restrictions():
+    assert normalize_legacy_workspace_policy(None, safe_import=True)['approval']['rules'] == []
+    converted = normalize_legacy_workspace_policy({'hitl_required_capabilities': ['external.email']}, safe_import=True)
     assert all(row['effect'] == 'ask' for row in converted['approval']['rules'])
     assert 'unknown' in {row['selector']['category'] for row in converted['approval']['rules']}
     with pytest.raises(LegacyApprovalConversionError):
@@ -151,7 +153,9 @@ async def test_update_preserves_other_preferences_and_checks_root_version(monkey
         await connection.run_sync(lambda sync: Entity.__table__.create(sync))
         await connection.run_sync(lambda sync: User.__table__.create(sync))
         await connection.run_sync(lambda sync: AuditLog.__table__.create(sync))
-    capabilities = {'can_view': True, 'can_edit_root': True, 'can_edit_local': True, 'can_approve_once': False, 'can_grant_run': False, 'can_save_rule': True}
+        for model in POLICY_WRITE_SIDE_EFFECT_MODELS:
+            await connection.run_sync(model.__table__.create)
+    capabilities ={'can_view': True, 'can_edit_root': True, 'can_edit_local': True, 'can_approve_once': False, 'can_grant_run': False, 'can_save_rule': True}
     monkeypatch.setattr(service, '_capabilities', AsyncMock(return_value=capabilities))
     async with AsyncSession(engine) as db:
         db.add(Entity(id='e', name='Account', settings={'approval_defaults': service.account_defaults(), 'unrelated': 'keep'}))

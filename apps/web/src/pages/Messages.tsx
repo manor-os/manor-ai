@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { getPreferredTimeZone } from "../lib/format";
 import type { UserSummary } from "../lib/types";
 import PageHeader from "../components/ui/PageHeader";
 import SearchInput from "../components/ui/SearchInput";
@@ -267,7 +268,7 @@ export default function Messages() {
                         </span>
                         {thread.last_message_at && (
                           <span style={{ fontSize: 11, color: "#a8a29e", flexShrink: 0, marginLeft: 8 }}>
-                            {new Date(thread.last_message_at).toLocaleDateString()}
+                            {new Date(thread.last_message_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}
                           </span>
                         )}
                       </div>
@@ -380,7 +381,7 @@ export default function Messages() {
                             color: msg.is_own ? "rgba(255,255,255,0.6)" : "#a8a29e",
                           }}
                         >
-                          {new Date(msg.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          {new Date(msg.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() })}
                         </p>
                       </div>
                     </div>

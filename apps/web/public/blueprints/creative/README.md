@@ -19,6 +19,9 @@ Illustrations and narration were generated through normal configured media tools
 | dubbing-english-playback.jpg | Fresh English Cedar Cup video playing in the browser on 2026-09-14 |
 | cedar-cup-english.mp4 | Byte-for-byte copy of the fresh 56.033-second English Workspace output |
 | podcast-episode.mp3 | Byte-for-byte copy of the actual AI-narrated Workspace output |
+| video-series-app.jpg | Unmodified 1280×720 browser capture of the Video Series Studio App with the Oak Street Baking Habits series opened: episode cards, the series' pinned narrator and its host and key art |
+| oak-street-bakery-episode.mp4 | Size-reduced re-encode of the actual E01 vertical episode (see below) |
+| series-showcase.mp4 | A 15-second edit of what two series made (see below), shown in the Video Series Studio and Stickman listings |
 
 Cedar Cup's English demo uses captured fictional cafe-app states with existing AI
 Mandarin narration and its matching Chinese SRT. The internal input was cropped
@@ -41,6 +44,33 @@ Original output SHA-256:
 - cedar-cup-english.mp4: `f5c4654d6d1aa7bd902f02cda62cd18ab9b9271d0f54489654c95c78758eab72`
 - dubbing-english-playback.jpg: `0739c4e2b2caf999b4ce416eb3a559e0c44ef9bb1fc134c1124b4cba47079283`
 - podcast-episode.mp3: `e3749ce6ce220e7751d1905e8d872c50dc72628347419f3c937b628ea039d342`
+
+Oak Street Bakery is fictional. The Video Series Studio made two episodes of one
+series on the local stack on 2026-10-25. E01 is run `01M5V2RMDW39YQADVZ27FCBB74`, with
+episode Document `01M5V33JBREZ45MD4EJH46ADJK`. E02 reused the series' narrator, host
+picture and key art without generating them again, and is still at the review gate.
+The public MP4 was re-encoded from that episode (H.264 CRF 31, AAC) to keep the
+bundle small. Picture, narration and burned captions are otherwise unchanged:
+720×1280, 44.437 seconds. Caption timing is estimated from the script, not
+word-aligned.
+
+- Original E01 episode.mp4: `37025568f46d11e4f7a805052c5c51afc13a092dd50cded89716b49d0b0e5f4a`
+- oak-street-bakery-episode.mp4: `44d2f7630053e345380b9b4de0c8225fad5c12f3c239bb4a9362b85730ea25aa`
+- video-series-app.jpg: `02707cb67e59e31a3575371509787f396832623542233ef09442501d16ff6b58`
+
+series-showcase.mp4 is an edited 1920×1080, 15.000-second cut made on 2026-10-26
+from actual local outputs of two fictional series: Tiny Habits, Calmer Mornings
+(Stickman studio; series intro, five episode thumbnails, two seconds of the E06
+episode) and Oak Street Baking Habits (Video Series Studio; series intro, three
+episode covers, two seconds of the E03 episode, the series host and key art). The
+vertical Oak Street material is centred over a blurred copy of itself; stills move
+in slowly; the closing frame tiles eight of these pictures. The cut adds no text
+of its own. The music is Mixkit "Motivating Mornings" under the Mixkit free
+license, from its 28.18-second phrase, slowed 0.8% so every cut lands on a beat,
+and loudness-normalized; the episodes' own narration is not used. It is an edit
+of generated outputs, not a continuous recording of a run.
+
+- series-showcase.mp4: `9091b4b1f301e1b6f396af1cd45a1fbe738942d8f3cf98acba0e89aaa87a1ca9`
 
 ## Verification scope and limits
 

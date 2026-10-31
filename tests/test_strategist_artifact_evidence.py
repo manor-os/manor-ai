@@ -1059,7 +1059,6 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
     from packages.core.services.task_service import update_task
-    from packages.core.tasks import ai_tasks
 
     workspace = Workspace(
         id=generate_ulid(),
@@ -1070,9 +1069,7 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     review_id = "rv_dependency_gate"
     task_a_id = generate_ulid()
     task_b_id = generate_ulid()
-    dispatched: list[str] = []
 
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
 
     db_session.add(workspace)
     subscription = _add_active_content_subscription(db_session, workspace)
@@ -1124,7 +1121,6 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     assert task_a.status == "in_progress"
     assert task_b.status == "pending"
     assert task_b.details["dependency_status"] == "waiting"
-    assert dispatched == []
     start_intents = select(RuntimeOutboxEvent.aggregate_id).where(
         RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
         RuntimeOutboxEvent.aggregate_id.in_([task_a_id, task_b_id]),
@@ -1149,7 +1145,6 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     assert task_b.details["dependency_status"] == "completed"
     assert task_b.details["dep_outputs"][0]["task_id"] == task_a_id
     assert task_b.details["dep_outputs"][0]["files"][0]["name"] == "strategy.md"
-    assert dispatched == []
     assert list((await db_session.execute(start_intents)).scalars()) == sorted([task_a_id, task_b_id])
 
 
@@ -1430,51 +1425,3 @@ async def test_dependency_gate_blocks_missing_predecessor_ids(db_session) -> Non
 
     assert status == "blocked"
     assert statuses == {}
-
-
-@pytest.mark.asyncio
-async def test_dependency_status_reconciles_stale_failed_task_from_completed_plan(db_session) -> None:
-    from packages.core.services.task_dependencies import dependency_status
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    entity_id = generate_ulid()
-    task_id = generate_ulid()
-    plan_id = generate_ulid()
-    db_session.add(Task(
-        id=task_id,
-        entity_id=entity_id,
-        title="Choose topic",
-        status="failed",
-        details={},
-    ))
-    db_session.add(ExecutionPlan(
-        id=plan_id,
-        entity_id=entity_id,
-        task_id=task_id,
-        status="completed",
-        plan_dag={"steps": []},
-    ))
-    db_session.add(ExecutionStep(
-        id=generate_ulid(),
-        plan_id=plan_id,
-        entity_id=entity_id,
-        step_key="choose_topic",
-        kind="subagent",
-        step_status="done",
-        result={"result": {"chosen_topic": "Start tiny"}},
-        depends_on=[],
-        evidence_refs=[],
-        cost={},
-        attempt_count=1,
-        max_attempts=3,
-    ))
-    await db_session.flush()
-
-    status, statuses = await dependency_status(
-        db_session,
-        entity_id=entity_id,
-        dependency_ids=[task_id],
-    )
-
-    assert status == "completed"
-    assert statuses == {task_id: "completed"}

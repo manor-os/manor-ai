@@ -42,7 +42,9 @@ def test_deny_always_wins_over_matching_allow():
         _rule("deny", action="workspace.file.modify", id="deny")]).outcome == "deny"
 
 
-def test_unknown_effect_follows_the_chosen_mode():
+def test_unknown_effect_follows_the_chosen_mode(monkeypatch):
+    # Production fallback for an undeclared key (tests run the strict contract).
+    monkeypatch.delenv("MANOR_STRICT_EFFECT_CONTRACT", raising=False)
     # The user's approval mode decides; an unnamed effect is no exception.
     assert _evaluate([], action="unknown.action", category="unknown", mode="automatic").outcome == "allow"
     assert _evaluate([], action="unknown.action", category="unknown", mode="confirm_changes").outcome == "ask"

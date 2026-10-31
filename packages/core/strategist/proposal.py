@@ -216,6 +216,10 @@ class ProposedTask(BaseModel):
     """Optional stable dedupe key for recurring work across review cycles
     (M7 ``correlation_key``); carried onto the proposal item verbatim."""
 
+    existing_task_id: Optional[str] = Field(default=None, max_length=64)
+    """The existing Task this one repairs, retries, resumes, verifies or
+    follows up, copied from the execution evidence; null for new work."""
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_capability_aliases(cls, data):
@@ -559,6 +563,22 @@ class Proposal(BaseModel):
     execution_review: ExecutionReview | None = None
     """Required during generation with a current snapshot. Optional when reading
     historical proposals created before execution evidence was recorded."""
+
+    retry_task_ids: list[str] = Field(default_factory=list, max_length=5)
+    """Blocked Tasks the Strategist wants retried. A retry is an action on the
+    original Task: the review retries that Task itself (system actor, the
+    Task retry path's safety checks) instead of minting a new recovery Task
+    or asking the customer."""
+
+    @field_validator("retry_task_ids", mode="before")
+    @classmethod
+    def _unique_retry_task_ids(cls, value):
+        if not isinstance(value, list):
+            return value
+        # A retry is advisory; keep the first five rather than failing the review.
+        return list(dict.fromkeys(
+            str(item).strip()[:64] for item in value if str(item or "").strip()
+        ))[:5]
 
     human_requests: list[ProposedHumanRequest] = Field(
         default_factory=list, max_length=3,

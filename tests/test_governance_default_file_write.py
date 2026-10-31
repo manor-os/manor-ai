@@ -21,7 +21,9 @@ from packages.core.governance.presets import apply_preset
     ("automatic", "provider.unknown", "allow"),
     ("confirm_changes", "provider.unknown", "ask"),
 ])
-def test_account_mode_controls_file_operations(mode, action, outcome):
+def test_account_mode_controls_file_operations(mode, action, outcome, monkeypatch):
+    # provider.unknown exercises the production fallback for undeclared keys.
+    monkeypatch.delenv("MANOR_STRICT_EFFECT_CONTRACT", raising=False)
     chain = build_policy_chain(scope=ApprovalScope(kind="account", id="entity", entity_id="entity"),
         root={"revision": 1, "policy": {"mode": mode, "rules": []}})
     assert evaluate_policy(chain, action_facts(action_key=action, resource_kind="file", risk_level="low")).outcome == outcome

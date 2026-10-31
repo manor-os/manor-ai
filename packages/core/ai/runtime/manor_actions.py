@@ -681,13 +681,55 @@ def _has_task_assignment_input(params: Mapping[str, Any]) -> bool:
     return any(_clean_param_text(params.get(key)) for key in _TASK_ASSIGNMENT_INPUT_KEYS)
 
 
+async def _collaborator_acting(db: Any, entity_id: str, user_id: str | None) -> bool:
+    """Whether an external collaborator acts in this call: the run's user, or one steering it."""
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+    from packages.core.services.runtime_authorization.collaborator import is_runtime_collaborator
+
+    if collaborators_acting_now(entity_id):
+        return True
+    return bool(user_id) and await is_runtime_collaborator(str(user_id), entity_id, db=db)
+
+
+async def collaborator_assignee_error(
+    db: Any, entity_id: str, workspace_id: str | None, assignee_id: str | None, *, user_id: str | None,
+) -> dict[str, Any] | None:
+    """A collaborator assigns a Task only to a person seated in its Workspace."""
+    if not assignee_id or not await _collaborator_acting(db, entity_id, user_id):
+        return None
+    _fields, _info, error = await _resolve_task_assignment(
+        db, entity_id, {"assignee_id": assignee_id}, workspace_id=workspace_id, collaborator=True,
+    )
+    return error
+
+
+async def _workspace_assignment_error(
+    db: Any, entity_id: str, workspace_id: str | None, agent_id: str | None,
+) -> dict[str, Any] | None:
+    """A Workspace Task runs only through an Agent subscribed to that Workspace."""
+    from packages.core.services.task_service import ensure_workspace_agent_assignment
+
+    try:
+        await ensure_workspace_agent_assignment(db, entity_id=entity_id, workspace_id=workspace_id, agent_id=agent_id)
+    except ValueError as exc:
+        return {"error": "agent_not_in_workspace", "message": str(exc), "agent_id": agent_id}
+    return None
+
+
 async def _resolve_task_assignment(
     db: Any,
     entity_id: str,
     params: Mapping[str, Any],
     *,
     workspace_id: str | None = None,
+    collaborator: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    """Resolve an assignee by id, email or name.
+
+    For an external collaborator (``collaborator``) only the Task's Workspace
+    is searched: its seated people and its Agents. Other people's emails are
+    never returned to them.
+    """
     from sqlalchemy import and_, or_, select
 
     from packages.core.constants.agents import (
@@ -718,6 +760,31 @@ async def _resolve_task_assignment(
             None,
         )
 
+    not_found = {
+        "error": "assignee_not_found",
+        "message": (
+            "Could not resolve the assignee. Use list_staff/list_agents, "
+            "then pass assignee_id, staff_id, user_id, agent_id, assignee_email, or assignee_name."
+        ),
+        "lookup": lookup.search_text,
+    }
+    # The collaborator's reach: the Workspace's Agents (its own and subscribed)
+    # and the people seated in it. ``None`` for anyone else.
+    workspace_agents = None
+    if collaborator:
+        if not workspace_id:
+            return {}, {}, not_found
+        from packages.core.models.workspace import AgentSubscription
+
+        workspace_agents = select(AgentSubscription.agent_id).where(
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.status == "active",
+        ).union(select(Agent.id).where(Agent.entity_id == entity_id, Agent.workspace_id == workspace_id))
+
+    def agent_scope():
+        return () if workspace_agents is None else (Agent.id.in_(workspace_agents),)
+
     if lookup.agent_id:
         result = await db.execute(
             select(Agent).where(
@@ -727,6 +794,7 @@ async def _resolve_task_assignment(
                     Agent.entity_id == entity_id,
                     and_(Agent.entity_id.is_(None), Agent.is_public.is_(True)),
                 ),
+                *agent_scope(),
             )
         )
         agent = result.scalar_one_or_none()
@@ -764,11 +832,16 @@ async def _resolve_task_assignment(
             clauses.extend([Staff.name.ilike(pattern), Staff.email.ilike(pattern)])
         if not clauses:
             return []
+        seated = (
+            (or_(Staff.id.in_(workspace_staff_ids), Staff.user_id.in_(workspace_user_ids)),)
+            if collaborator else ()
+        )
         result = await db.execute(
             select(Staff).where(
                 Staff.entity_id == entity_id,
                 Staff.deleted_at.is_(None),
                 or_(*clauses),
+                *seated,
             )
         )
         candidates = list(result.scalars().all())
@@ -791,7 +864,7 @@ async def _resolve_task_assignment(
                 "assignee_id": assignment_id,
                 "staff_id": staff.id,
                 "assignee_name": staff.name,
-                "assignee_email": staff.email,
+                **({} if collaborator else {"assignee_email": staff.email}),
             },
             None,
         )
@@ -813,7 +886,7 @@ async def _resolve_task_assignment(
     if user_clauses:
         result = await db.execute(
             select(User).where(
-                User.entity_id == entity_id,
+                User.id.in_(workspace_user_ids) if collaborator else User.entity_id == entity_id,
                 User.deleted_at.is_(None),
                 or_(*user_clauses),
             )
@@ -828,8 +901,8 @@ async def _resolve_task_assignment(
                 {
                     "assignee_type": "user",
                     "assignee_id": user.id,
-                    "assignee_name": user.display_name or user.email,
-                    "assignee_email": user.email,
+                    "assignee_name": user.display_name or (None if collaborator else user.email),
+                    **({} if collaborator else {"assignee_email": user.email}),
                 },
                 None,
             )
@@ -844,6 +917,7 @@ async def _resolve_task_assignment(
                     and_(Agent.entity_id.is_(None), Agent.is_public.is_(True)),
                 ),
                 or_(Agent.name.ilike(pattern), Agent.slug.ilike(pattern)),
+                *agent_scope(),
             )
         )
         agent = result.scalars().first()
@@ -854,21 +928,14 @@ async def _resolve_task_assignment(
                 None,
             )
 
-    if lookup.assignee_id and not lookup.email and not lookup.name:
+    if lookup.assignee_id and not lookup.email and not lookup.name and not collaborator:
         return (
             {"assignee_id": lookup.assignee_id, "agent_id": None, "agent_type": None},
             {"assignee_type": "unknown_id", "assignee_id": lookup.assignee_id},
             None,
         )
 
-    return {}, {}, {
-        "error": "assignee_not_found",
-        "message": (
-            "Could not resolve the assignee. Use list_staff/list_agents, "
-            "then pass assignee_id, staff_id, user_id, agent_id, assignee_email, or assignee_name."
-        ),
-        "lookup": lookup.search_text,
-    }
+    return {}, {}, not_found
 
 
 def _remove_task_assignment_aliases(params: dict[str, Any]) -> None:
@@ -951,6 +1018,7 @@ async def _prepare_task_update_fields(
     existing_task: Any,
     *,
     workspace_id: str | None = None,
+    collaborator: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
     update_params = dict(params)
     update_params.pop("task_id", None)
@@ -969,15 +1037,22 @@ async def _prepare_task_update_fields(
     if category_present:
         update_params["category_id"] = category_id
 
+    task_workspace_id = update_params.get("workspace_id") or existing_task.workspace_id or workspace_id
     assignment_fields, assignment_info, assignment_error = await _resolve_task_assignment(
         db,
         entity_id,
         update_params,
-        workspace_id=update_params.get("workspace_id") or existing_task.workspace_id or workspace_id,
+        workspace_id=task_workspace_id,
+        collaborator=collaborator,
     )
     if assignment_error and _has_task_assignment_input(update_params):
         return {}, {}, assignment_error
     if assignment_fields:
+        if error := await _workspace_assignment_error(
+            db, entity_id, update_params.get("workspace_id") or existing_task.workspace_id,
+            assignment_fields.get("agent_id"),
+        ):
+            return {}, {}, error
         update_params.update(assignment_fields)
     _remove_task_assignment_aliases(update_params)
 
@@ -1292,10 +1367,15 @@ async def runtime_manor_create_task(
         entity_id,
         create_params,
         workspace_id=create_params.get("workspace_id") or workspace_id,
+        collaborator=await _collaborator_acting(db, entity_id, user_id),
     )
     if assignment_error and _has_task_assignment_input(create_params):
         return json.dumps(assignment_error, default=str)
     if assignment_fields:
+        if error := await _workspace_assignment_error(
+            db, entity_id, create_params.get("workspace_id"), assignment_fields.get("agent_id"),
+        ):
+            return json.dumps(error, default=str)
         create_params.update(assignment_fields)
     _remove_task_assignment_aliases(create_params)
     create_params = _runtime_filter_params(create_params, _TASK_CREATE_ALLOWED_FIELDS)
@@ -1309,6 +1389,12 @@ async def runtime_manor_create_task(
             key: value for key, value in create_params["details"].items()
             if key not in TASK_EXECUTION_ORIGIN_KEYS
         }
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    if source_conversation := runtime_tool_call_context_from_kwargs(runtime_tool_kwargs or {}).conversation_id:
+        # Host provenance, as on every chat path that creates a Task: the
+        # drafting chat, which lets a later start find this Task.
+        create_params["conversation_id"] = source_conversation
     if create_params.get("task_type") == "interactive":
         # The injected conversation is the request's source chat, not the
         # Task-owned session Conversation created on the first Task turn.
@@ -1381,6 +1467,7 @@ async def runtime_manor_update_task(
         raw_params,
         existing_task,
         workspace_id=workspace_id,
+        collaborator=await _collaborator_acting(db, entity_id, user_id),
     )
     if update_error:
         return json.dumps(update_error, default=str)
@@ -1389,6 +1476,8 @@ async def runtime_manor_update_task(
     manual_execution = await runtime_tool_is_user_requested(
         db, entity_id=entity_id, workspace_id=existing_task.workspace_id, kwargs=runtime_tool_kwargs or {},
     )
+    from packages.core.constants.task import CancelSource
+
     try:
         task = await update_task(
             db,
@@ -1396,6 +1485,9 @@ async def runtime_manor_update_task(
             entity_id,
             user_id=user_id,
             manual_execution=manual_execution,
+            # The agent chose to cancel; ``manual_execution`` says the turn
+            # was started by a person, not that they asked for this cancel.
+            cancel_source=CancelSource.SYSTEM.value,
             **update_fields,
         )
     except TaskStatusTransitionError as exc:
@@ -1449,9 +1541,14 @@ async def runtime_manor_assign_task(
         entity_id,
         raw_params,
         workspace_id=raw_params.get("workspace_id") or existing_task.workspace_id or workspace_id,
+        collaborator=await _collaborator_acting(db, entity_id, user_id),
     )
     if assignment_error:
         return json.dumps(assignment_error, default=str)
+    if assignment_fields and (error := await _workspace_assignment_error(
+        db, entity_id, existing_task.workspace_id, assignment_fields.get("agent_id"),
+    )):
+        return json.dumps(error, default=str)
     if not assignment_fields:
         return json.dumps({
             "error": "assignee_required",
@@ -1462,6 +1559,7 @@ async def runtime_manor_assign_task(
             "required_params": _TASK_ASSIGNEE_REQUIRED_PARAMS,
         })
     from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+    from packages.core.constants.task import CancelSource
 
     task = await update_task(
         db,
@@ -1471,6 +1569,7 @@ async def runtime_manor_assign_task(
         manual_execution=await runtime_tool_is_user_requested(
             db, entity_id=entity_id, workspace_id=existing_task.workspace_id, kwargs=runtime_tool_kwargs or {},
         ),
+        cancel_source=CancelSource.SYSTEM.value,  # an agent call, never a user cancel
         **assignment_fields,
     )
     await db.commit()
@@ -1492,16 +1591,19 @@ async def runtime_manor_add_task_comment(
     entity_id: str,
     params: Mapping[str, Any] | None = None,
     actor_agent_id: str | None = None,
+    user_id: str | None = None,
 ) -> str:
-    """Add a task comment/log entry via the Runtime Manor task boundary."""
+    """Add a task comment/log entry via the Runtime Manor task boundary.
+
+    The author is the running Agent, else the run's own user: a caller-supplied
+    ``params.user_id`` never names the author.
+    """
 
     from packages.core.constants.task import TaskLogType
     from packages.core.services.task_service import add_task_log, agent_log_authorship
 
     raw_params = params or {}
-    created_by, meta, actor = await agent_log_authorship(
-        db, actor_agent_id, fallback=raw_params.get("user_id"),
-    )
+    created_by, meta, actor = await agent_log_authorship(db, actor_agent_id, fallback=user_id)
     log = await add_task_log(
         db,
         task_id=raw_params.get("task_id", ""),
@@ -1546,6 +1648,7 @@ async def runtime_manor_search_documents(
     user_id: str | None = None,
     workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
+    user_wording: str | None = None,
 ) -> str:
     """Search Knowledge documents via the Runtime Manor document boundary."""
 
@@ -1557,6 +1660,7 @@ async def runtime_manor_search_documents(
         workspace_id=workspace_id,
         params=dict(params or {}),
         db=db,
+        user_wording=user_wording,
     )
 
 
@@ -1986,8 +2090,13 @@ async def runtime_manor_upload_document(
         runtime_guard_file_mutation,
     )
     from packages.core.ai.runtime.file_contracts import FileMutationAction
-    from packages.core.services.generated_media_naming import collision_safe_artifact_path
+    from packages.core.services.generated_media_naming import (
+        collision_safe_artifact_path,
+        resolve_workspace_artifact_base_dir,
+        scope_workspace_artifact_path,
+    )
     from packages.core.services.knowledge_visibility import is_user_visible_path, normalize_rel_path
+    from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
     raw_params = params or {}
     file_path = str(raw_params.get("file_path") or raw_params.get("path", "")).strip()
@@ -2014,6 +2123,16 @@ async def runtime_manor_upload_document(
     source_rel = normalize_rel_path(os.path.relpath(source_path, entity_root))
     if not source_rel or not is_user_visible_path(source_rel):
         return json.dumps({"error": "Cannot upload a hidden/system source file"})
+    # Workspace uploads land in the Workspace/Task/Workflow archive, never at
+    # the entity root; approval and the copy both use the scoped target.
+    try:
+        artifact_base = await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id or None,
+            task_id=task_id,
+        )
+    except RuntimeError as exc:
+        return json.dumps({"error": str(exc), "uploaded": False})
 
     staged_path: str | None = None
     try:
@@ -2049,7 +2168,12 @@ async def runtime_manor_upload_document(
                 os.close(source_fd)
 
             content_sha256 = digest.hexdigest()
-            target_rel = collision_safe_artifact_path(entity_root, name)
+            target_rel = collision_safe_artifact_path(
+                entity_root,
+                scope_workspace_artifact_path(
+                    name, artifact_base, default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
+                ),
+            )
             blocked = await runtime_guard_file_mutation(
                 entity_id=entity_id,
                 user_id=user_id,

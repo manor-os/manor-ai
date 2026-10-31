@@ -690,7 +690,7 @@ def test_all_filesystem_projection_mutations_use_cancellation_boundary():
     from apps.api.routers import filesystem
     from packages.core.ai.runtime.file_actions import RuntimeFileProjectionTransaction
     from packages.core.ai.tools import bash_tool, file_tools
-    from packages.core.ai.tools import sandbox_file_tools, sandbox_tools
+    from packages.core.ai.tools import sandbox_tools
     from packages.core.ai.tools.generate_file import code
 
     for handler in (
@@ -706,12 +706,15 @@ def test_all_filesystem_projection_mutations_use_cancellation_boundary():
         assert source.index("_entity_filesystem_mutation_boundary") < source.index(
             "_finish_filesystem_mutation",
         )
-    assert "entity_filesystem_mutation_lock" in inspect.getsource(bash_tool._bash)
+    persist = inspect.getsource(bash_tool._persist_changes) + inspect.getsource(
+        bash_tool._entity_mutation_section,
+    )
+    assert "entity_filesystem_mutation_lock" in persist
+    assert "finish_entity_filesystem_mutation" in persist
     assert "runtime_entity_filesystem_mutation_lock" in inspect.getsource(
         file_tools._patch_file,
     )
     for handler in (
-        sandbox_file_tools._save_sandbox_file,
         sandbox_tools._sandbox_save_result,
         code.handle_code,
     ):
@@ -1337,7 +1340,7 @@ def test_raw_filesystem_readers_use_shared_entity_read_boundary():
     from apps.api.routers import filesystem
     from packages.core.ai.tools import bash_tool
 
-    assert "entity_filesystem_read_lock" in inspect.getsource(bash_tool._bash)
+    assert "entity_filesystem_read_lock" in inspect.getsource(bash_tool._stage_command)
     for handler in (
         filesystem.list_directory,
         filesystem.directory_tree,
@@ -3228,67 +3231,13 @@ async def test_delete_file_retains_durable_cleanup_intent_when_backup_cleanup_fa
 
 
 @pytest.mark.asyncio
-async def test_save_sandbox_file_rolls_back_failed_knowledge_projection(
-    fs_settings,
-    monkeypatch,
-):
-    from packages.core.ai.tools import sandbox_file_tools
-    from packages.core.services import knowledge_sync
-
-    monkeypatch.setenv("SANDBOX_SERVICE_URL", "http://sandbox-service")
-
-    class FakeSandboxClient:
-        async def read_file_base64(self, **_kwargs):
-            return SimpleNamespace(
-                content_base64=base64.b64encode(b"result").decode("ascii"),
-            )
-
-        async def close(self):
-            return None
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    async def fail_sync(**_kwargs):
-        return SimpleNamespace(
-            synced=False,
-            document_id=None,
-            reason="storage_limit",
-        )
-
-    monkeypatch.setattr(sandbox_file_tools, "_get_client", lambda: FakeSandboxClient())
-    monkeypatch.setattr(
-        sandbox_file_tools,
-        "runtime_guard_file_mutation",
-        allow_file_mutation,
-    )
-    monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", fail_sync)
-
-    result = json.loads(await sandbox_file_tools._save_sandbox_file(
-        "entity_1",
-        filename="result.txt",
-        sandbox_id="sandbox_1",
-        file_path="/tmp/result.txt",
-        user_id="user_1",
-    ))
-
-    assert result["saved"] is False
-    assert result["knowledge_sync_reason"] == "storage_limit"
-    assert not os.path.exists(
-        os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "result.txt"),
-    )
-
-
-@pytest.mark.asyncio
-async def test_save_sandbox_file_uses_runtime_identity_and_canonical_document_metadata(
+async def test_sandbox_save_result_uses_runtime_identity_and_canonical_document_metadata(
     fs_settings,
     monkeypatch,
 ):
     from packages.core import database
-    from packages.core.ai.tools import sandbox_file_tools
+    from packages.core.ai.tools import sandbox_tools
     from packages.core.services import knowledge_sync
-
-    monkeypatch.setenv("SANDBOX_SERVICE_URL", "http://sandbox-service")
 
     class FakeSandboxClient:
         async def read_file_base64(self, **_kwargs):
@@ -3334,12 +3283,17 @@ async def test_save_sandbox_file_uses_runtime_identity_and_canonical_document_me
         )
 
     monkeypatch.setattr(database, "async_session", lambda: FakeSessionContext())
-    monkeypatch.setattr(sandbox_file_tools, "_get_client", lambda: FakeSandboxClient())
-    monkeypatch.setattr(sandbox_file_tools, "runtime_guard_file_mutation", capture_guard)
+
+    async def allow_sandbox_access(**_kwargs):
+        return None
+
+    monkeypatch.setattr(sandbox_tools, "_get_client", lambda: FakeSandboxClient())
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", allow_sandbox_access)
+    monkeypatch.setattr(sandbox_tools, "runtime_guard_file_mutation", capture_guard)
     monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", capture_sync)
 
-    result = json.loads(await sandbox_file_tools._save_sandbox_file(
-        "entity_1",
+    result = json.loads(await sandbox_tools._sandbox_save_result(
+        entity_id="entity_1",
         filename="result.txt",
         sandbox_id="sandbox_1",
         file_path="/tmp/result.txt",
@@ -7016,6 +6970,42 @@ async def test_filesystem_move_refuses_implicit_destination_overwrite(
         assert file.read() == "source"
     with open(os.path.join(root, "destination.css"), encoding="utf-8") as file:
         assert file.read() == "destination"
+
+
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_workspace_audio_uses_task_archive(fs_settings, db_session, monkeypatch):
+    from sqlalchemy import select
+
+    from packages.core.ai.mcp import elevenlabs
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.workspace import Workspace
+
+    entity_id, workspace_id = generate_ulid(), generate_ulid()
+    db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="Studio"))
+    await db_session.commit()
+
+    elevenlabs.set_call_context({
+        "entity_id": entity_id, "user_id": "user_1",
+        "workspace_id": workspace_id, "task_id": "01TASK",
+    })
+    try:
+        path, fname = await elevenlabs._save_audio_bytes(b"audio", "tts")
+    finally:
+        elevenlabs.clear_call_context()
+
+    db_session.expire_all()
+    workspace = await db_session.get(Workspace, workspace_id)
+    expected = f"Workspaces/_by_id/{workspace.artifact_folder_id}/tasks/01TASK/audio/{fname}"
+    assert os.path.relpath(path, os.path.join(fs_settings.MANOR_FS_ROOT, entity_id)) == expected
+    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, entity_id, "audio"))
+    document = (await db_session.scalars(
+        select(Document).where(Document.entity_id == entity_id, Document.fs_path == expected)
+    )).one()
+    assert document.visibility == "workspace"
+    assert document.folder_id is not None
 
 
 def test_copy_entity_file_atomic_persists_verified_file(fs_settings, tmp_path):

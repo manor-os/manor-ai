@@ -83,10 +83,13 @@ def test_owner_requires_entity_and_builds_registry_key() -> None:
     with pytest.raises(ValueError):
         owner.lock_key("")
 
-    anonymous = SandboxOwner(entity_id="ent_1", user_id="")
-    assert anonymous.registrable is False
-    with pytest.raises(ValueError):
-        anonymous.registry_key("conversation:c1")
+    # User-less system work is owned by its workspace (attribution) and keyed
+    # as ``system``: its scope (one task) isolates it, and it registers too.
+    userless = SandboxOwner(entity_id="ent_1", user_id="", workspace_id="ws_1")
+    assert userless.registrable is True
+    assert userless.registry_key("conversation:Utask") == "sandbox:owner:ent_1:system:conversation:Utask"
+    # A human owner never carries a workspace: it cannot widen the key.
+    assert SandboxOwner(entity_id="ent_1", user_id="user_1", workspace_id="ws_1").workspace_id == ""
     with pytest.raises(ValueError):
         SandboxOwner(entity_id="", user_id="user_1")
 
@@ -206,7 +209,7 @@ async def test_load_degrades_malformed_fields_instead_of_dropping_record(fake_ca
 
 
 @pytest.mark.asyncio
-async def test_anonymous_owner_skips_registry(fake_cache) -> None:
+async def test_userless_owner_registers_under_its_own_system_key(fake_cache) -> None:
     from packages.core.services.sandbox_session_service import (
         SandboxOwner,
         SandboxSession,
@@ -214,8 +217,9 @@ async def test_anonymous_owner_skips_registry(fake_cache) -> None:
         register_sandbox_session,
     )
 
-    owner = SandboxOwner("ent_1", "")
-    scope = "conversation:conversation_1"
+    owner = SandboxOwner("ent_1", "", workspace_id="ws_1")
+    human = SandboxOwner("ent_1", "user_1")
+    scope = "conversation:U01TASK"
     assert await load_sandbox_session(owner, scope=scope) is None
 
     session = SandboxSession(
@@ -224,8 +228,10 @@ async def test_anonymous_owner_skips_registry(fake_cache) -> None:
         created_at=1.0,
         last_acquired_at=1.0,
     )
-    assert await register_sandbox_session(owner, session, scope=scope) is False
-    assert fake_cache.store == {}
+    assert await register_sandbox_session(owner, session, scope=scope) is True
+    assert (await load_sandbox_session(owner, scope=scope)).sandbox_id == "sb_1"
+    # Never visible to a human owner, even under the same scope string.
+    assert await load_sandbox_session(human, scope=scope) is None
 
 
 @pytest.mark.asyncio
@@ -251,23 +257,18 @@ async def test_register_returns_false_when_cache_unavailable(fake_cache) -> None
 
 
 @pytest.mark.asyncio
-async def test_release_only_unbinds_matching_conversation(monkeypatch, fake_cache) -> None:
-    from packages.core.services import sandbox_session_service
+async def test_release_drops_only_the_agents_view_while_the_conversation_keeps_the_sandbox(fake_cache) -> None:
+    from packages.core.ai.runtime.sandbox import (
+        RuntimeSandboxKind,
+        runtime_agent_sandbox,
+        runtime_init_sandbox_binding,
+        runtime_load_sandbox_binding,
+        runtime_sandbox_scope,
+    )
     from packages.core.services.sandbox_session_service import (
         SandboxOwner,
         release_sandbox_session,
     )
-
-    deleted: list[str] = []
-
-    async def fake_delete(conversation_id):
-        deleted.append(conversation_id)
-
-    async def fake_load_other(conversation_id):
-        return {"sandbox_id": "sb_other"}
-
-    monkeypatch.setattr(sandbox_session_service, "runtime_load_sandbox_context", fake_load_other)
-    monkeypatch.setattr(sandbox_session_service, "runtime_delete_sandbox_context", fake_delete)
 
     owner = SandboxOwner("ent_1", "user_1")
     # sb_1 is the conversation scope's warm session, so every release below
@@ -276,18 +277,20 @@ async def test_release_only_unbinds_matching_conversation(monkeypatch, fake_cach
     fake_cache.store[registry_key] = {"sandbox_id": "sb_1", "base_url": "http://sandbox-service"}
     fake_cache.store["sandbox:warm:sb_1"] = registry_key
 
-    assert await release_sandbox_session(owner=owner, sandbox_id="sb_1", conversation_id="conversation_1") == "kept"
-    assert deleted == []
+    scope = runtime_sandbox_scope(entity_id="ent_1", user_id="user_1", binding_key="conversation_1")
+    await runtime_init_sandbox_binding(scope, "sb_1", "skill_xlsx", agent_id="agent_1")
+    await runtime_init_sandbox_binding(scope, "sb_1", "", agent_id="agent_2")
 
-    async def fake_load_matching(conversation_id):
-        return {"sandbox_id": "sb_1"}
+    # agent_1 releases: its Skill view goes, the conversation keeps sb_1 and
+    # agent_2 still operates it.
+    assert await release_sandbox_session(owner=owner, sandbox_id="sb_1", scope=scope, agent_id="agent_1") == "kept"
+    assert await runtime_agent_sandbox(scope, "agent_1", RuntimeSandboxKind.SKILL) is None
+    assert (await runtime_agent_sandbox(scope, "agent_2", RuntimeSandboxKind.GENERIC))[0] == "sb_1"
+    record = await runtime_load_sandbox_binding(scope, "sb_1")
+    assert record["sandbox_id"] == "sb_1" and record["agents"] == ["agent_1", "agent_2"]
 
-    monkeypatch.setattr(sandbox_session_service, "runtime_load_sandbox_context", fake_load_matching)
-    assert await release_sandbox_session(owner=owner, sandbox_id="sb_1", conversation_id="conversation_1") == "kept"
-    assert deleted == ["conversation_1"]
-
-    assert await release_sandbox_session(owner=owner, sandbox_id="sb_1", conversation_id=None) == "kept"
-    assert deleted == ["conversation_1"]
+    # A container that is not the warm session is destroyed, and unbound.
+    fake_cache.store[registry_key] = {"sandbox_id": "sb_newer", "base_url": "http://sandbox-service"}
 
 
 @pytest.mark.asyncio
@@ -299,8 +302,21 @@ async def test_discard_one_shot_sandbox_destroys_only_matching_owner_scope(
         register_sandbox_session,
     )
 
+    from packages.core.ai.runtime.sandbox import (
+        runtime_init_sandbox_binding,
+        runtime_room_binding_key,
+        runtime_sandbox_scope,
+    )
+
     owner = SandboxOwner("ent_1", "user_1")
-    scope = "conversation:room-run:agent:agent_1"
+    # A group room run's one-shot key: never the requester's own (user) scope.
+    room = runtime_room_binding_key("01HROOMRUN0000000000000000")
+    scope = f"conversation:{room}"
+
+    await runtime_init_sandbox_binding(
+        runtime_sandbox_scope(entity_id="ent_1", user_id="user_1", binding_key=room),
+        "sb_room", "skill_x", agent_id="agent_1",
+    )
     session = SandboxSession(
         sandbox_id="sb_room", base_url="http://sandbox-service",
         created_at=1.0, last_acquired_at=1.0,
@@ -308,11 +324,11 @@ async def test_discard_one_shot_sandbox_destroys_only_matching_owner_scope(
     assert await register_sandbox_session(owner, session, scope=scope)
     assert await discard_sandbox_session(
         owner=SandboxOwner("ent_1", "other_user"), sandbox_id="sb_room",
-        conversation_id="room-run", agent_id="agent_1",
+        conversation_id=room, agent_id="agent_1",
     ) == "not_owned"
     assert fake_cache.store[owner.registry_key(scope)]["sandbox_id"] == "sb_room"
     assert await discard_sandbox_session(
-        owner=owner, sandbox_id="sb_room", conversation_id="room-run",
+        owner=owner, sandbox_id="sb_room", conversation_id=room,
         agent_id="agent_1",
     ) == "destroyed"
     assert {"handler": "destroy", "sandbox_id": "sb_room"} in scripted_client.calls
@@ -358,7 +374,7 @@ async def test_release_keeps_the_current_warm_session(fake_cache, scripted_clien
     fake_cache.store[registry_key] = {"sandbox_id": "sb_warm", "base_url": "http://sandbox-service"}
     fake_cache.store["sandbox:warm:sb_warm"] = registry_key
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_warm", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_warm")
 
     assert outcome == "kept"
     assert fake_cache.store["sandbox:warm:sb_warm"] == registry_key
@@ -391,7 +407,7 @@ async def test_kept_warm_release_keeps_the_instance_row_active(
 
     monkeypatch.setattr(sandbox_queue_service, "release_sandbox_instance", must_not_release)
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_warm", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_warm")
 
     assert outcome == "kept"
     assert fake_cache.store["sandbox:warm:sb_warm"] == registry_key
@@ -409,7 +425,7 @@ async def test_release_destroys_a_container_without_registration(
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan")
 
     assert outcome == "destroyed"
     assert {"handler": "destroy", "sandbox_id": "sb_orphan"} in scripted_client.calls
@@ -430,7 +446,7 @@ async def test_release_destroys_a_superseded_container(fake_cache, scripted_clie
     fake_cache.store["sandbox:warm:sb_old"] = registry_key
     fake_cache.store["sandbox:warm:sb_new"] = registry_key
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_old", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_old")
 
     assert outcome == "destroyed"
     assert {"handler": "destroy", "sandbox_id": "sb_old"} in scripted_client.calls
@@ -451,7 +467,7 @@ async def test_release_reports_destroy_failure_without_raising(
     scripted_client.destroy_exc = RuntimeError("sandbox service down")
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan")
 
     assert outcome == "destroy_failed"
     assert scripted_client.calls[-1]["handler"] == "close"
@@ -471,7 +487,7 @@ async def test_release_keeps_container_when_cache_is_unreachable(
     fake_cache.available = False
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_unknown", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_unknown")
 
     assert outcome == "kept"
     assert scripted_client.calls == []
@@ -488,7 +504,7 @@ async def test_release_destroys_when_marker_absent_and_cache_is_up(
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan")
 
     assert outcome == "destroyed"
     assert {"handler": "destroy", "sandbox_id": "sb_orphan"} in scripted_client.calls
@@ -522,7 +538,7 @@ async def test_release_reports_destroyed_even_if_bookkeeping_fails(
     fake_cache.store[registry_key] = {"sandbox_id": "sb_new", "base_url": "http://runner"}
     fake_cache.store["sandbox:warm:sb_old"] = registry_key
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_old", conversation_id=None, db=object())
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_old", db=object())
 
     assert outcome == "destroyed"
     assert {"handler": "destroy", "sandbox_id": "sb_old"} in scripted_client.calls
@@ -580,7 +596,7 @@ async def test_release_uses_one_db_session_in_external_runner_mode(
     monkeypatch.setattr(sandbox_queue_service, "release_sandbox_instance", fake_release_instance)
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan")
 
     assert outcome == "destroyed"
     assert len(opened) == 1
@@ -599,7 +615,7 @@ async def test_release_treats_not_found_as_destroyed(fake_cache, scripted_client
     scripted_client.destroy_exc = SandboxNotFoundError("sb_orphan")
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan", conversation_id=None)
+    outcome = await release_sandbox_session(owner=owner, sandbox_id="sb_orphan")
 
     assert outcome == "destroyed"
 
@@ -663,6 +679,7 @@ class ScriptedSandboxClient:
         config=None,
         auto_install=True,
         idempotency_key=None,
+        **extra,
     ):
         type(self).calls.append(
             {
@@ -673,6 +690,8 @@ class ScriptedSandboxClient:
                 "allowed_sensitive_keys": allowed_sensitive_keys,
                 "config": config,
                 "auto_install": auto_install,
+                # Only an isolation resolver's create arguments land here.
+                **({"extra": extra} if extra else {}),
             }
         )
         await asyncio.sleep(type(self).create_delay)
@@ -690,6 +709,7 @@ class ScriptedSandboxClient:
         config=None,
         auto_install=True,
         idempotency_key=None,
+        **extra,
     ):
         type(self).calls.append(
             {
@@ -700,6 +720,8 @@ class ScriptedSandboxClient:
                 "allowed_sensitive_keys": allowed_sensitive_keys,
                 "config": config,
                 "auto_install": auto_install,
+                # Only an isolation resolver's create arguments land here.
+                **({"extra": extra} if extra else {}),
             }
         )
         await asyncio.sleep(type(self).create_delay)
@@ -784,18 +806,21 @@ def recorded_contexts(monkeypatch):
 
     contexts: list[dict] = []
 
-    async def fake_init(conversation_id, sandbox_id, skill_id, **kwargs):
+    async def fake_init(scope, sandbox_id, skill_id, **kwargs):
         contexts.append(
             {
-                "conversation_id": conversation_id,
+                "conversation_id": scope.binding_key,
                 "sandbox_id": sandbox_id,
                 "skill_id": skill_id,
-                **kwargs,
+                "entity_id": scope.entity_id,
+                "user_id": scope.user_id,
+                "agent_id": kwargs.pop("agent_id", None),
+                **{key: value for key, value in kwargs.items() if key not in {"skill_key", "coexist"}},
             }
         )
         return {}
 
-    monkeypatch.setattr(svc, "runtime_init_sandbox_context", fake_init)
+    monkeypatch.setattr(svc, "runtime_init_sandbox_binding", fake_init)
     return contexts
 
 
@@ -853,7 +878,7 @@ async def test_acquire_creates_registers_and_binds_when_registry_empty(
         "auto_install": True,
     }
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_new"
     )
     assert fake_cache.leases == {}
@@ -865,6 +890,8 @@ async def test_acquire_creates_registers_and_binds_when_registry_empty(
             "entity_id": "ent_1",
             "user_id": "user_1",
             "agent_id": "agent_1",
+            "holds_credentials": False,
+            "credentials_owner_user_id": None,
         }
     ]
 
@@ -918,7 +945,7 @@ async def test_acquire_maps_missing_image_and_capacity_errors(
     assert result.retryable is True
     assert "Sandbox resources are busy" in result.message
     assert "Max active sandbox limit reached" in result.message
-    assert "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1" not in fake_cache.store
+    assert "sandbox:owner:ent_1:user_1:user" not in fake_cache.store
 
 
 @pytest.mark.asyncio
@@ -935,7 +962,7 @@ async def test_acquire_destroys_new_container_when_binding_fails(
     async def fail_context(*_args, **_kwargs):
         raise RuntimeError("Sandbox owner context could not be persisted.")
 
-    monkeypatch.setattr(svc, "runtime_init_sandbox_context", fail_context)
+    monkeypatch.setattr(svc, "runtime_init_sandbox_binding", fail_context)
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
     result = await acquire_sandbox_session(owner=owner, bundle=_bundle(), binding=_binding())
@@ -944,7 +971,7 @@ async def test_acquire_destroys_new_container_when_binding_fails(
     assert result.code == "context_persist_failed"
     assert "owner context" in result.message
     assert {"handler": "destroy", "sandbox_id": "sb_new"} in scripted_client.calls
-    assert "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1" not in fake_cache.store
+    assert "sandbox:owner:ent_1:user_1:user" not in fake_cache.store
 
 
 @pytest.mark.asyncio
@@ -1028,12 +1055,33 @@ def _seed_registry(
     conversation="conversation_1",
     agent="agent_1",
 ):
-    fake_cache.store[f"sandbox:owner:{entity}:{user}:conversation:{conversation}:agent:{agent}"] = {
+    # A human user's general sandbox serves all of the user's conversations.
+    scope = "user" if user else f"conversation:{conversation}"
+    fake_cache.store[f"sandbox:owner:{entity}:{user or 'system'}:{scope}"] = {
         "sandbox_id": sandbox_id,
         "base_url": "http://sandbox-service",
         "created_at": 1.0,
         "last_acquired_at": 1.0,
         "loaded_skills": ["docx"],
+    }
+
+
+def _seed_own_container(fake_cache, *, skill="xlsx", sandbox_id="sb_own"):
+    """A Skill's own container of user_1 whose env changed since it loaded.
+
+    Same Skill, other env: the container must be reloaded (load_skill) before
+    it can serve the new env, so a busy runner is waited for.
+    """
+
+    fake_cache.store[f"sandbox:owner:ent_1:user_1:user:skill:{skill}"] = {
+        "sandbox_id": sandbox_id,
+        "base_url": "http://sandbox-service",
+        "created_at": 1.0,
+        "last_acquired_at": 1.0,
+        "loaded_skills": [skill],
+        "current_skill": skill,
+        "env_injection": "exec",
+        "env_fingerprint": "stale",
     }
 
 
@@ -1073,7 +1121,7 @@ async def test_acquire_reuses_owner_sandbox_within_a_conversation(
     assert load_call["skill_name"] == "xlsx"
     assert load_call["idle_threshold"] == 30
     assert load_call["source"] == "builtin"
-    warm_key = "sandbox:owner:ent_1:user_1:conversation:conversation_2:agent:agent_1"
+    warm_key = "sandbox:owner:ent_1:user_1:user"
     assert fake_cache.store[warm_key]["loaded_skills"] == ["docx", "xlsx"]
     assert fake_cache.store[warm_key]["last_acquired_at"] > 1.0
     assert recorded_contexts[0]["conversation_id"] == "conversation_2"
@@ -1102,9 +1150,9 @@ async def test_acquire_isolates_entities_and_users(
     assert {
         fake_cache.store[key]["sandbox_id"]
         for key in (
-            "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1",
-            "sandbox:owner:ent_2:user_1:conversation:conversation_1:agent:agent_1",
-            "sandbox:owner:ent_1:user_2:conversation:conversation_1:agent:agent_1",
+            "sandbox:owner:ent_1:user_1:user",
+            "sandbox:owner:ent_2:user_1:user",
+            "sandbox:owner:ent_1:user_2:user",
         )
     } == {"sb_a", "sb_b", "sb_c"}
 
@@ -1129,13 +1177,13 @@ async def test_acquire_replaces_dead_registry_entry(
     assert session.reused is False
     assert "load_skill" not in [c["handler"] for c in scripted_client.calls]
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_new"
     )
 
 
 @pytest.mark.asyncio
-async def test_acquire_waits_while_sandbox_is_busy(
+async def test_skill_reload_waits_while_its_own_container_is_busy(
     fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
 ) -> None:
     from packages.core.services.sandbox_sdk.exceptions import SandboxError
@@ -1144,11 +1192,11 @@ async def test_acquire_waits_while_sandbox_is_busy(
         acquire_sandbox_session,
     )
 
-    _seed_registry(fake_cache)
+    _seed_own_container(fake_cache)
     scripted_client.load_results = [
         SandboxError("busy", status_code=409),
         SandboxError("busy", status_code=409),
-        _load_result(),
+        _load_result("sb_own"),
     ]
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -1157,9 +1205,74 @@ async def test_acquire_waits_while_sandbox_is_busy(
         owner=owner, bundle=_bundle(), binding=_binding(), sleep=clock.sleep, clock=clock
     )
 
-    assert session.sandbox_id == "sb_warm"
+    assert session.sandbox_id == "sb_own"
     assert session.reused is True
     assert clock.sleeps == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_busy_primary_holding_another_skill_gives_the_skill_its_own_container(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    """Never wait on, and never wipe, a Skill another agent is using right now."""
+    from packages.core.services.sandbox_sdk.exceptions import SandboxError
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_registry(fake_cache)  # the primary holds docx
+    scripted_client.load_results = [SandboxError("busy", status_code=409, code="sandbox_busy")]
+    clock = FakeClock()
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+
+    session = await acquire_sandbox_session(
+        owner=owner, bundle=_bundle("xlsx"), binding=_binding(), sleep=clock.sleep, clock=clock
+    )
+
+    assert (session.sandbox_id, session.reused) == ("sb_new", False)
+    assert clock.sleeps == []
+    primary = fake_cache.store["sandbox:owner:ent_1:user_1:user"]
+    assert primary["sandbox_id"] == "sb_warm" and primary["loaded_skills"] == ["docx"]
+    own = fake_cache.store["sandbox:owner:ent_1:user_1:user:skill:xlsx"]
+    assert own["sandbox_id"] == "sb_new"
+    assert "destroy" not in [c["handler"] for c in scripted_client.calls]
+    # Both are the conversation's: the binding names the new container.
+    assert recorded_contexts[-1]["sandbox_id"] == "sb_new"
+
+    # The next xlsx admission goes straight to the Skill's own container.
+    scripted_client.reset()
+    scripted_client.load_results = [_load_result("sb_new")]
+    again = await acquire_sandbox_session(owner=owner, bundle=_bundle("xlsx"), binding=_binding(agent_id="agent_2"))
+    assert again.sandbox_id == "sb_new"
+    assert [c["sandbox_id"] for c in scripted_client.calls if c["handler"] == "load_skill"] == ["sb_new"]
+
+
+@pytest.mark.asyncio
+async def test_busy_primary_holding_the_same_skill_is_shared_as_loaded(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    """Parallel delegates on one Skill share its container instead of waiting for a reload."""
+    from packages.core.services.sandbox_sdk.exceptions import SandboxError
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_registry(fake_cache)
+    fake_cache.store["sandbox:owner:ent_1:user_1:user"]["current_skill"] = "xlsx"
+    scripted_client.load_results = [SandboxError("busy", status_code=409, code="sandbox_busy")]
+    clock = FakeClock()
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+
+    session = await acquire_sandbox_session(
+        owner=owner, bundle=_bundle("xlsx"), binding=_binding(agent_id="agent_2"), sleep=clock.sleep, clock=clock
+    )
+
+    assert (session.sandbox_id, session.reused) == ("sb_warm", True)
+    assert clock.sleeps == []
+    assert "create_from_builtin" not in [c["handler"] for c in scripted_client.calls]
+    assert recorded_contexts[-1]["agent_id"] == "agent_2"
 
 
 @pytest.mark.asyncio
@@ -1173,7 +1286,7 @@ async def test_acquire_returns_busy_timeout_after_max_wait(
         acquire_sandbox_session,
     )
 
-    _seed_registry(fake_cache)
+    _seed_own_container(fake_cache)
     scripted_client.load_results = [SandboxError("busy", status_code=409)] * 10
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -1188,9 +1301,66 @@ async def test_acquire_returns_busy_timeout_after_max_wait(
     assert "create_from_builtin" not in [c["handler"] for c in scripted_client.calls]
     assert clock.now >= 3
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
-        == "sb_warm"
+        fake_cache.store["sandbox:owner:ent_1:user_1:user:skill:xlsx"]["sandbox_id"]
+        == "sb_own"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["sandbox_busy", None])
+async def test_acquire_waits_only_for_a_busy_409(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, code
+) -> None:
+    """``sandbox_busy`` (or a code-less 409 from an older runner) clears by waiting."""
+    from packages.core.services.sandbox_sdk.exceptions import SandboxError
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_own_container(fake_cache)
+    scripted_client.load_results = [
+        SandboxError("busy", status_code=409, code=code),
+        _load_result("sb_own"),
+    ]
+    clock = FakeClock()
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+
+    session = await acquire_sandbox_session(
+        owner=owner, bundle=_bundle(), binding=_binding(), sleep=clock.sleep, clock=clock
+    )
+
+    assert session.sandbox_id == "sb_own"
+    assert session.reused is True
+    assert clock.sleeps == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", ["sandbox_unavailable", "execution_conflict", "execution_state_conflict"]
+)
+async def test_acquire_creates_fresh_on_a_409_that_waiting_cannot_fix(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, code
+) -> None:
+    """A quarantined or destroying sandbox never becomes free: no busy-wait."""
+    from packages.core.services.sandbox_sdk.exceptions import SandboxError
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_registry(fake_cache)
+    scripted_client.load_results = [SandboxError("unavailable", status_code=409, code=code)] * 10
+    clock = FakeClock()
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+
+    session = await acquire_sandbox_session(
+        owner=owner, bundle=_bundle(), binding=_binding(), sleep=clock.sleep, clock=clock
+    )
+
+    assert session.sandbox_id == "sb_new"
+    assert clock.sleeps == []
+    assert [c["handler"] for c in scripted_client.calls].count("load_skill") == 1
 
 
 @pytest.mark.asyncio
@@ -1211,7 +1381,7 @@ async def test_acquire_recreates_when_load_skill_reports_sandbox_gone(
 
     assert session.sandbox_id == "sb_new"
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_new"
     )
 
@@ -1266,7 +1436,7 @@ async def test_acquire_reports_reused_binding_failure_without_destroying(
     async def fail_context(*_args, **_kwargs):
         raise RuntimeError("Sandbox owner context could not be persisted.")
 
-    monkeypatch.setattr(svc, "runtime_init_sandbox_context", fail_context)
+    monkeypatch.setattr(svc, "runtime_init_sandbox_binding", fail_context)
     _seed_registry(fake_cache)
     scripted_client.load_results = [_load_result()]
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -1278,7 +1448,7 @@ async def test_acquire_reports_reused_binding_failure_without_destroying(
     assert "no Sandbox tool access was granted" in result.message
     assert "destroy" not in [c["handler"] for c in scripted_client.calls]
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_warm"
     )
 
@@ -1301,7 +1471,7 @@ async def test_anonymous_owner_never_touches_registry(
     assert session.sandbox_id == "sb_new"
     assert "status" not in [c["handler"] for c in scripted_client.calls]
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_warm"
     )
     assert fake_cache.leases == {}
@@ -1321,7 +1491,7 @@ async def test_acquire_clamps_last_poll_to_remaining_budget(
 
     monkeypatch.setattr(local_sandbox_settings, "SANDBOX_QUEUE_POLL_SECONDS", 5)
     monkeypatch.setattr(local_sandbox_settings, "SANDBOX_QUEUE_MAX_WAIT_SECONDS", 12)
-    _seed_registry(fake_cache)
+    _seed_own_container(fake_cache)
     scripted_client.load_results = [SandboxError("busy", status_code=409)] * 10
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -1383,7 +1553,7 @@ async def test_acquire_treats_two_inconclusive_probes_as_dead(
     assert session.sandbox_id == "sb_new"
     assert clock.sleeps == [1]
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_new"
     )
 
@@ -1409,7 +1579,7 @@ async def test_acquire_keeps_registry_when_load_skill_transport_fails(
     assert "sb_warm" in result.message
     assert "create_from_builtin" not in [c["handler"] for c in scripted_client.calls]
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
         == "sb_warm"
     )
 
@@ -1439,7 +1609,8 @@ async def test_credentialed_bundle_replaces_a_container_whose_env_was_baked_at_c
 ) -> None:
     """A registry record without an injection mode came from an older service
     that baked env into the container. A credentialed skill must not load into
-    it; the warm container is retired and a fresh one takes its place."""
+    it; the shared container stays for the agents using it and the Skill gets
+    a container of its own."""
     from packages.core.services.sandbox_session_service import (
         SandboxBundle,
         SandboxOwner,
@@ -1464,11 +1635,15 @@ async def test_credentialed_bundle_replaces_a_container_whose_env_was_baked_at_c
     assert session.reused is False
     handlers = [c["handler"] for c in scripted_client.calls]
     assert "load_skill" not in handlers
-    assert "destroy" in handlers, "the superseded container must not be left to leak"
+    assert "destroy" not in handlers, "the shared primary serves the conversation's other agents"
     create_call = next(c for c in scripted_client.calls if c["handler"] == "create_from_builtin")
     assert create_call["env"] == {"API_KEY": "secret"}
     assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
+        fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"]
+        == "sb_warm"
+    )
+    assert (
+        fake_cache.store["sandbox:owner:ent_1:user_1:user:skill:xlsx"]["sandbox_id"]
         == "sb_new"
     )
     assert fake_cache.leases == {}
@@ -1503,12 +1678,12 @@ async def test_acquire_single_flight_waits_for_lock_holder(
         acquire_sandbox_session,
     )
 
-    fake_cache.leases["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock"] = "other-token"
+    fake_cache.leases["sandbox:owner:ent_1:user_1:user:lock"] = "other-token"
     clock = FakeClock()
 
     async def sleep_then_release(seconds: float) -> None:
         await clock.sleep(seconds)
-        fake_cache.leases.pop("sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock", None)
+        fake_cache.leases.pop("sandbox:owner:ent_1:user_1:user:lock", None)
         _seed_registry(fake_cache)
 
     scripted_client.load_results = [_load_result()]
@@ -1535,7 +1710,7 @@ async def test_acquire_lock_wait_times_out_as_busy(
         acquire_sandbox_session,
     )
 
-    fake_cache.leases["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock"] = "other-token"
+    fake_cache.leases["sandbox:owner:ent_1:user_1:user:lock"] = "other-token"
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
@@ -1547,7 +1722,7 @@ async def test_acquire_lock_wait_times_out_as_busy(
     assert result.code == "busy_timeout"
     assert scripted_client.calls == []
     assert fake_cache.leases == {
-        "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock": "other-token"
+        "sandbox:owner:ent_1:user_1:user:lock": "other-token"
     }
 
 
@@ -1564,13 +1739,13 @@ async def test_lock_wait_and_busy_wait_share_one_deadline(
         acquire_sandbox_session,
     )
 
-    fake_cache.leases["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock"] = "other-token"
+    fake_cache.leases["sandbox:owner:ent_1:user_1:user:skill:xlsx:lock"] = "other-token"
     clock = FakeClock()
 
     async def sleep_then_release(seconds: float) -> None:
         await clock.sleep(seconds)
-        fake_cache.leases.pop("sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:lock", None)
-        _seed_registry(fake_cache)
+        fake_cache.leases.pop("sandbox:owner:ent_1:user_1:user:skill:xlsx:lock", None)
+        _seed_own_container(fake_cache)
 
     scripted_client.load_results = [SandboxError("busy", status_code=409)] * 5
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -1640,7 +1815,9 @@ async def test_acquire_refuses_durable_external_without_runtime_context(
     monkeypatch.setattr(local_sandbox_settings, "SANDBOX_RUNNERS_JSON", '[{"base_url":"http://runner"}]')
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
-    result = await acquire_sandbox_session(owner=owner, bundle=_bundle(), binding=_binding())
+    # No conversation and no task: nothing could bind the sandbox, and there
+    # is neither a run to park nor a scope ticket to wait on.
+    result = await acquire_sandbox_session(owner=owner, bundle=_bundle(), binding=_binding(conversation_id=None))
 
     assert isinstance(result, SandboxSessionError)
     assert result.code == "not_configured"
@@ -1690,6 +1867,7 @@ async def test_acquire_enqueues_durable_reservation_with_runtime_context(
         return SimpleNamespace(id="res_1", deadline_at="2026-09-03T00:00:00+00:00")
 
     monkeypatch.setattr(sandbox_queue_service, "enqueue_sandbox_reservation", fake_enqueue)
+    _empty_scope_head(monkeypatch)
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
     result = await acquire_sandbox_session(
@@ -1740,6 +1918,7 @@ async def test_acquire_refuses_a_reservation_inside_a_prompt_skill_loop(
         raise AssertionError("a nested loop must not enqueue a durable reservation")
 
     monkeypatch.setattr(sandbox_queue_service, "enqueue_sandbox_reservation", unexpected_enqueue)
+    _empty_scope_head(monkeypatch)
 
     class UnexpectedDatabase:
         async def get(self, *_args):
@@ -1807,6 +1986,7 @@ async def test_durable_queue_full_maps_to_capacity_full(
         raise SandboxQueueFullError("sandbox_queue_full")
 
     monkeypatch.setattr(sandbox_queue_service, "enqueue_sandbox_reservation", full_enqueue)
+    _empty_scope_head(monkeypatch)
 
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
     result = await acquire_sandbox_session(
@@ -1892,6 +2072,9 @@ class FakeQueue:
         self.consumed: list[str] = []
         self.consume_error: Exception | None = None
         self.runner = SimpleNamespace(id="runner-1", base_url="http://runner-1")
+        # Another admission's in-flight ticket for the same scope, returned by
+        # enqueue instead of a new one (single flight).
+        self.joined: SimpleNamespace | None = None
 
     async def enqueue(
         self,
@@ -1909,6 +2092,7 @@ class FakeQueue:
         user_id=None,
         requester_kind="run",
         requester_id=None,
+        scope_key=None,
     ):
         # Mirrors the real ``enqueue_sandbox_reservation`` signature, so a
         # caller that passes an argument the queue service does not accept
@@ -1927,11 +2111,16 @@ class FakeQueue:
                 "user_id": user_id,
                 "requester_kind": requester_kind,
                 "requester_id": requester_id,
+                "scope_key": scope_key,
             }
         )
         if self.enqueue_error is not None:
             raise self.enqueue_error
-        return _ticket("queued")
+        if self.joined is not None:
+            return self.joined
+        ticket = _ticket("queued")
+        ticket.tool_call_id = tool_call_id
+        return ticket
 
     async def load(self, db, reservation_id):
         self.loads += 1
@@ -1964,7 +2153,27 @@ def fake_queue(monkeypatch):
     monkeypatch.setattr(sandbox_queue_service, "resolve_sandbox_runner", queue.resolve_runner)
     monkeypatch.setattr(sandbox_queue_service, "consume_sandbox_reservation", queue.consume)
     monkeypatch.setattr(database_module, "async_session", queue.factory)
+    _empty_scope_head(monkeypatch)
     return queue
+
+
+def _empty_scope_head(monkeypatch):
+    """Postgres knows no ticket and no container for the scope (fake DB sessions)."""
+
+    from packages.core.services import sandbox_queue_service
+
+    async def no_lock(db, scope_key):
+        return None
+
+    async def nothing(db, *, scope_key, exclude_sandbox_ids=(), now=None):
+        return None, None
+
+    async def no_container(db, *, scope_key, exclude_sandbox_ids=()):
+        return None
+
+    monkeypatch.setattr(sandbox_queue_service, "lock_sandbox_scope", no_lock)
+    monkeypatch.setattr(sandbox_queue_service, "find_scope_head", nothing)
+    monkeypatch.setattr(sandbox_queue_service, "find_scope_container", no_container)
 
 
 def _external_runner_settings(settings, monkeypatch):
@@ -1984,6 +2193,43 @@ def _task_binding():
         skill_id="skill_xlsx",
         task_id="01ABC",
     )
+
+
+@pytest.mark.asyncio
+async def test_admit_sandbox_attaches_the_calls_durable_ticket_before_acquiring(
+    local_sandbox_settings, monkeypatch
+) -> None:
+    """A durable run re-executes the tool call that queued its ticket: the
+    entry point must find that ticket first, or the idempotent enqueue hands
+    the call its own reservation back and it waits forever."""
+    from packages.core.services import sandbox_session_service as service
+    from packages.core.services.sandbox_session_service import SandboxBinding, SandboxOwner
+
+    _external_runner_settings(local_sandbox_settings, monkeypatch)
+    calls: list[str] = []
+    allocated = object()
+    attached: dict[str, object] = {"value": allocated}
+
+    async def attach(*, owner, bundle, binding, db):
+        calls.append("attach")
+        return attached["value"]
+
+    async def acquire(*, owner, bundle, binding, db, sleep, clock):
+        calls.append("acquire")
+        return "acquired"
+
+    monkeypatch.setattr(service, "attach_durable_reservation", attach)
+    monkeypatch.setattr(service, "acquire_sandbox_session", acquire)
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    binding = SandboxBinding(runtime_run_id="run_1", runtime_tool_call_id="call_1")
+    db = object()
+
+    assert await service.admit_sandbox(owner=owner, bundle=_bundle(), binding=binding, db=db) is allocated
+    assert calls == ["attach"]
+
+    attached["value"] = None
+    assert await service.admit_sandbox(owner=owner, bundle=_bundle(), binding=binding, db=db) == "acquired"
+    assert calls == ["attach", "attach", "acquire"]
 
 
 @pytest.mark.asyncio
@@ -2019,7 +2265,9 @@ async def test_task_requester_never_polls_on_the_callers_session(
     assert isinstance(session, SandboxSession)
     assert session.sandbox_id == "sb_task"
     assert (caller_db.commits, caller_db.rollbacks, caller_db.expired) == (0, 0, 0)
-    assert fake_queue.factory.opened == 1
+    # Private sessions only: enqueue (under the owner lock), the wait (outside
+    # it, so joiners are not blocked), and the attach.
+    assert fake_queue.factory.opened == 3
     assert fake_queue.db.rollbacks >= len(clock.sleeps)
     assert fake_queue.db.commits >= 2  # ticket enqueue + consume
 
@@ -2077,12 +2325,15 @@ async def test_task_requester_waits_for_allocation_then_attaches(
     assert fake_queue.cancelled == []
     assert recorded_contexts[0]["conversation_id"] == "U01ABC"
     assert recorded_contexts[0]["sandbox_id"] == "sb_task"
-    assert fake_cache.store["sandbox:owner:ent_1:user_1:conversation:U01ABC:agent:agent_1"]["sandbox_id"] == "sb_task"
+    assert fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"] == "sb_task"
     # Admission never touches the sandbox service directly on this path.
     # The task flow never sees the create response, so it asks the runner how
-    # it injects skill env; the fake health reports no mode, hence "create".
-    assert [call["handler"] for call in scripted_client.calls] == ["init", "health", "close"]
+    # it injects skill env and how it lays out Skills (one probe each; the
+    # layout answer is cached per runner). The fake health reports neither,
+    # hence "create" and no side-by-side Skill slots.
+    assert [call["handler"] for call in scripted_client.calls] == ["init", "health", "close"] * 2
     assert session.env_injection == "create"
+    assert session.skill_slots is False
     assert fake_cache.leases == {}
 
 
@@ -2116,6 +2367,9 @@ async def test_task_requester_failed_ticket_is_retryable_capacity(
     assert result.code == "capacity_full"
     assert result.retryable is True
     assert "sandbox_allocation_failed" in result.message
+    # The ticket's recorded code is the caller's to read (a runner refusal
+    # reaches its user by name).
+    assert result.cause == "sandbox_allocation_failed"
     assert fake_queue.consumed == []
     assert fake_queue.cancelled == []
     assert recorded_contexts == []
@@ -2195,6 +2449,40 @@ async def test_task_requester_keeps_waiting_while_the_runner_is_allocating(
     assert isinstance(session, SandboxSession)
     assert session.sandbox_id == "sb_late"
     assert clock.sleeps == [1, 1, 1, 1]
+    assert fake_queue.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_task_requester_waits_as_long_as_its_ticket_may_wait(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, fake_queue, monkeypatch
+) -> None:
+    """A pool whose fleet boots a machine gives its tickets a longer deadline
+    than the queue's default; the poller must not cancel the ticket early."""
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        SandboxSession,
+        acquire_sandbox_session,
+    )
+
+    _external_runner_settings(local_sandbox_settings, monkeypatch)
+    later = datetime.now(timezone.utc) + timedelta(minutes=15)
+    queued = SimpleNamespace(**{**vars(_ticket("queued")), "deadline_at": later})
+    # max_wait=3, poll=1: six queued polls outlast the default budget.
+    fake_queue.statuses = [queued] * 6 + [_ticket("allocated", sandbox_id="sb_booted")]
+    clock = FakeClock()
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_bundle(),
+        binding=_task_binding(),
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+    assert isinstance(session, SandboxSession)
+    assert session.sandbox_id == "sb_booted"
     assert fake_queue.cancelled == []
 
 
@@ -2324,7 +2612,7 @@ async def test_task_requester_bind_failure_destroys_allocated_container(
         destroyed.append({"sandbox_id": sandbox_id, "external": external})
         return "destroyed"
 
-    monkeypatch.setattr(svc, "runtime_init_sandbox_context", failing_init)
+    monkeypatch.setattr(svc, "runtime_init_sandbox_binding", failing_init)
     monkeypatch.setattr(svc, "_destroy_container", fake_destroy)
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -2342,7 +2630,7 @@ async def test_task_requester_bind_failure_destroys_allocated_container(
     assert "newly created Sandbox was destroyed" in result.message
     assert destroyed == [{"sandbox_id": "sb_task", "external": True}]
     assert fake_queue.consumed == []
-    assert "sandbox:owner:ent_1:user_1:conversation:U01ABC:agent:agent_1" not in fake_cache.store
+    assert "sandbox:owner:ent_1:user_1:user" not in fake_cache.store
     assert fake_cache.leases == {}
 
 
@@ -2363,10 +2651,11 @@ async def test_task_requester_consume_race_unbinds_and_is_retryable(
     # The abandoned-allocation sweep released the ticket while this call bound.
     fake_queue.consume_error = SandboxAllocationStateError("reservation_not_allocated")
 
-    unbound: list[str] = []
+    unbound: list[tuple[str, str, str | None]] = []
 
-    async def fake_delete(conversation_id):
-        unbound.append(conversation_id)
+    async def fake_delete(scope, sandbox_id):
+        unbound.append((scope.binding_key, scope.user_id, sandbox_id))
+        return True
 
     destroyed: list[str] = []
 
@@ -2374,7 +2663,7 @@ async def test_task_requester_consume_race_unbinds_and_is_retryable(
         destroyed.append(sandbox_id)
         return "destroyed"
 
-    monkeypatch.setattr(svc, "runtime_delete_sandbox_context", fake_delete)
+    monkeypatch.setattr(svc, "runtime_delete_sandbox_binding", fake_delete)
     monkeypatch.setattr(svc, "_destroy_container", fake_destroy)
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -2391,48 +2680,93 @@ async def test_task_requester_consume_race_unbinds_and_is_retryable(
     assert result.code == "capacity_full"
     assert result.retryable is True
     assert "released before it could be consumed" in result.message
-    # The conversation is handed back unbound, so the next call is not denied
-    # by a context pointing at a container this one no longer owns.
-    assert unbound == ["U01ABC"]
+    # The slot is handed back unbound (only while it still names this
+    # container), so the next call is not denied by a binding pointing at a
+    # container this one no longer owns.
+    assert unbound == [("U01ABC", "user_1", "sb_task")]
     # The sweep already released the instance; the idle reaper owns the rest.
     assert destroyed == []
-    assert "sandbox:owner:ent_1:user_1:conversation:U01ABC:agent:agent_1" not in fake_cache.store
+    assert "sandbox:owner:ent_1:user_1:user" not in fake_cache.store
     assert fake_cache.leases == {}
 
 
 @pytest.mark.asyncio
-async def test_durable_without_run_or_task_is_not_configured(
+async def test_delegate_without_run_or_task_polls_the_conversations_ticket(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, fake_queue, monkeypatch
+) -> None:
+    """A delegated agent runs inside its parent's tool call: no run to park,
+    no task. It waits on the conversation's ticket like a task worker."""
+    from packages.core.services.sandbox_session_service import (
+        SANDBOX_SCOPE_PAYLOAD_KEY,
+        SandboxBinding,
+        SandboxOwner,
+        SandboxSession,
+        acquire_sandbox_session,
+    )
+
+    _external_runner_settings(local_sandbox_settings, monkeypatch)
+    fake_queue.statuses = [_ticket("allocated", sandbox_id="sb_conv")]
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    clock = FakeClock()
+
+    result = await acquire_sandbox_session(
+        owner=owner,
+        bundle=_bundle(),
+        binding=SandboxBinding(conversation_id="conversation_1", agent_id="agent_1", skill_id="skill_xlsx"),
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    assert isinstance(result, SandboxSession) and result.sandbox_id == "sb_conv"
+    [enqueued] = fake_queue.enqueued
+    assert enqueued["requester_kind"] == "task"
+    assert enqueued["requester_id"] == "conversation:conversation_1"
+    scope_key = "sandbox:owner:ent_1:user_1:user"
+    assert enqueued["scope_key"] == scope_key
+    assert enqueued["request_payload"][SANDBOX_SCOPE_PAYLOAD_KEY] == scope_key
+    assert fake_cache.store[scope_key]["sandbox_id"] == "sb_conv"
+    assert fake_queue.consumed == ["res_1"]
+
+
+@pytest.mark.asyncio
+async def test_a_joined_ticket_is_never_cancelled_by_the_joiner_and_a_run_ticket_is_never_consumed(
     fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, fake_queue, monkeypatch
 ) -> None:
     from packages.core.services.sandbox_session_service import (
         SandboxBinding,
         SandboxOwner,
+        SandboxSession,
         SandboxSessionError,
         acquire_sandbox_session,
     )
 
     _external_runner_settings(local_sandbox_settings, monkeypatch)
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    binding = SandboxBinding(conversation_id="conversation_1", agent_id="agent_2", skill_id="skill_xlsx")
 
+    # Joined another admission's ticket, which never allocates: the joiner
+    # gives up without cancelling it.
+    fake_queue.joined = SimpleNamespace(**vars(_ticket("queued")), tool_call_id="someone-else")
+    fake_queue.statuses = [_ticket("queued")]
+    clock = FakeClock()
     result = await acquire_sandbox_session(
-        owner=owner,
-        bundle=_bundle(),
-        binding=SandboxBinding(conversation_id="conversation_1", agent_id="agent_1", skill_id="skill_xlsx"),
+        owner=owner, bundle=_bundle(), binding=binding, sleep=clock.sleep, clock=clock,
     )
-    assert isinstance(result, SandboxSessionError)
-    assert result.code == "not_configured"
-    assert "requires runtime context" in result.message
+    assert isinstance(result, SandboxSessionError) and result.code == "capacity_full"
+    assert fake_queue.cancelled == []
 
-    # A task id without an actor cannot own a reservation either.
-    anonymous = SandboxOwner(entity_id="ent_1", user_id="")
-    anonymous_result = await acquire_sandbox_session(
-        owner=anonymous,
-        bundle=_bundle(),
-        binding=_task_binding(),
+    # Joined a durable run's ticket that allocated: attach (register + bind)
+    # without consuming it; the run consumes its own ticket when it resumes.
+    fake_queue.joined = SimpleNamespace(**vars(_ticket("queued")), tool_call_id="call-of-the-run")
+    allocated = _ticket("allocated", sandbox_id="sb_run")
+    allocated.runtime_run_id = "run_1"
+    fake_queue.statuses = [allocated]
+    fake_queue.loads = 0
+    result = await acquire_sandbox_session(
+        owner=owner, bundle=_bundle(), binding=binding, sleep=clock.sleep, clock=clock,
     )
-    assert isinstance(anonymous_result, SandboxSessionError)
-    assert anonymous_result.code == "not_configured"
-    assert fake_queue.enqueued == []
+    assert isinstance(result, SandboxSession) and result.sandbox_id == "sb_run"
+    assert fake_queue.consumed == []
+    assert fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"] == "sb_run"
 
 
 @pytest.mark.asyncio
@@ -2448,7 +2782,7 @@ async def test_acquire_reuses_registered_sandbox_in_durable_mode_without_reserva
     monkeypatch.setattr(local_sandbox_settings, "SANDBOX_COORDINATION_MODE", "external-runner")
     monkeypatch.setattr(local_sandbox_settings, "SANDBOX_SERVICE_URL", "")
     _seed_registry(fake_cache)
-    fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["base_url"] = (
+    fake_cache.store["sandbox:owner:ent_1:user_1:user"]["base_url"] = (
         "http://runner-7"
     )
     scripted_client.load_results = [_load_result()]
@@ -2493,6 +2827,7 @@ async def test_credentialed_bundles_share_a_conversation_container_with_env_repl
         _load_result(sandbox_id="sb_cred_a"),
         _load_result(sandbox_id="sb_cred_a"),
         _load_result(sandbox_id="sb_cred_a"),
+        _load_result(sandbox_id="sb_cred_a"),
     ]
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
     binding = _binding(conversation_id="conversation_1")
@@ -2509,15 +2844,17 @@ async def test_credentialed_bundles_share_a_conversation_container_with_env_repl
     assert (second.sandbox_id, second.reused) == ("sb_cred_a", True)
     assert (third.sandbox_id, third.reused) == ("sb_cred_a", True)
     assert (fourth.sandbox_id, fourth.reused) == ("sb_cred_a", True)
-    assert (other.sandbox_id, other.reused) == ("sb_cred_other", False)
+    # The same user in another conversation: the same container, its env per load.
+    assert (other.sandbox_id, other.reused) == ("sb_cred_a", True)
 
     loads = [call for call in scripted_client.calls if call["handler"] == "load_skill"]
     assert [(call["skill_name"], call["env"], call["allowed_sensitive_keys"]) for call in loads] == [
         ("xlsx", {"XLSX_KEY": "secret"}, ["XLSX_KEY"]),
         ("docx", {"DOCX_KEY": "secret"}, ["DOCX_KEY"]),
         ("pptx", {}, []),
+        ("xlsx", {"XLSX_KEY": "secret"}, ["XLSX_KEY"]),
     ]
-    assert "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1" in fake_cache.store
+    assert "sandbox:owner:ent_1:user_1:user" in fake_cache.store
     assert not any(":skill:" in key for key in fake_cache.store)
     assert fake_cache.leases == {}
 
@@ -2544,7 +2881,7 @@ async def test_credentialed_bundle_never_reuses_a_container_with_env_baked_at_cr
         )
 
     _seed_registry(fake_cache)
-    fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["env_injection"] = "create"
+    fake_cache.store["sandbox:owner:ent_1:user_1:user"]["env_injection"] = "create"
     scripted_client.created_ids = ["sb_fresh"]
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
@@ -2570,7 +2907,7 @@ async def test_baked_env_container_serves_only_the_skill_it_holds(
         acquire_sandbox_session,
     )
 
-    key = "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"
+    key = "sandbox:owner:ent_1:user_1:user"
     _seed_registry(fake_cache)
     from packages.core.services.sandbox_session_service import env_fingerprint
 
@@ -2597,7 +2934,9 @@ async def test_baked_env_container_serves_only_the_skill_it_holds(
     other = await acquire_sandbox_session(owner=owner, bundle=plain_docx, binding=binding)
     assert (other.sandbox_id, other.reused) == ("sb_fresh", False)
     assert not any(c["handler"] == "load_skill" for c in scripted_client.calls)
-    assert fake_cache.store[key]["holds_credentials"] is False
+    # The plain Skill got a container of its own; the credentialed one keeps its.
+    assert fake_cache.store[f"{key}:skill:docx"]["holds_credentials"] is False
+    assert fake_cache.store[key]["holds_credentials"] is True
 
     # A baked-env container that never held credentials still shares plainly.
     scripted_client.reset()
@@ -2621,7 +2960,7 @@ async def test_reuse_reports_blocked_env_keys(
     )
 
     _seed_registry(fake_cache)
-    fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["env_injection"] = "exec"
+    fake_cache.store["sandbox:owner:ent_1:user_1:user"]["env_injection"] = "exec"
     loaded = _load_result()
     scripted_client.load_results = [SimpleNamespace(**{**loaded.__dict__, "env_blocked": ["AWS_SECRET"]})]
     bundle = SandboxBundle(skill_name="xlsx", files={"SKILL.md": "#"}, env={"AWS_SECRET": "x"})
@@ -2693,7 +3032,7 @@ async def test_same_skill_that_gained_credentials_does_not_reuse_a_baked_contain
         acquire_sandbox_session,
     )
 
-    key = "sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"
+    key = "sandbox:owner:ent_1:user_1:user"
     _seed_registry(fake_cache)
     fake_cache.store[key].update({"env_injection": "create", "current_skill": "xlsx", "holds_credentials": False})
     scripted_client.created_ids = ["sb_fresh"]
@@ -2703,6 +3042,9 @@ async def test_same_skill_that_gained_credentials_does_not_reuse_a_baked_contain
         binding=_binding(conversation_id="conversation_1"),
     )
     assert (session.sandbox_id, session.reused) == ("sb_fresh", False)
+    # Each step below tests the shared primary's rule, not the Skill's own
+    # container the previous step created.
+    fake_cache.store.pop(f"{key}:skill:xlsx")
 
     # Rotated credentials: same skill, same key, different value.
     from packages.core.services.sandbox_session_service import env_fingerprint
@@ -2723,6 +3065,7 @@ async def test_same_skill_that_gained_credentials_does_not_reuse_a_baked_contain
         binding=_binding(conversation_id="conversation_1"),
     )
     assert (rotated.sandbox_id, rotated.reused) == ("sb_rotated", False)
+    fake_cache.store.pop(f"{key}:skill:xlsx")
 
     # Revoked credentials: same skill, env removed.
     scripted_client.reset()
@@ -2801,10 +3144,10 @@ async def test_credentialed_bundle_without_conversation_never_registers(
 
 
 @pytest.mark.asyncio
-async def test_plain_bundles_reuse_within_a_conversation_only(
+async def test_plain_bundles_reuse_the_users_container_across_conversations(
     fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
 ) -> None:
-    """Warmth is per conversation: load_skill clears /skill on a skill change."""
+    """Warmth is per USER: every conversation of the user reuses the one container."""
 
     from packages.core.services.sandbox_session_service import (
         SandboxOwner,
@@ -2812,7 +3155,7 @@ async def test_plain_bundles_reuse_within_a_conversation_only(
     )
 
     scripted_client.created_ids = ["sb_c1", "sb_c2"]
-    scripted_client.load_results = [_load_result(sandbox_id="sb_c1")]
+    scripted_client.load_results = [_load_result(sandbox_id="sb_c1"), _load_result(sandbox_id="sb_c1")]
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
     first = await acquire_sandbox_session(
@@ -2827,21 +3170,16 @@ async def test_plain_bundles_reuse_within_a_conversation_only(
 
     assert (first.sandbox_id, first.reused) == ("sb_c1", False)
     assert (second.sandbox_id, second.reused) == ("sb_c1", True)
-    assert (third.sandbox_id, third.reused) == ("sb_c2", False)
+    assert (third.sandbox_id, third.reused) == ("sb_c1", True)
 
     handlers = [c["handler"] for c in scripted_client.calls]
-    assert handlers.count("create_from_builtin") == 2
-    assert handlers.count("load_skill") == 1
+    assert handlers.count("create_from_builtin") == 1
+    assert handlers.count("load_skill") == 2
 
-    assert "sandbox:owner:ent_1:user_1" not in fake_cache.store
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
-        == "sb_c1"
-    )
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_2:agent:agent_1"]["sandbox_id"]
-        == "sb_c2"
-    )
+    assert [key for key in fake_cache.store if key.startswith("sandbox:owner:")] == [
+        "sandbox:owner:ent_1:user_1:user"
+    ]
+    assert fake_cache.store["sandbox:owner:ent_1:user_1:user"]["sandbox_id"] == "sb_c1"
     assert fake_cache.leases == {}
 
 
@@ -2867,61 +3205,77 @@ async def test_generic_scope_is_conversation_prefixed(
         owner=owner, bundle=_bundle("xlsx"), binding=_binding(conversation_id="conversation_1")
     )
     generic_session = await acquire_sandbox_session(
-        owner=owner, bundle=generic, binding=_binding(conversation_id="conversation_1")
+        owner=owner, bundle=generic, binding=_binding(conversation_id="conversation_1", agent_id="agent_2")
     )
 
     assert (plain_session.sandbox_id, plain_session.reused) == ("sb_plain", False)
-    # The generic sandbox never lands in the conversation's skill container.
-    assert (generic_session.sandbox_id, generic_session.reused) == ("sb_generic", False)
+    # The generic sandbox is the conversation's primary container: it is
+    # shared, and joining it loads nothing (a reload would wipe the Skill).
+    assert (generic_session.sandbox_id, generic_session.reused) == ("sb_plain", True)
     assert "load_skill" not in [c["handler"] for c in scripted_client.calls]
+    assert [c["handler"] for c in scripted_client.calls].count("create_from_builtin") == 1
 
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
-        == "sb_plain"
-    )
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1:generic"]["sandbox_id"]
-        == "sb_generic"
-    )
-    assert "sandbox:owner:ent_1:user_1:generic" not in fake_cache.store
+    primary = fake_cache.store["sandbox:owner:ent_1:user_1:user"]
+    assert primary["sandbox_id"] == "sb_plain" and primary["current_skill"] == "xlsx"
+    assert not [key for key in fake_cache.store if key.endswith(":generic")]
     assert fake_cache.leases == {}
 
 
 @pytest.mark.asyncio
-async def test_agents_in_one_conversation_do_not_share_a_container(
+async def test_agents_in_one_conversation_share_one_container(
     fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
 ) -> None:
-    """Warm reuse is gated on the driving agent, not just the conversation.
-
-    Sharing would let either agent's ``load_skill`` wipe the other's
-    ``/skill``, and rebinding the container to the second agent locks the
-    first out of the sandbox it is still using.
-    """
+    """The sandbox belongs to the user x conversation: every agent of the
+    conversation (master, sub-agents, delegates) shares it, and each acquire
+    records the acting agent on the binding for audit."""
 
     from packages.core.services.sandbox_session_service import (
         SandboxOwner,
         acquire_sandbox_session,
     )
 
-    scripted_client.created_ids = ["sb_agent_1", "sb_agent_2"]
+    scripted_client.created_ids = ["sb_conversation", "sb_unexpected"]
+    scripted_client.load_results = [_load_result("sb_conversation")]
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
 
     first = await acquire_sandbox_session(owner=owner, bundle=_bundle(), binding=_binding(agent_id="agent_1"))
     second = await acquire_sandbox_session(owner=owner, bundle=_bundle(), binding=_binding(agent_id="agent_2"))
 
-    assert (first.sandbox_id, first.reused) == ("sb_agent_1", False)
-    assert (second.sandbox_id, second.reused) == ("sb_agent_2", False)
-    assert len([c for c in scripted_client.calls if c["handler"] == "create_from_builtin"]) == 2
-    assert "load_skill" not in [c["handler"] for c in scripted_client.calls]
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_1"]["sandbox_id"]
-        == "sb_agent_1"
-    )
-    assert (
-        fake_cache.store["sandbox:owner:ent_1:user_1:conversation:conversation_1:agent:agent_2"]["sandbox_id"]
-        == "sb_agent_2"
-    )
+    assert (first.sandbox_id, first.reused) == ("sb_conversation", False)
+    assert (second.sandbox_id, second.reused) == ("sb_conversation", True)
+    assert len([c for c in scripted_client.calls if c["handler"] == "create_from_builtin"]) == 1
+    # Same Skill already loaded: an overlay reload, no /skill wipe.
+    [load] = [c for c in scripted_client.calls if c["handler"] == "load_skill"]
+    assert load["idle_threshold"] == 0
+    assert [key for key in fake_cache.store if key.startswith("sandbox:owner:")] == [
+        "sandbox:owner:ent_1:user_1:user"
+    ]
+    assert [context["agent_id"] for context in recorded_contexts] == ["agent_1", "agent_2"]
     assert fake_cache.leases == {}
+
+
+@pytest.mark.asyncio
+async def test_other_users_never_share_a_container_the_same_user_always_does(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import (
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    scripted_client.created_ids = ["sb_u1_c1", "sb_u2_c1", "sb_u1_c2"]
+    scripted_client.load_results = [_load_result(sandbox_id="sb_u1_c1")]
+    alice = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    bob = SandboxOwner(entity_id="ent_1", user_id="user_2")
+
+    a = await acquire_sandbox_session(owner=alice, bundle=_bundle(), binding=_binding(conversation_id="c1"))
+    # Another member of the same workspace conversation: their own sandbox.
+    b = await acquire_sandbox_session(owner=bob, bundle=_bundle(), binding=_binding(conversation_id="c1"))
+    # The same user in another conversation: the user's one sandbox.
+    c = await acquire_sandbox_session(owner=alice, bundle=_bundle(), binding=_binding(conversation_id="c2"))
+
+    assert [a.sandbox_id, b.sandbox_id, c.sandbox_id] == ["sb_u1_c1", "sb_u2_c1", "sb_u1_c1"]
+    assert c.reused is True
 
 
 @pytest.mark.asyncio
@@ -2974,14 +3328,14 @@ def test_scope_segments_are_percent_encoded_and_cannot_collide() -> None:
     owner = SandboxOwner(entity_id="e1", user_id="u1")
     assert owner.registry_key(scope_a) != owner.registry_key(scope_b)
 
-    # A plain bundle whose reuse_scope carries ':' cannot forge another
+    # A dedicated container whose Skill name carries ':' cannot forge another
     # conversation's scope either.
-    plain_a = SandboxBundle(skill_name="x", files={}, reuse_scope="a:b")
-    plain_b = SandboxBundle(skill_name="x", files={}, reuse_scope="b")
-    _, plain_scope_a = sandbox_reuse_scope(plain_a, SandboxBinding(conversation_id="c"))
-    _, plain_scope_b = sandbox_reuse_scope(plain_b, SandboxBinding(conversation_id="c:a"))
-    assert plain_scope_a == "conversation:c:a%3Ab"
-    assert plain_scope_b == "conversation:c%3Aa:b"
+    dedicated_a = SandboxBundle(skill_name="a:b", files={}, config={"memory": "2g"})
+    dedicated_b = SandboxBundle(skill_name="b", files={}, config={"memory": "2g"})
+    _, dedicated_scope_a = sandbox_reuse_scope(dedicated_a, SandboxBinding(conversation_id="c:skill"))
+    _, dedicated_scope_b = sandbox_reuse_scope(dedicated_b, SandboxBinding(conversation_id="c:skill:a"))
+    assert dedicated_scope_a == "conversation:c%3Askill:skill:a%3Ab"
+    assert dedicated_scope_b == "conversation:c%3Askill%3Aa:skill:b"
 
     # No conversation, no scope — plain or credentialed.
     assert sandbox_reuse_scope(SandboxBundle(skill_name="xlsx", files={}), SandboxBinding()) == (False, None)
@@ -2998,10 +3352,18 @@ def test_every_scope_is_conversation_prefixed() -> None:
         sandbox_reuse_scope,
     )
 
+    # The generic sandbox is the conversation's primary container.
     generic = SandboxBundle(skill_name="generic-sandbox", files={}, reuse_scope="generic")
-    assert sandbox_reuse_scope(generic, SandboxBinding(conversation_id="c1")) == (
+    assert sandbox_reuse_scope(generic, SandboxBinding(conversation_id="c1", agent_id="a1")) == (
         True,
-        "conversation:c1:generic",
+        "conversation:c1",
+    )
+    # A bundle with its own container config runs in a dedicated container of
+    # the same conversation.
+    remotion = SandboxBundle(skill_name="remotion", files={}, config={"memory": "2g"})
+    assert sandbox_reuse_scope(remotion, SandboxBinding(conversation_id="c1")) == (
+        True,
+        "conversation:c1:skill:remotion",
     )
     plain = SandboxBundle(skill_name="xlsx", files={})
     assert sandbox_reuse_scope(plain, SandboxBinding(conversation_id="c1")) == (True, "conversation:c1")
@@ -3087,3 +3449,607 @@ async def test_warm_sandbox_base_url_reads_the_current_registry_record(fake_cach
     fake_cache.store[registry_key] = {"sandbox_id": "sb_newer", "base_url": "http://runner-7"}
     assert await warm_sandbox_base_url("sb_warm") is None
     assert await warm_sandbox_base_url("sb_unknown") is None
+
+
+# ── warm reuse respects the container's config ──
+#
+# One rule (sandbox-user-conversation): a container that cannot serve a
+# bundle is never destroyed while it serves other work. The user's shared
+# general container is never replaced; a dedicated one only while nothing
+# runs or waits in it. Otherwise the bundle gets a dedicated container of
+# the user's alongside.
+
+
+_DEFAULT_CONTAINER = {
+    "memory": "512m", "cpus": 1.0, "pids_limit": 256, "workdir_tmpfs_size": "256m", "network": "bridge",
+}
+_GENERAL_KEY = "sandbox:owner:ent_1:user_1:user"
+_REMOTION_KEY = "sandbox:owner:ent_1:user_1:user:skill:remotion-render"
+
+
+def _sized_bundle(config, skill_name="remotion-render"):
+    from packages.core.services.sandbox_session_service import SandboxBundle
+
+    return SandboxBundle(
+        skill_name=skill_name,
+        files={"SKILL.md": "# skill", "run.py": "print('ok')"},
+        source="builtin",
+        config=config,
+    )
+
+
+def _seed_sized_registry(fake_cache, *, requested, effective=None, key=_REMOTION_KEY):
+    """A warm container of user_1 under ``key`` (a sized Skill's dedicated one by default)."""
+
+    fake_cache.store[key] = {
+        "sandbox_id": "sb_warm",
+        "base_url": "http://sandbox-service",
+        "created_at": 1.0,
+        "last_acquired_at": 1.0,
+        "loaded_skills": ["remotion-render"],
+        "current_skill": "remotion-render",
+        "env_injection": "exec",
+        "requested_config": requested,
+    }
+    if effective is not None:
+        fake_cache.store[key]["container_config"] = effective
+    return key
+
+
+def _status_with(config, **extra):
+    return SimpleNamespace(status="ready", workdir="/skill", config=dict(config), **extra)
+
+
+def _fit_key(role, config):
+    from packages.core.services.sandbox_session_service import _misfit_role
+
+    return f"sandbox:owner:ent_1:user_1:user:{_misfit_role(_sized_bundle(config), role)}"
+
+
+@pytest.mark.asyncio
+async def test_an_idle_undersized_dedicated_container_is_replaced_in_its_own_scope(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    """A 512m container warmed for a Skill's dedicated role must not be handed
+    (via load_skill) to that Skill now asking 2g: it would OOM. Nothing runs or
+    waits in it, so it is replaced in place by a right-sized one."""
+
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    key = _seed_sized_registry(fake_cache, requested={"memory": "512m"})
+    scripted_client.status_results = [_status_with(_DEFAULT_CONTAINER)]
+    remotion = {"memory": "2g", "workdir_tmpfs_size": "1g", "pids_limit": 512}
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_sized_bundle(remotion),
+        binding=_binding(),
+    )
+
+    handlers = [call["handler"] for call in scripted_client.calls]
+    assert "load_skill" not in handlers
+    assert {"handler": "destroy", "sandbox_id": "sb_warm"} in scripted_client.calls
+    create = next(call for call in scripted_client.calls if call["handler"] == "create_from_builtin")
+    assert create["config"] == remotion
+    assert session.sandbox_id == "sb_new" and session.reused is False
+    assert fake_cache.store[key]["sandbox_id"] == "sb_new", "the replacement takes the same role"
+    assert fake_cache.store[key]["requested_config"] == remotion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "busy",
+    [
+        {"active_execution_ids": ["exec-other-conversation"]},
+        # A command waiting for a slot (a durable run parked on it) is work too.
+        {"queued_execution_ids": ["exec-parked"]},
+        {"active_execution_id": "exec-older-runner"},
+    ],
+    ids=["running", "queued", "single-exec-runner"],
+)
+async def test_an_undersized_dedicated_container_with_work_in_it_gets_a_sized_one_alongside(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, busy
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    key = _seed_sized_registry(fake_cache, requested={"memory": "512m"})
+    scripted_client.status_results = [_status_with(_DEFAULT_CONTAINER, **busy)]
+    clock = FakeClock()
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_sized_bundle({"memory": "2g"}),
+        binding=_binding(),
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+    handlers = [call["handler"] for call in scripted_client.calls]
+    assert "destroy" not in handlers, "never destroy a container work runs or waits in"
+    assert clock.sleeps == [], "never busy: no waiting for the other work to end"
+    assert session.sandbox_id == "sb_new"
+    assert fake_cache.store[key]["sandbox_id"] == "sb_warm"
+    fit_key = _fit_key("skill:remotion-render", {"memory": "2g"})
+    assert fit_key.startswith(_REMOTION_KEY + ":fit:")
+    assert fake_cache.store[fit_key]["sandbox_id"] == "sb_new"
+    assert fake_cache.store[fit_key]["requested_config"] == {"memory": "2g"}
+
+
+@pytest.mark.asyncio
+async def test_the_shared_general_container_is_never_replaced_for_a_skill_it_cannot_serve(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    """The general container (here created with low explicit limits and no
+    network) serves all of the user's work: even idle it is not replaced. The
+    Skill wanting the runner's defaults gets its own container alongside."""
+
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    _seed_sized_registry(fake_cache, requested={"network": "none", "pids_limit": 128}, key=_GENERAL_KEY)
+    scripted_client.status_results = [
+        _status_with({**_DEFAULT_CONTAINER, "network": "none", "pids_limit": 128})
+    ]
+    scripted_client.health_payload = {
+        "status": "ok", "sandbox_image_available": True,
+        "container_defaults": {**_DEFAULT_CONTAINER, "memory_mb": 512},
+    }
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=_bundle(), binding=_binding(),
+    )
+
+    handlers = [call["handler"] for call in scripted_client.calls]
+    assert "destroy" not in handlers and "load_skill" not in handlers
+    assert session.sandbox_id == "sb_new"
+    assert fake_cache.store[_GENERAL_KEY]["sandbox_id"] == "sb_warm"
+    assert fake_cache.store["sandbox:owner:ent_1:user_1:user:skill:xlsx"]["sandbox_id"] == "sb_new"
+
+
+@pytest.mark.asyncio
+async def test_a_generic_bundle_the_general_container_cannot_serve_gets_a_sized_one_alongside(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import (
+        GENERIC_SANDBOX_REUSE_SCOPE,
+        GENERIC_SANDBOX_SKILL_NAME,
+        SandboxBundle,
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_sized_registry(fake_cache, requested={"network": "none"}, key=_GENERAL_KEY)
+    scripted_client.status_results = [_status_with({**_DEFAULT_CONTAINER, "network": "none"})]
+    scripted_client.health_payload = {
+        "status": "ok", "sandbox_image_available": True,
+        "container_defaults": {**_DEFAULT_CONTAINER, "memory_mb": 512},
+    }
+    generic = SandboxBundle(
+        skill_name=GENERIC_SANDBOX_SKILL_NAME, files={}, source="builtin", reuse_scope=GENERIC_SANDBOX_REUSE_SCOPE,
+    )
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=generic, binding=_binding(skill_id=""),
+    )
+
+    assert "destroy" not in [call["handler"] for call in scripted_client.calls]
+    assert session.sandbox_id == "sb_new"
+    assert fake_cache.store[_GENERAL_KEY]["sandbox_id"] == "sb_warm"
+    fit = [key for key in fake_cache.store if key.startswith(_GENERAL_KEY + ":fit:")]
+    assert len(fit) == 1 and fake_cache.store[fit[0]]["sandbox_id"] == "sb_new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holds_credentials", [True, False])
+async def test_generic_work_never_attaches_to_credentials_an_old_runner_cannot_isolate(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, holds_credentials
+) -> None:
+    """On a runner without Skill slots a Skill's env reaches every command in
+    its container (baked at create, or handed to every exec): the user's
+    general container that a credentialed Skill created is never shared with
+    generic work, which gets its own container alongside instead."""
+
+    from packages.core.services.sandbox_session_service import (
+        GENERIC_SANDBOX_REUSE_SCOPE,
+        GENERIC_SANDBOX_SKILL_NAME,
+        SandboxBundle,
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    _seed_sized_registry(fake_cache, requested={}, key=_GENERAL_KEY)
+    fake_cache.store[_GENERAL_KEY].update(
+        env_injection="create", skill_slots=False, holds_credentials=holds_credentials,
+    )
+    scripted_client.status_results = [_status_with(_DEFAULT_CONTAINER)]
+    scripted_client.health_payload = {
+        "status": "ok", "sandbox_image_available": True,
+        "container_defaults": {**_DEFAULT_CONTAINER, "memory_mb": 512},
+    }
+    generic = SandboxBundle(
+        skill_name=GENERIC_SANDBOX_SKILL_NAME, files={}, source="builtin", reuse_scope=GENERIC_SANDBOX_REUSE_SCOPE,
+    )
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=generic, binding=_binding(skill_id=""),
+    )
+
+    assert fake_cache.store[_GENERAL_KEY]["sandbox_id"] == "sb_warm"
+    if holds_credentials:
+        assert session.sandbox_id == "sb_new"
+        assert "destroy" not in [call["handler"] for call in scripted_client.calls], "the Skill keeps its container"
+    else:
+        assert session.sandbox_id == "sb_warm" and session.reused is True
+
+
+@pytest.mark.asyncio
+async def test_reuse_accepts_a_warm_container_at_least_as_large(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    key = _seed_sized_registry(fake_cache, requested={"memory": "2g", "pids_limit": 512})
+    scripted_client.status_results = [
+        _status_with({**_DEFAULT_CONTAINER, "memory": "2g", "pids_limit": 512, "workdir_tmpfs_size": "1g"})
+    ]
+    scripted_client.load_results = [_load_result()]
+    # pids_limit is left to the default by this bundle but was explicit at
+    # create: it is compared against the runner's default (256 <= 512).
+    scripted_client.health_payload = {
+        "status": "ok", "sandbox_image_available": True,
+        "container_defaults": {**_DEFAULT_CONTAINER, "memory_mb": 512},
+    }
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        # A smaller ask fits in the 2g container.
+        bundle=_sized_bundle({"memory": "1g", "workdir_tmpfs_size": "512m"}),
+        binding=_binding(),
+    )
+
+    assert session.sandbox_id == "sb_warm" and session.reused is True
+    assert "create_from_builtin" not in [call["handler"] for call in scripted_client.calls]
+    # Loading a skill does not change the container: its origin is kept.
+    assert fake_cache.store[key]["requested_config"] == {"memory": "2g", "pids_limit": 512}
+    assert fake_cache.store[key]["container_config"]["memory"] == "2g"
+
+
+@pytest.mark.asyncio
+async def test_a_default_request_reuses_a_container_made_with_defaults(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    _seed_sized_registry(fake_cache, requested={}, key=_GENERAL_KEY)
+    scripted_client.status_results = [_status_with(_DEFAULT_CONTAINER)]
+    scripted_client.load_results = [_load_result()]
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=_bundle(), binding=_binding(),
+    )
+
+    assert session.sandbox_id == "sb_warm"
+    # Nothing to compare against the runner's defaults: no extra health call.
+    assert "health" not in [call["handler"] for call in scripted_client.calls]
+
+
+@pytest.mark.asyncio
+async def test_a_clamped_container_is_reused_for_the_same_request(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    """Video asks 4g; a 2 GiB runner clamps it to 1792m. The next video call
+    asks 4g again and must reuse that container, not churn an identical one."""
+
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    video = {"network": "none", "memory": "4g", "cpus": 4.0, "pids_limit": 512, "workdir_tmpfs_size": "2g"}
+    _seed_sized_registry(fake_cache, requested=video)
+    scripted_client.status_results = [
+        _status_with({**_DEFAULT_CONTAINER, **video, "memory": "1792m", "cpus": 1.0})
+    ]
+    scripted_client.load_results = [_load_result()]
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=_sized_bundle(video), binding=_binding(),
+    )
+
+    assert session.sandbox_id == "sb_warm" and session.reused is True
+
+
+@pytest.mark.asyncio
+async def test_a_different_network_posture_is_never_reused(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    _seed_sized_registry(fake_cache, requested={})
+    scripted_client.status_results = [_status_with(_DEFAULT_CONTAINER)]
+
+    session = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_sized_bundle({"network": "none"}),
+        binding=_binding(),
+    )
+
+    assert session.sandbox_id == "sb_new"
+    assert "load_skill" not in [call["handler"] for call in scripted_client.calls]
+
+
+@pytest.mark.asyncio
+async def test_create_records_the_requested_and_effective_config(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, monkeypatch
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxOwner, acquire_sandbox_session
+
+    original = _fake_create_result
+
+    def created(sandbox_id, **kwargs):
+        result = original(sandbox_id, **kwargs)
+        result.config = {**_DEFAULT_CONTAINER, "memory": "1792m"}
+        return result
+
+    monkeypatch.setitem(globals(), "_fake_create_result", created)
+
+    await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_sized_bundle({"memory": "4g"}),
+        binding=_binding(),
+    )
+
+    record = fake_cache.store[_REMOTION_KEY]
+    assert record["requested_config"] == {"memory": "4g"}
+    assert record["container_config"]["memory"] == "1792m"
+
+
+def test_a_sandbox_is_in_use_while_any_command_runs_or_waits_in_it() -> None:
+    from packages.core.services.sandbox_session_service import _sandbox_in_use
+
+    assert not _sandbox_in_use(SimpleNamespace(status="ready"))
+    assert not _sandbox_in_use(SimpleNamespace(status="ready", active_execution_ids=[], queued_execution_ids=[]))
+    assert _sandbox_in_use(SimpleNamespace(status="ready", active_execution_ids=["a"]))
+    assert _sandbox_in_use(SimpleNamespace(status="ready", queued_execution_ids=["q"]))
+    assert _sandbox_in_use(SimpleNamespace(status="executing"))
+def test_tool_owned_bundles_never_bind_a_sandbox_tool_slot() -> None:
+    """SESSION and ONE_SHOT containers belong to the tool that admitted them:
+    admitting one must never write (or overwrite) the agent's generic or
+    Skill binding, and a ONE_SHOT has no reuse scope at all."""
+
+    from packages.core.services.sandbox_session_service import (
+        GENERIC_SANDBOX_REUSE_SCOPE,
+        SandboxBinding,
+        SandboxBundle,
+        SandboxLifetime,
+        SandboxOwner,
+        sandbox_binding_scope,
+        sandbox_reuse_scope,
+    )
+
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    binding = SandboxBinding(conversation_id="conv_1", agent_id="agent_1", runtime_tool_call_id="call_1")
+    session = SandboxBundle(
+        skill_name="video-edit-runtime", files={}, reuse_scope="video-edit",
+        lifetime=SandboxLifetime.SESSION, purpose="video-session",
+    )
+    one_shot = SandboxBundle(skill_name="bash-tool", files={}, lifetime=SandboxLifetime.ONE_SHOT, purpose="bash")
+    warm = SandboxBundle(skill_name="xlsx", files={})
+
+    assert session.binding_kind is None and one_shot.binding_kind is None
+    assert sandbox_binding_scope(owner, session, binding) is None
+    assert sandbox_binding_scope(owner, one_shot, binding) is None
+    assert sandbox_binding_scope(owner, warm, binding) is not None
+    # A SESSION container is a dedicated role container of the user's
+    # (sandbox-user-conversation), whatever conversation admits it.
+    assert sandbox_reuse_scope(session, binding, owner) == (True, "user:video-edit")
+    assert sandbox_reuse_scope(one_shot, binding, owner) == (False, None)
+    # Each container of one durable call has its own reservation key.
+    assert session.reservation_suffix == ":video-session" and warm.reservation_suffix == ""
+    with pytest.raises(ValueError):
+        SandboxBundle(skill_name="s", files={}, lifetime=SandboxLifetime.SESSION)
+    with pytest.raises(ValueError):
+        SandboxBundle(
+            skill_name="s", files={}, reuse_scope=GENERIC_SANDBOX_REUSE_SCOPE, lifetime=SandboxLifetime.ONE_SHOT,
+        )
+
+
+# ── PERSISTENT: one long-lived container per owner scope, reached without a conversation ──
+
+_DESKTOP_KEY = "sandbox:owner:ent_1:user_1:user:desktop"
+
+
+def _persistent_bundle(*, isolation_key: str = "", isolation_ref: str | None = None):
+    from packages.core.services.sandbox_session_service import SandboxBundle, SandboxLifetime
+
+    return SandboxBundle(
+        skill_name="desktop", files={"README.md": "desktop\n"}, source="workspace", auto_install=False,
+        config={"memory": "2g"}, lifetime=SandboxLifetime.PERSISTENT, reuse_scope="desktop",
+        isolation_key=isolation_key, isolation_ref=isolation_ref,
+    )
+
+
+def test_a_persistent_bundle_is_owner_scoped_and_needs_no_conversation() -> None:
+    from packages.core.services.sandbox_session_service import (
+        SandboxBinding,
+        SandboxBundle,
+        SandboxLifetime,
+        SandboxOwner,
+        sandbox_binding_scope,
+        sandbox_reuse_scope,
+    )
+
+    bundle = _persistent_bundle()
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    # Tool-owned: never a model-visible sandbox slot.
+    assert bundle.binding_kind is None
+    assert sandbox_binding_scope(owner, bundle, SandboxBinding()) is None
+    for binding in (SandboxBinding(), SandboxBinding(conversation_id="conv_1")):
+        assert sandbox_reuse_scope(bundle, binding, owner) == (True, "user:desktop")
+    # It belongs to a person; user-less work has no persistent container.
+    assert sandbox_reuse_scope(bundle, SandboxBinding(), SandboxOwner(entity_id="ent_1", user_id=None)) == (False, None)
+    with pytest.raises(ValueError):
+        SandboxBundle(skill_name="s", files={}, lifetime=SandboxLifetime.PERSISTENT)
+    with pytest.raises(ValueError):
+        SandboxBundle(skill_name="s", files={}, isolation_ref="ref:1")  # a ref names its key
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_container_is_reused_across_admissions_not_replaced(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import SandboxBinding, SandboxOwner, acquire_sandbox_session
+
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    first = await acquire_sandbox_session(owner=owner, bundle=_persistent_bundle(isolation_key="k1"), binding=SandboxBinding())
+    assert first.sandbox_id == "sb_new"
+    assert fake_cache.store[_DESKTOP_KEY]["isolation_key"] == "k1"
+
+    scripted_client.calls.clear()
+    scripted_client.status_results = [_status_with({**_DEFAULT_CONTAINER, "memory": "2g"})]
+    scripted_client.load_results = [_load_result(sandbox_id="sb_new")]
+    again = await acquire_sandbox_session(owner=owner, bundle=_persistent_bundle(isolation_key="k1"), binding=SandboxBinding())
+
+    handlers = [call["handler"] for call in scripted_client.calls]
+    assert again.sandbox_id == "sb_new" and again.reused is True
+    assert "destroy" not in handlers and "create_from_files" not in handlers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lifetime",
+    ["persistent", "warm"],
+    ids=["persistent-desktop", "warm-skill"],
+)
+async def test_a_container_is_never_reused_for_another_isolation_key(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, lifetime
+) -> None:
+    """A container made for one isolation (in the cloud: one exit IP) never
+    serves a bundle that asks for another; an idle one is replaced."""
+
+    from packages.core.services.sandbox_session_service import (
+        SandboxBinding,
+        SandboxBundle,
+        SandboxOwner,
+        acquire_sandbox_session,
+    )
+
+    if lifetime == "persistent":
+        key, bundle, binding = _DESKTOP_KEY, _persistent_bundle(isolation_key="k2"), SandboxBinding()
+        skill = "desktop"
+    else:
+        key, skill = _REMOTION_KEY, "remotion-render"
+        bundle = SandboxBundle(
+            skill_name=skill, files={"SKILL.md": "# skill"}, source="builtin", config={"memory": "2g"},
+            isolation_key="k2",
+        )
+        binding = _binding()
+    fake_cache.store[key] = {
+        "sandbox_id": "sb_warm", "base_url": "http://sandbox-service", "created_at": 1.0,
+        "last_acquired_at": 1.0, "loaded_skills": [skill], "current_skill": skill,
+        "env_injection": "exec", "requested_config": {"memory": "2g"}, "isolation_key": "k1",
+    }
+    scripted_client.status_results = [_status_with({**_DEFAULT_CONTAINER, "memory": "2g"})]
+
+    session = await acquire_sandbox_session(owner=SandboxOwner(entity_id="ent_1", user_id="user_1"), bundle=bundle, binding=binding)
+
+    assert {"handler": "destroy", "sandbox_id": "sb_warm"} in scripted_client.calls
+    assert session.sandbox_id == "sb_new"
+    assert fake_cache.store[key]["isolation_key"] == "k2"
+
+
+@pytest.mark.asyncio
+async def test_an_isolation_ref_is_resolved_into_the_create_and_fails_closed_when_unknown(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, monkeypatch
+) -> None:
+    from packages.core.services import sandbox_isolation
+    from packages.core.services.sandbox_session_service import SandboxBinding, SandboxOwner, acquire_sandbox_session
+
+    monkeypatch.setattr(sandbox_isolation, "_RESOLVERS", {})
+
+    async def resolve(ref: str) -> dict:
+        assert ref == "test:7"
+        return {"network_profile": {"route": "seven"}}
+
+    sandbox_isolation.register_isolation_resolver("test:", resolve)
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+
+    session = await acquire_sandbox_session(
+        owner=owner, bundle=_persistent_bundle(isolation_key="k7", isolation_ref="test:7"), binding=SandboxBinding(),
+    )
+    create = next(call for call in scripted_client.calls if call["handler"] == "create_from_files")
+    assert create["extra"] == {"network_profile": {"route": "seven"}}
+    assert session.sandbox_id == "sb_new"
+
+    fake_cache.store.clear()
+    scripted_client.calls.clear()
+    failed = await acquire_sandbox_session(
+        owner=owner, bundle=_persistent_bundle(isolation_key="k8", isolation_ref="unknown:8"), binding=SandboxBinding(),
+    )
+    assert getattr(failed, "code", None) == "create_failed"
+    assert failed.cause == "isolation_unavailable"
+    assert not any(call["handler"].startswith("create_from") for call in scripted_client.calls)
+
+
+def test_a_ticket_carries_the_isolation_ref_and_key_never_what_they_resolve_to() -> None:
+    from packages.core.services.sandbox_session_service import _bundle_from_payload, _reservation_request_payload
+
+    bundle = _persistent_bundle(isolation_key="k9", isolation_ref="test:9")
+    payload = _reservation_request_payload(bundle)
+    assert payload["isolation_ref"] == "test:9" and payload["isolation_key"] == "k9"
+    restored = _bundle_from_payload(payload, bundle)
+    assert (restored.isolation_ref, restored.isolation_key) == ("test:9", "k9")
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_container_is_destroyed_and_forgotten_only_when_its_owner_retires_it(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts
+) -> None:
+    from packages.core.services.sandbox_session_service import (
+        SandboxBinding,
+        SandboxOwner,
+        acquire_sandbox_session,
+        discard_session_sandbox,
+    )
+
+    owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
+    bundle = _persistent_bundle(isolation_key="k1")
+    session = await acquire_sandbox_session(owner=owner, bundle=bundle, binding=SandboxBinding())
+    assert _DESKTOP_KEY in fake_cache.store
+
+    await discard_session_sandbox(owner=owner, bundle=bundle, binding=SandboxBinding(), sandbox_id=session.sandbox_id)
+
+    assert {"handler": "destroy", "sandbox_id": session.sandbox_id} in scripted_client.calls
+    assert _DESKTOP_KEY not in fake_cache.store
+
+
+@pytest.mark.asyncio
+async def test_a_background_service_waits_on_its_own_ticket_for_a_persistent_container(
+    fake_cache, scripted_client, local_sandbox_settings, recorded_contexts, fake_queue, monkeypatch
+) -> None:
+    """Outside every runtime (no run, task or conversation) a service booting
+    a PERSISTENT container waits on a ticket of its own, which carries only
+    the isolation reference."""
+    from packages.core.services.sandbox_session_service import (
+        SandboxBinding,
+        SandboxOwner,
+        SandboxSession,
+        acquire_sandbox_session,
+    )
+
+    _external_runner_settings(local_sandbox_settings, monkeypatch)
+    fake_queue.statuses = [_ticket("allocated", sandbox_id="sb_desktop")]
+    clock = FakeClock()
+
+    result = await acquire_sandbox_session(
+        owner=SandboxOwner(entity_id="ent_1", user_id="user_1"),
+        bundle=_persistent_bundle(isolation_key="k1", isolation_ref="test:1"),
+        binding=SandboxBinding(background_requester="service:boot-1"),
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+    assert isinstance(result, SandboxSession) and result.sandbox_id == "sb_desktop"
+    [enqueued] = fake_queue.enqueued
+    assert enqueued["requester_kind"] == "task"
+    assert enqueued["requester_id"] == "service:boot-1"
+    assert enqueued["scope_key"] == _DESKTOP_KEY
+    assert enqueued["request_payload"]["isolation_ref"] == "test:1"
+    assert fake_cache.store[_DESKTOP_KEY]["sandbox_id"] == "sb_desktop"
+    assert fake_cache.store[_DESKTOP_KEY]["isolation_key"] == "k1"

@@ -123,6 +123,8 @@ async def _supersede_conflicting_task_recovery_surfaces(
         request.resolved_reason = "superseded_by_effect_reconciliation"
         request.decided_at = now
         request.decided_via = "effect_reconciliation"
+        from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+        await wake_run_for_closed_request(db, request)
         await ledger_adapters.record_approval_event(
             db,
             request,
@@ -393,28 +395,59 @@ async def ensure_task_recovery_hitl(
 TASK_INPUT_ACTION_KEY = "task.request_input"
 
 
+def asked_by_context(asked_by: str | None) -> str:
+    """The line a card shows when an agent working on the Task asked."""
+    agent = str(asked_by or "").strip()
+    return f"Asked by {agent}, an agent working on this Task." if agent else ""
+
+
 async def ensure_task_input_hitl(
     db: AsyncSession,
     task: Task,
     *,
     question: dict,
+    dedup_key: Optional[str] = None,
+    asked_by: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Message | None:
-    """Create the one input card for a task parked by ``request_input``.
+    """Create the input card for a question a Task's agent asked (``request_input``).
 
     Reuses the free-form ``HUMAN_INPUT`` card shape, keyed by ``task_id``
     (no step): the workspace-chat resolve endpoint routes such a card to the
     legacy task resume rather than to a plan step.
+
+    One card per Task by default (``task:{task_id}:task.request_input``). A
+    delegated agent's run asks on its own card: it passes its own
+    ``dedup_key`` (one per run and call), ``asked_by`` (its agent's name,
+    shown on the card) and ``run_id`` (the run the answer resumes). The card
+    stays a Task card, so every answer surface routes it as before.
+
+    A Task outside any Workspace has no Workspace Chat: its card is posted in
+    the Task's own conversation, where its approval cards go too.
     """
-    if not task.workspace_id:
+    if not task.workspace_id and not task.conversation_id:
         return None
     text = str(question.get("question") or "").strip()
     if not text:
         return None
+    question = dict(question)
+    asked = asked_by_context(asked_by)
+    if asked and not str(question.get("context") or "").startswith(asked):
+        question["context"] = f"{asked} {question.get('context') or ''}".strip()
+    agent_label = str(asked_by or "").strip()[:100] or None
+    run_fields = {
+        **({"run_id": str(run_id), "run_kind": "child"} if run_id else {}),
+        **({"agent_label": agent_label} if agent_label else {}),
+    }
     payload = {
         "question": text,
         "why": str(question.get("context") or "The agent needs this to finish the task."),
-        "action_to_take": "Answer here or on the task page; the agent resumes with your answer.",
-        "action_link": _task_url(task.id),
+        # A host-owned link (a screen hand-over) is where the person acts.
+        "action_to_take": str(
+            question.get("action_to_take")
+            or "Answer here or on the task page; the agent resumes with your answer."
+        ),
+        "action_link": question.get("action_link") or _task_url(task.id),
     }
     for key in ("options", "fields", "context"):
         if question.get(key):
@@ -436,27 +469,60 @@ async def ensure_task_input_hitl(
                 "task_title": task.title,
                 "pending_kind": PendingActionKind.HUMAN_INPUT.value,
                 "question": dict(question),
+                **run_fields,
             },
         ),
+        dedup_key=dedup_key,
         reason=text,
         matched_rule="task.request_input",
         hitl_type=HitlType.INPUT.value,
         payload=payload,
     )
-    existing = await _message_for_request(
-        db,
-        entity_id=task.entity_id,
-        workspace_id=task.workspace_id,
-        request_id=request.id,
-    )
+    existing = await _task_input_card_for_request(db, task=task, request_id=request.id)
     if existing is not None:
         return existing
 
-    body_lines = [f"Question from the agent working on “{task.title}”:", "", text]
+    body_lines = [
+        f"Asked by {agent_label}, an agent working on “{task.title}”:"
+        if agent_label
+        else f"Question from the agent working on “{task.title}”:",
+        "",
+        text,
+    ]
     options = question.get("options")
     if isinstance(options, list) and options:
         body_lines.append("")
         body_lines.append("Options: " + " / ".join(str(item) for item in options))
+    pending_action = {
+        "kind": PendingActionKind.HUMAN_INPUT.value,
+        "task_id": task.id,
+        "approval_request_id": request.id,
+        "hitl_type": HitlType.INPUT.value,
+        "payload": payload,
+        "prompt": text,
+        **({"options": list(options)} if isinstance(options, list) and options else {}),
+        "input_schema": {
+            "type": "object",
+            "properties": {"response": {"type": "string"}},
+            "required": ["response"],
+        },
+        **run_fields,
+    }
+    refs = [{"type": "task", "id": task.id, "title": task.title}]
+    meta = {"task_id": task.id, "task_hitl": True, **run_fields}
+    if not task.workspace_id:
+        from packages.core.services.conversation_messages import add_message
+
+        return await add_message(
+            db,
+            str(task.conversation_id),
+            role="assistant",
+            content="\n".join(body_lines),
+            message_kind="hitl_request",
+            refs=refs,
+            pending_action=pending_action,
+            meta=meta,
+        )
     return await chat_service.post_message(
         db,
         entity_id=task.entity_id,
@@ -464,23 +530,25 @@ async def ensure_task_input_hitl(
         body="\n".join(body_lines),
         message_kind="hitl_request",
         author_kind="agent",
-        refs=[{"type": "task", "id": task.id, "title": task.title}],
-        pending_action={
-            "kind": PendingActionKind.HUMAN_INPUT.value,
-            "task_id": task.id,
-            "approval_request_id": request.id,
-            "hitl_type": HitlType.INPUT.value,
-            "payload": payload,
-            "prompt": text,
-            **({"options": list(options)} if isinstance(options, list) and options else {}),
-            "input_schema": {
-                "type": "object",
-                "properties": {"response": {"type": "string"}},
-                "required": ["response"],
-            },
-        },
-        meta={"task_id": task.id, "task_hitl": True},
+        refs=refs,
+        pending_action=pending_action,
+        meta=meta,
     )
+
+
+async def _task_input_card_for_request(db: AsyncSession, *, task: Task, request_id: str) -> Message | None:
+    if task.workspace_id:
+        return await _message_for_request(
+            db, entity_id=task.entity_id, workspace_id=task.workspace_id, request_id=request_id,
+        )
+    rows = (await db.execute(
+        select(Message).where(
+            Message.conversation_id == task.conversation_id,
+            Message.resolved_at.is_(None),
+            Message.pending_action["approval_request_id"].astext == request_id,
+        )
+    )).scalars().all()
+    return rows[0] if rows else None
 
 
 async def resolve_task_input_hitl(
@@ -490,17 +558,25 @@ async def resolve_task_input_hitl(
     user_id: str,
     answer: str,
     payload: Optional[dict] = None,
+    request_id: Optional[str] = None,
 ) -> None:
-    """Grant + consume the task's open input request and close its cards."""
-    requests = list((await db.execute(
-        select(HitlRequest).where(
-            HitlRequest.entity_id == task.entity_id,
-            HitlRequest.origin_kind == ApprovalOriginKind.TASK.value,
-            HitlRequest.origin_task_id == task.id,
-            HitlRequest.action_key == TASK_INPUT_ACTION_KEY,
-            HitlRequest.status == ApprovalStatus.PENDING.value,
-        )
-    )).scalars().all())
+    """Grant + consume the task's open input request and close its cards.
+
+    With ``request_id`` only that request and its card close (a Task whose
+    delegated agents asked several questions keeps the others open);
+    without it, every open input request of the Task (a legacy Task asks
+    one question at a time).
+    """
+    query = select(HitlRequest).where(
+        HitlRequest.entity_id == task.entity_id,
+        HitlRequest.origin_kind == ApprovalOriginKind.TASK.value,
+        HitlRequest.origin_task_id == task.id,
+        HitlRequest.action_key == TASK_INPUT_ACTION_KEY,
+        HitlRequest.status == ApprovalStatus.PENDING.value,
+    )
+    if request_id:
+        query = query.where(HitlRequest.id == request_id)
+    requests = list((await db.execute(query)).scalars().all())
     for request in requests:
         request.context = {
             **(request.context or {}),
@@ -509,14 +585,21 @@ async def resolve_task_input_hitl(
         await grant_approval(db, request, by_user_id=user_id, via="task_hitl")
         await consume_approval(db, request)
 
-    if not task.workspace_id:
+    if task.workspace_id:
+        card_scope = (
+            Conversation.entity_id == task.entity_id,
+            Conversation.workspace_id == task.workspace_id,
+        )
+    elif task.conversation_id:
+        # Outside a Workspace the card is in the Task's own conversation.
+        card_scope = (Conversation.id == task.conversation_id,)
+    else:
         return
     rows = list((await db.execute(
         select(Message)
         .join(Conversation, Message.conversation_id == Conversation.id)
         .where(
-            Conversation.entity_id == task.entity_id,
-            Conversation.workspace_id == task.workspace_id,
+            *card_scope,
             Message.resolved_at.is_(None),
             Message.pending_action.isnot(None),
         )
@@ -528,13 +611,14 @@ async def resolve_task_input_hitl(
             action.get("kind") == PendingActionKind.HUMAN_INPUT.value
             and action.get("task_id") == task.id
             and not action.get("step_id")
+            and (not request_id or action.get("approval_request_id") == request_id)
         ):
             await chat_service.resolve_pending_action(
                 db,
                 message_id=message.id,
                 user_id=user_id,
                 resolution=resolution,
-                emit_followup=False,
+                publish_resolution=False,
             )
 
 
@@ -607,5 +691,5 @@ async def resolve_task_hitl(
                 message_id=message.id,
                 user_id=user_id,
                 resolution=resolution,
-                emit_followup=False,
+                publish_resolution=False,
             )

@@ -111,6 +111,9 @@ async def test_partially_executable_skill_still_runs(db_session, monkeypatch):
 
     assert "code" not in result and result["content"] == "Done."
     assert len(calls) == 1
+    # The run is not silently narrower: the child and its caller both see what was withheld.
+    assert result["withheld_tools"] == ["generate_file"]
+    assert "does not grant these tools this Skill declares: generate_file" in calls[0]
 
 
 @pytest.mark.asyncio
@@ -151,6 +154,8 @@ async def test_unrestricted_parent_scope_is_not_refused(db_session, monkeypatch)
 
     assert "code" not in result
     assert len(calls) == 1
+    assert "withheld_tools" not in result
+    assert "does not grant" not in calls[0]
 
 
 @pytest.mark.asyncio
@@ -263,7 +268,7 @@ async def test_builtin_config_carries_runtime_tools_optional(db_session, monkeyp
 
 @pytest.mark.parametrize("name,orchestration", [
     ("invoke_skill", True), ("search_tools", True), ("call_tool", True), ("request_input", True),
-    ("delegate_to_agent", True), ("submit_result", True), ("list_skills", True),
+    ("delegate_to_agent", True), ("complete_task", True), ("list_skills", True),
     ("read_file", False), ("generate_file", False), ("workspace_search", False), ("mcp__chrome__status", False),
 ])
 def test_orchestration_tools_are_not_a_skills_work(name, orchestration):

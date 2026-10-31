@@ -6,13 +6,10 @@ class of regression cannot come back somewhere else in the same function.
 1. Every ``continue`` in the dispatcher checkout loop must either record why
    the step was skipped (``_stamp_dispatch_skip``), move the step to a
    terminal/paused status itself, or be one of the explicitly allow-listed
-   non-structural skips (retry backoff, setup blocked, target-worker
-   mismatch, dependency waiting). A silent ``continue`` is exactly the
-   "pending forever with no reason" class the watchdog cannot see.
-2. Every ``fail_lease(`` call in the internal worker's lease body must carry
-   the attempt's captured evidence, so a retry can never repeat an external
-   side effect the failed attempt already performed.
-3. The four dispatcher report surfaces must all check lease ownership before
+   non-structural skips (retry backoff, target-worker mismatch, dependency
+   waiting). A silent ``continue`` is exactly the "pending forever with no
+   reason" class the watchdog cannot see.
+2. The four dispatcher report surfaces must all check lease ownership before
    touching the step.
 """
 from __future__ import annotations
@@ -26,17 +23,12 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 DISPATCHER_SRC = REPO / "packages/core/dispatcher/service.py"
-WORKER_SRC = REPO / "packages/core/workers/internal.py"
 
 # ``if <test>: ... continue`` blocks that legitimately skip without a stamp.
 # Each entry is a substring that must appear in the ``if`` test's source.
 _ALLOWED_UNSTAMPED_SKIP_TESTS = (
     "step_retry_ready",          # retry backoff: the real error already explains it
-    "setup_status",              # workspace setup blocked: executor reports it
     "target_worker_id",          # plan pinned to another worker
-    "worker.kind != INTERNAL_WORKER_KIND",  # coordinator root is SQL-filtered from external workers
-    "local_worker_plan",         # local-worker plans are for paired workers
-    'step.provider == "browser_setup"',
     'dep_status == "waiting"',   # dependency not done yet: expected
     "len(leased) >= max_n",      # window full for this pass
 )
@@ -125,28 +117,6 @@ def test_every_dispatcher_skip_is_stamped_or_allow_listed() -> None:
         "dispatcher checkout skips a step silently — the executor watchdog can "
         "never escalate a skip it cannot see:\n" + "\n".join(unexplained)
         + f"\n(context: {lines[0][:60]}...)"
-    )
-
-
-def test_every_worker_fail_lease_carries_evidence() -> None:
-    source = WORKER_SRC.read_text()
-    tree = ast.parse(source)
-    fn = _function_node(tree, "_execute_claimed_lease")
-    missing: list[str] = []
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        if name != "fail_lease":
-            continue
-        kwargs = {kw.arg for kw in node.keywords}
-        if "evidence_refs" not in kwargs:
-            missing.append(f"line {node.lineno}")
-    assert not missing, (
-        "fail_lease is called without the attempt's captured evidence at: "
-        + ", ".join(missing)
-        + " — a retry after such a failure can repeat an external side effect"
     )
 
 

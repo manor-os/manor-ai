@@ -312,3 +312,79 @@ def test_manor_agent_tool_guidance_asks_for_step_by_step_work_through_handoffs()
     step = guidance.split("Think step by step")[1].split("\n- ")[0]
     assert "private" in step
     assert "sandbox_ready" in step and "same turn" in step
+
+
+# Review finding (2026-10-05): not every skill use asks for a file. "What does
+# this PDF say" runs the pdf skill and answers from what it read; the gate kept
+# sending that answer back until the round budget ran out, or until the model
+# saved a junk file to satisfy it.
+
+@pytest.mark.asyncio
+async def test_a_plain_answer_may_end_the_turn_once_the_skill_has_run() -> None:
+    contract = _handed_off()
+    _sandbox(contract, "extract", "exec", EXEC_OK, command="python extract.py")
+
+    decision = await contract.validate(answer("answered"))
+
+    assert decision.action == FinalResponseAction.ACCEPT
+
+
+@pytest.mark.asyncio
+async def test_a_skill_that_never_ran_still_cannot_end_the_turn() -> None:
+    contract = _handed_off()
+    _sandbox(contract, "peek", "read_file", "# SKILL.md", path="/skill/SKILL.md")
+
+    decision = await contract.validate(answer("answered"))
+
+    assert decision.action == FinalResponseAction.CONTINUE_EXECUTION
+    assert decision.diagnostic["error"] == "sandbox_handoff_undelivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["partial", "completed"])
+async def test_running_the_skill_does_not_excuse_an_undelivered_deliverable(status) -> None:
+    contract = _handed_off()
+    _sandbox(contract, "build", "exec", EXEC_OK, command="python build.py")
+
+    decision = await contract.validate(answer(status, ["build"], ["file not saved yet"]))
+
+    assert decision.action == FinalResponseAction.CONTINUE_EXECUTION
+    assert decision.diagnostic["error"] == "sandbox_handoff_undelivered"
+
+
+@pytest.mark.asyncio
+async def test_that_the_skill_ran_survives_the_durable_resume_checkpoint() -> None:
+    contract = _handed_off()
+    _sandbox(contract, "extract", "exec", EXEC_OK, command="python extract.py")
+    resumed = ChatEvidenceContract()
+    resumed.restore_checkpoint_state(json.loads(json.dumps(contract.checkpoint_state())))
+
+    assert (await resumed.validate(answer("answered"))).action == FinalResponseAction.ACCEPT
+
+
+@pytest.mark.parametrize(("ledger", "blocked", "granted"), [
+    ({"sandbox_handoffs": [{"skill": "pptx", "sandbox_id": "sbx", "state": "pending"}]}, (), True),
+    ({"sandbox_handoffs": []}, (), False),
+    ({"sandbox_handoffs": [{"skill": "pptx", "sandbox_id": "sbx", "state": "pending"}]}, ("sandbox",), False),
+])
+def test_a_resumed_run_gets_back_the_sandbox_its_skill_handed_off(ledger, blocked, granted):
+    """The handoff's ``sandbox`` grant was run-local: a sandbox exec that parked
+    on its exec slot resumed without the tool (TOOL_NOT_IN_RUNTIME_SURFACE)."""
+
+    from types import SimpleNamespace
+
+    from packages.core.ai.runtime.envelope import RuntimeDiscoveredToolGrants
+    from packages.core.ai.runtime.harness import _runtime_restore_sandbox_handoff_grant
+    from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
+
+    envelope = SimpleNamespace(discovered_tool_grants=RuntimeDiscoveredToolGrants(), blocked_tool_names=blocked)
+    sandbox_schema = {"type": "function", "function": {"name": "sandbox", "parameters": {"type": "object"}}}
+    tools = _runtime_restore_sandbox_handoff_grant(
+        envelope, [],
+        run_state=None, runtime_checkpoint={"tool_evidence": ledger},
+        tool_evidence=RuntimeToolEvidence(),
+        schema_for=lambda name: sandbox_schema if name == "sandbox" else None,
+    )
+
+    assert ("sandbox" in envelope.discovered_tool_grants.tool_names) is granted
+    assert tools == ([sandbox_schema] if granted else [])

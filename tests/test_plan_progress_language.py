@@ -1,24 +1,16 @@
-"""Real Plan/Dispatcher transitions share one runtime-owned language snapshot."""
-from contextlib import asynccontextmanager
+"""Dispatcher worker-job transitions share one runtime-owned language snapshot."""
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
-from packages.core.constants.supervisor import (
-    SupervisorDecision,
-    SupervisorDecisionSource,
-    SupervisorVerdict,
-)
 from packages.core.dispatcher.service import Dispatcher
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.task import Task, TaskLog
+from packages.core.models.task import Task
 from packages.core.models.user import User
-from packages.core.plans.executor import PlanExecutor
-from packages.core.plans.response_language import (
+from packages.core.services.task_response_language import (
     PLAN_RESPONSE_LOCALE_KEY,
     resolve_plan_response_locale,
 )
@@ -34,13 +26,6 @@ async def _user(db, entity_id, locale):
     db.add(user)
     await db.flush()
     return user
-
-
-def _session_factory(db):
-    @asynccontextmanager
-    async def factory():
-        yield db
-    return factory
 
 
 async def _pending_plan(db, *, task=None):
@@ -61,54 +46,6 @@ async def _pending_plan(db, *, task=None):
 
 
 @pytest.mark.asyncio
-async def test_cycle_uses_late_manual_receipt_and_keeps_snapshot_on_later_cycle(db_session, monkeypatch):
-    plan, _ = await _pending_plan(db_session)
-    user = await _user(db_session, plan.entity_id, "zh")
-    assert PLAN_RESPONSE_LOCALE_KEY not in plan.dispatcher_state
-    # Authenticated manual creation writes this AFTER create_plan_from_dag.
-    record_manual_plan_execution(plan, user_id=user.id, action="plan_create")
-    announce = AsyncMock()
-    monkeypatch.setattr(PlanExecutor, "_announce", announce)
-
-    executor = PlanExecutor(session_factory=_session_factory(db_session))
-    first = await executor.run_cycle(plan.id)
-    assert first["next_action"] == "schedule_self"
-    assert plan.dispatcher_state[PLAN_RESPONSE_LOCALE_KEY] == "zh"
-    assert plan.dispatcher_state["cycle_count"] == 4
-    assert announce.await_args.kwargs["locale"] == "zh"
-
-    user.locale = "en"
-    record_manual_plan_execution(plan, user_id="another-operator", action="plan_resume")
-    await db_session.flush()
-    await executor.run_cycle(plan.id)
-    assert announce.await_args.kwargs["locale"] == "zh"
-    assert plan.plan_dag["metadata"]["response_locale"] == "de"
-
-
-@pytest.mark.asyncio
-async def test_cycle_freezes_after_resolving_actual_runtime_actor(db_session, monkeypatch):
-    entity_id = generate_ulid()
-    creator = await _user(db_session, entity_id, "en")
-    actor = await _user(db_session, entity_id, "zh")
-    task = Task(id=generate_ulid(), entity_id=entity_id, creator_id=creator.id, title="Report", status="in_progress")
-    db_session.add(task)
-    await db_session.flush()
-    plan, _ = await _pending_plan(db_session, task=task)
-
-    async def resolve_billing(db, task_id, **kwargs):
-        assert db is db_session and task_id == task.id
-        assert PLAN_RESPONSE_LOCALE_KEY not in plan.dispatcher_state
-        return SimpleNamespace(user_id=actor.id)
-
-    monkeypatch.setattr("packages.core.plans.executor.runtime_ensure_task_billing_context", resolve_billing)
-    monkeypatch.setattr(PlanExecutor, "_announce", AsyncMock())
-    await PlanExecutor(session_factory=_session_factory(db_session)).run_cycle(plan.id)
-    assert plan.dispatcher_state[PLAN_RESPONSE_LOCALE_KEY] == "zh"
-    logs = (await db_session.execute(select(TaskLog).where(TaskLog.task_id == task.id))).scalars().all()
-    assert any("执行计划已启动" in log.content for log in logs)
-
-
-@pytest.mark.asyncio
 async def test_legacy_plan_resolves_task_actor_and_ignores_forged_dag_language(db_session):
     entity_id = generate_ulid()
     user = await _user(db_session, entity_id, "zh-CN")
@@ -121,15 +58,6 @@ async def test_legacy_plan_resolves_task_actor_and_ignores_forged_dag_language(d
     task.creator_id = "retired-actor"
     await db_session.flush()
     assert await resolve_plan_response_locale(db_session, plan, user_id="changed-actor") == "zh"
-
-
-@pytest.mark.asyncio
-async def test_pending_approval_does_not_freeze_locale_before_execution(db_session):
-    plan, _ = await _pending_plan(db_session)
-    plan.status = "pending_approval"
-    result = await PlanExecutor(session_factory=_session_factory(db_session)).run_cycle(plan.id)
-    assert result["next_action"] == "wait_for_approval"
-    assert PLAN_RESPONSE_LOCALE_KEY not in plan.dispatcher_state
 
 
 @pytest.mark.asyncio
@@ -175,50 +103,6 @@ async def test_dispatcher_transitions_use_snapshot_and_preserve_result_data(db_s
         assert "等待" in log.await_args.args[2]
         assert "Exact requested input" in log.await_args.args[2]
     assert all(call.kwargs["locale"] == "zh" for call in notify.await_args_list)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("verdict", [SupervisorVerdict.COMPLETED, SupervisorVerdict.NEEDS_HUMAN])
-async def test_finalize_localizes_visible_summary_without_changing_supervisor_or_artifact_contract(db_session, monkeypatch, verdict):
-    entity_id = generate_ulid()
-    user = await _user(db_session, entity_id, "en")
-    task = Task(id=generate_ulid(), entity_id=entity_id, creator_id=user.id, title="Test report", status="in_progress")
-    db_session.add(task)
-    await db_session.flush()
-    plan, step = await _pending_plan(db_session, task=task)
-    plan.dispatcher_state = {PLAN_RESPONSE_LOCALE_KEY: "zh"}
-    plan.started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-    step.step_status = "done"
-    step.result = {"text": "English document content"}
-    decision = SupervisorDecision(verdict, "Exact model evidence", SupervisorDecisionSource.MODEL)
-    monkeypatch.setattr(PlanExecutor, "_supervise_outcome", AsyncMock(return_value=decision))
-    recovery = AsyncMock()
-    monkeypatch.setattr("packages.core.services.task_chat_hitl.ensure_task_recovery_hitl", recovery)
-
-    await PlanExecutor._finalize(db_session, plan, "completed")
-    await db_session.flush()
-    logs = (await db_session.execute(select(TaskLog).where(TaskLog.task_id == task.id))).scalars().all()
-    text = "\n".join(log.content for log in logs)
-    assert "Plan completed" not in text
-    assert "Task Completed" not in text
-    assert "**Verdict:**" not in text
-    assert "Exact model evidence" in text
-    assert "English document content" in text
-    assert "计划" in text
-    assert task.actual_output["supervisor_verdict"] == verdict.value
-    assert task.actual_output["supervisor_evidence"] == "Exact model evidence"
-    assert step.result == {"text": "English document content"}
-    if verdict is SupervisorVerdict.NEEDS_HUMAN:
-        assert task.status == "waiting_on_customer"
-        prompt = recovery.await_args.kwargs["prompt"]
-        assert "This task stopped" not in prompt
-        assert "任务" in prompt
-    else:
-        assert task.status == "completed"
-    # A duplicate executor delivery does not append another terminal record.
-    await PlanExecutor(session_factory=_session_factory(db_session)).run_cycle(plan.id)
-    after = (await db_session.execute(select(TaskLog).where(TaskLog.task_id == task.id))).scalars().all()
-    assert len(after) == len(logs)
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,12 +28,14 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.staff import Staff, StaffRole
 from packages.core.models.user import Entity, User
 from packages.core.models.workspace import Workspace
+from packages.core.services.team_authority import require_can_grant_role
 from packages.core.permissions import (
     Permission,
     check_effective_permission,
 )
 from packages.core.services.auth_service import (
     create_access_token,
+    require_assignable_role,
 )
 from packages.core.services.team_invite_service import (
     accept_team_invite_for_user,
@@ -125,11 +127,15 @@ class RoleCreateRequest(BaseModel):
     permissions: list[str] = []
     is_default: bool = False
 
+    _assignable_role = field_validator("name")(require_assignable_role)
+
 
 class RoleUpdateRequest(BaseModel):
     name: Optional[str] = None
     permissions: Optional[list[str]] = None
     is_default: Optional[bool] = None
+
+    _assignable_role = field_validator("name")(require_assignable_role)
 
 
 async def _role_to_response(db: AsyncSession, role: StaffRole) -> RoleResponse:
@@ -361,6 +367,8 @@ async def invite_staff(
     # Validate role (if provided)
     if req.role_id:
         await _load_role(db, req.role_id, user.entity_id)
+        # Accepting grants this role: only an owner may invite an owner/admin.
+        await require_can_grant_role(db, user, role_id=req.role_id)
 
     workspace_ids = list(dict.fromkeys(req.workspace_ids or []))
     if workspace_ids:

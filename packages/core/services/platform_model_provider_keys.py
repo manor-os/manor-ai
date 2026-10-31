@@ -71,7 +71,7 @@ def mask_provider_api_key(value: str) -> str:
     return key[:4] + "****" + key[-4:] if len(key) > 8 else "****"
 
 
-def _validate_provider_key(provider: str, api_key: str) -> None:
+def validate_provider_key(provider: str, api_key: str) -> None:
     handler = handler_for_provider(provider)
     if not handler:
         raise ValueError(f"Unknown model provider: {provider}")
@@ -101,6 +101,9 @@ def _validate_provider_key(provider: str, api_key: str) -> None:
             f"{handler.display_name} token must start with one of: {', '.join(handler.key_prefixes)}"
         )
 
+
+# Backwards-compatible private alias for existing callers and tests.
+_validate_provider_key = validate_provider_key
 
 async def _get_row(db: AsyncSession, provider: str) -> PlatformModelProviderKey | None:
     return (await db.execute(
@@ -157,7 +160,7 @@ async def upsert_official_provider_key(
     key = sanitize_provider_api_key(api_key, source=f"{provider}.official_api_key")
     if not key:
         raise ValueError("API token is empty or malformed.")
-    _validate_provider_key(provider, key)
+    validate_provider_key(provider, key)
 
     row = await _get_row(db, provider)
     now = datetime.now(timezone.utc)

@@ -203,10 +203,16 @@ def _room_tool_call_id(run_id: str, tool_name: str, arguments: dict) -> str:
 
 
 def _room_sandbox_binding_key(run_id: str) -> str:
-    """A non-ULID, 26-character binding used only by this run's sandbox."""
+    """A non-ULID, 26-character binding used only by this run's sandbox.
+
+    The sandbox runtime recognises it (``runtime_is_room_binding_key``) and
+    keeps it one-shot: a room run never shares the requester's own sandbox.
+    """
     if not re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", run_id):
         raise RoomAgentCompletionError("invalid_room_run_id")
-    return "L" + run_id[1:]
+    from packages.core.ai.runtime.sandbox import runtime_room_binding_key
+
+    return runtime_room_binding_key(run_id)
 
 
 async def _invoke_room_file_skill(
@@ -1230,12 +1236,10 @@ async def run_room_agent_completion(
                     result_media_job_id=outcome.media_job_id,
                 )
             if outcome.media_job_id:
-                from packages.core.tasks.media_tasks import schedule_suno_audio_job, schedule_video_job
+                from packages.core.tasks.media_tasks import schedule_video_job
 
                 if normalized["kind"] == "video":
                     schedule_video_job(outcome.media_job_id)
-                elif normalized["kind"] == "audio":
-                    schedule_suno_audio_job(outcome.media_job_id)
             return outcome.json_result
 
     # A group turn never inherits the Agent's personal web, integration, or

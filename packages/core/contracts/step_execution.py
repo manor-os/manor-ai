@@ -1,9 +1,9 @@
-"""Step-local delivery intent and a narrowing-only execution effect boundary.
+"""Step-local delivery intent and Workflow tool-operation denials.
 
-Payload JSON Schema describes data, not permission.  These declarations are
-persisted by Plan materialization and installed by the worker, never taken
-from tool arguments.  The context follows nested Skill/Agent calls and cannot
-widen an outer Step's limit.  All ordinary Agent/governance gates still apply.
+Payload JSON Schema describes data, not permission.  A Step's execution
+contract is a closed, server-owned declaration that a human resume cannot
+widen.  A Workflow step's operation denylist follows nested Skill/Agent calls
+and only narrows.  All ordinary Agent/governance gates still apply.
 """
 from __future__ import annotations
 
@@ -41,121 +41,9 @@ class StepExecutionContract(BaseModel):
     effects: StepEffects
 
 
-_EFFECT_ORDER = {
-    StepEffects.READ_ONLY: 0,
-    StepEffects.ARTIFACT_WRITE: 1,
-    StepEffects.AUTHORIZED: 2,
-}
-_step_contracts: ContextVar[tuple[StepExecutionContract, ...]] = ContextVar(
-    "runtime_step_execution_contracts", default=(),
-)
-
-
-@contextmanager
-def step_execution_scope(
-    contract: StepExecutionContract | dict[str, Any] | None,
-) -> Iterator[None]:
-    """Install a host-loaded Step restriction; absent legacy fields inherit."""
-    if contract is None:
-        yield
-        return
-    parsed = StepExecutionContract.model_validate(contract)
-    token = _step_contracts.set((*_step_contracts.get(), parsed))
-    try:
-        yield
-    finally:
-        _step_contracts.reset(token)
-
-
-def current_step_effects() -> StepEffects | None:
-    contracts = _step_contracts.get()
-    return min((item.effects for item in contracts), key=_EFFECT_ORDER.__getitem__) if contracts else None
-
-
-def step_execution_prompt() -> str:
-    contracts = _step_contracts.get()
-    if not contracts:
-        return ""
-    contract = contracts[-1]
-    effects = current_step_effects()
-    delivery = (
-        "Return this Step's payload inline. Do not turn an intermediate result "
-        "into the whole Task's final deliverable."
-        if contract.delivery is StepDelivery.INLINE
-        else "Deliver a real, readable artifact reference. Reuse an existing "
-        "artifact when that satisfies this Step; a filename alone is not evidence."
-    )
-    restriction = {
-        StepEffects.READ_ONLY: (
-            "This Step is read-only: do not create/change files, business records, "
-            "or external state, including inside a Skill. After user input, return "
-            "only this Step's declared result; later Steps own their own work."
-        ),
-        StepEffects.ARTIFACT_WRITE: (
-            "This Step may create/modify its requested local artifacts, but may not "
-            "publish/send externally or mutate other business records."
-        ),
-        StepEffects.AUTHORIZED: (
-            "Only actions authorized by the Agent configuration and the Task scope "
-            "may run; this contract adds no tool or approval permissions."
-        ),
-    }[effects]
-    return f"[Runtime Step execution contract]\n{delivery}\n{restriction}"
-
-
-def step_contract_tool_error(
-    tool_name: str,
-    arguments: dict[str, Any],
-    *,
-    entity_id: str | None = None,
-    workspace_id: str | None = None,
-    task_id: str | None = None,
-    declared_effect: str | None = None,
-) -> str | None:
-    """Pure pre-I/O restriction using the same trusted tool classifier as Runtime."""
-    effects = current_step_effects()
-    if effects is None or effects is StepEffects.AUTHORIZED:
-        return None
-    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
-    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
-
-    classification = classify_runtime_tool(
-        tool_name, arguments, entity_id=entity_id, workspace_id=workspace_id,
-        task_id=task_id, declared_effect=declared_effect,
-    )
-    if classification.effect is RuntimeToolEffect.READ_ONLY:
-        return None
-    if (
-        classification.effect is RuntimeToolEffect.CONTROL
-        and tool_name in {"submit_result", "request_input", "sandbox_destroy"}
-    ):
-        return None
-    if classification.effect is RuntimeToolEffect.ORCHESTRATOR and tool_name == "invoke_skill":
-        # Prompt Skill tools re-enter this boundary; sandbox Skills separately
-        # reject restricted Step scopes before executing unclassified code.
-        return None
-    action_key = getattr(classification.action, "action_key", None)
-    if tool_name == "request_input" and action_key == "human.input.request":
-        # Asking for input persists framework continuation state, not business
-        # work. Its ordinary exact HITL and runtime gates still apply.
-        return None
-    if (
-        effects is StepEffects.ARTIFACT_WRITE
-        and classification.effect is RuntimeToolEffect.ACTION
-        and action_key in {"workspace.file.create", "workspace.file.modify", "workspace.file.write"}
-    ):
-        return None
-    return (
-        f"Step execution contract effects={effects.value} does not permit tool "
-        f"'{tool_name}'. No action was executed. Keep this Step's result within "
-        "its declared scope; do not perform a downstream Step's work."
-    )
-
-
 # A Workflow agent step may refuse named operations of a tool, e.g.
-# ``{"video_edit": ["render"]}`` for a step that must stop at review. Like the
-# effect contract above, the scope follows nested Skill/Agent calls and nested
-# scopes only add denials.
+# ``{"video_edit": ["render"]}`` for a step that must stop at review. The
+# scope follows nested Skill/Agent calls and nested scopes only add denials.
 TOOL_OPERATION_DENYLIST_KEY = "tool_operation_denylist"
 _tool_operation_denylists: ContextVar[tuple[dict[str, frozenset[str]], ...]] = ContextVar(
     "runtime_step_tool_operation_denylists", default=(),

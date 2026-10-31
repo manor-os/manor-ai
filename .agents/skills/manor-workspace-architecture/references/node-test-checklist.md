@@ -95,6 +95,13 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-02: Runtime scope and chat
 
+- Context checkpoint recovery: run `tests/test_context_checkpoint_recovery.py`
+  with context compaction scenarios, runtime context management, cancellation,
+  and durable Chat compaction suites. Verify actual packed-request admission,
+  one shorter retry, hard-window fallback boundaries, unchanged source history,
+  next-batch output headroom and usage/cancellation on the configured route.
+  Provider mocks prove these control paths, not live summary quality.
+
 - Workspace operation guides: run `tests/test_workspace_operation_skills.py`,
   `tests/test_builtin_ledger_skills.py`, `tests/test_skill_execution_kind.py`,
   `tests/test_prompt_builder_routing.py`, `tests/test_ai_runtime_harness.py`,
@@ -168,11 +175,17 @@ and **Pass criteria**. A skipped category needs a reason.
   Verify a member's current/quoted attachments, visible history, selected room
   files and actual public results enter as original bytes with provenance and
   hash, while over-limit, inaccessible or changed sources fail closed.
-  Upload a file over the former 10 MiB ceiling, reject one above 100 MiB,
-  and serialize uploads at the 500 MiB room total. Count inline copies from
-  both local upload and Knowledge share against the owning Entity's Knowledge
+  Upload a file over the former 100 MiB ceiling, accept up to 1 GiB, reject
+  larger files, and serialize uploads at the 10 GiB room total. Keep inline
+  storage through 100 MiB; larger uploads and Knowledge shares use bounded
+  4 MiB database chunks with exact size/hash checks. Count both inline and
+  chunked copies from local upload and Knowledge share against the owning Entity's Knowledge
   storage plan across personal and Entity rooms; retain closed/removed bytes
   and avoid double-counting generated Documents.
+  Batch downloads accept up to 100 files totaling 5 GiB, recheck each file's
+  current room authority, and stream a server-prepared ZIP without accumulating
+  its contents in browser memory. Verify cancellation and failure release
+  private snapshots and shared disk reservations.
   All active members may request web search; the model decides whether to use
   the tool, and its query must be copied from the sender's latest message.
   Test that search never derives a query from group
@@ -272,17 +285,11 @@ and **Pass criteria**. A skipped category needs a reason.
   schemas; the model must explicitly choose its next available tool. Successful
   source writes with failed validation keep success, resource identity and
   structured violations across repeated observations and context compaction.
-- Diagnostic-only recovery: run `tests/test_skill_result_receipt_errors.py`,
-  `tests/test_planner_output_contract_feedback.py`, and
+- Diagnostic-only recovery: run `tests/test_skill_result_receipt_errors.py` and
   `tests/test_step_execution_contract.py`. Failed receipt save/read-back must
   preserve primary/save/read evidence without an automatic overwrite or a false
-  verified result. Plan errors expose paths/constraints, not fixed repair calls
-  or sample output defaults. Acceptance and draft errors expose concrete causes;
+  verified result. Draft errors expose concrete causes;
   existing HITL, effect proof and terminal validation remain host-owned.
-  Planner transport must return malformed-JSON/root-type errors rather than
-  replace arguments with `{}`, and must not expose Pydantic input values.
-  Run `tests/test_task_coordinator_worker.py`: non-retryable delivery errors
-  preserve their cause without scheduling a busy-read retry or replaying Steps.
 - Common input validation: run `tests/test_tool_argument_json_recovery.py`,
   `tests/test_runtime_tool_input_validation.py`,
   `tests/test_runtime_preflight_validation_loop.py`, and
@@ -565,8 +572,7 @@ and **Pass criteria**. A skipped category needs a reason.
   resumed execution skips the batch suffix and automatic follow-ups, then
   produces one failed no-tools summary when its checkpoint is safe to persist;
   an unsettled external effect still requires reconciliation. The failure
-  marker survives Worker, coordinator-child, and nested-Skill checkpoints,
-  including a crash before final submission and both sides of the round cap;
+  marker survives nested-Skill checkpoints, including both sides of the round cap;
   it cannot become a successful or writable retry. Host-proven read-only or
   no-effect feedback may continue correction without restoring authority to
   forged result JSON.
@@ -699,164 +705,84 @@ and **Pass criteria**. A skipped category needs a reason.
 
 - Blueprint setup admission: run `tests/test_workspace_setup_task_admission.py`,
   `tests/test_workspace_setup_gates.py` and `tests/test_blueprint_startup_service.py`.
-  Verify that the exact active setup run's child stays on the coordinated Plan
-  path and reaches the ordinary billing gate, while forged child markers,
+  Verify that the exact active setup run's child stays on the coordinated
+  runtime and reaches the ordinary billing gate, while forged child markers,
   changed contract/job revision, cancelled runs, paused/deleted Workspaces and
-  inactive Agent subscriptions stop planning, new Plan cycles and Step checkout. App
+  inactive Agent subscriptions stop execution. App
   status must use the latest actual occurrence and a Workspace-scoped Task link,
   even when the ScheduledJob summary is empty. Normal Tasks remain blocked.
 
-- Planner contract feedback: run `tests/test_planner_output_contract_feedback.py`.
-  Verify `submit_plan` advertises canonical shape names rather than free-form
-  prose, explains Step-level contract placement, and returns actionable,
-  structured diagnostics for missing/unknown/conflicting declarations. A
-  corrected candidate must remain in the same model conversation, while
-  persistent invalid output stays bounded and never receives a guessed
-  contract. Preserve the enforceable Task-schema terminal-Step exception.
-
-- V3 Task control and source DAG: run `tests/test_task_coordinator_worker.py`,
-  `tests/test_task_coordinator_wakeup.py`,
-  `tests/test_task_coordinator_steps.py`, and
-  `tests/test_task_coordinator_llm_route.py`. Include
-  `tests/test_planner_agent_interface.py` and
-  `tests/test_planner_mcp_runtime_scope.py` to verify the initial catalog uses
-  Agent descriptions rather than system prompts/internal inventories,
-  `get_agent_schema` returns only a uniquely active service's actual scoped
-  capability summary and shared delegation contract (including Workspace
-  disabled-provider exclusions without dropping dynamic wildcard bindings),
-  `get_task_context` retrieves only requested inputs/resources, and every
-  Agent Step declares its own output contract. Verify normal Workspace Task
-  admission creates/reuses one durable TaskCoordinatorRun, `plan_task` commits
-  the typed source DAG without a root control Step, ready Steps release under
-  the exact claim with bounded concurrency, and retries/wakes do not duplicate
-  billing, delegation, or terminal effects. A typed `TaskCapabilityGapError`
-  that cannot enter an eligible worker acquisition path must stop after one
-  planning call, record a specific FAILED/BLOCKED diagnostic without staging
-  human input or a configuration draft, and retain the exact claim fence;
-  it must not be swallowed into repeated model tool errors or grant tools.
-  Run `tests/test_task_capability_recovery.py` and
-  `tests/test_agent_effective_capabilities.py` for configuration review
-  persistence, duplicate repair suppression, same-Task durable resume, stale
-  generation/subscription/claim rejection, denied/unknown gaps and fresh retry
-  capability checks. An eligible explicit retry of a stopped, Plan-less V3 run
-  may reach worker acquisition without approving an old configuration draft;
-  nonmanager, simulated, stale-generation, active-claim and retained pending
-  manual-DAG paths remain strict.
+- Task agent-loop control: run `tests/test_task_coordinator_wakeup.py` and
+  `tests/test_task_agent_loop.py`. Verify normal Workspace Task admission
+  creates/reuses one durable TaskCoordinatorRun pinned to its factory identity
+  and Workspace scope, a stale generation or claim cannot claim, checkpoint or
+  ACK a newer wake, and retries/wakes do not duplicate billing, delegation, or
+  terminal effects. Include `tests/test_planner_mcp_runtime_scope.py` and
+  `tests/test_agent_effective_capabilities.py`: cached actions respect exact
+  names and Workspace disabled-provider exclusions without dropping dynamic
+  wildcard bindings, and capabilities never transfer between services or
+  subscriptions.
   Blocker projections must preserve system audit identity
   while naming the actual affected Agent; old logs are not current authority.
-  Run `tests/test_task_plan_submission.py` to check that direct
-  manual/create-from-task Workspace APIs return HTTP 202 with a durable V3
-  submission receipt without synchronously writing a Plan; duplicate same
-  input reuses the receipt only during the same in-progress Task generation's
-  admission window, changed input conflicts, a pending manual DAG is carried
-  only by explicit Task retry, and an applied DAG is never reused for an
-  automatic replan. A deterministically invalid manual DAG must commit a
-  rejected receipt with the blocked Task under the exact claim; a changed DAG
-  can atomically retry and resubmit only with the latest rejected receipt,
-  no saved Plan, and no live claim, while the original request remains 409.
-  New Workspace Plan writes without the live claim fail;
-  taskless/entity legacy APIs retain their synchronous 201 Plan response.
 
-- V2 compatibility coordinator contract folding: run `tests/test_robust_planner_coordinator.py`.
-  Verify every folded checklist item retains its authoritative schema,
-  provider/action, risk, expected evidence, stable item identity, and dependency
-  order; the model cannot replace these fields with coordinator prose. Include
-  `tests/test_coordinator_typed_materialization.py` and
-  `tests/test_task_owner_recovery.py`: all background/custom Task business
-  types must select the closed coordinated runtime factory and materialize one
-  control root plus one dormant typed child per source item; interactive and
-  approval Tasks must remain on their explicit foreground/HITL adapters. Block
-  Planner provider I/O, then deactivate or replace any root/delegate
-  subscription or Agent binding in another transaction. The returned DAG must
-  fail before Plan/Step persistence, and the canonical selection fingerprint
-  must be independent of query/input ordering. Confirm the provider wait holds
-  no database connection or subscription row lock.
+- Runtime selection: run `tests/test_robust_planner_coordinator.py`; the
+  canonical selection fingerprint must be independent of binding ordering.
+  Include `tests/test_task_owner_recovery.py`: all background/custom Task
+  business types must select the closed coordinated runtime factory;
+  interactive and approval Tasks must remain on their explicit foreground/HITL
+  adapters.
 
-- Durable Task/Plan admission: run `tests/test_task_execution_outbox.py` and
-  `tests/test_plan_cycle_outbox.py`. Verify Task lifecycle generations fold
-  concurrent starts, broker acceptance does not ACK either delivery hop, old
-  Plan cycles cannot close newer wake generations, `schedule_self` replaces
-  the same Plan row atomically, and a Plan-wide HEAVY claim admits only one
-  concurrent delivery even when broker redelivery reuses its task id. Delayed
+- Durable Task admission: run `tests/test_task_execution_outbox.py`. Verify Task lifecycle generations fold
+  concurrent starts, broker acceptance does not ACK either delivery hop, and
+  duplicate start consumers admit one Task run and one wake. Delayed
   CONTROL and HEAVY messages must not cross a future same-generation due time.
-  Verify the independently scheduled, advisory-locked bounded indexed backstop
-  recovers a committed runnable state without waking active-lease or human-only
-  Plans, and does not apply a relative sleep delay twice. A hot Plan backlog
-  must not starve generic outbox events, and an older generic backlog must not
-  starve Plan progress. The Plan recovery indexes must use nonblocking
-  concurrent creation and repair an interrupted invalid index. With a large
-  mixed backlog, `EXPLAIN` must choose the Plan and non-Plan category partial
-  due indexes respectively; fixed category predicates must remain literals so
-  prepared statements cannot hide the index implication.
   Include Kanban and both bulk mutation surfaces plus cross-Workspace bulk
-  authorization. An ACK or wake-staging infrastructure failure after a cycle
-  committed must not mark the business Plan failed. Production business paths
+  authorization. Production business paths
   must stage a durable generation and may issue only its exact CONTROL hint;
   generationless direct wake helpers must not exist, and HEAVY delivery without
-  the exact event/generation pair must fail before claiming or running a Plan.
+  the exact event/generation pair must fail before claiming or running a Task.
 
-- Platform-tool planning: run `tests/test_planner_service_tool_attribution.py`
-  and `tests/test_worker_proposal_runtime_metadata.py`, plus the capability-gap
-  cases in `tests/test_robust_planner_dispatch_preflight.py`. Verify exact service/runtime
+- Platform-tool scope: run `tests/test_planner_service_tool_attribution.py`
+  and `tests/test_worker_proposal_runtime_metadata.py`. Verify exact service/runtime
   scope, Workspace/Task overlays, distinct deployments of a reused Agent,
-  ambiguous-service rejection, native schema-to-subagent routing, and unchanged
+  ambiguous-service rejection, and unchanged
   provider-action lookup. Treat Task required capabilities as demands against
   the selected root/service Agents' aggregate callable scope, not grants;
   missing capabilities fail before provider/billing work without falsely
-  requiring the root Agent to own every service capability. A materialized
-  subagent must pass its resolved subscription to context assembly on every
-  execution attempt.
+  requiring the root Agent to own every service capability.
 
 - Recovery regression: `tests/test_task_owner_recovery.py` covers Task API and
-  Workspace Chat retries for a completed legacy Plan, identical first/retry
+  Workspace Chat retries, identical first/retry
   service scope with/without owners, duplicate retry rejection, unavailable
   and foreign teams, deleted Workspaces, commit/rollback dispatch fencing.
+  `tests/test_task_agent_loop.py` covers a retry continuing the same transcript
+  and `tests/test_task_coordinator_manual_retry.py` a duplicate manual retry
+  that cannot renew a running Task. `tests/test_plan_dag_retirement_migration.py`
+  covers the one-time close-out of retired plan_dag work.
 
-- Automated: `.venv/bin/pytest -q tests/test_workspace_setup_gates.py tests/test_task_session.py tests/test_task_state_machine.py tests/test_task_dependencies.py tests/test_plan_schema.py tests/test_plan_materialization_linker.py tests/test_task_output_step_contract.py tests/test_plan_contract_enforcement.py`; plus `.venv/bin/pytest -q tests/test_workspace_write_authz.py -k 'plan'`
+- Automated: `.venv/bin/pytest -q tests/test_workspace_setup_gates.py tests/test_task_session.py tests/test_task_state_machine.py tests/test_task_dependencies.py tests/test_plan_schema.py tests/test_task_output_step_contract.py tests/test_task_coordinator_wakeup.py tests/test_task_agent_loop.py`
 - Integration: approve a Task with a predecessor and required artifact; assert
-  pending dependency, release, Plan materialization, and terminal producer bind.
-  Race two Plan persistence callers for one Task and assert the second waits,
-  then observes the first non-terminal Plan without writing another. Edit the
-  Task while provider generation is in flight and assert the stale Plan is
-  discarded without overwriting the newer Task governance context.
-  Race API and worker planning while the provider is blocked; assert one
-  renewable Task claim admits only one billing/provider path through the fenced
-  Plan commit. Crash after Plan commit but before queue publication and assert a
-  redelivery dispatches that exact Plan. Race a stale planning-failure writer
-  with an uncommitted Plan and assert it waits, then preserves the Task and Plan.
-  Race Plan admission with an uncommitted Workspace delete and assert it waits,
-  then rejects before Planner/provider work or Plan persistence.
-  Repeat the delete race against Plan approve/cancel/retry and assert each waits
-  for the Workspace lock and rejects without changing or dispatching the Plan.
-  Change a Task to terminal after background planning resolves its scope but
-  before admission locks complete; assert no context/provider work or Plan row.
-  Retry the same Task-bound Plan through both Task and Plan API surfaces after
-  deactivating or replacing a pinned service subscription; assert both reject
-  before resetting any Plan/Step state. A valid unchanged pin must resume via
-  the common factory rather than a retry-specific routing switch.
+  pending dependency, release, and terminal producer bind.
   Attempt ordinary update, Kanban, and bulk starts for a Workspace Task whose
   factory result is `MANUAL`; each must reject before the status write and
   create no execution intent.
   Delete an interactive Task with queued and running chat work; assert its
   Runtime run tree is cancelled and its Conversation can no longer resolve.
-- Manual: inspect Task timeline and Plan steps before execution; verify owner,
+- Manual: inspect the Task page; verify owner,
   delegates, dependencies, expected output, and approval gates are visible.
-- Pass criteria: only legal state transitions occur; Plan is acyclic and scoped;
-  each Task owns at most one non-terminal Plan and stale Task snapshots never
-  reach persistence; duplicate API/worker planning cannot duplicate provider
-  spend, and a stale failure cannot overwrite a committed active Plan;
+- Pass criteria: only legal state transitions occur; each Task owns at most one
+  live Task run, and duplicate starts cannot duplicate provider spend;
   required output has one unambiguous producer; blocked, interactive, and
   terminal Tasks do not dispatch, and manual service keys stay within the Task
   owner/delegate scope.
   Deleted interactive Tasks leave no runnable or fallback Task Session turn.
-  Planner provider actions come only from the resolved Task requester's callable accounts.
+  Task provider actions come only from the resolved Task requester's callable accounts.
 
-## WS-07: Executor, Dispatcher, and worker lease
+## WS-07: Task execution, Dispatcher, and worker lease
 
 - Required Skill recovery: run `tests/test_skill_tools.py` and
   `tests/test_required_skill_recovery.py`. Completed domain verdicts are accepted
-  as invocation evidence; failure/wait results are not. Parent submission and
-  partial Plan success cannot hide a required Skill blocker. Internal missing
+  as invocation evidence; failure/wait results are not. Internal missing
   prerequisites do not blind-retry; human input retains its own gate.
 
 - Internal file continuation: run `tests/test_runtime_file_effect_recovery.py`,
@@ -864,9 +790,8 @@ and **Pass criteria**. A skipped category needs a reason.
   `tests/test_runtime_file_effect_loop_recovery.py`,
   `tests/test_runtime_file_effect_migration.py`,
   `tests/test_dispatcher_file_recovery.py`, `tests/test_nested_skill_durability.py`,
-  `tests/test_nested_skill_output_recovery.py`, `tests/test_effect_checkpoint_proof.py`,
-  `tests/test_duplicate_tool_call_identity.py`
-  and `tests/test_robust_worker_exec_subagent.py` against isolated PostgreSQL.
+  `tests/test_effect_checkpoint_proof.py`,
+  and `tests/test_duplicate_tool_call_identity.py` against isolated PostgreSQL.
   Cover ordinary/nested result persistence before round checkpoints, lost
   return recovery from exact committed journals, no replay, bounded submission
   correction, exhausted recovery without user verification, stale owner/call/
@@ -887,10 +812,9 @@ and **Pass criteria**. A skipped category needs a reason.
   new synthetic interrupted Task independently of historical pending cards;
   automated/model-stub tests alone do not establish live-provider completion.
 
-- Step boundaries: run `tests/test_step_execution_contract.py`. Require explicit
-  delivery/effect declarations for newly planned Agent Steps, preserve legacy
-  Plans, and round-trip the declaration through coordinator folding and
-  materialization. Prove inline payload shape does not grant writes, nested
+- Step boundaries: run `tests/test_step_execution_contract.py`. Require closed,
+  explicit delivery/effect declarations that a human resume cannot remove or
+  widen. Prove inline payload shape does not grant writes, nested
   work cannot widen the host scope, and concurrent Steps do not share limits.
   Read-only rejection must precede approval, intent, and handler I/O.
 - Nested Skill durability: run `tests/test_nested_skill_durability.py` and
@@ -904,16 +828,13 @@ and **Pass criteria**. A skipped category needs a reason.
   Rescan a completed create across later rounds and verify exactly one strong
   receipt, without reclassifying it as modify. Different owner scope, generation,
   arguments, results, and weak evidence must not suppress another effect.
-- Manual regression: run two inline read-only DAG branches followed by one
-  artifact-writing join; invoke a prompt Skill that really creates a file;
-  and pause a read-only choice Step before its dependent artifact Step.
-  Verify real file counts, exact receipts, original Plan resume, and final
+- Manual regression: invoke a prompt Skill that really creates a file.
+  Verify real file counts, exact receipts, and final
   Task completion. Keep earlier failed runs intact as evidence.
 
 - Tool input rejection: run `tests/test_generate_file_input_preflight.py`,
   `tests/test_runtime_preflight_validation_loop.py`,
-  `tests/test_generate_file_kind_contract.py`,
-  `tests/test_robust_worker_exec_subagent.py`, and
+  `tests/test_generate_file_kind_contract.py`, and
   `tests/test_robust_worker2_partial_transcript.py`. Reject a document call
   missing complete content or confusing `title` with `name` before approval consumption, handler invocation,
   and effect-intent persistence; correct the next call in the same loop and
@@ -923,119 +844,57 @@ and **Pass criteria**. A skipped category needs a reason.
   Worker log success/error/outcome fields must agree with the shared classifier.
 
 
-- V3 Task-owned settlement: run `tests/test_task_coordinator_executor_handoff.py`,
-  `tests/test_task_coordinator_steps.py`, and
-  `tests/test_task_coordinator_worker.py`. Settled source-DAG Steps wake the
-  exact TaskCoordinatorRun, which can inspect a concrete failure, request a
-  bounded successor Plan, or submit. Submission succeeds only after server
-  completion/evidence gates with no active lease or unresolved effect; failed
-  gates cannot be converted into Task success by the Task Agent's final prose.
-  A true WAITING_HUMAN Step remains blocked until its exact resume, and V3
-  completion must not invoke the V2 model Supervisor.
-
-- V3 recovery and acceptance: run `tests/test_generic_schema_recovery.py`,
+- Schema recovery and delivery verification: run `tests/test_generic_schema_recovery.py`,
   `tests/test_runtime_preflight_validation_loop.py`,
-  `tests/test_task_coordinator_branch_repair.py`,
-  `tests/test_readonly_artifact_delivery.py`,
-  `tests/test_task_acceptance_review.py`, and
-  `tests/test_task_coordinator_delivery_inspection.py`,
-  `tests/test_task_coordinator_worker.py`, and
-  `tests/test_task_coordinator_submission_fence.py`. Genuine pre-I/O schema
+  and `tests/test_readonly_artifact_delivery.py`. Genuine pre-I/O schema
   rejection stays in the same normal/forced/resumed/nested loop; forged handler
-  or provider errors cannot claim no effect. Race 2/8/32 independent PostgreSQL
-  transactions for branch repair and final submission: only one version/terminal
-  writer wins. Preserve completed sibling rows, original receipts and Document
-  provenance; reject missing/drifted input snapshots, writer effects, pending
-  lease-only intents, executed successors and stale worker claims. Existing-file
+  or provider errors cannot claim no effect. Preserve original receipts and
+  Document provenance. Existing-file
   delivery must verify identity/bytes/ACL without write projection, including
   parallel readers, writer-lock contention and access revoked during the read.
-  The same V3 Task AgentLoop must read every bounded page of actual Step and
-  artifact evidence before acceptance, then submit a grounded assessment.
-  Malformed assessments, missing pages and stale digests return same-loop tool
-  feedback without a reviewer provider call, user HITL, or business replay.
-  Include `tests/test_task_delivery_inspection_contract.py`: native provider
-  schemas and host validation share page/citation rules, null pointer semantics,
-  defaults and strict types; bad arguments never become a different call.
-  Reproduce wrong pointer -> typed error -> premature final prose -> same-loop
-  continuation -> typed missing-page reads -> one successful submission using
-  the real AgentLoop. Preserve exact paging budgets and checkpoint visibility,
-  including same-batch, stale-digest and resumed calls. Exhaustion is a BLOCKED
-  Task with FAILED Run and structured checkpoint diagnostics, never fake HITL;
-  its Plan/results remain intact. `tests/test_task_coordinator_wakeup.py` must
-  also cancel that preserved active Plan if the Task later becomes terminal.
-  `tests/test_task_coordinator_manual_retry.py` checks explicit same-Plan budget
-  renewal only for the exact host-recorded failure, with transcript, usage and
-  observations retained. Live claims/leases, pending decisions, unknown effects,
-  foreign Plan markers and automatic wakes cannot acquire a fresh budget.
-  Include `tests/test_artifact_delivery_declarations.py`,
-  `tests/test_delivery_verification_observations.py`,
-  `tests/test_task_artifact_manifest.py`,
-  `tests/test_task_replan_observation_contract.py`, and
-  `tests/test_task_submission_observation_contract.py`: a required schema-declared
+  Task completion: `tests/test_task_agent_loop.py` covers an invalid
+  `complete_task` returned to the same loop, a checkpointed submission that
+  finishes without another model call, and a missing completion that continues
+  and then blocks; the host verifies deliverables before writing the terminal
+  state, never fake HITL.
+  `tests/test_task_coordinator_manual_retry.py` checks a manual retry never
+  restarts a Task that is already in progress.
+  Include `tests/test_artifact_delivery_declarations.py`: a required schema-declared
   delivery slot (including arbitrary business names inside `outputs.data`)
-  reaches the same strict acceptance without payload mutation or another
-  execution attempt. Multiple identity candidates require an explicit final
-  declaration; a legacy structural candidate exposes its basis and pointers
-  for semantic assessment, not a claim that an input is the final deliverable.
-  Failed inspection retains Step outcomes, historical receipts and bounded
-  diagnostic pages, but leaks no unverified file bytes and cannot accept
-  diagnostic evidence. A settled-effect replan refusal must let the actual
-  AgentLoop inspect and submit without resetting Steps or opening HITL;
-  unknown effects still prohibit replay. Exercise revoked access, changed bytes,
-  concurrent writers, stale claims and concurrent finalization separately.
-  With deployment self-repair disabled, a failed precommit submission must
-  retain tools and the exact cause in the same real AgentLoop; inspect again
-  without executing an authored stateful batch suffix or completing the Task.
-  Contract pages expose schema/declaration context but cannot be cited as
-  delivered content, and all required pages must be checkpointed before submit.
+  is identified without payload mutation. Multiple identity candidates require an explicit final
+  declaration; a legacy structural candidate exposes its basis and pointers,
+  not a claim that an input is the final deliverable.
+  Unknown effects still prohibit replay.
   Run `tests/test_search_tools_usable_matches.py`,
   `tests/test_tool_discovery_v2.py`, and
   `tests/test_agentic_loop_search_tools_payload.py`: inferred-provider failure
   preserves in-scope alternatives and shared error details through compaction,
   while explicit provider queries stay scoped and no discovery error forces a
   parent-loop exit or authorizes an alternative execution.
-  Finalization releases DB locks during provider turns and rejects changed
-  requirements/results/files/Workspace lifecycle/Agent deployment at commit.
-  These isolated DB/model-stub races are not live-provider throughput proof:
-  separately run local Cloud browser Tasks and inspect actual worker execution
-  start/end overlap, output content, artifacts, terminal states and orphan leases.
+  These isolated DB/model-stub tests are not live-provider proof:
+  separately run local Cloud browser Tasks and inspect actual
+  output content, artifacts and terminal states.
   Include `tests/test_patch_file_no_effect.py` and
   `tests/test_native_artifact_output_contract.py`: missing-target patch rejection
   must persist exact no-effect proof before continuing; post-write exceptions
   and forged errors remain unknown. A valid native files[] contract (including
   open_url and business summary fields) must survive host coercion unchanged;
   invalid const/required/additionalProperties cannot be normalized into success.
-  Test loop-budget exhaustion and malformed coordinator assessments separately
-  from a real content rejection; correction must not execute business Steps.
-  Accepted assessments must cite present output/artifact evidence with exact
-  quotes. Full container quotes must match complete JSON including types and
-  array order; reject duplicate keys, partial objects, double escaping, non-finite
-  numbers and excessive nesting. Reject missing summaries, imagined hidden streams, citations
-  into request/prompt/schema, invalid JSON Pointers and fabricated quotations.
-  Grounding does not prove model completeness: replay real missing-output and
-  unsupported-fact samples separately, without changing historical Task status.
-  Run `tests/test_readonly_submit_preflight_loop.py`: invalid artifact references
-  must stay correctable within one normal/forced/resumed attempt, never execute
-  the same-batch suffix, never capture invalid output or change effect receipts.
-  Plain/serialized/forged error JSON must still fail closed. Run web source
+  Run web source
   `task-output-delivery-fields.test.mjs` and verify the actual Task page at desktop
   and narrow widths: custom business summaries must remain visible beside files.
 
-- Shared Agent Step / V2 coordinator nested-loop regression: run
+- Shared Agent-loop checkpoint and delegation regression: run
   `tests/test_robust_worker_coordinator.py`,
-  `tests/test_robust_worker_exec_subagent.py`,
   `tests/test_human_input_resume_db.py`,
   `tests/test_robust_worker2_partial_transcript.py`,
-  `tests/test_robust_worker2_resume.py`, and
-  `tests/test_robust_worker2_round_cap.py`. Verify stable child/idempotency
-  reuse, per-round durable transcript checkpoints, shared Chat Agent-loop
-  resume, bounded rounds, final schema failure, typed result/evidence/artifact/
-  Knowledge/usage/cost handoff, pinned subscription/Agent identity before
-  provider I/O, Planner `params.system_prompt` remaining Step input rather
-  than replacing the Agent's configuration, child-owned `request_input`
-  suspension/exact answer resume,
-  free-form/structured answer replacement, blocked-card replay after a crash
-  between child park and parent projection, and parent/child lease fencing. Ambiguous
+  `tests/test_robust_worker2_round_cap.py`,
+  `tests/test_task_agent_durable_delegation.py`, and
+  `tests/test_task_agent_child_runs.py`. Verify per-round durable transcript
+  checkpoints, shared Chat Agent-loop resume, bounded rounds, typed
+  delegation receipts derived only from successful tool results,
+  free-form/structured answer replacement, and that a Workspace Task's input
+  card cannot resume through the legacy loop. Ambiguous
   effects and missing checkpoints must fail closed without fresh delegation.
 
 - External-worker fencing and concurrency: run
@@ -1049,28 +908,18 @@ and **Pass criteria**. A skipped category needs a reason.
   tokenized live action without a receipt and assert it parks for reconciliation
   with the claim retained instead of retrying.
 
-- V2 Supervisor concurrency: include `tests/test_robust_executor_supervisor.py`.
-  Block provider review in one session, then cancel or settle in another and
-  assert the second transaction is not blocked by provider I/O. The stale
-  verdict must fail its token/full-state fingerprint check and write no terminal
-  state or Task log.
-
-- Publish completion: `tests/test_evidence_channel.py` and
-  `tests/test_dispatcher_envelope_status.py` cover rejection of text-only
-  publishing Plans, V2 Supervisor evidence checks, and V3 server-gated
-  submission. `tests/test_task_action_execution.py`
-  covers LLM-selected actions, exact arguments/accounts, receipt preservation,
-  same-attempt duplicate suppression, live-lease/Task/Workspace revalidation,
-  and approval/simulation boundaries. Contract failures retain receipts and
+- Step result contract: `tests/test_dispatcher_envelope_status.py` covers the
+  StepResult envelope status as the control signal. Contract failures retain
+  receipts and
   manual recovery reconciles them rather than replaying external effects.
-  `tests/test_plan_output_contract_e2e.py` verifies Supervisor rejects an action
-  without a receipt even when its native output schema passes.
+  `tests/test_plan_output_contract_e2e.py` verifies business payloads survive
+  the full lease boundary and an invalid payload never completes the Step.
 
 
-- Automated: `.venv/bin/pytest -q tests/test_orchestration_hardening.py tests/test_plan_retries.py tests/test_dispatcher_ref_resolution.py tests/test_dispatcher_envelope_status.py tests/test_lease_heartbeat.py tests/test_task_runner_terminal_guard.py tests/test_scheduler.py tests/test_scheduler_tick.py tests/test_skill_creation_matching.py tests/test_event_emitter.py`; plus `.venv/bin/pytest -q tests/test_workflow_runner_nodes.py tests/test_workflows.py -k 'claim or terminal_commit'`
+- Automated: `.venv/bin/pytest -q tests/test_orchestration_hardening.py tests/test_plan_retries.py tests/test_dispatcher_ref_resolution.py tests/test_dispatcher_envelope_status.py tests/test_lease_heartbeat.py tests/test_scheduler.py tests/test_scheduler_tick.py tests/test_skill_creation_matching.py tests/test_event_emitter.py`; plus `.venv/bin/pytest -q tests/test_workflow_runner_nodes.py tests/test_workflows.py -k 'claim or terminal_commit'`
 - Automation Agent-selection regression: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_tool_surface_consolidation.py tests/test_ai_runtime_harness.py tests/test_tool_surface_executable.py tests/test_structured_runtime_queries.py -k 'scheduled_job or cron or automation'`. Verify the tool tells the model to query real Agents before supplying `agent_id`; a selected Agent must be active with exactly one current scoped deployment; valid selections persist, omitted or invalid/stale/unavailable selections fall back to the trusted caller, Manor AI falls back to `manor-master`, and the creation receipt exposes the final stored Agent ID. Trusted management API callers retain their separate explicit selection contract.
 - Automated Sandbox lifecycle: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_sandbox_runner_lifecycle.py tests/test_sandbox_sdk.py`
-- Integration: execute a two-step Plan with ref passing, then simulate duplicate
+- Integration: execute a two-step external worker-job Plan with ref passing, then simulate duplicate
   delivery, lease expiry, retryable failure, and terminal failure. Duplicate a
   background Agent Task while its renewable claim is live, then simulate owner
   crash and assert the delayed recheck resumes after claim expiry. Race two
@@ -1091,10 +940,11 @@ and **Pass criteria**. A skipped category needs a reason.
   sequence, one idempotent response, same-process completion, bounded cleanup,
   and rejection of conflicting, oversized, secret-bearing, or unknown-event
   responses.
-  Execute a coordinator item through multiple nested tool rounds, interrupt it
-  after a durable checkpoint, and redeliver the parent. Assert the same child
-  and idempotency lineage resumes, terminal children are reused, receipts are
-  not replayed, and a replaced child or parent lease cannot commit the handoff.
+  Crash a Task agent loop around a durable delegation park, lose the parent
+  wake, and leave the child batch unsettled; assert recovery settles the batch
+  and wakes the parent without orphan children
+  (`tests/test_task_agent_durable_delegation.py`), and a stale claim aborts
+  without writing (`tests/test_task_agent_loop.py`).
   Run overlapping occurrences of one Agent
   schedule and assert distinct Tasks retain exact run lineage. Race the
   scheduler tick with a reschedule or A-to-B-to-A config update; assert the old
@@ -1159,11 +1009,11 @@ and **Pass criteria**. A skipped category needs a reason.
   handoff, a legacy ISO backoff, and an
   invalid high calendar value; assert none republishes completed business or
   remains permanently hidden from the due scan.
-- Manual: follow Task execution timeline; verify one active worker per Step,
-  stable attempts, visible retries, and one terminal Task reconciliation.
+- Manual: follow a Task on its page; verify one live Task run,
+  visible retries, and one terminal Task state.
 - Pass criteria: no duplicate completion/side effect, references resolve from
   accepted upstream results, retry bounds hold, and unsupported success claims
-  cannot complete the Plan. A denied Agent Task claim is acknowledged only
+  cannot complete the Task. A denied Agent Task claim is acknowledged only
   after one delayed recovery check is accepted by the broker; a completed Task
   makes that recovery delivery a no-op. A lost Agent claim is acknowledged only
   after terminal evidence, a durable Task recovery intent, or a broker-accepted
@@ -1180,25 +1030,18 @@ and **Pass criteria**. A skipped category needs a reason.
   exact revision installs a Skill. Scheduled Workspace Chat output
   has one durable Message, a terminal projection state, and no pre-commit ghost
   event; malformed recovery rows are inspectable and leave the active scan.
-  A live setup regression leaves materialized pending
-  Steps unleased and resumes them only after the trusted setup contract is ready.
   Cooperative provider rate limits release the active Lease into bounded,
   Retry-After-aware retry without consuming a business attempt; provider
   failures retain their real status, and exhausted credits do not blind-retry.
-  A queue failure after Plan commit redispatches the same Plan ID and surfaces
-  a durable recovery action on exhaustion instead of creating a second Plan.
   Worker event persistence finishes before its local
   loop closes, while external delivery has a bounded shutdown wait and resumes
   through durable retry state rather than replaying committed Task work. Runtime
-  schema hydration uses the same actor account boundary as planning and cannot
+  schema hydration uses the same actor account boundary as execution and cannot
   import another tenant's discovered action. Scheduled Skill provider work
   holds neither the request transaction nor a worker DB connection; its final
   write revalidates Job and Skill revisions under lifecycle -> Job -> Skill
   lock order, and a failed final fence leaves any new file directory
   unreachable without changing the previously committed Skill.
-  Coordinator success additionally requires a schema-valid typed child
-  envelope and authoritative tool receipts; parent evidence and cost attribution
-  survive child contract failure without converting it to success.
 
 - Resident Webchat Automated: run `tests/test_webchat_resident_scope.py` real
   ToolPool/envelope cases plus `tests/test_runtime_tool_policy.py` external MCP denial.
@@ -1206,7 +1049,7 @@ and **Pass criteria**. A skipped category needs a reason.
   contact or worker surface and assert refusal before resident provider I/O.
 - Resident Webchat Manual: the public Agent exposes only the narrow self-read
   tool during verification; no manager Task or worker identity is substituted.
-- Resident Webchat Pass criteria: existing Plan/worker scopes remain unchanged;
+- Resident Webchat Pass criteria: existing Task/worker scopes remain unchanged;
   a resident read token cannot become generic managed integration authority.
 
 - Resident Create Automated: run `tests/test_webchat_resident_create.py`, `tests/test_webchat_resident_scope.py`, `tests/test_webchat_resident_gateway.py`, `tests/test_webchat_resident_migration.py` and `tests/test_manor_workspace_architecture_skill.py` on a dedicated test database; also run all ten cross-cutting files required below for WS-07 changes.
@@ -1243,32 +1086,17 @@ and **Pass criteria**. A skipped category needs a reason.
   browser, check search, select/remove, local file selection, keyboard access,
   and mobile layout without resolving a real pending request with test data.
 
-- Task input projection: run `tests/test_task_input_projection.py` and the web
-  Task approval/source tests. Only current ordinary INPUT requests with exact
-  Plan/Step/lease/message scope may render, including two parallel requests
-  while the Task remains in progress. Reject stale, private, cross-Workspace,
-  authorization and review cards; expose no token or continuation payload.
-  In Task detail and the task drawer, submit through the original Chat resolver,
-  verify the same Plan resumes once, and show “Responded” rather than “Approved”.
 
-
-- Coordinator approval bridge: run
-  `tests/test_robust_coordinator_approval_bridge.py` and the HITL cases in
-  `tests/test_robust_worker_coordinator.py` plus
-  `tests/test_human_input_resume_db.py` and V3 waiting-Step cases in
-  `tests/test_task_coordinator_executor_handoff.py`. Verify the lease-scoped
-  Task card (direct source Step in V3, typed-child lease in V2, legacy root
-  lease in V1) binds one exact nested
-  Runtime tool request and stable child lineage, grant/deny is
-  mirrored atomically, nested approver authority is checked independently,
-  tampered or ambiguous bindings fail closed, and approval causes a
+- Task approval and input resume: run `tests/test_task_agent_loop_hitl.py`,
+  `tests/test_task_agent_child_hitl.py`,
+  `tests/test_robust_coordinator_approval_bridge.py`, and
+  `tests/test_human_input_resume_db.py`. Verify the Task card binds one exact
+  parked Runtime tool request, tampered or stale cards cannot resume a newer
+  park, the approved token cannot run a different call, and approval causes a
   server-forced continuation of the saved call rather than model reconstruction.
-  The V3 TaskCoordinatorRun observes the blocked Step but cannot approve or
-  consume its tool token.
-  For nested `request_input`, also verify the park commit clears stale answer
-  channels and binds child/call identity, each new response replaces the other
-  answer channel, and a successor lease replays the stored blocked envelope
-  before an answer exists without re-entering the child Agent loop.
+  A delegated child's question or approval parks on its own card, and each
+  answer wakes only its asker. For `request_input`, each new response replaces
+  the other answer channel.
 
 - Effect reconciliation: run `tests/test_effect_reconciliation.py`,
   `tests/test_coordinator_approval_receipt_binding.py`, and
@@ -1280,10 +1108,10 @@ and **Pass criteria**. A skipped category needs a reason.
   transaction as the lease transition. Unknown enum/provider states and
   malformed evidence must fail closed.
 
-- Autonomous recovery vs. human input: run `tests/test_task_coordinator_autonomy.py`,
-  `tests/test_task_coordinator_worker.py`, `tests/test_task_coordinator_manual_retry.py`,
+- Autonomous recovery vs. human input: run
+  `tests/test_task_coordinator_manual_retry.py`,
   `tests/test_runtime_request_input_tool.py`, `tests/test_runtime_human_input.py`, and the
-  executor/dispatcher timeout and retry suites. Verify missing/invalid model
+  dispatcher timeout and retry suites. Verify missing/invalid model
   justifications return a no-effect diagnostic in the same loop; genuine human
   facts and exact-file reviews can still suspend and resume; historical questions
   remain readable. Missing file receipts, validation failure and exhausted retry
@@ -1292,13 +1120,21 @@ and **Pass criteria**. A skipped category needs a reason.
   must report failure, not waiting-for-user or success. Keep unknown external
   effects, exact approval identity, credits, cancellation and stale claims closed.
 
+- Task input surfaces: park a Task agent loop on `request_input`, answer
+  through Task comments, Task input, blocker tool and Workspace card, then
+  consume its host result in the same run without asking again. Reject
+  stale/missing request IDs, expired/cancelled requests, changed checkpoints
+  and revoked file access. At desktop and mobile widths, actual TaskDetail must expose file links,
+  current cards and bounded progress; reload and stale drafts cannot replay
+  or retarget input.
+
 - Generated-media contract: run `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_generated_media_authorization_contract.py tests/test_media_output_approval_resume.py tests/test_media_policy_resources.py`.
   Integration must persist and consume the real approval, write actual bytes,
   and register Knowledge. Cover explicit-token and tokenless resume, a collision
   affecting only a non-primary encoding, and deny/HITL rules for every physical,
   logical, and original requested path. A stale grant must remain unconsumed.
 
-- TikTok video review automated: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_tiktok_publish_review_api.py tests/test_tiktok_mcp.py tests/test_tiktok_publish_approval.py tests/test_tiktok_attachment_upload.py tests/test_youtube_tiktok_mcp.py`; `npm --prefix apps/web run test:tiktok-publish-review-browser`, plus the web build.
+- TikTok video/photo review automated: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_tiktok_publish_review.py tests/test_tiktok_publish_review_api.py tests/test_tiktok_mcp.py tests/test_tiktok_publish_approval.py tests/test_tiktok_attachment_upload.py tests/test_youtube_tiktok_mcp.py`; `npm --prefix apps/web run test:tiktok-publish-review-browser`, plus the web build. Photo coverage includes exact ordered images, actual JPEG/WebP bytes, all previews loaded, selected cover, and replay protection.
 - TikTok integration: use a mocked creator/provider and real HITL persistence.
   Refresh and submit one exact review; reject stale review IDs, unexpected
   fields, missing declarations, changed source/account, and repeated approval.
@@ -1334,10 +1170,9 @@ and **Pass criteria**. A skipped category needs a reason.
   and assert it remains paused until the exact durable child receipt arrives.
   Resolve two HITL requests stored on the same Message concurrently and assert
   both resolution markers survive commit and refresh.
-  Pause a coordinator child on a write tool, approve only the Task-facing lease
-  card, and assert the linked nested request is granted and consumed by exactly
-  one resumed stable child. Repeat with denial, changed lineage, and replaced
-  leases; none may execute or mint a new continuation.
+  Pause a delegated child run on a write tool, approve its card, and assert the
+  call runs exactly once. Repeat with denial, an approval racing a re-park, and
+  a cancelled child; none may execute twice or mint a new continuation.
   Fail an approved chat-tool continuation before provider I/O, both as a
   returned preflight error and as an unavailable settlement store. Assert the
   Agent loop keeps explicitly read-only tools, can execute one alternate read,
@@ -1418,6 +1253,14 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-09: Workspace Flow and Workflow runtime
 
+- Direct-launch scope: run
+  `tests/test_workflows.py::test_start_workflow_inherits_definition_workspace_and_rejects_conflicts`
+  and `tests/test_workflows.py::test_workspace_owned_workflow_binding_cannot_cross_workspace`.
+  Workspace-owned definitions must keep their scope even without a binding or
+  explicit caller Workspace, and an explicit conflicting scope must fail before
+  run creation. Binding creation, updates (including changing the definition)
+  and legacy binding execution must enforce the same boundary. Retain
+  shared-definition and lifecycle admission coverage.
 - Parallel retry and node deadline regressions: run
   `.venv/bin/pytest -q tests/test_workflow_parallel_retry.py tests/test_workflow_node_timeouts.py`.
   Prove successful siblings execute once, all active checks precede fan-in,
@@ -1499,12 +1342,12 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-10: Artifact and Knowledge projection
 
-- Scoped file acceptance: run `tests/test_file_deliverable_contract.py`,
-  `tests/test_plan_artifact_requirements.py` and `tests/test_strategist_deliverables.py`.
+- Scoped file acceptance: run `tests/test_file_deliverable_contract.py`
+  and `tests/test_strategist_deliverables.py`.
   Require the declared logical folder and canonical Document plus actual
   write/readback of the final bytes. Reject another project/Workspace/Entity,
   trash, missing IDs, old-attempt receipts, read-before-write, model-only claims
-  and later changed files; a schema-valid phantom cannot pass Supervisor.
+  and later changed files.
 
 - Video composition output contract: run `tests/test_compose_video_output_contract.py`, `tests/test_media_output_approval_resume.py`, and `tests/test_media_policy_resources.py` with isolated test storage. Verify exact MP4/recipe pair approval, sidecar-only collisions, stale consent, cross-Workspace rejection and concurrent CREATE protection. Force each post-render projection failure and confirm the model-facing error retains committed output identities without claiming complete delivery or replaying the render.
 - Video authoring recovery: run `tests/test_video_edit_runtime.py` and
@@ -1523,7 +1366,7 @@ and **Pass criteria**. A skipped category needs a reason.
   projects or provider generation. Static/unit checks alone do not prove a real
   user composition or final MP4.
 
-- Video render isolation/resource regression: run `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_video_render_sandbox_isolation.py tests/test_video_runtime_resources.py` plus the Sandbox backend process-init tests. Verify a render uses fresh capacity and releases only its own execution Sandbox on success, failure, transport loss and cancellation; review preserves the editable session. PID/CPU/memory pressure must reduce worker concurrency or return structured diagnostics before starting Chromium, and timeout must reap descendants without killing another execution. Run a real bounded render in a new test Sandbox; inspect nonempty MP4/duration and process cleanup. Do not replay an existing user's paid generation to prove this contract.
+- Video render isolation/resource regression: run `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_video_render_sandbox_isolation.py tests/test_video_runtime_resources.py` plus the Sandbox backend process-init tests. Verify a render uses fresh capacity and releases only its own execution Sandbox on success, failure, transport loss and cancellation; review preserves the editable session. PID/CPU/memory pressure must reduce worker concurrency or return structured diagnostics before starting Chromium, and timeout must reap descendants without killing another execution. HyperFrames' FFmpeg runs through `media_governor.py`: concurrent processes and their CPU windows come from the sandbox budget, a PID/OOM/thread-spawn failure retries once at one FFmpeg on one CPU, then returns `render_resource_limit` (reason, step, attempts). Browser steps (check, snapshot, render) get a navigation budget sized from `MANOR_VIDEO_NAVIGATION_TIMEOUT_MS` (default 60 s) plus the project's media, retry once with doubled timeouts on a page timeout, then return `snapshot_timeout`/`render_timeout` (reason, step, attempts, `retryable: true`). Multi-layer extraction is proven by `MANOR_VIDEO_DOCKER_TEST=1 MANOR_VIDEO_DOCKER_IMAGE=<sandbox-skill tag> pytest tests/test_video_runtime_docker.py -k montage`. Run a real bounded render in a new test Sandbox; inspect nonempty MP4/duration and process cleanup. Do not replay an existing user's paid generation to prove this contract.
 - Video Sandbox lease regression: run `.venv/bin/pytest -q tests/test_sandbox_runner_touch.py tests/test_video_edit_runtime.py`.
   Verify authenticated heartbeat 200 with refreshed expiry; missing 404,
   unavailable 409 and unauthenticated 401 without lease mutation; no command or
@@ -1533,9 +1376,9 @@ and **Pass criteria**. A skipped category needs a reason.
 
 - Folder-layout regression: run `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_generated_media_naming.py tests/test_generated_media_authorization_contract.py tests/test_task_scoped_artifacts.py tests/test_knowledge_workspace_binding.py tests/test_blueprint_installer_embedded.py tests/test_human_request_items.py tests/test_recording_uploads.py tests/test_chrome_recording_uploads.py tests/test_email_attachment_bridge.py tests/test_youtube_publication_receipts.py tests/test_knowledge_visibility.py`.
   Also run `tests/test_conversation_generated_files.py`: default ordinary Chat
-  outputs share one private title-named folder, same-title sessions stay
-  separate, a rename preserves the folder and document IDs, and explicit
-  destinations or Workspace sessions keep their existing routing.
+  outputs from every producing tool share one private title-named folder,
+  same-title sessions stay separate, a rename preserves the folder and document
+  IDs, and explicit destinations or Workspace sessions keep their existing routing.
   Cover root files without implicit type buckets; Task buckets; Workflow lineage
   precedence and legacy retries; exact approval/save agreement; same-basename
   starters with distinct portable paths; idempotent logical repair and later
@@ -1546,7 +1389,7 @@ and **Pass criteria**. A skipped category needs a reason.
   nullable-folder migration in a disposable database and run migration graph
   checks; never execute a projection repair against production as part of tests.
   Also run `tests/test_knowledge_starter_layout.py`,
-  `tests/test_internal_worker_bootstrap.py`, `tests/test_file_tools_doc_visibility.py`
+  `tests/test_file_tools_doc_visibility.py`
   and `tests/test_bash_output_paths.py`. Empty Workspace listings must not fall
   back to Knowledge root. Bash approval, execution and projection must agree on
   the resolved path while existing source operands stay usable. Document-ID-only file reads must
@@ -1557,10 +1400,9 @@ and **Pass criteria**. A skipped category needs a reason.
   Need Input must preserve an existing user folder and a foreign Workspace
   origin. Bash tests must include numeric echo output, escaped names, comments,
   trailing directory slashes and ephemeral sandbox commands.
-- Coordinator handoff: include `tests/test_robust_worker_coordinator.py` when
+- Delegation receipts: include `tests/test_robust_worker_coordinator.py` when
   changing delegated output capture. Verify only successful tool receipts feed
-  typed evidence/artifact/Knowledge refs, those refs survive child schema
-  failure for reconciliation, and assistant prose cannot manufacture evidence.
+  typed evidence/artifact/Knowledge refs, and assistant prose cannot manufacture evidence.
 
 - Generated-media contract: also run `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_media_output_job_contract.py`.
   Integration covers Chinese/case/underscore names, initial and late collisions,
@@ -1571,7 +1413,7 @@ and **Pass criteria**. A skipped category needs a reason.
   Pass only when malformed or cross-job contracts fail before writes and late
   collisions neither overwrite a file nor choose an unapproved suffix.
 
-- Automated: `.venv/bin/pytest -q tests/test_artifact_knowledge_projection.py tests/test_workspace_artifacts.py tests/test_workspace_task_artifacts_are_visible.py tests/test_task_scoped_artifacts.py tests/test_knowledge_file_consistency.py tests/test_internal_worker_artifact_capture.py tests/test_entity_fs_write_guard.py tests/test_generate_file_tool.py tests/test_workspace_artifact_purge.py tests/test_event_emitter.py tests/test_email_attachment_bridge.py tests/test_documents.py`; `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_document_permissions.py -k 'signature_request'`; `npm --prefix apps/web exec playwright test e2e/knowledge-upload-lifecycle.spec.ts e2e/knowledge-upload-page.spec.ts`; `npm --prefix apps/web run build`
+- Automated: `.venv/bin/pytest -q tests/test_artifact_knowledge_projection.py tests/test_workspace_artifacts.py tests/test_workspace_task_artifacts_are_visible.py tests/test_task_scoped_artifacts.py tests/test_knowledge_file_consistency.py tests/test_entity_fs_write_guard.py tests/test_generate_file_tool.py tests/test_workspace_artifact_purge.py tests/test_event_emitter.py tests/test_email_attachment_bridge.py tests/test_documents.py`; `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_document_permissions.py -k 'signature_request'`; `npm --prefix apps/web exec playwright test e2e/knowledge-upload-lifecycle.spec.ts e2e/knowledge-upload-page.spec.ts`; `npm --prefix apps/web run build`
   PDF fields additionally require `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_document_signature_fields.py tests/test_document_signature_lock.py tests/test_pdf_signature_stamping.py`.
 - Integration: produce one real file from a Task and one from a Workflow; assert
   entity-relative path, Document row, provenance, viewer URL, Task/chat card,
@@ -1686,12 +1528,9 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-12: Credits and usage
 
-- Coordinator accounting: include `tests/test_robust_worker_coordinator.py`.
-  Verify every completed inner round advances the stable child Step's cumulative
-  cost watermark, RUNNING/DONE crash recovery neither loses nor duplicates it,
-  each V2 child reaches ordinary Dispatcher accounting exactly once, and the
-  parent keeps diagnostics without adding those totals to its own billable
-  counters. Legacy V1 roll-up must remain compatible without changing V2.
+- Delegation accounting: include `tests/test_task_agent_durable_delegation.py`.
+  Verify delegated child-run usage is attributed to the parent Task and billed
+  once per child call.
 
 - Apify automated: `tests/test_apify_client.py`, `tests/test_apify_mcp.py`,
   `tests/test_apify_integration.py`; Cloud source also runs
@@ -1717,35 +1556,6 @@ and **Pass criteria**. A skipped category needs a reason.
   one start and debit per quote; explicit BYOK cannot switch to platform debit;
   unknown startup/missing cost remain auditable and reserved; unresolved work
   blocks purge, recovery never restarts it, and runtime state is not exported.
-
-- Suno automated: run `tests/test_suno_provider.py`,
-  `tests/test_model_catalog_audio.py`, `tests/test_model_catalog_byok_contract.py`,
-  `tests/test_generate_file_tool.py -k suno`,
-  `tests/test_runtime_tool_policy.py -k suno`, `tests/test_mcp_skill_packs.py`,
-  and `tests/test_tool_surface_executable.py`. Verify the catalog, runtime
-  schema, in-process dispatcher, health checker, skill route, actor credential
-  path, and read/write approval effects remain aligned.
-- Suno integration: with mocked provider responses, submit one Catalog song,
-  one MCP song, cover,
-  and mashup; assert the exact Bearer-authenticated endpoint and payload, then
-  poll only by returned job id. Force an ambiguous create timeout and assert no
-  retry occurs and the error instructs manual reconciliation. For the Catalog
-  path, assert managed credentials reserve before provider I/O, persist the
-  provider id before polling, create a Knowledge Document before completion,
-  and atomically settle one usage row/reservation; BYOK creates neither debit
-  nor reservation. Health and usage checks must call read-only endpoints and
-  never create music.
-- Suno manual: connect a personal `sk_live_…` key, approve one inexpensive
-  generation, observe submitted-to-terminal status, and compare Suno usage.
-  Confirm the resulting URL is described as an upstream reference until an
-  authorized Knowledge import creates a durable artifact.
-- Suno pass criteria: each approval or Catalog job starts at most one paid request; status and
-  usage reads require no create approval and cannot spend generation credits;
-  timeout/error never reports completion or triggers automatic replay; an
-  ambiguous managed submit retains its reservation for reconciliation; managed
-  success settles exactly once after Knowledge projection; BYOK never becomes
-  a Manor Credit debit; no credential, remote job, or URL is exported as
-  Blueprint configuration state.
 
 - Native source-promotion/status regression: run the WS-02 Browser admission/status
   and `tests/test_voice_work_sources.py` suites alongside the existing voice billing
@@ -1798,7 +1608,7 @@ and **Pass criteria**. A skipped category needs a reason.
   `tests/test_workspace_manual_scheduler.py`, `tests/test_review_trigger_kind.py`,
   `tests/test_workspace_setup_gates.py`, `tests/test_workspace_workflow_entrypoints.py`,
   `tests/test_scheduler.py`, and `tests/test_unified_approvals.py`. Verify manual
-  file writes, Task/Plan start/retry/approval, Flow runs, collection, and human
+  file writes, Task start/retry/approval, Flow runs, collection, and human
   Strategist requests work without resuming autonomy. Scheduled/event reviews
   and automatic Tasks must remain stopped; paused review proposals require
   explicit approval. Preserve ACL, setup, credit, deletion, and provenance fences.
@@ -1807,6 +1617,11 @@ and **Pass criteria**. A skipped category needs a reason.
   discovery and lease commit. Confirm manual child lineage remains scoped,
   generated ownerless Goal schedules retain the run-now requester, and paused
   manual Initiative delivery passes only its exact current producer authority.
+  Independently enabled Workflow schedules and standalone Stat collectors must
+  execute automatically while Strategist remains paused. Disabled jobs,
+  disabled bindings, wrong scheduled origins, deleted Workspaces and blocked
+  setup must still refuse new execution. Verify a Workflow-only live Blueprint
+  installs paused with its declared automations enabled.
 - Automated: `.venv/bin/pytest -q tests/test_workspace_lifecycle.py tests/test_document_permissions.py tests/test_folder_permissions.py tests/test_document_access_batch.py tests/test_entity_fs_write_guard.py tests/test_reusable_resource_locking.py tests/test_deletion_tasks.py tests/test_workspace_mechanism_regressions.py tests/test_user_lifecycle.py tests/test_workspace_purge_owned_resources.py tests/test_twilio_voice_runtime.py tests/test_blueprint_channel_revert.py tests/test_integrations.py -k 'delete or restore or purge or paused or payload or disconnect or userless or twilio_binding or blueprint_twilio'`; plus `.venv/bin/pytest -q tests/test_sharing_permission_boundaries.py -k 'rechecks or auth_read or read_gate or folder_list_gate or revoked_bearer or can_manage or primary_entity or actor_resolution'` and `DEPLOYMENT_MODE=cloud .venv/bin/pytest -q tests/test_admin_impersonation.py -k 'ended_impersonation or owner_can_start_and_end'`
   PDF signature boundaries additionally require `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_document_signature_fields.py tests/test_document_signature_lock.py tests/test_document_permissions.py -k 'signature'`.
   Knowledge retention additionally covers `tests/test_workspace_artifact_purge.py`,
@@ -1924,6 +1739,12 @@ and **Pass criteria**. A skipped category needs a reason.
 - Knowledge dependency regression: `tests/test_blueprint_knowledge_workflow_refs.py`
   covers Markdown/CSV locators, native reads, simulation/live install/re-export,
   excluded and foreign starters, and file commit/rollback/savepoint ownership.
+  Explicit `initial_file` templates must export frozen seed content after live
+  edits, reject invalid/missing seed metadata without a current-content fallback,
+  and leave ordinary artifacts excluded in both the picker and exporter.
+  `tests/test_blueprint_configuration_upgrade.py` verifies initial template
+  upgrade/revert preserves current bytes and rejects destructive mode changes;
+  `tests/test_blueprint_v11_e2e.py` covers the authorized configuration API.
 
 - Automated: `.venv/bin/pytest -q tests/test_workspace_setup_gates.py tests/test_blueprint_payload_v11.py tests/test_blueprint_exporter_embedded.py tests/test_blueprint_installer_embedded.py tests/test_blueprint_installer_workflows.py tests/test_blueprint_v11_e2e.py tests/test_workspace_stats.py tests/test_manor_workspace_blueprint_checker.py tests/test_manor_workspace_blueprint_roundtrip.py`
 - Integration: export a configured Workspace, install simulate/live in an
@@ -1959,6 +1780,13 @@ and **Pass criteria**. A skipped category needs a reason.
 - Resident Create Pass criteria: local draft authority never becomes generic management, confirmation or billing authority; only reviewed revision/proof/Origin can submit, unknown never means failed or not-written, no private state migrates in Blueprint and no stale session can read or publish it.
 
 ## WS-15: Notification persistence and delivery
+
+- Native group/DM email regression: `tests/test_chat_email_notifications.py`
+  exercises the default unread threshold, custom delay, no repeat range, bounded
+  escaped excerpts using the common template, live read/mute/membership/owner
+  and verified-address checks, deferred quiet hours/disabled SMTP, provider
+  retry and concurrent discovery/delivery locks. Mock SMTP; never use actual
+  users as test receivers. Personal preferences and receipts are not exported.
 
 - Group mention/reply regression: active post-join recipients receive one
   idempotent in-app alert for an explicit @ or direct reply, even when both
@@ -2114,16 +1942,15 @@ git diff --check
 
 - Automated: `test_runtime_file_journal.py`, `test_runtime_file_journal_recovery.py`,
   `test_merge_video_output_contract.py`, `test_merge_video_projection.py`,
-  `test_task_artifact_manifest.py`, `test_workspace_response_contract.py` and
-  the acceptance/coordinator suites cover WS-02/07/08/10/13.
+  `test_workspace_response_contract.py` and
+  the Task agent-loop and delivery-verification suites cover WS-02/07/08/10/13.
 - Integration: use an isolated PostgreSQL database for lost-ACK recovery,
   projection rollback, concurrent target collisions and current-run evidence;
   verify the Alembic journal migration and unique unresolved-path fence.
-- Manual: resume an eligible old delivery-review hold with an exact Plan/run
-  version and confirm the writer Step/attempt remains unchanged. Observe Chat
+- Manual: observe Chat
   progress against durable records, not unrelated background work.
-- Pass: no later file is overwritten by rollback; no settled write is repeated
-  for an assessment-format error; no final Task summary claims execution without
+- Pass: no later file is overwritten by rollback; no settled write is repeated;
+  no final Task summary claims execution without
   its scoped current evidence. Runtime journal/manifest/event rows are absent
   from Blueprint exports. Crash-safe deletion and all multi-file renderers are
   outside this write/copy and single-MP4 boundary.
@@ -2144,6 +1971,12 @@ origin, billable provider path, artifact type, or deletion-owned resource:
 
 - Automated: `tests/test_client_workspace_delivery.py`, `tests/test_people.py`, `tests/test_workspace_access_defaults.py`.
 - Integration: receive in a different owned organization, verify direct Owner, no Staff or Marketplace record and no provider access; repeat acceptance returns the same Workspace. Select Markdown/CSV starters with fixed Workflow references and an App, accept, read the native files and compare the re-export. Confirm unselected Knowledge stays excluded and missing, foreign or unsafe dependencies fail before invitation persistence.
+- Initial-file delivery: use both a mutable CSV queue and an unrelated Markdown
+  handoff. Select their explicitly configured initial templates, verify recipient
+  files contain only the seed, and compare source IDs, metadata and bytes before
+  and after delivery. Edit the recipient copy and confirm re-export still uses
+  the seed. Picker labels must distinguish initial templates from current content
+  and identify required Workflow dependencies without exposing excluded files.
 - Manual: Company client detail → contact → optional Workspace invitation; recipient verifies email and accepts. Check expiry, rotation, revoke, narrow layout and keyboard access.
 - Pass criteria: source remains intact, customer install commits paused, no automatic sharing or execution, and deleted/revoked source authority prevents pending acceptance.
 

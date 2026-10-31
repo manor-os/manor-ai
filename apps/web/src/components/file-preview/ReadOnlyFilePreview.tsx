@@ -4,7 +4,8 @@ import remarkGfm from "remark-gfm";
 import MarkdownTable from "../MarkdownTable";
 import { getFilePreviewKind } from "../../lib/filePreviewKind";
 import { createFilePreviewSource, filePreviewMediaBlob } from "../../lib/filePreviewSource";
-import { parseDelimitedText } from "../../lib/delimitedText";
+import { fetchFileBlob } from "../../lib/fileTransfer";
+import { CsvPreview } from "./CsvPreview";
 import {
   assertDiagramPreviewFileSize,
   readDiagramPreviewText,
@@ -13,6 +14,7 @@ import { t } from "../../lib/i18n";
 import OfficePreview, { DocxOfficePreview } from "./OfficePreview";
 import type { ReadOnlyFilePreviewProps } from "./types";
 import Button from "../ui/Button";
+import ImagePreview from "./ImagePreview";
 
 const LazyDiagramArtifactViewer = lazy(() => import("../diagram/DiagramArtifactViewer"));
 const LazyXlsxViewer = lazy(() => import("../../pages/FileViewer").then(({ XlsxViewer }) => ({ default: XlsxViewer })));
@@ -52,9 +54,8 @@ export default function ReadOnlyFilePreview({
         const binary = await createFilePreviewSource({
           blob, url: source.contentUrl,
           fetchBinary: source.fetchBinary || (kind === "diagram" ? async (signal) => {
-            const response = await fetch(source.contentUrl, { signal });
-            if (!response.ok) throw new Error(`File loading failed (HTTP ${response.status})`);
-            return new Blob([await readDiagramPreviewText(response)]);
+            return (await fetchFileBlob(source.contentUrl, { signal }, fetch,
+              async (response) => new Blob([await readDiagramPreviewText(response)]))).blob;
           } : undefined),
         }).getBlob(controller.signal);
         if (cancelled) return;
@@ -100,7 +101,7 @@ export default function ReadOnlyFilePreview({
     return <Suspense fallback={<PreviewLoading />}><LazyPdfJsViewer url="" blob={loadedBlob} docName={file.name || "PDF"} canEdit={false} onDownload={canDownload ? onDownload : undefined} /></Suspense>;
   }
   if (kind === "image") {
-    return <img src={mediaUrl} alt={file.name || "Image"} onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} style={{ maxWidth: "100%", display: "block", margin: "0 auto" }} />;
+    return <ImagePreview src={mediaUrl} alt={file.name || "Image"} onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} />;
   }
   if (kind === "video") {
     return <video src={mediaUrl} controls onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} controlsList={canDownload ? undefined : "nodownload"} style={{ width: "100%", maxHeight: "75vh", background: "#000" }} />;
@@ -129,19 +130,6 @@ export default function ReadOnlyFilePreview({
   return <CodePreview content={previewContent} />;
 }
 
-function CsvPreview({ content }: { content: string }) {
-  const rows = parseDelimitedText(content).rows;
-  if (!rows.length) return <PreviewFallback />;
-  const columnCount = Math.max(1, ...rows.map((row) => row.length));
-  return (
-    <div style={{ overflowX: "auto" }}>
-      <table className="glass-table">
-        <thead><tr>{Array.from({ length: columnCount }, (_, index) => <th key={index}>{rows[0]?.[index] ?? ""}</th>)}</tr></thead>
-        <tbody>{rows.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{Array.from({ length: columnCount }, (_, columnIndex) => <td key={columnIndex} style={{ whiteSpace: "pre-wrap" }}>{row[columnIndex] ?? ""}</td>)}</tr>)}</tbody>
-      </table>
-    </div>
-  );
-}
 
 function CodePreview({ content }: { content: string }) {
   return <pre style={{ margin: 0, padding: 16, background: "#fafaf9", overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#292524" }}><code>{content}</code></pre>;

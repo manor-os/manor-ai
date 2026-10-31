@@ -1,4 +1,5 @@
 """Workspace Stat CRUD, deterministic collectors, and observation writes."""
+
 from __future__ import annotations
 
 import logging
@@ -10,6 +11,7 @@ from typing import Any, Optional
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import COORDINATOR_PARAM_KEY, ExecutionStepStatus
 from packages.core.constants.goals import GoalStatus
 from packages.core.constants.task import TaskStatus
 from packages.core.models.base import generate_ulid
@@ -20,12 +22,22 @@ from packages.core.models.document import (
     Integration,
     VectorStatus,
 )
+from packages.core.models.execution import ExecutionStep
 from packages.core.models.goal import Goal
-from packages.core.models.scheduler import AgentExecution
 from packages.core.models.task import Task
+from packages.core.models.task_agent_child import TaskAgentChildRun
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace_stat import WorkspaceStat, WorkspaceStatObservation
 from packages.core.services.task_state_machine import TERMINAL_STATUSES
+from packages.core.services.workspace_health_metrics import (
+    AGENT_CHILD_JUDGED_PHASES,
+    FAILED,
+    STEP_OUTCOMES,
+    SUCCEEDED,
+    WORKFLOW_RUN_OUTCOMES,
+    agent_child_succeeded_clause,
+    statuses_with,
+)
 from packages.core.stats.integration_keys import (
     get_stat_integration_spec,
     provider_aliases_for_stat_integration,
@@ -39,10 +51,15 @@ logger = logging.getLogger(__name__)
 
 STAT_KEY_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,119}$")
 SUPPORTED_VALUE_TYPES = {"number", "percent", "currency", "duration"}
-SUPPORTED_COLLECTOR_TYPES = {"manual", "workspace_internal", "integration", "agent_review"}
+SUPPORTED_COLLECTOR_TYPES = {"manual", "workspace_internal", "integration", "public_post", "agent_review"}
 SUPPORTED_WINDOWS = {
-    "latest", "lifetime", "rolling_24h", "rolling_7d", "rolling_30d",
-    "calendar_week", "calendar_month",
+    "latest",
+    "lifetime",
+    "rolling_24h",
+    "rolling_7d",
+    "rolling_30d",
+    "calendar_week",
+    "calendar_month",
 }
 _LIBRARY_DEFAULT_CADENCE = object()
 _STAT_NUMBER_QUANTUM = Decimal("0.000001")
@@ -51,6 +68,27 @@ _MAX_ABS_STAT_NUMBER = Decimal("1000000000000000000")
 
 class StatError(ValueError):
     pass
+
+
+def stat_freshness_status(stat: WorkspaceStat, *, now: datetime | None = None) -> str:
+    """Return the shared reader-facing freshness state for a Workspace Stat."""
+    if stat.status != "active":
+        return stat.status
+    if stat.collector_type == "agent_review" and (stat.last_assessment or {}).get("collector_revision") != stat.revision:
+        return "not_assessed"
+    if stat.last_collection_status == "error":
+        return "collection_error"
+    if stat.last_collection_status == "insufficient_evidence":
+        return "insufficient_evidence"
+    if stat.current_value_updated_at is None:
+        return "not_assessed" if stat.collector_type == "agent_review" else "no_data"
+    if stat.freshness_limit_seconds:
+        updated = stat.current_value_updated_at
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if ((now or datetime.now(timezone.utc)) - updated).total_seconds() > stat.freshness_limit_seconds:
+            return "stale"
+    return "fresh"
 
 
 def _normalize_stat_number(value: object) -> Decimal:
@@ -102,6 +140,79 @@ def _validate_definition(*, key: str, value_type: str, collector_type: str, wind
         raise StatError(f"unsupported window: {window}")
 
 
+def _stat_integration_spec(config: dict[str, Any]):
+    integration_key = str(config.get("integration_key") or "").strip()
+    if not integration_key:
+        legacy_key = stat_integration_key_for_provider(config.get("provider"))
+        integration_key = legacy_key.value if legacy_key else ""
+    return integration_key, get_stat_integration_spec(integration_key)
+
+
+async def _require_collaborator_integration(
+    db: AsyncSession, *, entity_id: str, workspace_id: str, collector_type: str, config: Optional[dict[str, Any]],
+) -> None:
+    """While a collaborator acts, an integration collector names a connection usable in the Workspace.
+
+    Their own connection or a provider a customer member bound to the
+    Workspace (collaborator_scope.collaborator_integration_usable); never an
+    implicit pick of the company's newest connection. 403 otherwise.
+    """
+    if collector_type != "integration":
+        return
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    acting = collaborators_acting_now(entity_id)
+    if not acting:
+        return
+    from fastapi import HTTPException
+
+    from packages.core.services.collaborator_scope import collaborator_integration_usable
+
+    config = config or {}
+    _key, spec = _stat_integration_spec(config)
+    connection_id = str(config.get("connection_id") or "").strip()
+    integration = (await db.execute(select(Integration).where(
+        Integration.id == connection_id,
+        Integration.entity_id == entity_id,
+        Integration.provider.in_(provider_aliases_for_stat_integration(spec.key)),
+        Integration.status == "active",
+    ))).scalar_one_or_none() if spec is not None and connection_id else None
+    if not await collaborator_integration_usable(
+        db, entity_id=entity_id, workspace_id=workspace_id, integration=integration, user_ids=acting,
+    ):
+        raise HTTPException(
+            403,
+            "External collaborators collect Stats only from their own connection or one "
+            "bound to this Workspace by a member of this company",
+        )
+
+
+def normalize_public_post_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate publication identity before persisting or collecting a Stat."""
+    from packages.core.services.public_social_metrics import canonicalize_public_post_url
+
+    required = ("platform", "public_url", "external_post_id", "metric_key")
+    if not isinstance(config, dict) or any(
+        not isinstance(config.get(key), str) or not config[key].strip() for key in required
+    ):
+        raise StatError("public_post collector requires platform, public_url, external_post_id, and metric_key")
+    normalized = {**config, **{key: config[key].strip() for key in required}}
+    normalized["platform"] = normalized["platform"].lower()
+    try:
+        canonical_url, post_id = canonicalize_public_post_url(normalized["platform"], normalized["public_url"])
+    except ValueError as exc:
+        raise StatError(str(exc)) from exc
+    if post_id != normalized["external_post_id"]:
+        raise StatError("public_url identity does not match external_post_id")
+    supported = {"views", "likes", "comments"}
+    if normalized["platform"] == "tiktok":
+        supported.add("shares")
+    if normalized["metric_key"] not in supported:
+        raise StatError(f"unsupported public_post metric_key: {normalized['metric_key']}")
+    normalized["public_url"] = canonical_url
+    return normalized
+
+
 async def create_stat(
     db: AsyncSession,
     *,
@@ -127,6 +238,8 @@ async def create_stat(
     collector_type = str(collector_type or "manual").strip().lower()
     window = str(window or "latest").strip().lower()
     _validate_definition(key=key, value_type=value_type, collector_type=collector_type, window=window)
+    if collector_type == "public_post":
+        collector_config = normalize_public_post_config(collector_config or {})
     from packages.core.stats.assessment import validate_review_definition
     validate_review_definition(collector_type, collector_config or {}, collection_cadence)
     existing = (await db.execute(select(WorkspaceStat).where(
@@ -135,6 +248,9 @@ async def create_stat(
     ))).scalar_one_or_none()
     if existing:
         raise StatError(f"a stat with key {key!r} already exists in this workspace")
+    await _require_collaborator_integration(
+        db, entity_id=entity_id, workspace_id=workspace_id, collector_type=collector_type, config=collector_config,
+    )
 
     stat = WorkspaceStat(
         entity_id=entity_id,
@@ -238,6 +354,62 @@ async def get_stat_by_key(
     ))).scalar_one_or_none()
 
 
+# User preference holding each Workspace's personal stat order and hidden stats.
+STAT_QUICK_VIEW_PREFERENCE_KEY = "workspace_stats_quick_views"
+
+
+async def attach_assessment_runtime(db: AsyncSession, items: list[dict[str, Any]], entity_id: str, workspace_id: str) -> None:
+    """Derive agent-review progress from the owning Workflow, never from answer text.
+
+    Each item is a stat payload with ``collector_type``, ``collector_config``,
+    ``status`` and ``freshness_status``; assessed items gain
+    ``assessment_runtime`` and a freshness phase such as ``assessing``.
+    """
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workflow import WorkflowBinding
+
+    assessed = [item for item in items if item["collector_type"] == "agent_review"]
+    if not assessed:
+        return
+    bindings = (await db.execute(select(WorkflowBinding).where(
+        WorkflowBinding.entity_id == entity_id, WorkflowBinding.workspace_id == workspace_id,
+    ))).scalars().all()
+    jobs = (await db.execute(select(ScheduledJob).where(
+        ScheduledJob.entity_id == entity_id, ScheduledJob.workspace_id == workspace_id,
+        ScheduledJob.execution_type == "workflow",
+    ))).scalars().all()
+    runs = (await db.execute(select(WorkflowRun).where(
+        WorkflowRun.entity_id == entity_id, WorkflowRun.workspace_id == workspace_id,
+        WorkflowRun.binding_id.in_([binding.id for binding in bindings]),
+    ).distinct(WorkflowRun.binding_id).order_by(WorkflowRun.binding_id, WorkflowRun.created_at.desc()))).scalars().all()
+    for item in assessed:
+        matches = [binding for binding in bindings if (binding.config or {}).get("workspace_blueprint_workflow_slug") == item["collector_config"].get("workflow_slug")]
+        phase = "configuration_error"
+        if len(matches) == 1:
+            binding = matches[0]
+            schedules = [job for job in jobs if (job.execution_target or {}).get("binding_id") == binding.id]
+            run = next((run for run in runs if run.binding_id == binding.id), None)
+            if len(schedules) == 1:
+                phase = item["freshness_status"]
+                if not binding.enabled or binding.status != "active" or not schedules[0].enabled:
+                    phase = "paused"
+                elif run and run.status == "paused":
+                    phase = "paused"
+                elif run and run.status in {"pending", "running"}:
+                    phase = "assessing"
+                elif run and run.status in {"failed", "cancelled"}:
+                    phase = "assessment_error"
+                if phase != "paused" and schedules[0].enabled and schedules[0].last_status in {"failed", "error"} and (
+                    run is None or (schedules[0].last_run_at and schedules[0].last_run_at > run.created_at)
+                ):
+                    phase = "assessment_error"
+                item["assessment_runtime"] = {"workflow_id": binding.workflow_id,
+                    "binding_id": binding.id, "job_id": schedules[0].job_id, "run_id": run.id if run else None,
+                    "run_status": run.status if run else None, "next_run_at": schedules[0].next_run_at}
+        if item["status"] == "active":
+            item["freshness_status"] = phase
+
+
 async def list_stats(db: AsyncSession, *, entity_id: str, workspace_id: str) -> list[WorkspaceStat]:
     return list((await db.execute(
         select(WorkspaceStat)
@@ -258,8 +430,17 @@ async def update_stat(db: AsyncSession, stat: WorkspaceStat, **fields: Any) -> W
     collector_type = fields.get("collector_type", stat.collector_type)
     _validate_definition(key=stat.key, value_type=stat.value_type, collector_type=collector_type,
                          window=fields.get("window", stat.window))
+    if collector_type == "public_post":
+        fields["collector_config"] = normalize_public_post_config(fields.get("collector_config", stat.collector_config))
     validate_review_definition(collector_type, fields.get("collector_config", stat.collector_config),
                                fields.get("collection_cadence", stat.collection_cadence))
+    if (
+        "collector_config" in fields and fields["collector_config"] != stat.collector_config
+    ) or collector_type != stat.collector_type:
+        await _require_collaborator_integration(
+            db, entity_id=stat.entity_id, workspace_id=stat.workspace_id, collector_type=collector_type,
+            config=fields.get("collector_config", stat.collector_config),
+        )
     changed = False
     for key, value in fields.items():
         if key not in allowed:
@@ -454,35 +635,66 @@ async def collect_stat(
     period = bucket_start.isoformat() if bucket_start else "latest"
     idempotency_key = f"collect:r{stat.revision}:{stat.window}:{period}:{bucket_end.isoformat()}"
 
+    if stat.collector_type == "public_post":
+        # A retried public-page fetch may return different counters or evidence.
+        # Reuse the persisted sampling bucket instead of comparing a fresh page
+        # against the immutable observation with the same idempotency key.
+        existing = await db.scalar(select(WorkspaceStatObservation).where(
+            WorkspaceStatObservation.stat_id == stat.id,
+            WorkspaceStatObservation.idempotency_key == idempotency_key,
+        ))
+        if existing is not None:
+            return existing
+
+    collection_error = None
     try:
         if stat.collector_type == "workspace_internal":
             value, evidence = await _collect_workspace_internal(
-                db, stat, window_start=window_start, window_end=window_end,
+                db,
+                stat,
+                window_start=window_start,
+                window_end=window_end,
             )
             source = "workspace_internal"
         elif stat.collector_type == "integration":
             value, evidence = await _collect_integration(db, stat)
             source = f"integration:{evidence['provider']}"
+        elif stat.collector_type == "public_post":
+            value, evidence = await _collect_public_post(stat)
+            source = "public_post"
         else:
             raise StatError(f"unsupported collector type: {stat.collector_type}")
-        return await record_observation(
-            db,
-            stat,
-            value=value,
-            source=source,
-            observed_at=observed_at,
-            window_start=window_start,
-            window_end=window_end,
-            evidence=evidence,
-            idempotency_key=idempotency_key,
-        )
     except Exception as exc:
         stat.last_collection_status = "error"
         stat.last_collection_error = str(exc)[:2000]
+        if stat.collector_type != "public_post":
+            await db.flush()
+            from fastapi import HTTPException
+
+            if isinstance(exc, (StatError, HTTPException)):
+                raise
+            raise StatError(str(exc)) from exc
+        value, source = None, "collector_error"
+        collection_error = str(exc)[:2000]
+        evidence = {"gaps": ["collector_error"], "error": collection_error}
+    # Persistence failures must propagate; attempting another observation in
+    # the same failed transaction would hide the original database error.
+    observation = await record_observation(
+        db,
+        stat,
+        value=value,
+        source=source,
+        observed_at=observed_at,
+        window_start=window_start,
+        window_end=window_end,
+        evidence=evidence,
+        idempotency_key=idempotency_key,
+    )
+    if collection_error is not None:
+        stat.last_collection_status = "error"
+        stat.last_collection_error = collection_error
         await db.flush()
-        if isinstance(exc, StatError):
-            raise
-        raise StatError(str(exc)) from exc
+    return observation
 
 
 def _time_filter(column: Any, start: Optional[datetime], end: datetime) -> list[Any]:
@@ -582,32 +794,57 @@ async def _collect_workspace_internal(
         total = int((await db.execute(select(func.count()).select_from(WorkflowRun).where(*base))).scalar_one() or 0)
         if metric == "workflow_run_count":
             return Decimal(total), {"metric": metric, "count": total}
-        terminal = int((await db.execute(select(func.count()).select_from(WorkflowRun).where(
-            *base, WorkflowRun.status.in_({"completed", "failed", "cancelled"}),
+        judged = int((await db.execute(select(func.count()).select_from(WorkflowRun).where(
+            *base, WorkflowRun.status.in_(statuses_with(WORKFLOW_RUN_OUTCOMES, SUCCEEDED, FAILED)),
         ))).scalar_one() or 0)
         completed = int((await db.execute(select(func.count()).select_from(WorkflowRun).where(
-            *base, WorkflowRun.status == "completed",
+            *base, WorkflowRun.status.in_(statuses_with(WORKFLOW_RUN_OUTCOMES, SUCCEEDED)),
         ))).scalar_one() or 0)
-        value = Decimal(completed * 100) / Decimal(terminal) if terminal else Decimal("0")
-        return value, {"metric": metric, "terminal": terminal, "completed": completed, "total": total}
+        value = Decimal(completed * 100) / Decimal(judged) if judged else Decimal("0")
+        return value, {"metric": metric, "judged": judged, "completed": completed, "total": total}
 
     if metric in {"agent_run_count", "agent_success_rate"}:
-        base = [
-            AgentExecution.entity_id == stat.entity_id,
-            AgentExecution.workspace_id == stat.workspace_id,
-            *_time_filter(AgentExecution.created_at, window_start, window_end),
+        # Agent work is the delegated child runs of the Task agent loop plus
+        # the agent-resolved steps of the retired Plan/Step engine. Legacy
+        # coordinator fold roots only supervise their children, so counting
+        # them would double the same work; skipped steps never ran.
+        step_base = [
+            ExecutionStep.entity_id == stat.entity_id,
+            ExecutionStep.workspace_id == stat.workspace_id,
+            ExecutionStep.resolved_agent_id.is_not(None),
+            ~ExecutionStep.params.has_key(COORDINATOR_PARAM_KEY),
+            ExecutionStep.step_status != ExecutionStepStatus.SKIPPED.value,
+            *_time_filter(ExecutionStep.created_at, window_start, window_end),
         ]
-        total = int((await db.execute(select(func.count()).select_from(AgentExecution).where(*base))).scalar_one() or 0)
+        child_base = [
+            TaskAgentChildRun.entity_id == stat.entity_id,
+            TaskAgentChildRun.workspace_id == stat.workspace_id,
+            *_time_filter(TaskAgentChildRun.created_at, window_start, window_end),
+        ]
+
+        async def count(model: Any, *filters: Any) -> int:
+            return int((await db.execute(
+                select(func.count()).select_from(model).where(*filters)
+            )).scalar_one() or 0)
+
+        total = await count(ExecutionStep, *step_base) + await count(TaskAgentChildRun, *child_base)
         if metric == "agent_run_count":
             return Decimal(total), {"metric": metric, "count": total}
-        terminal = int((await db.execute(select(func.count()).select_from(AgentExecution).where(
-            *base, AgentExecution.status.in_({"completed", "failed", "cancelled"}),
-        ))).scalar_one() or 0)
-        completed = int((await db.execute(select(func.count()).select_from(AgentExecution).where(
-            *base, AgentExecution.status == "completed",
-        ))).scalar_one() or 0)
-        value = Decimal(completed * 100) / Decimal(terminal) if terminal else Decimal("0")
-        return value, {"metric": metric, "terminal": terminal, "completed": completed, "total": total}
+        judged = await count(ExecutionStep, *step_base, ExecutionStep.step_status.in_(
+            statuses_with(STEP_OUTCOMES, SUCCEEDED, FAILED),
+        )) + await count(
+            TaskAgentChildRun, *child_base,
+            TaskAgentChildRun.phase.in_(AGENT_CHILD_JUDGED_PHASES),
+        )
+        # A finished child that reported anything but ``completed`` (blocked,
+        # partial …) did not deliver; the launch review counts it the same way.
+        completed = await count(
+            ExecutionStep, *step_base, ExecutionStep.step_status == ExecutionStepStatus.DONE.value,
+        ) + await count(
+            TaskAgentChildRun, *child_base, agent_child_succeeded_clause(),
+        )
+        value = Decimal(completed * 100) / Decimal(judged) if judged else Decimal("0")
+        return value, {"metric": metric, "judged": judged, "completed": completed, "total": total}
 
     if metric == "knowledge_ready_documents":
         total = int((await db.execute(
@@ -630,11 +867,10 @@ async def _collect_integration(
     db: AsyncSession, stat: WorkspaceStat,
 ) -> tuple[Decimal, dict[str, Any]]:
     config = stat.collector_config or {}
-    integration_key = str(config.get("integration_key") or "").strip()
-    if not integration_key:
-        legacy_key = stat_integration_key_for_provider(config.get("provider"))
-        integration_key = legacy_key.value if legacy_key else ""
-    spec = get_stat_integration_spec(integration_key)
+    integration_key, spec = _stat_integration_spec(config)
+    await _require_collaborator_integration(
+        db, entity_id=stat.entity_id, workspace_id=stat.workspace_id, collector_type="integration", config=config,
+    )
     metric_key = str(config.get("metric_key") or "").strip()
     connection_id = str(config.get("connection_id") or "").strip()
     if spec is None or not metric_key:
@@ -674,4 +910,35 @@ async def _collect_integration(
         "provider": spec.provider_key,
         "connection_id": integration.id,
         "metric_key": metric_key,
+    }
+
+
+async def _collect_public_post(stat: WorkspaceStat) -> tuple[Decimal | None, dict[str, Any]]:
+    """Collect one publicly visible publication metric without domain-specific state."""
+
+    config = normalize_public_post_config(stat.collector_config or {})
+    platform = config["platform"]
+    expected_post_id = config["external_post_id"]
+    metric_key = config["metric_key"]
+    from packages.core.services.public_social_metrics import collect_public_post_metrics
+
+    snapshot = await collect_public_post_metrics(
+        platform=platform,
+        public_url=config["public_url"],
+        expected_post_id=expected_post_id,
+        expected_account_id=config.get("account_id"),
+        expected_account_handle=config.get("account_handle"),
+    )
+    metric = (snapshot.get("metrics") or {}).get(metric_key) or {}
+    available = metric.get("availability") == "available" and metric.get("value") is not None
+    return Decimal(str(metric["value"])) if available else None, {
+        "subject": config.get("subject"),
+        "platform": platform,
+        "external_post_id": expected_post_id,
+        "precision": metric.get("precision"),
+        "raw_value": metric.get("raw_value"),
+        "definition": f"{snapshot.get('parser_version') or 'public-social-v1'}:{platform}:{metric.get('provider_metric_name') or metric_key}",
+        "availability": metric.get("availability") or "unavailable",
+        **({"gaps": [metric.get("reason") or "metric_unavailable"]} if not available else {}),
+        "collector_evidence": snapshot.get("evidence") or {},
     }

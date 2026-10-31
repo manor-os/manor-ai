@@ -49,12 +49,15 @@ from typing import Any, Awaitable, Callable, Optional
 from sqlalchemy import and_, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.blueprints.knowledge_templates import (
+    INITIAL_BODY_KEY,
+    normalize_knowledge_template,
+)
 from packages.core.constants.agents import is_master_agent
 from packages.core.constants.blueprints import (
     BlueprintInstallTodoKind,
     installed_blueprint_job_id,
 )
-from packages.core.constants.execution import WorkerStatus
 from packages.core.blueprints.freshness import (
     BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
@@ -68,6 +71,7 @@ from packages.core.blueprints.freshness import (
 from packages.core.blueprints.payload import (
     PayloadError, migrate_payload, validate_payload,
 )
+from packages.core.blueprints.registry import sync_installed_package
 from packages.core.blueprints.simulation import resolve_simulation_experience
 from packages.core.blueprints.workflow_dependencies import (
     WorkflowDependencyError,
@@ -105,6 +109,7 @@ from packages.core.models.workspace import (
 )
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from packages.core.services.entity_service import create_workspace
+from packages.core.services.integration_resolution import is_user_facing_integration_provider
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.marketplace_resource_links import (
     MarketplaceIdentityConflictError,
@@ -135,7 +140,6 @@ from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
     settings_with_default_workspace_access,
 )
-from packages.core.workers.registry import ensure_internal_worker
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +259,7 @@ class InstallResult:
     subscription_ids: list[str] = field(default_factory=list)
     scheduled_job_ids: list[str] = field(default_factory=list)
     workflow_binding_ids: list[str] = field(default_factory=list)
+    workflow_ids: list[str] = field(default_factory=list)
     custom_field_ids: list[str] = field(default_factory=list)
     governance_applied: bool = False
     #: Author never_allow entries installed as approval gates instead (the
@@ -262,6 +267,105 @@ class InstallResult:
     demoted_hard_blocks: list[str] = field(default_factory=list)
     todos: list[InstallTodo] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+def validate_portable_recipe_resources(recipe: Mapping[str, Any]) -> None:
+    """Validate Draft/Blueprint executable resources before materialization."""
+    from packages.core.blueprints.payload import _validate_scheduled_jobs, _validate_workflows
+    portable = {"workflows": list(recipe.get("workflows") or []), "scheduled_jobs": list(recipe.get("scheduled_jobs") or [])}
+    _validate_workflows(portable)
+    _validate_scheduled_jobs(portable)
+    for workflow in portable["workflows"]:
+        if isinstance(workflow, dict):
+            _blueprint_workflow_definition_values(workflow)
+
+
+async def materialize_workspace_recipe_resources(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace: Workspace,
+    recipe: Mapping[str, Any],
+    user_id: str | None,
+    mode: InstallMode = InstallMode.LIVE,
+    source_template_id: str,
+    source_version: str = "1.0.0",
+    binding_source_template_id: str | None = None,
+    skill_id_by_component_key: dict[str, str] | None = None,
+) -> dict[str, dict[str, str] | list[str]]:
+    """Materialize portable Workflow/Job resources on an existing Workspace.
+
+    Direct Blueprint install and the AI Draft path both call this primitive.
+    It deliberately receives an existing Workspace and performs no lifecycle,
+    transaction, capacity, approval, or post-commit dispatch work itself.
+    """
+    workflow_specs = [dict(item) for item in recipe.get("workflows") or [] if isinstance(item, Mapping)]
+    stat_ids: list[str] = []
+    stat_ids_by_key: dict[str, str] = {}
+    for stat_payload in recipe.get("stats") or []:
+        if not isinstance(stat_payload, Mapping):
+            raise InstallError("Blueprint stats must be objects")
+        key = str(stat_payload.get("key") or stat_payload.get("library_key") or "").strip()
+        stat_id = await _install_stat(
+            db, entity_id=entity_id, workspace_id=workspace.id,
+            payload=dict(stat_payload), mode=mode,
+        )
+        stat_ids.append(stat_id)
+        if key:
+            stat_ids_by_key[key] = stat_id
+
+    workflow_ids: dict[str, str] = {}
+    binding_ids: dict[str, str] = {}
+    for spec in workflow_specs:
+        workflow_id = await _install_workflow(
+            db, entity_id=entity_id, workspace_id=workspace.id, w=spec,
+            source_template_id=source_template_id, source_version=source_version,
+            installed_by=user_id, adopt_unmapped=False,
+        )
+        if workflow_id:
+            workflow_ids[str(spec.get("slug") or "").strip()] = workflow_id
+    for spec in workflow_specs:
+        slug = str(spec.get("slug") or "").strip()
+        workflow_id = workflow_ids.get(slug)
+        resolved = spec
+        if WorkflowDependencyFactory.has_dependencies(list(spec.get("steps") or [])):
+            try:
+                resolved = deepcopy(spec)
+                resolved["steps"] = WorkflowDependencyFactory.to_runtime(
+                    list(spec.get("steps") or []), workflow_id_by_key=workflow_ids,
+                )
+            except WorkflowDependencyError as exc:
+                raise InstallError(str(exc)) from exc
+            workflow_id = await _install_workflow(
+                db, entity_id=entity_id, workspace_id=workspace.id, w=resolved,
+                source_template_id=source_template_id, source_version=source_version,
+                installed_by=user_id, adopt_unmapped=False,
+            )
+            if workflow_id:
+                workflow_ids[slug] = workflow_id
+        if workflow_id and not bool(spec.get("internal")):
+            binding_id = await _install_workflow_binding(
+                db, entity_id=entity_id, workspace_id=workspace.id,
+                workflow_id=workflow_id, w=resolved,
+                source_template_id=binding_source_template_id or source_template_id,
+            )
+            if binding_id:
+                binding_ids[slug] = binding_id
+
+    job_ids: list[str] = []
+    for job in recipe.get("scheduled_jobs") or []:
+        if not isinstance(job, Mapping):
+            raise InstallError("Blueprint scheduled jobs must be objects")
+        job_ids.append(await _install_scheduled_job(
+            db, entity_id=entity_id, workspace_id=workspace.id, sj=dict(job),
+            user_id=user_id, mode=mode, source_template_id=source_template_id,
+            skill_id_by_component_key=skill_id_by_component_key,
+        ))
+    return {
+        "stat_ids": stat_ids, "stat_ids_by_key": stat_ids_by_key,
+        "workflow_ids": workflow_ids, "workflow_binding_ids": binding_ids,
+        "scheduled_job_ids": job_ids,
+    }
 
 
 _INSTALL_VARIABLE_PATTERN = re.compile(
@@ -855,6 +959,8 @@ async def sync_workspace_live_setup_requirements(
 
     for provider_slug, blocking in required_mcp.items():
         provider = canonical_provider_key(provider_slug)
+        if not is_user_facing_integration_provider(provider):
+            continue
         requirements.append(InstallTodo(
             kind=BlueprintInstallTodoKind.MISSING_INTEGRATION.value,
             detail=f"Connect the required {provider!r} integration.",
@@ -898,6 +1004,8 @@ async def sync_workspace_live_setup_requirements(
                 continue
             server_slug = str(binding.get("server_slug") or "").strip()
             if not server_slug:
+                continue
+            if not is_user_facing_integration_provider(server_slug):
                 continue
             requirements.append(InstallTodo(
                 kind=BlueprintInstallTodoKind.MCP_CONFIGURATION.value,
@@ -1388,6 +1496,8 @@ async def install_blueprint(
         "channel_requirements": list(contract.get("channels") or []),
         "session_requirements": list(contract.get("sessions") or []),
     }
+    # Name the exact release installed, when the registry holds it.
+    await sync_installed_package(db, settings["_blueprint"])
     workspace.settings = settings
     await db.flush()
     await ensure_workspace_owner_membership(
@@ -1523,7 +1633,10 @@ async def install_blueprint(
             db,
             entity_id=entity_id,
             user_id=user_id,
-            provider_keys=required_mcp_slugs,
+            provider_keys=[
+                slug for slug in required_mcp_slugs
+                if is_user_facing_integration_provider(slug)
+            ],
         )
         for state in readiness.values():
             provider = state.provider
@@ -1585,12 +1698,6 @@ async def install_blueprint(
         if todo:
             result.todos.append(todo)
 
-    # A copied workspace must be executable, not merely point at Agents.
-    # This is idempotent and binds every active subscription to the entity's
-    # built-in worker, including the subscriptions created just above.
-    if result.subscription_ids:
-        await ensure_internal_worker(db, entity_id)
-
     # ── Custom fields ──
     for cf in recipe.get("custom_fields") or []:
         cfd_id = await _install_custom_field(
@@ -1598,33 +1705,8 @@ async def install_blueprint(
         )
         result.custom_field_ids.append(cfd_id)
 
-    # ── Stats (before Goals so Goals can reference stat_key) ──
-    for stat_payload in recipe.get("stats") or []:
-        stat_id = await _install_stat(
-            db,
-            entity_id=entity_id,
-            workspace_id=workspace.id,
-            payload=stat_payload,
-            mode=mode,
-        )
-        result.stat_ids.append(stat_id)
-
-    # ── Goals (measurement schedule follows Workspace runtime) ──
-    for g in recipe.get("goals") or []:
-        gid = await _install_goal(
-            db,
-            entity_id=entity_id,
-            workspace_id=workspace.id,
-            g=g,
-            runtime_enabled=(
-                workspace.status == "active" and bool(workspace.heartbeat_enabled)
-            ),
-        )
-        result.goal_ids.append(gid)
-
-    # ── Workflows ──
-    # Definitions are installed before ScheduledJobs so portable workflow_slug
-    # targets can be resolved to the concrete definition + Workspace binding.
+    # Workflows, Stats and Jobs are also materialized for an AI-created Draft.
+    # Keep their native installation behavior in one primitive.
     workflow_source_id = str(
         blueprint_id
         or f"blueprint-payload:{blueprint_content_fingerprint(source_payload)}"
@@ -1636,57 +1718,37 @@ async def install_blueprint(
     workflow_source_version = str(
         blueprint_version or manifest.get("blueprint_version") or "1.0.0"
     )
-    workflow_specs = list(recipe.get("workflows") or [])
-    workflow_id_by_key: dict[str, str] = {}
-    app_binding_id_by_key: dict[str, str] = {}
-    for w in workflow_specs:
-        workflow_id = await _install_workflow(
-            db,
-            entity_id=entity_id,
-            workspace_id=workspace.id,
-            w=w,
-            source_template_id=workflow_source_template_id,
-            source_version=workflow_source_version,
-            installed_by=user_id,
-            adopt_unmapped=False,
-        )
-        if workflow_id:
-            workflow_id_by_key[str(w.get("slug") or "").strip()] = workflow_id
+    materialized_resources = await materialize_workspace_recipe_resources(
+        db, entity_id=entity_id, workspace=workspace, recipe=recipe,
+        user_id=user_id, mode=mode, source_template_id=workflow_source_template_id,
+        source_version=workflow_source_version,
+        binding_source_template_id=workflow_source_id,
+        skill_id_by_component_key=skill_id_by_slug,
+    )
+    result.stat_ids.extend(materialized_resources["stat_ids"])
+    result.workflow_ids.extend(materialized_resources["workflow_ids"].values())
+    result.workflow_binding_ids.extend(materialized_resources["workflow_binding_ids"].values())
+    result.scheduled_job_ids.extend(materialized_resources["scheduled_job_ids"])
+    workflow_id_by_key = dict(materialized_resources["workflow_ids"])
+    app_binding_id_by_key = dict(materialized_resources["workflow_binding_ids"])
 
-    for w in workflow_specs:
+    # ``active`` is the Strategist runtime state. A Blueprint that deploys
+    # only explicitly enabled Workflows keeps those automations independent
+    # while its Strategist starts paused. Simulation remains runnable so its
+    # declared walkthrough can execute against sandbox adapters.
+    if mode != InstallMode.SIMULATE and not heartbeat_enabled:
+        workspace.status = "paused"
+
+    # ── Goals (stats have been materialized above) ──
+    for g in recipe.get("goals") or []:
+        gid = await _install_goal(
+            db, entity_id=entity_id, workspace_id=workspace.id, g=g,
+            runtime_enabled=(workspace.status == "active" and bool(workspace.heartbeat_enabled)),
+        )
+        result.goal_ids.append(gid)
+
+    for w in recipe.get("workflows") or []:
         workflow_id = workflow_id_by_key.get(str(w.get("slug") or "").strip())
-        resolved_workflow = w
-        if WorkflowDependencyFactory.has_dependencies(list(w.get("steps") or [])):
-            try:
-                resolved_workflow = deepcopy(w)
-                resolved_workflow["steps"] = WorkflowDependencyFactory.to_runtime(
-                    list(w.get("steps") or []),
-                    workflow_id_by_key=workflow_id_by_key,
-                )
-            except WorkflowDependencyError as exc:
-                raise InstallError(str(exc)) from exc
-            workflow_id = await _install_workflow(
-                db,
-                entity_id=entity_id,
-                workspace_id=workspace.id,
-                w=resolved_workflow,
-                source_template_id=workflow_source_template_id,
-                source_version=workflow_source_version,
-                installed_by=user_id,
-                adopt_unmapped=False,
-            )
-        if workflow_id and not bool(w.get("internal")):
-            binding_id = await _install_workflow_binding(
-                db,
-                entity_id=entity_id,
-                workspace_id=workspace.id,
-                workflow_id=workflow_id,
-                w=resolved_workflow,
-                source_template_id=workflow_source_id,
-            )
-            if binding_id:
-                result.workflow_binding_ids.append(binding_id)
-                app_binding_id_by_key[str(w.get("slug") or "").strip()] = binding_id
         if workflow_id and blueprint_id:
             await record_marketplace_resource_link(
                 db,
@@ -1704,16 +1766,6 @@ async def install_blueprint(
                 metadata={"source_slug": w.get("slug")},
             )
 
-    # ── Scheduled jobs ──
-    for sj in recipe.get("scheduled_jobs") or []:
-        sj_id = await _install_scheduled_job(
-            db, entity_id=entity_id, workspace_id=workspace.id, sj=sj,
-            user_id=user_id, mode=mode,
-            source_template_id=workflow_source_template_id,
-            skill_id_by_component_key=skill_id_by_slug,
-        )
-        result.scheduled_job_ids.append(sj_id)
-
     if workspace_operating_model.get("app_view") is not None:
         from packages.core.blueprints.app_view import remap_app_view
         from packages.core.blueprints.exporter import _portable_agent_slug
@@ -1728,6 +1780,8 @@ async def install_blueprint(
                 **workspace.operating_model,
                 "app_view": remap_app_view(
                     workspace_operating_model["app_view"], workflows=app_binding_id_by_key,
+                    workflow_definitions=workflow_id_by_key,
+                    stat_keys=set(materialized_resources["stat_ids_by_key"]),
                     agents={_portable_agent_slug(a): a.id for a in app_agents},
                     automations={j["job_id"]: installed_blueprint_job_id(j["job_id"], workspace.id)
                                  for j in recipe.get("scheduled_jobs") or []},
@@ -1921,6 +1975,10 @@ async def install_blueprint(
     from packages.core.blueprints.reconfigure import capture_install_baseline
 
     await capture_install_baseline(db, workspace=workspace, payload=payload)
+    # Text the Blueprint ships in one language reads in each viewer's.
+    from packages.core.services.workspace_translation import schedule_workspace_translation
+
+    schedule_workspace_translation(workspace.id)
     return result
 
 
@@ -2600,6 +2658,7 @@ async def _install_scheduled_job(
         cron_expr=sj.get("cron_expr"),
         every_seconds=sj.get("every_seconds"),
         run_at=sj.get("run_at"),
+        stop_after=(datetime.fromisoformat(str(sj["stop_after"])) if sj.get("stop_after") else None),
         timezone=sj.get("timezone", "UTC"),
         payload_message=sj.get("payload_message"),
         agent_id=agent_id,
@@ -2973,38 +3032,41 @@ async def _install_embedded_agent(
             if declared_allowed_tools is None
             else list(declared_allowed_tools)
         )
-        live_setup_requirements.append(InstallTodo(
-            kind=BlueprintInstallTodoKind.MCP_CONFIGURATION.value,
-            detail=(
-                f"Restore the {server_slug!r} MCP binding for agent {slug!r}."
-            ),
-            payload={
-                "server_slug": server_slug,
-                "agent_slug": slug,
-                "installed_agent_id": agent.id,
-                "allowed_tools": declared_allowed_tools,
-                "required_config_fields": required_config_fields,
-            },
-            blocking=binding_is_required,
-        ))
-        if srv is None:
-            todos.append(InstallTodo(
-                kind=BlueprintInstallTodoKind.MCP_SERVER.value,
+        user_facing_provider = is_user_facing_integration_provider(server_slug)
+        if user_facing_provider:
+            live_setup_requirements.append(InstallTodo(
+                kind=BlueprintInstallTodoKind.MCP_CONFIGURATION.value,
                 detail=(
-                    f"Install the {server_slug!r} MCP server, then bind it to "
-                    f"agent {slug!r}. The blueprint expects these fields to be "
-                    f"set on the binding: "
-                    f"{list(binding.get('config_override_allowlist') or []) or '(none)'}"
+                    f"Restore the {server_slug!r} MCP binding for agent {slug!r}."
                 ),
                 payload={
                     "server_slug": server_slug,
                     "agent_slug": slug,
-                    "allowed_tools": binding.get("allowed_tools"),
-                    "config_override_allowlist": binding.get("config_override_allowlist"),
+                    "installed_agent_id": agent.id,
+                    "allowed_tools": declared_allowed_tools,
                     "required_config_fields": required_config_fields,
                 },
                 blocking=binding_is_required,
             ))
+        if srv is None:
+            if user_facing_provider:
+                todos.append(InstallTodo(
+                    kind=BlueprintInstallTodoKind.MCP_SERVER.value,
+                    detail=(
+                        f"Install the {server_slug!r} MCP server, then bind it to "
+                        f"agent {slug!r}. The blueprint expects these fields to be "
+                        f"set on the binding: "
+                        f"{list(binding.get('config_override_allowlist') or []) or '(none)'}"
+                    ),
+                    payload={
+                        "server_slug": server_slug,
+                        "agent_slug": slug,
+                        "allowed_tools": binding.get("allowed_tools"),
+                        "config_override_allowlist": binding.get("config_override_allowlist"),
+                        "required_config_fields": required_config_fields,
+                    },
+                    blocking=binding_is_required,
+                ))
             continue
         existing_mcp = existing_mcp_bindings.get(srv.id)
         if existing_mcp is not None:
@@ -3036,7 +3098,7 @@ async def _install_embedded_agent(
                 and not configured_fields[field].strip()
             )
         ]
-        if missing_config_fields:
+        if missing_config_fields and user_facing_provider:
             todos.append(InstallTodo(
                 kind=BlueprintInstallTodoKind.MCP_CONFIGURATION.value,
                 detail=(
@@ -3343,15 +3405,37 @@ async def _install_knowledge_pack(
     if not title:
         return None
 
-    # Idempotent: reuse existing group with the same (entity_id,
-    # workspace_id, name) tuple.
-    existing = (await db.execute(
+    # Installed Blueprint slugs are the portable identity. Display titles are
+    # not unique: the exporter assigns distinct slugs to same-title groups,
+    # and reusing by title would silently drop every later group.
+    slug_groups = list((await db.execute(
+        select(DocumentGroup).where(
+            DocumentGroup.entity_id == entity_id,
+            DocumentGroup.workspace_id == workspace_id,
+            DocumentGroup.settings["installed_from_blueprint_slug"].astext == slug,
+        )
+    )).scalars().all()) if slug else []
+    if len(slug_groups) > 1:
+        raise InstallError(f"Knowledge pack slug {slug!r} is ambiguous")
+    existing = slug_groups[0] if slug_groups else None
+    same_title_groups = list((await db.execute(
         select(DocumentGroup).where(
             DocumentGroup.entity_id == entity_id,
             DocumentGroup.workspace_id == workspace_id,
             DocumentGroup.name == title,
         )
-    )).scalar_one_or_none()
+    )).scalars().all())
+    if existing is None:
+        # Retain the legacy idempotency behavior for a pre-existing local
+        # group that has not yet been assigned a Blueprint pack identity.
+        legacy_groups = [
+            group for group in same_title_groups
+            if not isinstance(group.settings, dict)
+            or not group.settings.get("installed_from_blueprint_slug")
+        ]
+        if len(legacy_groups) > 1:
+            raise InstallError(f"Knowledge pack title {title!r} is ambiguous")
+        existing = legacy_groups[0] if legacy_groups else None
     if existing is not None:
         group_id = existing.id
     else:
@@ -3567,15 +3651,10 @@ async def _knowledge_starter_path_is_occupied(
 
 
 def _blueprint_document_template(document: dict[str, Any]) -> dict[str, Any] | None:
-    template = document.get("template")
-    if not isinstance(template, dict):
-        return None
-    return {
-        "id": str(template.get("id") or "").strip(),
-        "mode": str(template.get("mode") or "").strip(),
-        "renderer": str(template.get("renderer") or "").strip(),
-        "version": int(template.get("version") or 1),
-    }
+    try:
+        return normalize_knowledge_template(document.get("template"))
+    except ValueError as exc:
+        raise InstallError(str(exc)) from exc
 
 
 async def _materialize_knowledge_pack_document(
@@ -3603,6 +3682,11 @@ async def _materialize_knowledge_pack_document(
         knowledge_pack_slug=knowledge_pack_slug, documents=[document],
     )
     template = _blueprint_document_template(document)
+    initial_body = (
+        {INITIAL_BODY_KEY: body}
+        if template and template["mode"] == "initial_file"
+        else {}
+    )
     if document_key:
         workspace_rows = await _workspace_blueprint_document_rows(
             db,
@@ -3637,6 +3721,7 @@ async def _materialize_knowledge_pack_document(
                     extra={
                         "blueprint_document_key": document_key,
                         "blueprint_template": template,
+                        **initial_body,
                     },
                 )
             await db.flush()
@@ -3652,9 +3737,8 @@ async def _materialize_knowledge_pack_document(
             path=path,
             document_key=document_key,
         ):
-            # A live template owns only its binding/projection metadata.  Its
-            # operator-visible body and the Workspace records it projects are
-            # deliberately not overwritten by install or upgrade.
+            # Template configuration never overwrites the operator's current
+            # file. Initial-file content is a separate export/install seed.
             if template is not None:
                 await _require_blueprint_document_owned_by_workspace(db, row, workspace_id)
                 row.metadata_ = merge_document_metadata(
@@ -3664,6 +3748,7 @@ async def _materialize_knowledge_pack_document(
                         "blueprint_knowledge_pack_slug": knowledge_pack_slug,
                         "blueprint_starter_path": path,
                         "blueprint_template": template,
+                        **initial_body,
                     },
                 )
             await repair_workspace_document_projection(
@@ -3712,6 +3797,7 @@ async def _materialize_knowledge_pack_document(
                     else {}
                 ),
                 **({"blueprint_template": template} if template is not None else {}),
+                **initial_body,
             },
         ),
     )
@@ -3833,6 +3919,9 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
             "trigger_type": w.get("trigger_type") or "manual",
             **_blueprint_workflow_trigger_config(w),
         }
+        # How the run's production shows travels on the trigger, beside its inputs.
+        if isinstance(w.get("production"), dict):
+            trigger_config["production"] = dict(w["production"])
         if isinstance(w.get("run_inputs"), list):
             run_inputs = [
                 dict(item)
@@ -4386,19 +4475,12 @@ async def _run_post_install_check(
         return
 
     if kind == "agent_callable":
-        from packages.core.models.worker import SubscriptionWorker, Worker
-
         service_key = check.get("service_key")
         if not service_key:
             return
         row = (await db.execute(
             select(AgentSubscription.id)
             .join(Agent, Agent.id == AgentSubscription.agent_id)
-            .join(
-                SubscriptionWorker,
-                SubscriptionWorker.subscription_id == AgentSubscription.id,
-            )
-            .join(Worker, Worker.id == SubscriptionWorker.worker_id)
             .where(
                 AgentSubscription.workspace_id == workspace_id,
                 AgentSubscription.entity_id == entity_id,
@@ -4407,8 +4489,6 @@ async def _run_post_install_check(
                 Agent.entity_id == entity_id,
                 Agent.status == "active",
                 Agent.deleted_at.is_(None),
-                Worker.entity_id == entity_id,
-                Worker.status == WorkerStatus.ACTIVE,
             )
             .limit(1)
         )).scalar_one_or_none()
@@ -4429,11 +4509,12 @@ async def _run_post_install_check(
         if not job_id:
             return
         scoped_job_id = installed_blueprint_job_id(job_id, workspace_id)
+        # The check proves the schedule is installed. Paused (by a person, or
+        # after failing runs) it is still installed and must not block work.
         rows = list((await db.execute(
             select(ScheduledJob).where(
                 ScheduledJob.workspace_id == workspace_id,
                 ScheduledJob.job_id == scoped_job_id,
-                ScheduledJob.enabled.is_(True),
             )
         )).scalars().all())
         if not rows:

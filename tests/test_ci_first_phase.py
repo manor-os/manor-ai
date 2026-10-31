@@ -58,6 +58,7 @@ def test_ci_uses_private_three_stage_triggers_and_public_pr_triggers() -> None:
     else:
         assert triggers["pull_request"]["branches"] == ["dev", "main"]
         assert triggers["push"]["branches"] == ["dev"]
+        assert triggers["merge_group"] == {"types": ["checks_requested"]}
 
 
 def test_pull_request_gate_keeps_docker_e2e_out_of_required_jobs() -> None:
@@ -102,7 +103,7 @@ def test_python_smoke_tests_are_the_required_first_phase_python_gate() -> None:
     assert "python scripts/run_python_tests.py smoke" in run_commands
     assert "--report-dir artifacts/smoke" in run_commands
     if not IS_PUBLIC_EXPORT:
-        assert "python scripts/ci_impact.py --run-focused" in run_commands
+        assert "python scripts/ci_impact.py --run-media-tests" in run_commands
 
 
 def test_email_proof_smoke_installs_its_isolated_redis_binary() -> None:
@@ -241,5 +242,7 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     assert deploy_with["external_repository"] == "manor-os/manor-os.github.io"
     assert deploy_with["destination_dir"] == "docs/manor-ai"
     assert deploy_with["keep_files"] is True
+
+
 
 

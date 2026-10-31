@@ -77,6 +77,29 @@ def test_decision_parser_is_json_only_and_strict() -> None:
         assert validation_error
 
 
+@pytest.mark.parametrize("decision", [
+    {"version": "1", "decision": "notify", "message": "Ready", "reason_code": "ready"},
+    {"version": "1", "decision": "silent", "reason_code": "nothing_new", "evidence_refs": [{"type": "source"}]},
+    {"version": "1", "decision": "notify", "reason_code": "ready"},
+    {"version": "1", "decision": "notify", "message": "   ", "reason_code": "ready"},
+    {"version": "1", "decision": "silent", "reason_code": "none", "message": "raw"},
+    {"version": "1", "decision": "silent", "reason_code": "Not-Snake"},
+    {"version": "2", "decision": "silent", "reason_code": "none"},
+    {"version": "1", "decision": "silent", "reason_code": "none", "extra": True},
+    {"version": "1", "decision": "silent", "reason_code": "none", "evidence_refs": [{"id": "x"}]},
+])
+def test_the_declared_result_schema_accepts_exactly_what_settlement_accepts(decision) -> None:
+    """The Task agent loop validates an Initiative Task's result against the
+    schema it declares; a result the loop accepts must also settle."""
+    from jsonschema import Draft202012Validator
+
+    from packages.core.contracts.agent_initiative import INITIATIVE_DECISION_RESULT_SCHEMA
+
+    schema_ok = Draft202012Validator(INITIATIVE_DECISION_RESULT_SCHEMA).is_valid(decision)
+    parsed, _error = parse_initiative_decision(decision)
+    assert schema_ok is (parsed is not None)
+
+
 def test_fingerprint_is_normalized_and_evidence_order_independent() -> None:
     left = _decision(
         message="  Material   UPDATE  ",
@@ -345,22 +368,6 @@ def test_result_revision_fence_allows_only_exact_or_system_one_shot_bump() -> No
         run=run,
         allow_one_shot_completion=True,
     ) is False
-
-
-def test_task_runner_metadata_preserves_exact_initiative_identity() -> None:
-    from packages.core.ai.task_runner import _task_runtime_metadata
-
-    marker = {
-        "version": "1",
-        "initiative_id": "initiative-1",
-        "initiative_run_id": "run-1",
-        "initiative_revision": 2,
-        "agent_subscription_id": "subscription-1",
-        "owner_user_id": "user-1",
-    }
-    assert _task_runtime_metadata(
-        SimpleNamespace(details={"agent_initiative": marker})
-    ) == {"agent_initiative": marker}
 
 
 @pytest.mark.asyncio

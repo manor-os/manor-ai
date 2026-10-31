@@ -2,12 +2,16 @@ from copy import deepcopy
 
 from packages.core.governance.approval_policy_migration import normalize_legacy_workspace_policy
 from packages.core.governance.approval_projection import import_blueprint_governance, compile_workspace_rules
+from tests.fixtures.approval_v1.approval_policy_migration import (
+    normalize_legacy_workspace_policy as v1_normalize_legacy_workspace_policy,
+)
 
 
 def fixture_source():
     old = {'never_allow_actions': ['ticket.create', 'billing.*'],
            'auto_approve_actions': ['email.send'], 'max_risk_level': 'medium'}
-    converted = normalize_legacy_workspace_policy(old, root_entity_id='e', safe_import=True)
+    # The audited after-image is what the historical conversion wrote.
+    converted = v1_normalize_legacy_workspace_policy(old, root_entity_id='e', safe_import=True)
     source = {'governance_policies': [{'workspace_id': 'w', 'entity_id': 'e', 'revision': 8, 'policy': converted}],
         'workspaces': [{'id': 'w', 'entity_id': 'e', 'settings': {}, 'operating_model': {}}],
         'governance_revisions': [{'workspace_id': 'w', 'revision': 8}]}

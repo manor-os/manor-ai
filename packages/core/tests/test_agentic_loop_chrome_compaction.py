@@ -346,7 +346,15 @@ def test_chrome_screenshot_rejects_invalid_webp_without_leaking_base64():
     }
 
 
-def test_chrome_task_ledger_preserves_user_takeover_interruption() -> None:
+@pytest.mark.parametrize(
+    ("reason", "next_action"),
+    [
+        ("user_takeover", "report_control_interruption"),
+        ("extension_reload", "report_control_interruption"),
+        ("explicit_stop", "report_explicit_stop"),
+    ],
+)
+def test_chrome_task_ledger_preserves_interruption_reason(reason: str, next_action: str) -> None:
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
     messages = [
         {"role": "user", "content": "Use Chrome to update the draft."},
@@ -365,7 +373,7 @@ def test_chrome_task_ledger_preserves_user_takeover_interruption() -> None:
             "content": json.dumps({
                 "ok": False,
                 "status": "interrupted",
-                "reason": "user_takeover",
+                "reason": reason,
                 "group_id": "group-a",
                 "control_epoch": "epoch-1",
                 "action_executed": False,
@@ -378,8 +386,8 @@ def test_chrome_task_ledger_preserves_user_takeover_interruption() -> None:
     ledger = json.loads(ledger_text.split("[Chrome task ledger]\n", 1)[1])
 
     assert ledger["stage"] == "interrupted"
-    assert ledger["reason"] == "user_takeover"
-    assert ledger["next"] == "report_user_takeover"
+    assert ledger["reason"] == reason
+    assert ledger["next"] == next_action
     assert ledger["group_id"] == "group-a"
 
 

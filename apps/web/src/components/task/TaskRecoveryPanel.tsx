@@ -1,14 +1,11 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import type { Task, TaskLog, TaskInputRequest } from "../../lib/types";
+import type { Task, TaskLog } from "../../lib/types";
 import { IconError, IconPlay, IconRefresh, IconWarning } from "../icons";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
 import { currentTaskBlocker } from "../../lib/taskBlocker";
 import TaskBlockerNotice from "./TaskBlockerNotice";
 import Card from "../ui/Card";
-import ChatActionCard from "../ui/ChatActionCard";
-import Chip from "../ui/Chip";
 
 
 type RecoverableStatus = "waiting_on_customer" | "blocked" | "failed";
@@ -19,12 +16,6 @@ interface TaskRecoveryPanelProps {
   logs: TaskLog[];
   comment?: string;
   detailReason?: string;
-  inputStepId?: string;
-  inputPrompt?: string;
-  inputRequests?: TaskInputRequest[];
-  inputResetToken?: number;
-  onResolveInput?: (request: TaskInputRequest, choice: string, note?: string, payload?: Record<string, any>, files?: File[]) => void;
-  reviewEffectsHref?: string;
   isPending?: boolean;
   variant?: "detail" | "compact";
   onRetry: (note?: string) => void;
@@ -47,18 +38,17 @@ function isRecoverableStatus(status: string): status is RecoverableStatus {
 function findLatestRecoveryEvent(
   logs: TaskLog[],
   status: RecoverableStatus,
-  inputStepId?: string,
 ) {
   const targetTypes =
     status === "waiting_on_customer"
       ? new Set(["ai_hitl_requested", "step_needs_human"])
       : status === "failed"
         ? new Set(["ai_execution_failed"])
-        : new Set(["ai_needs_replan"]);
-  return [...logs].reverse().find((log) => (
-    targetTypes.has(log.log_type)
-    && (!inputStepId || String(log.meta?.step_id || "") === inputStepId)
-  ));
+        : new Set(["ai_needs_replan", "ai_execution_failed"]);
+  return [...logs].sort((a, b) => (
+    Date.parse(b.created_at || "") - Date.parse(a.created_at || "")
+    || b.id.localeCompare(a.id)
+  )).find((log) => targetTypes.has(log.log_type));
 }
 
 function hitlFieldsFromLog(log?: TaskLog): HITLField[] {
@@ -76,12 +66,6 @@ export default function TaskRecoveryPanel({
   logs,
   comment = "",
   detailReason = "",
-  inputStepId,
-  inputPrompt = "",
-  inputRequests = [],
-  inputResetToken,
-  onResolveInput,
-  reviewEffectsHref,
   isPending = false,
   variant = "detail",
   onRetry,
@@ -91,7 +75,7 @@ export default function TaskRecoveryPanel({
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const isRecoverable = isRecoverableStatus(status);
   const lastEvent = isRecoverable
-    ? findLatestRecoveryEvent(logs, status, inputStepId)
+    ? findLatestRecoveryEvent(logs, status)
     : undefined;
 
   useEffect(() => {
@@ -100,40 +84,26 @@ export default function TaskRecoveryPanel({
 
   useEffect(() => {
     setFieldValues({});
-  }, [inputStepId, lastEvent?.id]);
+  }, [lastEvent?.id]);
 
-  // Runtime input is orthogonal to Task lifecycle: parallel work may still
-  // be running. Reuse the same form and exact resolver as Workspace Chat.
-  if (inputRequests.length > 0 && onResolveInput) {
-    return (
-      <Card minHeight={0} hoverable={false} className={`task-recovery-panel task-recovery-panel--${variant}`}>
-        <Chip size="sm">{t("component.workspace_chat.input_needed")}</Chip>
-        {inputRequests.map((request) => (
-          <ChatActionCard
-            key={request.message_id}
-            action={request.pending_action}
-            workspaceId={task?.workspace_id}
-            disabled={isPending}
-            resetToken={inputResetToken}
-            onResolve={(choice, note, payload, files) => onResolveInput(request, choice, note, payload, files)}
-          />
-        ))}
-      </Card>
-    );
-  }
   if (!isRecoverable) return null;
 
   const isWaiting = status === "waiting_on_customer";
   const isFailed = status === "failed";
   const reason = formatUserFacingStructuredText(
-    (inputStepId ? "" : detailReason) || lastEvent?.meta?.reason || lastEvent?.content || "",
+    detailReason
+    || lastEvent?.meta?.coordinator_outcome?.message
+    || lastEvent?.meta?.reason
+    || lastEvent?.content
+    || "",
   );
   const question = formatUserFacingStructuredText(
-    inputPrompt || lastEvent?.meta?.question || "",
+    lastEvent?.meta?.question || "",
   );
   const hitlFields = isWaiting ? hitlFieldsFromLog(lastEvent) : [];
   const hasStructuredHITL = hitlFields.length > 0;
-  const hasDetails = Boolean(question || (reason && reason !== question) || hasStructuredHITL);
+  const showReasonInline = status === "blocked" && Boolean(reason);
+  const hasDetails = Boolean(question || (reason && reason !== question && !showReasonInline) || hasStructuredHITL);
   const acceptsInput = isWaiting && Boolean(onRespond);
   const StatusIcon = isFailed ? IconError : IconWarning;
   const ActionIcon = acceptsInput ? IconPlay : IconRefresh;
@@ -143,33 +113,6 @@ export default function TaskRecoveryPanel({
     : isFailed
       ? { bg: "#f8f0ef", border: "#ecc8c5", text: "#883a35", icon: "#c14a44", iconBg: "#f1dddb" }
       : { bg: "#f9f4ec", border: "#ecdac2", text: "#7c4a2e", icon: "#b66a3c", iconBg: "#ffedd5" };
-
-  if (reviewEffectsHref) {
-    const compact = variant === "compact";
-    return (
-      <div className={`task-recovery-panel task-recovery-panel--${variant} task-recovery-panel--effect-review`} style={{
-        background: palette.bg,
-        border: `1px solid ${palette.border}`,
-        borderRadius: compact ? 10 : 12,
-        padding: compact ? 10 : 12,
-        display: "flex",
-        alignItems: "center",
-        flexWrap: "wrap",
-        gap: compact ? 8 : 10,
-      }}>
-        <div className="task-recovery-icon" style={{ width: compact ? 28 : 30, height: compact ? 28 : 30, borderRadius: 8, background: palette.iconBg, color: palette.icon, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-          <IconWarning size={compact ? 14 : 15} />
-        </div>
-        <div style={{ flex: 1, minWidth: 180 }}>
-          <div className="task-recovery-title" style={{ fontSize: compact ? 12 : 13, fontWeight: 750, color: "#1c1917" }}>{t("component.task_recovery_panel.effect_review_title")}</div>
-          <div className="task-recovery-helper" style={{ fontSize: compact ? 11 : 12, color: palette.text, lineHeight: 1.5, marginTop: 2 }}>{t("component.task_recovery_panel.effect_review_helper")}</div>
-        </div>
-        <Link to={reviewEffectsHref} className="btn-manor" style={{ fontSize: compact ? 11 : 12, padding: "0 12px", minHeight: 30, whiteSpace: "nowrap" }}>
-          {t("component.task_recovery_panel.review_in_chat")}
-        </Link>
-      </div>
-    );
-  }
 
   const blocker = currentTaskBlocker(task);
   if (blocker) {
@@ -291,6 +234,7 @@ export default function TaskRecoveryPanel({
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="task-recovery-title" style={{ fontSize: 12, fontWeight: 750, color: "#1c1917" }}>{compactTitle}</div>
+          {showReasonInline && <p className="task-recovery-reason mt-1 break-words text-xs text-stone-600">{reason}</p>}
           {expanded && <div className="task-recovery-helper" style={{ fontSize: 11, color: "#78716c", lineHeight: 1.45, marginTop: 2 }}>{helper}</div>}
         </div>
         {hasDetails && (
@@ -322,14 +266,14 @@ export default function TaskRecoveryPanel({
           <ActionIcon size={12} />
           {isPending ? t("component.task_recovery_panel.starting") : compactRetryLabel}
         </button>
-        {expanded && (question || reason) && (
+        {expanded && (question || (reason && !showReasonInline)) && (
           <div className="task-recovery-details" style={{
             width: "100%", marginTop: 8, padding: "8px 10px", borderRadius: 8,
             background: "rgba(255,255,255,0.72)", color: question ? "#292524" : "#78716c",
             fontSize: 11, lineHeight: 1.5,
           }}>
             {question || reason}
-            {question && reason && reason !== question && <div style={{ marginTop: 6, color: "#78716c" }}>{reason}</div>}
+            {question && reason && reason !== question && !showReasonInline && <div style={{ marginTop: 6, color: "#78716c" }}>{reason}</div>}
           </div>
         )}
         {expanded && renderStructuredFields(true)}
@@ -350,6 +294,7 @@ export default function TaskRecoveryPanel({
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="task-recovery-title" style={{ fontSize: 13, fontWeight: 750, color: "#1c1917" }}>{title}</div>
+          {showReasonInline && <p className="task-recovery-reason mt-1 break-words text-xs text-stone-600">{reason}</p>}
           {expanded && <div className="task-recovery-helper" style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, marginTop: 2 }}>{helper}</div>}
         </div>
         {hasDetails && (
@@ -381,7 +326,7 @@ export default function TaskRecoveryPanel({
           {question}
         </div>
       )}
-      {expanded && reason && reason !== question && (
+      {expanded && reason && reason !== question && !showReasonInline && (
         <div className="task-recovery-reason" style={{ fontSize: 12, color: palette.text, lineHeight: 1.5, marginTop: 8 }}>{reason}</div>
       )}
       {renderStructuredFields(false)}

@@ -1,19 +1,14 @@
 """Setup can use the normal Task runtime only through its durable job receipt."""
 
-from contextlib import asynccontextmanager
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
 from packages.core.constants.blueprints import installed_blueprint_job_id
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
 from packages.core.models.task import Task
 from packages.core.models.workspace import AgentSubscription, Workspace
-from packages.core.plans.executor import PlanExecutor
-from packages.core.plans.planner import PlannerError, _assert_workspace_setup_allows_planning
 from packages.core.services.blueprint_startup_service import blueprint_startup_contract_fingerprint
 from packages.core.services.task_execution import resolve_task_execution
 from packages.core.services.workspace_readiness import (
@@ -96,11 +91,11 @@ async def _setup(db):
 
 
 @pytest.mark.asyncio
-async def test_setup_child_keeps_coordinated_runtime_and_passes_planner_gate(db_session):
-    workspace, _sub, _job, _run, task = await _setup(db_session)
+async def test_setup_child_keeps_coordinated_runtime_and_setup_authority(db_session):
+    _workspace, _sub, _job, _run, task = await _setup(db_session)
     route = await resolve_task_execution(db_session, task)
     assert route.runtime_kind.value == "coordinated_plan"
-    await _assert_workspace_setup_allows_planning(db_session, SimpleNamespace(workspace=workspace), task)
+    assert await task_is_authorized_workspace_setup(db_session, task)
 
 
 @pytest.mark.asyncio
@@ -119,8 +114,15 @@ async def test_copied_job_markers_do_not_authorize_an_ordinary_task(db_session):
     db_session.add(ordinary)
     await db_session.flush()
     assert not await task_is_authorized_workspace_setup(db_session, ordinary)
-    with pytest.raises(PlannerError, match="setup is incomplete"):
-        await _assert_workspace_setup_allows_planning(db_session, SimpleNamespace(workspace=workspace), ordinary)
+
+
+@pytest.mark.asyncio
+async def test_setup_the_person_asked_for_runs_while_the_workspace_is_paused(db_session):
+    workspace, _sub, _job, run, task = await _setup(db_session)
+    workspace.status = "paused"
+    run.trigger_type = "manual"
+    await db_session.flush()
+    assert await task_is_authorized_workspace_setup(db_session, task)
 
 
 @pytest.mark.asyncio
@@ -177,8 +179,6 @@ async def test_setup_authority_is_revalidated_on_every_gate(db_session, revocati
         run.result = {**run.result, "dispatch_ledger": "invalid"}
     await db_session.flush()
     assert not await task_is_authorized_workspace_setup(db_session, task)
-    with pytest.raises(PlannerError):
-        await _assert_workspace_setup_allows_planning(db_session, SimpleNamespace(workspace=workspace), task)
 
 
 @pytest.mark.asyncio
@@ -198,105 +198,3 @@ async def test_automatic_setup_uses_actual_run_and_scoped_child_when_job_summary
     assert await evaluate_workspace_automatic_setup_status(
         db_session, workspace, [{"setup_job_id": "prepare-assets"}]
     ) == ("failed", task.id)
-
-
-@pytest.mark.asyncio
-async def test_setup_executor_reaches_normal_billing_gate_and_revocation_stops_it(db_session, monkeypatch):
-    from packages.core.plans import executor
-
-    workspace, _sub, job, _run, task = await _setup(db_session)
-    plan = ExecutionPlan(
-        id=generate_ulid(),
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        task_id=task.id,
-        status="draft",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    )
-    db_session.add(plan)
-    await db_session.flush()
-
-    class BillingGateReached(Exception):
-        pass
-
-    async def billing(*args, **kwargs):
-        raise BillingGateReached
-
-    monkeypatch.setattr(executor, "runtime_ensure_task_billing_context", billing)
-
-    @asynccontextmanager
-    async def sessions():
-        yield db_session
-
-    runner = PlanExecutor(session_factory=sessions)
-    with pytest.raises(BillingGateReached):
-        await runner.run_cycle(plan.id)
-    job.enabled = False
-    await db_session.flush()
-    result = await runner.run_cycle(plan.id)
-    assert result["status"] == "blocked_setup"
-    assert plan.status == "draft"
-
-
-@pytest.mark.asyncio
-async def test_setup_dispatcher_reaches_budget_gate_and_still_blocks_other_tasks(db_session, monkeypatch):
-    from decimal import Decimal
-    from packages.core import budget
-    from packages.core.dispatcher.service import Dispatcher
-    from packages.core.models.execution import ExecutionStep
-    from packages.core.models.worker import SubscriptionWorker, Worker
-    from packages.core.models.workspace import Agent
-
-    workspace, sub, job, _run, task = await _setup(db_session)
-    worker = Worker(
-        id=generate_ulid(), entity_id=workspace.entity_id, kind="internal",
-        display_name="Setup worker", status="active", monthly_spent_usd=Decimal("0"),
-        capabilities={"supported_kinds": ["subagent"], "max_risk_level": "high"},
-    )
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
-        task_id=task.id, status="running", execution_mode="live", approval_required=False,
-        plan_dag={"steps": []},
-    )
-    step = ExecutionStep(
-        id=generate_ulid(), plan_id=plan.id, entity_id=workspace.entity_id,
-        workspace_id=workspace.id, step_key="prepare_assets", kind="subagent",
-        service_key=sub.service_key, params={"prompt": "Prepare the shared assets."},
-        depends_on=[], step_status="pending", risk_level="low", requires_approval=False,
-        attempt_count=0, max_attempts=3,
-    )
-    ordinary = Task(
-        id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
-        title="Ordinary work", status="in_progress", agent_id=task.agent_id,
-        owner_subscription_id=sub.id, details=deepcopy(task.details),
-    )
-    db_session.add_all([
-        worker, plan, step, ordinary,
-        Agent(id=task.agent_id, entity_id=workspace.entity_id, name="Producer",
-              slug=f"producer-{task.agent_id}", status="active"),
-        SubscriptionWorker(subscription_id=sub.id, worker_id=worker.id,
-                           priority=100, is_preferred=True),
-    ])
-    await db_session.flush()
-
-    class BudgetGateReached(Exception):
-        pass
-
-    async def check_budget(*args, **kwargs):
-        raise BudgetGateReached
-
-    monkeypatch.setattr(budget, "check_workspace_budget", check_budget)
-    dispatcher = Dispatcher()
-    with pytest.raises(BudgetGateReached):
-        await dispatcher.checkout_steps_for_worker(db_session, worker, plan_id=plan.id)
-    plan.task_id = ordinary.id
-    await db_session.flush()
-    assert await dispatcher.checkout_steps_for_worker(db_session, worker, plan_id=plan.id) == []
-    plan.task_id = task.id
-    job.enabled = False
-    await db_session.flush()
-    assert await dispatcher.checkout_steps_for_worker(db_session, worker, plan_id=plan.id) == []
-    assert step.step_status == "pending"
-    assert step.current_lease_id is None

@@ -1063,7 +1063,11 @@ async def test_workspace_chat_free_music_import_is_shared(
 ):
     from apps.api.routers import media
     from packages.core.config import get_settings
-    from packages.core.services.open_music_catalog import DownloadedOpenMusic, OpenMusicTrack
+    from packages.core.services.open_music_catalog import (
+        COMMONS_CATALOG,
+        DownloadedOpenMusic,
+        OpenMusicTrack,
+    )
 
     headers = await _auth(client, "wsdoc_chat_music_owner")
     owner = await _me(client, headers)
@@ -1091,14 +1095,19 @@ async def test_workspace_chat_free_music_import_is_shared(
     settings = get_settings()
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
     monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    # A fallback-catalog track: its license and credit are recorded under the
+    # catalog that listed it, exactly as Openverse tracks are.
     track = OpenMusicTrack(
-        id="test-track", title="Music", creator="Creator", duration_seconds=1,
-        preview_url="https://example.test/preview", source_url="https://example.test/source",
-        license="cc0", license_name="CC0", license_url="https://example.test/license",
-        attribution="Creator", source="test", provider="test", genres=(),
+        id="commons:123", title="Music", creator="Creator", duration_seconds=1,
+        preview_url="https://upload.wikimedia.org/preview.mp3",
+        source_url="https://commons.wikimedia.org/wiki/File:Music.mp3",
+        license="by", license_name="CC BY 4.0", license_url="https://creativecommons.org/licenses/by/4.0/",
+        attribution='"Music" by Creator, via Wikimedia Commons', source=COMMONS_CATALOG,
+        provider=COMMONS_CATALOG, genres=(), catalog=COMMONS_CATALOG,
     )
 
-    async def fake_track(_track_id):
+    async def fake_track(track_id):
+        assert track_id == track.id
         return track
 
     async def fake_download(_track, target_path, **_kwargs):
@@ -1116,6 +1125,15 @@ async def test_workspace_chat_free_music_import_is_shared(
     document = imported.json()["document"]
     assert document["visibility"] == "workspace"
     assert document["fs_path"].startswith("Workspaces/_by_id/")
+    assert imported.json()["track"]["catalog"] == COMMONS_CATALOG
+    async with db_module.async_session() as db:
+        stored = await db.get(Document, document["id"])
+    assert stored.source == COMMONS_CATALOG
+    credit = stored.metadata_["external"][COMMONS_CATALOG]
+    assert credit["id"] == "commons:123"
+    assert credit["license"] == "by"
+    assert credit["license_url"] == track.license_url
+    assert credit["attribution"] == track.attribution
     assert (await client.get(
         f"/api/v1/documents/{document['id']}", headers=member["headers"],
     )).status_code == 200

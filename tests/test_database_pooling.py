@@ -9,7 +9,7 @@ from packages.core import database
 
 def test_cloud_pgbouncer_mode_keeps_a_client_pool_and_unique_prepared_names() -> None:
     """Each new PgBouncer client connection costs a TLS + SCRAM handshake
-    (~105ms on DOKS); API/chat reuse connections from a bounded pool."""
+    (~105ms on managed Postgres); API/chat reuse connections from a bounded pool."""
     settings = SimpleNamespace(
         DATABASE_ECHO=False,
         DATABASE_POOL_MODE="pgbouncer",

@@ -277,6 +277,8 @@ async def test_canonical_action_scope_reaches_shared_policy(monkeypatch):
         "action_key": "chrome.fill_or_select",
         "resource_id": "tab:1",
         "capability_id": "chrome.action",
+        # The provider's own category reaches the shared policy as facts.
+        "policy_category": None,
     }
 
 

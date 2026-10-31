@@ -23,7 +23,8 @@ Credentials are leased from the ChannelConfig's source Integration::
 
     {
       "runner_url":   "https://wechat-bot.internal:8800",  # default OK
-      "bearer_token": "shared-secret",                       # optional
+      "bearer_token": "shared-secret",                       # required
+                                                             # for inbound
       "session_id":   "abc123",                              # required
                                                              # — set when
                                                              # the user
@@ -42,6 +43,7 @@ where the user's WeChat sends a hello first.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -174,16 +176,17 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
     async def verify_inbound(
         self, cc: ChannelConfig, *, headers, query, body,
     ) -> bool:
-        """If the runner was given a bearer token, every inbound POST it
-        makes back to us must echo it in ``Authorization: Bearer ...``."""
+        """Every inbound POST the runner makes back to us must echo its
+        bearer token in ``Authorization: Bearer ...``. Without a configured
+        token there is nothing to prove the sender, so reject."""
         credentials = await self.credentials(
             cc, reason="channel.wechat_personal.verify_inbound",
         )
-        expected = credentials.get("bearer_token")
+        expected = str(credentials.get("bearer_token") or "").strip()
         if not expected:
-            return True  # no shared secret configured — accept
+            return False
         got = (headers.get("authorization") or headers.get("Authorization") or "").strip()
-        return got == f"Bearer {expected}"
+        return hmac.compare_digest(got.encode(), f"Bearer {expected}".encode())
 
     async def parse_inbound(
         self, cc: ChannelConfig, *, headers, query, body,

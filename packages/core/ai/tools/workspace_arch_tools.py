@@ -17,6 +17,7 @@ call before it reaches the handler.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -158,59 +159,81 @@ PROPOSE_SERVICE_SCHEMA = {
 }
 
 
-CONFIGURE_APP_VIEW_SCHEMA = {
+DESIGN_APP_VIEW_SCHEMA = {
     "type": "function",
     "function": {
-        "name": "ws_configure_app_view",
+        "name": "ws_design_app_view",
         "description": (
-            "Choose the home panel's title, description, primary service, order, short display names, and optional guided inputs "
-            "from services already saved in this Workspace draft. Presentation only: "
-            "this does not create runnable Workflows or grant tools."
+            "Command the App designer to design this Draft's App page from the services, Workflows, "
+            "tracked numbers and Automations already saved. It composes the page from the App module schematic and recipes "
+            "(entries, card actions, data views, sections) and returns a checked candidate with its design notes; "
+            "the candidate changes nothing until you accept it with ws_accept_app_view. To send it back, call "
+            "this again with feedback."
         ),
         "parameters": {
             "type": "object",
-            "required": ["draft_id", "hero_service_key", "service_order"],
+            "required": ["draft_id", "brief"],
             "properties": {
                 "draft_id": {"type": "string"},
-                "page_eyebrow": {"type": "string", "maxLength": 60},
-                "page_title": {"type": "string", "minLength": 1, "maxLength": 100},
-                "page_description": {"type": "string", "maxLength": 600},
-                "page_layout": {"type": "string", "enum": ["feature", "cover", "list"]},
-                "hero_service_key": {"type": "string"},
-                "service_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
-                "labels": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["service_key", "label"],
-                        "properties": {
-                            "service_key": {"type": "string"},
-                            "label": {"type": "string", "minLength": 1, "maxLength": 80},
-                        },
-                    },
-                },
-                "forms": {
-                    "type": "array",
-                    "description": "Optional guided input fields for a saved service action. File fields attach the selected file to Workspace chat.",
-                    "items": {
-                        "type": "object", "required": ["service_key", "fields"],
-                        "properties": {
-                            "service_key": {"type": "string"},
-                            "fields": {"type": "array", "maxItems": 10, "items": {
-                                "type": "object", "required": ["key", "label", "type"],
-                                "properties": {
-                                    "key": {"type": "string"}, "label": {"type": "string"},
-                                    "type": {"type": "string", "enum": ["text", "long_text", "file", "number", "select"]},
-                                    "required": {"type": "boolean"}, "placeholder": {"type": "string"},
-                                    "options": {"type": "array", "items": {"type": "string"}},
-                                },
-                            }},
-                        },
-                    },
-                },
+                "brief": {"type": "string", "minLength": 1, "maxLength": 4000, "description": (
+                    "What the person wants to do from the App, in their words: the main job, the kinds of work "
+                    "they start, what they want to see (progress, results, numbers).")},
+                "feedback": {"type": "string", "maxLength": 4000, "description": (
+                    "Why the last candidate was not accepted and what to change.")},
             },
         },
     },
+}
+
+ACCEPT_APP_VIEW_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_accept_app_view",
+        "description": (
+            "Accept the App designer's candidate as this Draft's App page. Accept only when it fits the "
+            "brief: the main job is the hero, every visible entry is something the person starts, and the data "
+            "views show what the Workflows keep."
+        ),
+        "parameters": {"type": "object", "required": ["draft_id"], "properties": {"draft_id": {"type": "string"}}},
+    },
+}
+
+PROPOSE_WORKFLOW_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_propose_workflow",
+        "description": "Add or replace a portable native Workflow definition in this draft. Use stable snake_case slug and structured steps; this creates no run.",
+        "parameters": {"type": "object", "required": ["draft_id", "slug", "name", "steps"], "properties": {
+            "draft_id": {"type": "string"}, "slug": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+            "name": {"type": "string", "minLength": 1}, "steps": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "type", "config"], "properties": {
+                "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "name": {"type": "string"},
+                "type": {"type": "string", "description": "Native Workflow node type. For a project use exactly workflow_project, never tool/manor."},
+                "next": {"type": "array", "items": {"type": "string"}},
+                "config": {"type": "object", "description": "For workflow_project create: {operation:'create',project_type:'...',project_key:'...',schema_version:1,state_schema:{type:'object',properties:{status:{type:'string'},deliverable_document_id:{type:'string'}}},state:{},current_stage:'new'}. State fields used by App must appear in state_schema.properties."}
+            }}},
+            "internal": {"type": "boolean"}, "trigger_type": {"type": "string"}, "binding_config": {"type": "object"},
+            "variables": {"type": "array"},
+            "run_inputs": {"type": "array", "items": {"type": "object"}, "description": (
+                "The inputs a run asks for: {key,label,type,required,hidden,description,schema}. A hidden input "
+                "an App entry fills: schema {type:'string','x-ui':{control:'workflow_project_select',"
+                "project_type:'<type>'}} picks a project; a plain string takes a planned code.")},
+            "output_schema": {"type": "object"}, "enabled": {"type": "boolean"}
+        }}
+    }
+}
+
+PROPOSE_STAT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_propose_stat",
+        "description": "Add or replace one portable native Stat definition. The collector and key must be explicit; this never creates observations.",
+        "parameters": {"type": "object", "required": ["draft_id", "key", "name"], "properties": {
+            "draft_id": {"type": "string"}, "key": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
+            "name": {"type": "string", "minLength": 1}, "library_key": {"type": "string"}, "description": {"type": "string"},
+            "value_type": {"type": "string"}, "unit": {"type": "string"}, "window": {"type": "string"},
+            "collector_type": {"type": "string"}, "collector_config": {"type": "object"}, "collection_cadence": {"type": "string"}, "goal_eligible": {"type": "boolean"}
+        }}
+    }
 }
 
 
@@ -678,6 +701,7 @@ PROPOSE_AUTOMATION_SCHEMA = {
                 "description": {"type": "string", "minLength": 10},
                 "trigger": {"type": "string", "description": "e.g. 'daily 08:00', 'on_message_received', 'weekly mon 09:00'"},
                 "service_key": {"type": "string"},
+                "scheduled_job": {"type": "object", "description": "Optional native scheduled-job declaration. Include job_id, schedule and execution_target; workflow targets use workflow_slug from ws_propose_workflow."},
             },
         },
     },
@@ -980,7 +1004,10 @@ MARK_READY_SCHEMA = {
 ALL_TOOL_SCHEMAS = [
     COMMIT_BASICS_SCHEMA,
     PROPOSE_SERVICE_SCHEMA,
-    CONFIGURE_APP_VIEW_SCHEMA,
+    DESIGN_APP_VIEW_SCHEMA,
+    ACCEPT_APP_VIEW_SCHEMA,
+    PROPOSE_WORKFLOW_SCHEMA,
+    PROPOSE_STAT_SCHEMA,
     PROPOSE_GOAL_SCHEMA,
     PROPOSE_AGENT_MAPPING_SCHEMA,
     REQUEST_CUSTOM_AGENT_SCHEMA,
@@ -3034,58 +3061,147 @@ def _hard_block_request_problem(draft, *, flagged: bool, quote: str) -> str:
     return ""
 
 
-# ── ws_configure_app_view ───────────────────────────────────────────────────
+# ── ws_design_app_view / ws_accept_app_view ─────────────────────────────────
 
-async def _configure_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
-    from packages.core.services.workspace_app_view import normalize_app_view_config
+async def _design_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
+    """Run the App design sub-agent and keep its candidate beside the App."""
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.workspace_app_designer import (
+        AppDesignContext,
+        app_view_candidate_summary,
+        project_structure_issues,
+        run_app_designer,
+    )
+
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    brief = str(kwargs.get("brief") or "").strip()
+    if not brief:
+        return _err("brief is required: say what the person wants to do from the App")
+    fields = dict(draft.fields or {})
+    context = AppDesignContext.from_draft_fields(fields)
+    if not context.services and not context.workflows:
+        return _err("save the services and Workflows before commanding the App design")
+    blocking = [issue for issue in project_structure_issues(context.workflows) if issue["severity"] == "P0"]
+    if blocking:
+        return _err("fix these Workflows with ws_propose_workflow before commanding the App design",
+                    issues=blocking)
+    result = await run_app_designer(
+        context, brief=brief, feedback=kwargs.get("feedback"), entity_id=entity_id, user_id=user_id or None,
+        workspace_id=None, surface=ChatSurface.WORKSPACE_DRAFT_ARCHITECT,
+    )
+    if result.app_view is None:
+        return _err("the App designer did not produce a page that passes its checks",
+                    design_notes=result.notes, attempts=result.attempts)
+    fields["app_view_candidate"] = {
+        "app_view": result.app_view, "brief": brief, "recipes": result.recipes,
+        "warnings": result.warnings, "design_notes": result.notes,
+    }
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({
+        "candidate": app_view_candidate_summary(result.app_view), "recipes": result.recipes,
+        "warnings": result.warnings, "design_notes": result.notes,
+        "next": "Accept with ws_accept_app_view, or call ws_design_app_view again with feedback.",
+    })
+
+
+async def _accept_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
+    from packages.core.services.workspace_app_designer import AppDesignContext
 
     draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
     if draft is None:
         return _err("draft not found")
     fields = dict(draft.fields or {})
-    service_keys = {
-        str(service.get("key") or service.get("service_key") or "").strip()
-        for service in fields.get("services") or []
-        if isinstance(service, dict)
-    }
-    hero = str(kwargs.get("hero_service_key") or "").strip()
-    order = kwargs.get("service_order") or []
-    if not hero or hero not in service_keys:
-        return _err("hero_service_key must name a service already in the draft")
-    if (
-        not isinstance(order, list)
-        or any(not isinstance(key, str) for key in order)
-        or len(order) != len(set(order))
-        or any(key not in service_keys for key in order)
-    ):
-        return _err("service_order must contain unique saved service keys")
-    labels: dict[str, str] = {}
-    for row in kwargs.get("labels") or []:
-        if not isinstance(row, dict) or row.get("service_key") not in service_keys:
-            return _err("each display label must name a saved service key")
-        labels[f"service:{row['service_key']}"] = row.get("label", "")
-    forms: dict[str, list[dict[str, Any]]] = {}
-    for row in kwargs.get("forms") or []:
-        if not isinstance(row, dict) or row.get("service_key") not in service_keys:
-            return _err("each form must name a saved service key")
-        forms[f"service:{row['service_key']}"] = row.get("fields", [])
-    try:
-        config = normalize_app_view_config({
-            "eyebrow": kwargs.get("page_eyebrow"),
-            "title": kwargs.get("page_title") or None,
-            "description": kwargs.get("page_description"),
-            "layout": kwargs.get("page_layout", "feature"),
-            "hero": f"service:{hero}",
-            "order": [f"service:{key}" for key in order],
-            "labels": labels,
-            "forms": forms,
-        })
-    except ValueError as exc:
-        return _err(str(exc))
+    candidate = fields.get("app_view_candidate")
+    if not isinstance(candidate, dict):
+        return _err("no App design is waiting; command one with ws_design_app_view")
+    # The Draft may have changed since the design was checked.
+    config, errors, _ = AppDesignContext.from_draft_fields(fields).check(candidate.get("app_view"))
+    if errors:
+        return _err("the Draft changed since this design was checked; command a new design", errors=errors)
     fields["app_view"] = config
+    fields.pop("app_view_candidate", None)
     draft.fields = fields
     await _persist(db, draft)
-    return _ok({"hero_service_key": hero, "service_order": order})
+    return _ok({"accepted": True, "hero": config["hero"], "entry_count": len(config["entries"]),
+                "component_count": len(config["components"])})
+
+
+async def _propose_workflow(db, *, entity_id: str, user_id: str = "", **kwargs):
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    slug = str(kwargs.get("slug") or "").strip()
+    if not _SLUG_RE.match(slug):
+        return _err("workflow slug must be snake_case", got=slug)
+    steps = kwargs.get("steps")
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+        return _err("workflow steps must be a non-empty array of objects")
+    for step in steps:
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        if step.get("type") == "tool" and str(config.get("tool") or "") == "manor":
+            return _err("use the native workflow_project node for project creation; tool/manor wrappers cannot declare App-readable project state")
+        if step.get("type") == "workflow_project" and str(config.get("operation") or "") in {"create", "claim"}:
+            schema = config.get("state_schema")
+            if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict):
+                return _err("workflow_project create requires state_schema.properties for every App-readable state field")
+    workflow = {key: copy.deepcopy(kwargs[key]) for key in (
+        "slug", "name", "steps", "internal", "trigger_type", "binding_config", "variables", "run_inputs",
+        "output_schema", "enabled",
+    ) if key in kwargs}
+    workflow["slug"] = slug
+    try:
+        from packages.core.blueprints.installer import _blueprint_workflow_definition_values
+        _blueprint_workflow_definition_values(workflow)
+    except Exception as exc:
+        return _err(f"workflow is invalid: {exc}")
+    fields = dict(draft.fields or {})
+    fields["workflows"] = _replace_in_list(
+        [item for item in fields.get("workflows") or [] if isinstance(item, dict)],
+        "slug", slug, workflow,
+    )
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"slug": slug, "internal": bool(workflow.get("internal"))})
+
+
+async def _propose_stat(db, *, entity_id: str, user_id: str = "", **kwargs):
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    key = str(kwargs.get("key") or "").strip()
+    if not key:
+        return _err("stat key is required")
+    stat = {field: copy.deepcopy(kwargs[field]) for field in (
+        "key", "name", "library_key", "description", "value_type", "unit", "window", "collector_type", "collector_config", "collection_cadence", "goal_eligible"
+    ) if field in kwargs}
+    stat["key"] = key
+    try:
+        # Reuse the native Stat definition validator, rather than accepting a
+        # dashboard-only shape that fails only after Workspace creation.
+        resolve_draft_goal_measurements({"stats": [stat], "goals": []})
+    except ValueError as exc:
+        return _err(str(exc))
+    fields = dict(draft.fields or {})
+    fields["stats"] = _replace_in_list(
+        [item for item in fields.get("stats") or [] if isinstance(item, dict)],
+        "key", key, stat,
+    )
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"key": key})
+
+
+def _validate_draft_resources(fields: dict[str, Any]) -> None:
+    """Apply portable Blueprint validation before Draft readiness/finalize."""
+    from packages.core.blueprints.installer import validate_portable_recipe_resources
+    recipe = {"workflows": fields.get("workflows") or [], "scheduled_jobs": fields.get("scheduled_jobs") or []}
+    try:
+        validate_portable_recipe_resources(recipe)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
 
 
 # ── ws_propose_automation ───────────────────────────────────────────────────
@@ -3114,6 +3230,19 @@ async def _propose_automation(db, *, entity_id: str, user_id: str = "", **kwargs
         if _automation_signature(item) != _automation_signature(automation)
     ]
     fields["automations"] = _replace_in_list(existing, "automation_key", automation_key, automation)
+    scheduled_job = kwargs.get("scheduled_job")
+    if scheduled_job is not None:
+        if not isinstance(scheduled_job, dict):
+            return _err("scheduled_job must be an object")
+        job_id = str(scheduled_job.get("job_id") or automation_key).strip()
+        if not _SLUG_RE.match(job_id):
+            return _err("scheduled_job.job_id must be snake_case")
+        native_job = copy.deepcopy(scheduled_job)
+        native_job["job_id"] = job_id
+        fields["scheduled_jobs"] = _replace_in_list(
+            [item for item in fields.get("scheduled_jobs") or [] if isinstance(item, dict)],
+            "job_id", job_id, native_job,
+        )
     _reconcile_removed_channel_references(fields)
     draft.fields = fields
     await _persist(db, draft)
@@ -3637,6 +3766,22 @@ async def _get_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
     draft = await _load_draft(db, draft_id, entity_id, user_id)
     if draft is None:
         return _err("draft not found")
+    fields = dict(draft.fields or {})
+    workflows = [item for item in fields.get("workflows") or [] if isinstance(item, dict)]
+    stats = [item for item in fields.get("stats") or [] if isinstance(item, dict)]
+    producers = []
+    for workflow in workflows:
+        for step in workflow.get("steps") or []:
+            config = step.get("config") if isinstance(step, dict) else None
+            if not isinstance(config, dict) or str(step.get("type") or step.get("kind") or "") != "workflow_project":
+                continue
+            schema = config.get("state_schema") if isinstance(config.get("state_schema"), dict) else {}
+            producers.append({
+                "workflow_slug": workflow.get("slug"), "project_type": config.get("project_type"),
+                "schema_version": config.get("schema_version"),
+                "step_id": step.get("id"),
+                "state_fields": sorted((schema.get("properties") or {}).keys()),
+            })
     return _ok({
         "draft": {
             "id": draft.id,
@@ -3644,7 +3789,14 @@ async def _get_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             "ready": bool(draft.ready),
             "missing": list(draft.missing or []),
             # Source text is paged through ws_read_source; never dump it here.
-            "fields": strip_source_text(dict(draft.fields or {})),
+            "fields": strip_source_text(fields),
+        },
+        "resource_catalog": {
+            "workflow_definitions": [str(item.get("slug")) for item in workflows if item.get("slug")],
+            "workflow_bindings": [str(item.get("slug")) for item in workflows if item.get("slug") and not item.get("internal")],
+            "stats": [str(item.get("key") or item.get("library_key")) for item in stats if item.get("key") or item.get("library_key")],
+            "scheduled_jobs": [str(item.get("job_id")) for item in fields.get("scheduled_jobs") or [] if isinstance(item, dict) and item.get("job_id")],
+            "project_producers": producers,
         },
     })
 
@@ -3836,6 +3988,36 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
 
     fields = dict(draft.fields or {})
     issues: List[Dict[str, Any]] = []
+
+    # A data component is executable configuration, not decorative prose.  It
+    # may only refer to native resources actually present in this Draft.  The
+    # same validator runs again during Blueprint export/install with resolved
+    # IDs, but reject invalid AI output before a Draft can be marked ready.
+    if isinstance(fields.get("app_view"), dict):
+        try:
+            from packages.core.services.workspace_app_view import validate_app_view_data_contract
+            workflows = [item for item in fields.get("workflows") or [] if isinstance(item, dict)]
+            definitions = {str(item.get("slug") or "") for item in workflows if item.get("slug")}
+            bindings = {str(item.get("slug") or "") for item in workflows if item.get("slug") and not item.get("internal")}
+            stats = {str(item.get("key") or item.get("library_key") or "") for item in fields.get("stats") or [] if isinstance(item, dict)}
+            validate_app_view_data_contract(
+                fields["app_view"].get("data_sources", {}), fields["app_view"].get("components", []),
+                catalog={"workflow_definitions": definitions, "workflow_bindings": bindings,
+                         "stat_keys": stats, "workflows": workflows},
+            )
+        except ValueError as exc:
+            issues.append({"severity": "P0", "where": "app_view", "message": str(exc)})
+    from packages.core.services.workspace_app_designer import project_structure_issues
+    issues.extend(project_structure_issues(
+        [item for item in fields.get("workflows") or [] if isinstance(item, dict) and item.get("slug")]))
+    if isinstance(fields.get("app_view_candidate"), dict):
+        issues.append({"severity": "P1", "where": "app_view_candidate", "message": (
+            "An App design is waiting for acceptance -- accept it with ws_accept_app_view or "
+            "send it back with ws_design_app_view and feedback.")})
+    try:
+        _validate_draft_resources(fields)
+    except ValueError as exc:
+        issues.append({"severity": "P0", "where": "resources", "message": str(exc)})
 
     # Top-level basics
     for required in ("name", "kind", "operating_context", "primary_work"):
@@ -4488,7 +4670,10 @@ async def _mark_ready(db, *, entity_id: str, user_id: str = "", **kwargs):
 HANDLERS = {
     "ws_commit_basics": _commit_basics,
     "ws_propose_service": _propose_service,
-    "ws_configure_app_view": _configure_app_view,
+    "ws_design_app_view": _design_app_view,
+    "ws_accept_app_view": _accept_app_view,
+    "ws_propose_workflow": _propose_workflow,
+    "ws_propose_stat": _propose_stat,
     "ws_propose_goal": _propose_goal,
     "ws_propose_agent_mapping": _propose_agent_mapping,
     "ws_request_custom_agent": _request_custom_agent,

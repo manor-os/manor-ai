@@ -37,6 +37,21 @@ def test_service_workflow_target_uses_the_flow_input_contract_and_keeps_service_
     assert action["inputs"] == list(flow().run_inputs)
 
 
+def test_a_targeted_entry_carries_a_hidden_flow_input_only_when_its_preset_sets_it():
+    hidden_flow = SimpleNamespace(**{**vars(flow()), "run_inputs": (
+        {"key": "topic", "label": "Topic", "required": True},
+        {"key": "kind", "label": "Kind", "hidden": True, "default": ""},
+    )})
+    ws = workspace("workflow:binding")
+    ws.operating_model["app_view"]["presets"] = {"service:draft": {"kind": "pitch"}}
+    action = next(row for row in project_workspace_app_view(ws, [hidden_flow])["actions"] if row["key"] == "service:draft")
+    assert [(item["key"], item.get("default"), item.get("hidden", False)) for item in action["inputs"]] == [
+        ("topic", None, False), ("kind", "pitch", True)]
+    action = next(row for row in project_workspace_app_view(workspace("workflow:binding"), [hidden_flow])["actions"]
+                  if row["key"] == "service:draft")
+    assert [item["key"] for item in action["inputs"]] == ["topic"]
+
+
 def test_unavailable_selected_workflow_never_falls_back_to_the_service_agent():
     agent = {"id": "agent", "name": "Writer", "service_key": "draft"}
     action = project_workspace_app_view(workspace("workflow:binding"), [], agents=[agent])["actions"][0]
@@ -89,7 +104,8 @@ async def test_shared_catalog_contains_agents_automations_and_only_readable_save
     private = SimpleNamespace(id="private", entity_id="entity", name="Private", description="", steps=[], variables={})
     invalid = SimpleNamespace(id="invalid", entity_id="entity", name="Invalid", description="", steps=[], variables={})
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([saved, private, invalid]),
+        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([[]]), Rows([]),
+        Rows([saved, private, invalid]),
     ]))
     entries = AsyncMock(return_value=[flow()])
     monkeypatch.setattr("packages.core.services.workspace_workflow_router.list_workspace_chat_entrypoints", entries)
@@ -111,7 +127,7 @@ async def test_runtime_app_keeps_live_targets_without_querying_saved_workflow_ca
     job = SimpleNamespace(job_id="job", name="Daily", enabled=False, last_status=None,
                           execution_target={}, agent_initiative_id=None)
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]),
+        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([[]]), Rows([]),
     ]))
     entries = AsyncMock(return_value=[flow()])
     readable = AsyncMock()
@@ -123,7 +139,7 @@ async def test_runtime_app_keeps_live_targets_without_querying_saved_workflow_ca
     assert view == project_workspace_app_view(workspace(target), [flow()], [job], [
         {"id": "agent", "name": "Writer", "service_key": "draft"},
     ])
-    assert db.execute.await_count == 2
+    assert db.execute.await_count == 4
     readable.assert_not_awaited()
     assert entries.call_args.kwargs["require_control"] is True
     assert entries.call_args.kwargs["user"] is user
@@ -137,7 +153,7 @@ async def test_app_loader_calls_real_workflow_catalog_with_unpublished_bindings(
     workflow = SimpleNamespace(id="workflow", name="Article Flow", description="Generate an article",
                                steps=[], variables={})
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(binding, workflow)]), Rows([]), Rows([]), Rows([]),
+        Rows([(binding, workflow)]), Rows([]), Rows([]), Rows([[]]), Rows([]), Rows([]),
     ]))
     monkeypatch.setattr("packages.core.services.workspace_access.user_can_write_workspace_artifacts",
                         AsyncMock(return_value=True))
@@ -310,7 +326,9 @@ async def test_reviewed_attachment_persists_a_runnable_app_target_and_rechecks_d
     response = await client.post(f"/api/v1/workspaces/{ws_id}/operation/drafts", headers=headers, json={
         "patches": [
             {"op": "service_role.upsert", "payload": {"service": {"key": "article", "name": "Write Article"}}},
-            {"op": "workflow_binding.attach", "payload": {"workflow_id": workflow_id, "service_key": "article"}},
+            {"op": "workflow_binding.attach", "payload": {
+                "workflow_id": workflow_id, "service_key": "article", "slug": "article-flow",
+            }},
         ],
     })
     assert response.status_code == 200, response.text
@@ -327,6 +345,13 @@ async def test_reviewed_attachment_persists_a_runnable_app_target_and_rechecks_d
     assert applied.status_code == 200, applied.text
     bindings = (await client.get(bindings_url, headers=headers)).json()
     assert len(bindings) == 1
+    # The slug is the Workflow's portable identity (export, agent_review
+    # Stats); a later attach cannot rename it.
+    assert bindings[0]["config"]["workspace_blueprint_workflow_slug"] == "article-flow"
+    renamed = await client.post(f"/api/v1/workspaces/{ws_id}/operation/drafts", headers=headers, json={
+        "patches": [{"op": "workflow_binding.attach", "payload": {"workflow_id": workflow_id, "slug": "renamed-flow"}}],
+    })
+    assert renamed.status_code == 200 and renamed.json()["validation"]["valid"] is False, renamed.text
     view = (await client.get(f"/api/v1/workspaces/{ws_id}/app-view", headers=headers)).json()
     action = next(row for row in view["actions"] if row["key"] == "service:article")
     assert action["kind"] == "workflow"

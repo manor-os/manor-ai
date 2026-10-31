@@ -1,0 +1,22 @@
+{
+  "name": "manor",
+  "displayName": "Manor",
+  "version": "0.9.1",
+  "icon": "./assets/logo.png",
+  "description": "Build, version, test and deliver Manor Workspaces for your customers from Claude Code.",
+  "author": {
+    "name": "Manor AI",
+    "url": "https://github.com/manor-os/manor-os"
+  },
+  "homepage": "https://github.com/manor-os/manor-os/tree/main/plugins/manor",
+  "repository": "https://github.com/manor-os/manor-os",
+  "license": "Manor Sustainable Use License 1.0",
+  "keywords": [
+    "manor",
+    "workspace",
+    "blueprint",
+    "agents",
+    "mcp",
+    "fde"
+  ]
+}

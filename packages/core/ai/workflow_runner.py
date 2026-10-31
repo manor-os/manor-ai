@@ -23,6 +23,7 @@ import html
 import ipaddress
 import json
 import logging
+import math
 import operator
 import os
 import re
@@ -51,6 +52,7 @@ from packages.core.ai.runtime import (
     runtime_prepare_named_tool_surface_for_turn,
     runtime_prepare_prompt_appendix_for_turn,
     runtime_prepare_trace_envelope_for_turn,
+    runtime_prompt_with_completion_rules,
     runtime_prompt_with_output_schema,
     runtime_request_for_surface_turn,
     runtime_tool_status_for_chat,
@@ -68,22 +70,52 @@ from packages.core.constants.workflow import (
 )
 from packages.core.database import async_session
 from packages.core.database_runtime import release_read_transaction
+from packages.core.i18n import t, text_locale
 from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+from packages.core.services.dashboard_http import (
+    PublicHttpsEndpoint,
+    create_public_https_transport,
+)
 from packages.core.services.workflow_run_execution_claim import (
     CLAIM_HELD as WORKFLOW_RUN_EXECUTION_CLAIM_HELD,
 )
 from packages.core.services.workflow_run_execution_claim import (
     WorkflowRunExecutionClaimLost,
     commit_fenced_execution_boundary,
+    expired_workflow_run_claim_token,
     workflow_run_execution_claim,
+)
+from packages.core.worker_drain import worker_drain_requested
+from packages.core.services.workflow_claim_recovery import (
+    MANUAL_STEP_EXECUTION_DRIVER,
+    WORKFLOW_CLAIM_HANDOFF_HEADER,
+    WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD,
+    WORKFLOW_EXECUTION_RECOVERY_TRIGGER_FIELD,
+    workflow_claim_handoff_digest,
+)
+from packages.core.services.workflow_step_resilience import (
+    EFFECT_JOURNALED_STEP_TYPES,
+    StepEffectIntentWatcher,
+    arm_step_effect_journal,
+    armed_step_effect_journal_sequence,
+    is_transient_retry_record,
+    plan_step_transient_retry,
+    transient_failure_from_exception,
+)
+from packages.core.ai.workflow_failure import (
+    CONTEXT_OVERFLOW_MESSAGE_KEY,
+    REPLACED_MESSAGE_KEY,
+    settle_workflow_failure,
+    workflow_platform_failure,
+    workflow_run_failure_headline,
 )
 from packages.core.services.workflow_run_trace import (
     DEFINITION_CHANGED_ERROR,
+    STALLED_ERROR_PREFIX,
     append_execution_trace,
     build_definition_snapshot,
     build_execution_snapshot,
-    summarize_trace_text,
     workflow_definition_changed,
     workflow_definition_fingerprint,
     workflow_execution_view,
@@ -101,6 +133,14 @@ from packages.core.constants.integrations import (
     INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
 )
 logger = logging.getLogger(__name__)
+
+# ``run()`` outcome: the run continues in a successor delivery. Either this
+# owner lost its lease and recovery handed the run on (or left it for the next
+# manual step), or its worker began shutting down between nodes.
+WORKFLOW_RUN_EXECUTION_RESUMED_ELSEWHERE = "resumed_elsewhere"
+# ``_run_loop`` outcome: stopped at a node boundary because the worker is
+# shutting down; the caller hands its lease to the next delivery.
+_WORKER_DRAIN_HANDOFF = "worker_drain_handoff"
 
 WorkflowSessionFactory = async_sessionmaker[AsyncSession]
 _IMPORTED_WORKFLOW_SESSION_FACTORY = async_session
@@ -196,9 +236,16 @@ def _validate_workflow_http_url(value: str) -> str:
     return raw
 
 
-async def _resolve_workflow_http_host(url: str) -> None:
+async def _resolve_workflow_http_host(url: str) -> PublicHttpsEndpoint:
+    import httpx
+
     parsed = urlsplit(url)
-    hostname = parsed.hostname or ""
+    # Match the HTTP client's IDNA normalization before pinning the connection.
+    hostname = httpx.URL(url).raw_host.decode("ascii").rstrip(".").casefold()
+    try:
+        hostname = ipaddress.ip_address(hostname).compressed
+    except ValueError:
+        pass
     port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
     try:
         results = await asyncio.to_thread(
@@ -219,6 +266,7 @@ async def _resolve_workflow_http_host(url: str) -> None:
             raise WorkflowHttpPolicyError("Public workflow HTTP host resolved unexpectedly") from exc
         if not address.is_global:
             raise WorkflowHttpPolicyError("Public workflow HTTP host resolved to a private network")
+    return PublicHttpsEndpoint(url, hostname, port, tuple(sorted(addresses)))
 
 
 class _StageRunProxy:
@@ -286,14 +334,50 @@ def _stage_operation_checkpoint(result: dict[str, Any]) -> dict[str, Any]:
     return {field: deepcopy(result[field]) for field in retained_fields if field in result}
 
 
-def _workflow_sandbox_url() -> str:
-    """Resolve the sandbox URL at call time so tests/config reloads stay reliable."""
+def _workflow_sandbox_configured() -> bool:
+    """Is a sandbox runner configured? Resolved at call time so tests/config reloads stay reliable."""
     try:
         from packages.core.config import get_settings
 
-        return str(get_settings().SANDBOX_SERVICE_URL or "").strip()
+        settings = get_settings()
+        if str(settings.SANDBOX_SERVICE_URL or "").strip():
+            return True
+        return settings.SANDBOX_COORDINATION_MODE == "external-runner" and bool(
+            str(settings.SANDBOX_RUNNERS_JSON or "").strip()
+        )
     except Exception:
-        return ""
+        return False
+
+
+_CODE_NODE_MEMORY_MIB = (128, 512, 4096)  # min, default, max
+_CODE_NODE_PIDS = (64, 512, 1024)
+_CODE_NODE_CPUS = (0.25, 1.0, 4.0)
+
+
+def _code_node_resources(config: dict) -> dict[str, Any]:
+    """Bounded sandbox limits a code node may request (``memory``, ``pids_limit``, ``cpus``).
+
+    The runner kills a command once the sandbox nears its pids limit, and pids
+    count threads: a headless browser or ffmpeg needs far more than a plain
+    script. Out-of-range or malformed values fall back to the bounds/defaults.
+    """
+    memory_mib = _CODE_NODE_MEMORY_MIB[1]
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mMgG])[bB]?\s*", str(config.get("memory") or ""))
+    if match:
+        value = float(match.group(1)) * (1024 if match.group(2).lower() == "g" else 1)
+        memory_mib = int(min(max(value, _CODE_NODE_MEMORY_MIB[0]), _CODE_NODE_MEMORY_MIB[2]))
+
+    def bounded(key: str, bounds: tuple, cast: Any) -> Any:
+        try:
+            return cast(min(max(cast(config[key]), bounds[0]), bounds[2]))
+        except (KeyError, TypeError, ValueError):
+            return bounds[1]
+
+    return {
+        "memory": f"{memory_mib}m",
+        "cpus": bounded("cpus", _CODE_NODE_CPUS, float),
+        "pids_limit": bounded("pids_limit", _CODE_NODE_PIDS, int),
+    }
 
 
 def _is_cacheable(step: dict) -> bool:
@@ -616,8 +700,14 @@ def workflow_approval_decision_metadata(
 def workflow_input_wait_value(
     config: dict[str, Any],
     variables: dict[str, Any] | None,
+    *,
+    context: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Resolve and validate the one object submitted to an input wait."""
+    """Resolve and validate the one object submitted to an input wait.
+
+    ``context`` is the run's variables when ``variables`` holds only the
+    submission: the form the person answered was built from them.
+    """
     input_schema = config.get("input_schema")
     if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
         raise ValueError("Input waits require an object input_schema.")
@@ -627,8 +717,24 @@ def workflow_input_wait_value(
     properties = input_schema.get("properties")
     if not isinstance(properties, dict):
         raise ValueError("Input waits require object properties.")
+    # Validate against the form as shown, including fields listed from run data.
+    bound = _bind_schema_defaults(input_schema, {**(context or {}), **source})
+    input_schema = bound
     if isinstance(value, dict):
         value = {key: value[key] for key in properties if key in value}
+        # A listed item left blank was not answered, so later steps see only the answers.
+        for key, child in properties.items():
+            if isinstance(child, dict) and FIELDS_FROM in child and isinstance(value.get(key), dict):
+                value[key] = {
+                    item: text for item, text in value[key].items()
+                    if not (isinstance(text, str) and not text.strip())
+                }
+        # A field the person's answer leaves out takes its declared default, so a
+        # later step never reads an unresolved reference to it. Only an actual
+        # answer is completed this way: defaults never answer a wait by themselves.
+        for key, child in (bound.get("properties") or {}).items():
+            if key not in value and isinstance(child, dict) and "default" in child:
+                value[key] = deepcopy(child["default"])
     if not isinstance(value, dict):
         value = {
             key: source[key]
@@ -744,6 +850,28 @@ async def _project_workflow_chat_safely(db, projector, **kwargs) -> None:
         logger.debug("Workflow Chat projection skipped", exc_info=True)
 
 
+def _template_text(value: Any) -> str:
+    """How a value reads inside text: lists of names as ``EP.05, EP.06``,
+    structures as JSON — never Python's ``['EP.05']`` / ``{'a': 1}`` repr,
+    which leaked into review titles, Chat messages and prompts."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        item is None or isinstance(item, (str, int, float, bool)) for item in value
+    ):
+        items = [str(item) for item in value if item is not None]
+        # Sentences (blockers, reasons) keep their own full stops and read one after another;
+        # short names join with commas.
+        sentences = any(item.rstrip().endswith((".", "!", "?", "。", "！", "？")) for item in items)
+        return (" " if sentences else ", ").join(items)
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def _render_template(template: str, variables: dict) -> str:
     """Replace ``{{var}}`` / ``{{var.field.subfield}}`` placeholders.
 
@@ -755,7 +883,7 @@ def _render_template(template: str, variables: dict) -> str:
     def _replacer(m: re.Match) -> str:
         key = m.group(1).strip()
         val = _lookup_reference(key, variables, missing=m.group(0))
-        return str(val) if val is not None else m.group(0)
+        return _template_text(val) if val is not None else m.group(0)
 
     # ``[^{}]+`` allows spaces and punctuation inside a ref so imported node
     # names resolve; non-variable expressions (``{{ $env.X }}``) simply fail
@@ -824,6 +952,49 @@ def _resolve_binding(value: Any, variables: dict) -> Any:
     return _render_template(value, variables)
 
 
+_MAX_FIELD_SUGGESTIONS = 3
+
+
+def _collection_answer_text(value: Any, variables: dict) -> str:
+    """A binding's value as answer text; empty when it has not resolved yet."""
+    value = _resolve_binding(value, variables)
+    if isinstance(value, list):
+        value = "; ".join(part.strip() for part in value if isinstance(part, str) and part.strip())
+    if value is None or isinstance(value, (dict, bool)):
+        return ""
+    text = str(value).strip()
+    return "" if "{{" in text else text
+
+
+def _collection_field_for_prompt(field: dict, variables: dict) -> dict:
+    """Resolve a collected field's recommendation against this run.
+
+    A ``default`` binding such as ``{{analysis.work.title}}`` prefills the
+    field so the person only confirms it; ``suggestions`` are alternative
+    one-click answers. A binding without a value yet is dropped, so the form
+    never shows raw ``{{...}}`` text.
+    """
+    resolved_field = dict(field)
+    default = field.get("default")
+    if isinstance(default, str) and "{{" in default:
+        text = _collection_answer_text(default, variables)
+        if text:
+            resolved_field["default"] = text
+        else:
+            resolved_field.pop("default", None)
+    suggestions = field.get("suggestions")
+    if isinstance(suggestions, list):
+        resolved: list[str] = []
+        for item in suggestions:
+            text = _collection_answer_text(item, variables)
+            if text and text not in resolved:
+                resolved.append(text)
+            if len(resolved) == _MAX_FIELD_SUGGESTIONS:
+                break
+        resolved_field["suggestions"] = resolved
+    return resolved_field
+
+
 def _resolve_structure(value: Any, variables: dict) -> Any:
     """Resolve Workflow references recursively while preserving JSON value types."""
     if isinstance(value, dict):
@@ -831,6 +1002,72 @@ def _resolve_structure(value: Any, variables: dict) -> Any:
     if isinstance(value, list):
         return [_resolve_structure(item, variables) for item in value]
     return _resolve_binding(value, variables)
+
+
+FIELDS_FROM = "x-fields-from"
+
+
+def _schema_fields_from(items: Any) -> dict[str, Any]:
+    """One optional text field per item a run produced, such as each detail a step gathered.
+
+    An item is a label, or ``{"label", "hint", "value", "source"}``. The label is
+    the field's key, so the answer reads as label → text wherever a later step
+    uses it. A value someone or something already found fills the field for the
+    person to check, with where it came from; a hint is the example shown inside
+    a box still empty.
+    """
+    if not isinstance(items, list):
+        return {}  # Unresolved here; the form keeps whatever fields it was shown with.
+
+    def text(value: Any, limit: int) -> str:
+        return " ".join(str(value or "").split())[:limit]
+
+    properties: dict[str, Any] = {}
+    for item in items:
+        fields = item if isinstance(item, dict) else {"label": item}
+        label = text(fields.get("label"), 160)
+        if not label or label in properties:
+            continue
+        hint, source = text(fields.get("hint"), 160), text(fields.get("source"), 160)
+        value = str(fields.get("value") or "").strip()[:4000]
+        properties[label] = {
+            "type": "string", "title": label, "maxLength": 4000,
+            **({"default": value} if value else {}),
+            # Tall enough to read what was found without scrolling inside the box.
+            "x-ui": {"control": "textarea", "rows": min(6, max(2, len(value) // 80 + 1)),
+                     **({"placeholder": hint} if hint else {}),
+                     **({"source": source} if value and source else {})},
+        }
+    # Stored forms do not keep key order, so the listed order is declared; the
+    # items are asked one by one as a numbered list.
+    return {"properties": properties, "additionalProperties": False,
+            "x-ui": {"order": list(properties), "layout": "list"}}
+
+
+def _bind_schema_defaults(schema: Any, variables: dict) -> Any:
+    """Resolve ``default`` bindings so a paused input form opens with run values.
+
+    A default that still names a missing variable is dropped rather than shown
+    to the person as ``{{...}}`` text. An object declaring ``x-fields-from``
+    gets its fields from the run, one per listed item.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    bound = {key: value for key, value in schema.items() if key not in {"default", FIELDS_FROM}}
+    if FIELDS_FROM in schema:
+        fields = _schema_fields_from(_resolve_binding(schema[FIELDS_FROM], variables))
+        if "x-ui" in fields:
+            fields["x-ui"] = {**(bound.get("x-ui") or {}), **fields["x-ui"]}
+        bound.update(fields)
+    if "default" in schema:
+        value = _resolve_structure(schema["default"], variables)
+        if not (isinstance(value, str) and re.search(r"\{\{[^{}]+?\}\}", value)):
+            bound["default"] = value
+    if isinstance(schema.get("properties"), dict):
+        bound["properties"] = {
+            key: _bind_schema_defaults(child, variables) for key, child in schema["properties"].items()
+        }
+    return bound
 
 
 def _parse_agent_output(value: Any, output_format: Any) -> Any:
@@ -854,6 +1091,73 @@ def _has_terminal_failure(result: Any) -> bool:
         return True
     control = payload.get("control")
     return isinstance(control, dict) and control.get("terminal_failure") is True
+
+
+def _with_platform_failure(step: dict, result: Any, evidence_states: list[Any]) -> Any:
+    """Record the platform fault an Agent step's tools hit and never got past.
+
+    The host observed it in the run's tool evidence; the model's own summary
+    is not consulted. A completed step keeps its outcome: a Stop node that
+    reports it adopts the failure.
+    """
+    from packages.core.ai.runtime.tool_evidence import runtime_unresolved_platform_error
+
+    if not isinstance(result, dict) or result.get("status") not in {"completed", "failed"}:
+        return result
+    if isinstance(result.get("platform_failure"), dict):
+        return result
+    fault = next(filter(None, map(runtime_unresolved_platform_error, reversed(evidence_states))), None)
+    if fault is None:
+        return result
+    return {**result, "platform_failure": workflow_platform_failure(fault, step=step)}
+
+
+def _runtime_loop_failure_fields(result: Any) -> dict[str, Any]:
+    """The loop's own error code and outage flag, for step-level resilience."""
+    if isinstance(result, dict):
+        error, detail = result.get("error"), result.get("error_detail")
+    else:
+        error, detail = getattr(result, "error", None), getattr(result, "error_detail", None)
+    fields: dict[str, Any] = {}
+    if isinstance(error, str) and error.strip():
+        fields["runtime_error"] = error.strip()[:120]
+    if isinstance(detail, dict) and detail.get("transient") is True:
+        # llm_client already spent its own retry budget on this call.
+        fields["provider_transient"] = True
+    return fields
+
+
+# The loop's own verdicts after the provider answered. Every other code
+# (llm_call_failed, byok_provider_error, …) is a failed model call.
+_LOOP_ERROR_MESSAGES = {
+    "final_response_validation_failed": "Agent step ended without meeting its completion requirement.",
+    "output_schema_validation_failed": "Agent output did not match the step's output schema.",
+    "pseudo_tool_markup": "Agent wrote tool-call text instead of calling a tool.",
+    "consecutive_truncations": "Agent replies were repeatedly cut off at the model's output limit.",
+    "billing_settlement_failed": "Model usage could not be settled for billing.",
+}
+
+
+def _last_tool_error(result: Any) -> str:
+    """The newest failed tool result in the loop transcript, as ``tool: detail``."""
+    from packages.core.ai.runtime.tool_error_contract import tool_error_summary
+
+    messages = getattr(result, "messages", None) or []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        error = tool_error_summary(message.get("content"))
+        if not error:
+            continue
+        call_id = message.get("tool_call_id")
+        name = next((
+            str((call.get("function") or {}).get("name") or call.get("name") or "")
+            for prior in reversed(messages[:index]) if isinstance(prior, dict)
+            for call in prior.get("tool_calls") or [] if isinstance(call, dict) and call.get("id") == call_id
+        ), "")
+        return f"{name}: {error}"[:500] if name else error[:500]
+    return ""
 
 
 def _agent_loop_failure_message(result: Any) -> str | None:
@@ -887,7 +1191,26 @@ def _agent_loop_failure_message(result: Any) -> str | None:
         elif content:
             detail = content
 
-    message = "Model provider request failed before producing a response."
+    if error == "context_budget_exceeded":
+        # Raised by the loop's own context budget (often a failed compaction)
+        # before any provider call; the step records the structured detail.
+        return "Agent working context exceeded its limit before any model call."
+    if error in _LOOP_ERROR_MESSAGES:
+        # The loop's own verdict (a completion contract, schema or billing
+        # gate), not the provider's. The provider answered every call.
+        message = _LOOP_ERROR_MESSAGES[error]
+        tool_error = _last_tool_error(result)
+        parts = [message, detail if detail != error else "", f"Last tool error: {tool_error}" if tool_error else ""]
+        return " ".join(part for part in parts if part)
+    if isinstance(detail_obj, dict) and detail_obj.get("transient") is True:
+        # llm_client already retried within its budget. The step itself is
+        # sound; retrying it from here once the provider recovers is the fix.
+        message = (
+            "Model provider outage: the provider stopped responding and automatic "
+            "retries did not recover it. Retry this step once the provider is back."
+        )
+    else:
+        message = "Model provider request failed before producing a response."
     return f"{message} {detail}" if detail else message
 
 
@@ -1266,6 +1589,10 @@ def _workflow_agent_resume_prompt(
     step_id: str,
 ) -> str:
     """Apply current recovery rules to both historical and new Agent steps."""
+    if is_transient_retry_record(previous_result):
+        # Re-run only because the attempt provably changed nothing: the
+        # original instructions are the whole task, there is nothing to recover.
+        return ""
     if not isinstance(previous_result, dict) or not (
         _workflow_step_result_requires_reexecution(previous_result)
         or previous_result.get("status") == "failed"
@@ -1313,6 +1640,63 @@ def _continues_on_error(step: dict) -> bool:
     """Return whether a failed step advances through a handled-error policy."""
     policy = str((step.get("config") or {}).get("on_error", "stop")).strip().lower()
     return policy in {"continue", "continue_error"}
+
+
+def _unapplied_step_outcome(
+    steps: list[dict],
+    run: WorkflowRun,
+) -> tuple[dict, dict] | None:
+    """A committed node result whose run-level outcome was never committed.
+
+    The runner commits a node's receipt before it commits the run's
+    pause/failure, so an owner that dies between the two leaves an active run
+    whose failed or paused node is neither runnable nor done. Its successor
+    must apply that outcome, never report the graph as stuck.
+    """
+    by_id = {str(step.get("id")): step for step in steps if step.get("id")}
+    candidates: list[tuple[str, dict, dict]] = []
+    for step_id, result in (run.step_results or {}).items():
+        step = by_id.get(str(step_id))
+        if step is None or not isinstance(result, dict):
+            continue
+        status = result.get("status")
+        if status == "failed" and result.get("continued") is not True and not _continues_on_error(step):
+            candidates.append((str(result.get("completed_at") or ""), step, result))
+        elif status == "paused" and not _workflow_step_result_requires_reexecution(result):
+            candidates.append((str(result.get("completed_at") or ""), step, result))
+    if not candidates:
+        return None
+    # Failures win: a later pause could not have been reached past them.
+    candidates.sort(key=lambda item: (item[2].get("status") == "failed", item[0]))
+    _completed_at, step, result = candidates[-1]
+    return step, result
+
+
+def _no_runnable_steps_error(steps: list[dict], run: WorkflowRun) -> str:
+    """Name every node and its recorded state when a graph cannot advance."""
+    step_results = run.step_results or {}
+    states = []
+    for step in steps:
+        step_id = str(step.get("id") or "")
+        if not step_id or step.get("type") == "note":
+            continue
+        result = step_results.get(step_id)
+        if isinstance(result, dict):
+            state = str(result.get("status") or "recorded")
+            if result.get("continued") is True:
+                state += " (continued)"
+            if result.get("resume_strategy"):
+                state += f" (resume: {result['resume_strategy']})"
+        else:
+            state = "not run"
+        states.append(f"{step_id} [{step.get('type') or 'unknown'}]: {state}")
+    detail = "; ".join(states) or "no steps"
+    if len(detail) > 1500:
+        detail = detail[:1500] + "…"
+    return (
+        f"{STALLED_ERROR_PREFIX} "
+        f"(current step: {run.current_step_id or 'none'}). Steps: {detail}"
+    )
 
 
 _HANDLED_INPUT_MISSING = object()
@@ -1740,6 +2124,8 @@ class WorkflowRunner:
     ) -> None:
         self._cache_index = cache_index or {}
         self._session_factory = session_factory or _default_workflow_session_factory()
+        # Run id -> the collaborators behind it, resolved once per run.
+        self._run_collaborators: dict[str, frozenset[str]] = {}
 
     @staticmethod
     def prime_cache_from_results(step_results: dict | None) -> dict:
@@ -1759,24 +2145,73 @@ class WorkflowRunner:
 
     # ── Public entry point ───────────────────────────────────────────────
 
-    async def run(self, workflow_run_id: str, progress=None) -> str:
+    async def run(
+        self,
+        workflow_run_id: str,
+        progress=None,
+        *,
+        claim_handoff_token: str | None = None,
+    ) -> str:
         """Execute a workflow run to completion or pause.
 
         ``progress`` is an optional async callback invoked with
         ``{"id": step_id, "status": ...}`` as each step starts ("running") and
         finishes — used by the streaming run endpoint to light up the canvas
         node-by-node. ``None`` (default) leaves behaviour unchanged.
+        ``claim_handoff_token`` adopts the lease a claim-loss recovery
+        retained for this delivery.
         """
         from packages.core.ai.runtime.execution_nesting import runtime_nested_execution_scope
 
         # A workflow run is one execution nesting level: run inline from an
         # agent loop, its nodes are not that loop's own calls.
         with runtime_nested_execution_scope():
-            return await self._run(workflow_run_id, progress)
+            return await self._run(
+                workflow_run_id,
+                progress,
+                claim_handoff_token=claim_handoff_token,
+            )
 
-    async def _run(self, workflow_run_id: str, progress=None) -> str:
+    async def _run(
+        self,
+        workflow_run_id: str,
+        progress=None,
+        *,
+        claim_handoff_token: str | None = None,
+    ) -> str:
+        if not claim_handoff_token:
+            try:
+                expired_token = await expired_workflow_run_claim_token(workflow_run_id)
+            except Exception:
+                # Best effort: the lease itself still fences this delivery.
+                logger.debug(
+                    "WorkflowRunner: expired-lease probe failed for run %s",
+                    workflow_run_id,
+                    exc_info=True,
+                )
+                expired_token = None
+            if expired_token:
+                # A redelivery or retry racing the recovery sweep must not
+                # replay the lost owner's interrupted node blindly.
+                logger.warning(
+                    "WorkflowRunner: run %s was abandoned by its previous owner; "
+                    "recovering before executing",
+                    workflow_run_id,
+                )
+                return await self._recover_and_report(
+                    workflow_run_id,
+                    expired_claim_token=expired_token,
+                )
+        lost_claim_token: str | None = None
         try:
-            async with workflow_run_execution_claim(workflow_run_id) as claim:
+            async with workflow_run_execution_claim(
+                workflow_run_id,
+                **(
+                    {"handoff_claim_token": claim_handoff_token}
+                    if claim_handoff_token
+                    else {}
+                ),
+            ) as claim:
                 if not claim:
                     logger.info(
                         "WorkflowRunner: run %s execution claim denied (%s)",
@@ -1784,7 +2219,8 @@ class WorkflowRunner:
                         claim.reason,
                     )
                     return WORKFLOW_RUN_EXECUTION_CLAIM_HELD
-                await self._run_claimed(
+                lost_claim_token = getattr(claim, "token", None)
+                loop_outcome = await self._run_claimed(
                     workflow_run_id,
                     progress,
                     before_terminal_commit=claim.raise_if_lost,
@@ -1792,27 +2228,85 @@ class WorkflowRunner:
                     execution_claim=claim,
                 )
                 claim.raise_if_lost()
-                return "executed"
+                if loop_outcome != _WORKER_DRAIN_HANDOFF:
+                    return "executed"
+                try:
+                    handoff_token = claim.retain_for_handoff()
+                except RuntimeError:
+                    # Released on exit instead; the successor acquires it fresh.
+                    handoff_token = None
         except WorkflowRunExecutionClaimLost:
             logger.error(
                 "WorkflowRunner: run %s lost its execution claim",
                 workflow_run_id,
                 exc_info=True,
             )
-            settled_status = await self._fail_lost_execution_claim(
+            return await self._recover_and_report(
+                workflow_run_id,
+                lost_claim_token=lost_claim_token,
+            )
+        # Publish only after the claim context exited, as recovery does, so
+        # the successor cannot race this owner's exit.
+        await self._hand_off_to_next_worker(workflow_run_id, handoff_token)
+        return WORKFLOW_RUN_EXECUTION_RESUMED_ELSEWHERE
+
+    async def _hand_off_to_next_worker(
+        self,
+        workflow_run_id: str,
+        handoff_token: str | None,
+    ) -> None:
+        """Queue the rest of a run whose worker is shutting down.
+
+        No node is in flight, so the successor simply continues from the
+        durable frontier. If the publish is lost, the retained lease expires
+        unadopted and claim-loss recovery resumes the run: none of its nodes
+        were interrupted.
+        """
+
+        async with self._session_factory() as db:
+            from sqlalchemy import select
+
+            trigger_data = (await db.execute(
+                select(WorkflowRun.trigger_data).where(WorkflowRun.id == workflow_run_id)
+            )).scalar_one_or_none()
+        trigger_data = trigger_data if isinstance(trigger_data, dict) else {}
+        logger.info(
+            "WorkflowRunner: worker is shutting down; run %s continues on "
+            "another worker from its next node",
+            workflow_run_id,
+        )
+        if not WorkflowRunner.enqueue(
+            workflow_run_id,
+            claim_handoff_token=handoff_token,
+            scheduled_run_id=str(trigger_data.get("scheduled_run_id") or "") or None,
+            scheduled_job_id=str(trigger_data.get("scheduled_job_id") or "") or None,
+        ):
+            logger.warning(
+                "WorkflowRunner: run %s handoff could not be queued; its lease "
+                "expires unadopted and the recovery sweep resumes it",
+                workflow_run_id,
+            )
+
+    async def _recover_and_report(self, workflow_run_id: str, **recovery) -> str:
+        """Run claim-loss recovery and translate its status to a run outcome."""
+        settled_status = await self._recover_lost_execution_claim(
+            workflow_run_id,
+            session_factory=self._session_factory,
+            **recovery,
+        )
+        if settled_status == WorkflowRunStatus.CANCELLED.value:
+            await self._settle_cancelled_subworkflow_descendants(
                 workflow_run_id,
                 session_factory=self._session_factory,
             )
-            if settled_status == WorkflowRunStatus.CANCELLED.value:
-                await self._settle_cancelled_subworkflow_descendants(
-                    workflow_run_id,
-                    session_factory=self._session_factory,
-                )
-            return (
-                "executed"
-                if settled_status is not None
-                else WORKFLOW_RUN_EXECUTION_CLAIM_HELD
-            )
+        if settled_status is None:
+            return WORKFLOW_RUN_EXECUTION_CLAIM_HELD
+        if settled_status in {
+            WorkflowRunStatus.PENDING.value,
+            WorkflowRunStatus.RUNNING.value,
+        }:
+            return WORKFLOW_RUN_EXECUTION_RESUMED_ELSEWHERE
+        return "executed"
 
     async def _run_claimed(
         self,
@@ -1822,8 +2316,12 @@ class WorkflowRunner:
         before_terminal_commit: Callable[[], None] | None = None,
         after_terminal_commit: Callable[[], None] | None = None,
         execution_claim=None,
-    ) -> None:
-        """Execute after the caller has acquired exclusive execution rights."""
+    ) -> str | None:
+        """Execute after the caller has acquired exclusive execution rights.
+
+        Returns ``_WORKER_DRAIN_HANDOFF`` when the run stopped at a node
+        boundary because its worker is shutting down.
+        """
         async with self._session_factory() as db:
             from sqlalchemy import select
 
@@ -1901,15 +2399,23 @@ class WorkflowRunner:
                 run.status = "running"
                 run.started_at = run.started_at or _utc_now()
                 await db.commit()
+            if (run.trigger_data or {}).get(WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD):
+                # The full runner now drives this run; claim-loss recovery must
+                # hand it to a worker instead of waiting for a manual step.
+                trigger_data = dict(run.trigger_data or {})
+                trigger_data.pop(WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD, None)
+                run.trigger_data = trigger_data
+                await db.commit()
 
             try:
-                await self._run_loop(
+                if await self._run_loop(
                     execution_workflow,
                     run,
                     db,
                     progress,
                     terminal_commit=terminal_commit,
-                )
+                ) == _WORKER_DRAIN_HANDOFF:
+                    return _WORKER_DRAIN_HANDOFF
             except WorkflowRunExecutionClaimLost:
                 raise
             except Exception as exc:
@@ -1948,6 +2454,12 @@ class WorkflowRunner:
         await db.commit()
         if run.status == WorkflowRunStatus.FAILED:
             await self._dispatch_error_handlers(run, db)
+        if run.status == WorkflowRunStatus.CANCELLED:
+            from packages.core.services.media_job_control import stop_open_media_jobs_for_run
+
+            # Clips, images or audio a cancelled run queued are not wanted any more; stop paying for them.
+            await stop_open_media_jobs_for_run(db, entity_id=run.entity_id, run_id=str(run.id))
+            await db.commit()
         if terminal:
             await self._propagate_subworkflow_result(run, db)
             run.terminal_effects_completed_at = _utc_now()
@@ -1955,13 +2467,22 @@ class WorkflowRunner:
             await db.commit()
 
     @staticmethod
-    async def _fail_lost_execution_claim(
+    async def _recover_lost_execution_claim(
         workflow_run_id: str,
         *,
         session_factory: WorkflowSessionFactory | None = None,
         expired_claim_token: str | None = None,
+        lost_claim_token: str | None = None,
     ) -> str | None:
-        """Settle an active run only after acquiring fresh recovery ownership."""
+        """Continue or settle a run whose owner lost its lease.
+
+        Runs only under fresh recovery ownership. A run whose interrupted
+        nodes are all replay-safe stays active and is handed to one worker
+        delivery through its retained lease (or left for the next manual
+        step); otherwise it fails with an error naming the uncertain node.
+        Returns the resulting status, or ``None`` when another live owner
+        holds the run.
+        """
         factory = session_factory or _default_workflow_session_factory()
         async with workflow_run_execution_claim(
             workflow_run_id,
@@ -1969,7 +2490,7 @@ class WorkflowRunner:
         ) as recovery_claim:
             if not recovery_claim:
                 logger.info(
-                    "WorkflowRunner: run %s claim-loss settlement deferred to current owner",
+                    "WorkflowRunner: run %s claim-loss recovery deferred to current owner",
                     workflow_run_id,
                 )
                 return None
@@ -1989,30 +2510,136 @@ class WorkflowRunner:
                     cancel_run_from_cancelled_ancestor,
                 )
 
-                if not await cancel_run_from_cancelled_ancestor(db, run):
-                    run.status = "failed"
-                    run.error = "Workflow execution claim was lost"
-                    run.completed_at = _utc_now()
-                mark_workflow_terminal_effects_pending(run)
-                from packages.core.services.workflow_chat_projection import (
-                    project_workflow_run_status,
+                if await cancel_run_from_cancelled_ancestor(db, run):
+                    return await WorkflowRunner._settle_recovered_run(
+                        run, db, recovery_claim, factory,
+                    )
+                decision = await WorkflowRunner._claim_loss_decision(
+                    db,
+                    run,
+                    lost_claim_token=expired_claim_token or lost_claim_token,
+                    session_factory=factory,
                 )
-
-                await project_workflow_run_status(db, run=run)
-                from packages.core.ledger.adapters import record_workflow_run_status
-
-                await record_workflow_run_status(db, run)
+                trigger_data = dict(run.trigger_data or {})
+                recovery_state = dict(decision.recovery_state)
+                manual_step = (
+                    trigger_data.get(WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD)
+                    == MANUAL_STEP_EXECUTION_DRIVER
+                )
+                if decision.resume and not manual_step:
+                    recovery_state["handoff_claim_digest"] = (
+                        workflow_claim_handoff_digest(recovery_claim.token)
+                    )
+                trigger_data[WORKFLOW_EXECUTION_RECOVERY_TRIGGER_FIELD] = recovery_state
+                run.trigger_data = trigger_data
+                if not decision.resume:
+                    logger.error(
+                        "WorkflowRunner: run %s lost its execution owner and "
+                        "cannot resume: %s",
+                        workflow_run_id,
+                        decision.error,
+                    )
+                    run.status = "failed"
+                    run.error = decision.error
+                    run.completed_at = _utc_now()
+                    return await WorkflowRunner._settle_recovered_run(
+                        run, db, recovery_claim, factory,
+                    )
+                logger.warning(
+                    "WorkflowRunner: run %s lost its execution owner; resuming "
+                    "at %s (interruption %s)",
+                    workflow_run_id,
+                    list(decision.interrupted_step_ids) or "its next step",
+                    recovery_state.get("attempts"),
+                )
                 await commit_fenced_execution_boundary(
                     db.commit,
                     execution_claim=recovery_claim,
                     session=db,
                     after_commit=recovery_claim.mark_terminal_committed,
                 )
-                await WorkflowRunner(session_factory=factory)._finalize_run_effects(
-                    run,
-                    db,
-                )
-                return str(run.status)
+                resumed_status = str(run.status)
+                if manual_step:
+                    # Stepped by a person: the next /step re-runs the frontier;
+                    # never advance the graph on their behalf.
+                    return resumed_status
+                handoff_token = recovery_claim.retain_for_handoff()
+        # The retained lease outlives the claim context; publish only now so
+        # the successor cannot race this owner's exit.
+        if not WorkflowRunner.enqueue(
+            workflow_run_id,
+            claim_handoff_token=handoff_token,
+            scheduled_run_id=str(trigger_data.get("scheduled_run_id") or "") or None,
+            scheduled_job_id=str(trigger_data.get("scheduled_job_id") or "") or None,
+        ):
+            logger.warning(
+                "WorkflowRunner: run %s resume could not be queued; its lease "
+                "expires unadopted and the recovery sweep hands it off again",
+                workflow_run_id,
+            )
+        return resumed_status
+
+    @staticmethod
+    async def _claim_loss_decision(
+        db,
+        run: WorkflowRun,
+        *,
+        lost_claim_token: str | None,
+        session_factory: WorkflowSessionFactory,
+    ):
+        """Evaluate the durable frontier the lost owner was executing."""
+        from sqlalchemy import select
+
+        from packages.core.services.workflow_claim_recovery import (
+            decide_workflow_claim_loss,
+        )
+
+        workflow = (await db.execute(
+            select(WorkflowDefinition).where(WorkflowDefinition.id == run.workflow_id)
+        )).scalar_one_or_none()
+        execution_workflow = workflow_execution_view(workflow, run)
+        # Without a definition the successor settles the run without running
+        # a node, so there is nothing to replay.
+        frontier = (
+            WorkflowRunner(session_factory=session_factory)._find_runnable_steps(
+                execution_workflow,
+                run,
+            )
+            if execution_workflow
+            else []
+        )
+        return decide_workflow_claim_loss(
+            run,
+            frontier,
+            lost_claim_token=lost_claim_token,
+            now=_utc_now(),
+        )
+
+    @staticmethod
+    async def _settle_recovered_run(
+        run: WorkflowRun,
+        db,
+        recovery_claim,
+        factory: WorkflowSessionFactory,
+    ) -> str:
+        """Commit a recovery's terminal outcome and drain its effects."""
+        mark_workflow_terminal_effects_pending(run)
+        from packages.core.services.workflow_chat_projection import (
+            project_workflow_run_status,
+        )
+
+        await project_workflow_run_status(db, run=run)
+        from packages.core.ledger.adapters import record_workflow_run_status
+
+        await record_workflow_run_status(db, run)
+        await commit_fenced_execution_boundary(
+            db.commit,
+            execution_claim=recovery_claim,
+            session=db,
+            after_commit=recovery_claim.mark_terminal_committed,
+        )
+        await WorkflowRunner(session_factory=factory)._finalize_run_effects(run, db)
+        return str(run.status)
 
     @staticmethod
     async def _settle_cancelled_subworkflow_descendants(
@@ -2037,7 +2664,7 @@ class WorkflowRunner:
             descendant_run_ids = await active_subworkflow_descendant_ids(db, root)
 
         for descendant_run_id in descendant_run_ids:
-            await WorkflowRunner._fail_lost_execution_claim(
+            await WorkflowRunner._recover_lost_execution_claim(
                 descendant_run_id,
                 session_factory=factory,
             )
@@ -2158,9 +2785,16 @@ class WorkflowRunner:
                 from packages.core.services.workflow_chat_projection import (
                     project_workflow_run_status,
                 )
-                from packages.core.services.workflow_run_control import cancel_run
+                from packages.core.services.workflow_run_control import (
+                    cancel_run,
+                    inherited_cancel_source,
+                )
 
-                cancel_run(parent, actor_id=cancelled_by)
+                cancel_run(
+                    parent,
+                    actor_id=cancelled_by,
+                    source=inherited_cancel_source(child.cancel_source),
+                )
                 if str(parent.id) != host_run_id:
                     parent_trigger_data = dict(parent.trigger_data or {})
                     parent_trigger_data["_workflow_chat_cancel_ancestors"] = {
@@ -2583,8 +3217,12 @@ class WorkflowRunner:
         progress=None,
         *,
         terminal_commit: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
-        """Loop: find runnable steps -> execute -> advance -> repeat."""
+    ) -> str | None:
+        """Loop: find runnable steps -> execute -> advance -> repeat.
+
+        Returns ``_WORKER_DRAIN_HANDOFF`` when it stopped before starting a
+        node because the worker is shutting down.
+        """
         from packages.core.services.workflow_chat_projection import workflow_chat_context
 
         async def _commit_terminal() -> None:
@@ -2611,6 +3249,10 @@ class WorkflowRunner:
                 status=status,
                 result=result,
             )
+            if status == "running" and isinstance(run, WorkflowRun) and hasattr(db, "refresh"):
+                # Committed with the running entry: claim-loss recovery reads
+                # it to tell an effect-free interruption from an uncertain one.
+                arm_step_effect_journal(run, step)
             if progress:
                 try:
                     await progress({"id": step_id, "status": status})
@@ -2653,6 +3295,18 @@ class WorkflowRunner:
             await project_workflow_run_status(db, run=run)
             await _commit_terminal()
 
+        async def _fail_for_result(step: dict, result: dict) -> None:
+            run.current_step_id = step["id"]
+            run.status = "failed"
+            run.error = workflow_run_failure_headline(step, result)
+            run.completed_at = _utc_now()
+            from packages.core.services.workflow_chat_projection import (
+                project_workflow_run_status,
+            )
+
+            await project_workflow_run_status(db, run=run)
+            await _commit_terminal()
+
         steps = workflow.steps or []
         max_iterations = len(steps) * 3  # safety cap
 
@@ -2675,12 +3329,28 @@ class WorkflowRunner:
                     final_output = _final_run_output(steps, run.step_results or {})
                     if final_output is not None:
                         run.variables = {**(run.variables or {}), "__result": final_output}
-                else:
-                    # Could be waiting (paused) or stuck
-                    if run.status != "paused":
-                        run.status = "failed"
-                        run.error = "No runnable steps and workflow not complete"
-                        run.completed_at = _utc_now()
+                elif run.status != "paused":
+                    unapplied = _unapplied_step_outcome(steps, run)
+                    if unapplied is not None:
+                        # A predecessor committed this node's receipt but died
+                        # before committing the run's outcome; apply it now.
+                        step, result = unapplied
+                        logger.warning(
+                            "WorkflowRunner: run %s applies the unsettled %s "
+                            "outcome of step %s",
+                            run.id,
+                            result.get("status"),
+                            step["id"],
+                        )
+                        if result.get("status") == "paused":
+                            await _pause_for_result(step, result)
+                        else:
+                            await _fail_for_result(step, result)
+                        return
+                    run.status = "failed"
+                    run.error = _no_runnable_steps_error(steps, run)
+                    run.completed_at = _utc_now()
+                    logger.error("WorkflowRunner: run %s: %s", run.id, run.error)
                 from packages.core.services.workflow_chat_projection import (
                     project_workflow_run_status,
                 )
@@ -2688,6 +3358,13 @@ class WorkflowRunner:
                 await project_workflow_run_status(db, run=run)
                 await _commit_terminal()
                 return
+
+            if worker_drain_requested():
+                # The worker is shutting down and will be killed when its
+                # grace runs out. Never start a node it could interrupt
+                # mid-effect; another worker continues from this boundary.
+                await db.commit()
+                return _WORKER_DRAIN_HANDOFF
 
             # A run and its AsyncSession are stateful. Keep a fan-out frontier
             # ordered so branches never issue concurrent ORM operations on the
@@ -2706,7 +3383,12 @@ class WorkflowRunner:
                     return
                 batch = []
                 for step in runnable:
-                    result = await self._execute_step_safe(step, run, db)
+                    result = await self._settle_failure(
+                        step,
+                        self._defer_transient_failure(step, await self._execute_step_safe(step, run, db), run),
+                        run,
+                        db,
+                    )
                     batch.append((step, result))
                     if result.get("code") == "runtime_approval_required":
                         # A native approval parks the run at this exact call.
@@ -2738,10 +3420,7 @@ class WorkflowRunner:
                     if result.get("status") == "failed" and not _continues_on_error(step):
                         run.current_step_id = step["id"]
                         run.status = "failed"
-                        run.error = summarize_trace_text(
-                            result.get("error"),
-                            fallback=f"Step {step['id']} failed",
-                        )
+                        run.error = workflow_run_failure_headline(step, result)
                         run.completed_at = _utc_now()
                         from packages.core.services.workflow_chat_projection import project_workflow_run_status
 
@@ -2758,7 +3437,12 @@ class WorkflowRunner:
                     terminal_commit=_commit_terminal,
                 ):
                     return
-                result = await self._execute_step_safe(step, run, db)
+                result = await self._settle_failure(
+                    step,
+                    self._defer_transient_failure(step, await self._execute_step_safe(step, run, db), run),
+                    run,
+                    db,
+                )
                 _continue_failed_result(step, result, run)
                 self._record_step_result(step, result, run)
                 await _emit(
@@ -2779,11 +3463,20 @@ class WorkflowRunner:
                 if result.get("status") == "failed" and not _continues_on_error(step):
                     run.current_step_id = step["id"]
                     run.status = "failed"
-                    run.error = summarize_trace_text(
-                        result.get("error"),
-                        fallback=f"Step {step['id']} failed",
-                    )
+                    run.error = workflow_run_failure_headline(step, result)
                     run.completed_at = _utc_now()
+                    if result.get("code") == "workflow_project_conflict" and result.get("project_id"):
+                        from packages.core.services.workflow_service import workflow_project_replaced_by_other_run
+
+                        # A newer run made this project meanwhile: this run is
+                        # replaced, which needs nobody, so it closes quietly.
+                        if await workflow_project_replaced_by_other_run(db, run, str(result["project_id"])):
+                            from packages.core.constants.task import CancelSource
+                            from packages.core.services.workflow_run_control import cancel_run
+
+                            cancel_run(run, actor_id="system", source=CancelSource.SYSTEM, at=run.completed_at,
+                                       allow_problem_terminal=True)
+                            run.error = t(REPLACED_MESSAGE_KEY, await self._failure_locale(run, db))
                     from packages.core.services.workflow_chat_projection import project_workflow_run_status
 
                     await project_workflow_run_status(db, run=run)
@@ -2843,6 +3536,60 @@ class WorkflowRunner:
         return True
 
     # ── Step dispatch ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _defer_transient_failure(step: dict, result: dict, run: WorkflowRun) -> dict:
+        """Park a transiently failed, replay-safe step on a timed re-execution.
+
+        Uses the durable continuation timer waits use: the run pauses with a
+        due continuation, and the resume sweep re-executes this exact step.
+        Past the step's retry budget the failure stands, unchanged but for
+        its retry history.
+        """
+        if not isinstance(result, dict) or result.get("status") != "failed":
+            return result
+        planned = plan_step_transient_retry(
+            step,
+            result,
+            previous_result=(run.step_results or {}).get(step.get("id")),
+            now=_utc_now(),
+        )
+        if planned is None:
+            return result
+        state = planned.get("transient_retry") or {}
+        if planned.get("status") != "paused":
+            logger.warning(
+                "WorkflowRunner: run %s step %s exhausted transient retries (%s): %s",
+                run.id, step.get("id"), state.get("reason"), result.get("error"),
+            )
+            return planned
+        resume_at = datetime.fromisoformat(planned["resume_at"])
+        run.continuation_token = generate_ulid()
+        run.continuation_due_at = resume_at
+        run.continuation_next_attempt_at = resume_at
+        logger.warning(
+            "WorkflowRunner: run %s step %s failed transiently (%s); retry %s/%s at %s: %s",
+            run.id, step.get("id"), state.get("reason"), state.get("retry"),
+            state.get("max_retries"), planned["resume_at"], result.get("error"),
+        )
+        return planned
+
+    async def _settle_failure(self, step: dict, result: dict, run: WorkflowRun, db) -> dict:
+        """Give a failed step result the headline the platform owns."""
+        if not isinstance(result, dict) or result.get("status") != "failed":
+            return result
+        locale = await self._failure_locale(run, db)
+        return settle_workflow_failure(step, result, step_results=run.step_results, locale=locale)
+
+    @staticmethod
+    async def _failure_locale(run: WorkflowRun, db) -> str | None:
+        try:
+            from packages.core.ai.response_language import resolve_response_locale
+
+            return await resolve_response_locale(run.started_by, db=db)
+        except Exception:
+            logger.debug("Workflow failure locale unavailable", exc_info=True)
+            return None
 
     async def _execute_step_safe(
         self,
@@ -2966,6 +3713,25 @@ class WorkflowRunner:
         max_tries = max(1, min(int(config.get("max_tries", 3) or 3), 5)) if retry_on_fail else 1
         wait_secs = min(float(config.get("retry_wait_ms", 1000) or 0) / 1000.0, 30.0) if retry_on_fail else 0.0
 
+        # Agent-loop nodes report every call that may cross effect I/O before
+        # its handler runs; a node interrupted or failing before any such call
+        # provably changed nothing. With an armed journal (see _run_loop) the
+        # first one is also recorded durably, for claim-loss recovery.
+        effect_watcher = (
+            StepEffectIntentWatcher(
+                run_id=str(run.id),
+                step_id=str(step_id),
+                trace_sequence=(
+                    armed_step_effect_journal_sequence(run, str(step_id))
+                    if isinstance(run, WorkflowRun) else None
+                ),
+                session_factory=self._session_factory,
+            )
+            if step.get("type") in EFFECT_JOURNALED_STEP_TYPES and not config.get("batch")
+            else None
+        )
+        from packages.core.ai.runtime.tool_effect_intents import runtime_tool_effect_watch_scope
+
         result: dict = {"status": "failed", "error": "step did not run"}
         for attempt in range(max_tries):
             # Tools and services take their own admission slot; a read left open
@@ -2974,12 +3740,17 @@ class WorkflowRunner:
             # change, and it would keep that read (and the slot) for the step.
             await _commit_step_pointer_only(db, run)
             await release_read_transaction(db)
+            intents_before = effect_watcher.effect_intents if effect_watcher is not None else 0
             try:
                 execution = (
                     self._execute_step(step, run, db, execution_node_id=execution_node_id)
                     if execution_node_id is not None else self._execute_step(step, run, db)
                 )
-                result = await execution if timeout is None else await asyncio.wait_for(execution, timeout=timeout)
+                with runtime_tool_effect_watch_scope(effect_watcher):
+                    result = (
+                        await execution if timeout is None
+                        else await asyncio.wait_for(execution, timeout=timeout)
+                    )
             except asyncio.TimeoutError:
                 result = {"status": "failed", "error": f"Step {step_id} timed out"}
             except Exception as exc:
@@ -2989,6 +3760,16 @@ class WorkflowRunner:
                 if isinstance(exc, WorkflowRuntimeApprovalError):
                     result.update(code="runtime_approval_continuation_unavailable",
                                   do_not_replay=True, retry_blocked=True)
+                transient = transient_failure_from_exception(exc)
+                if transient is not None:
+                    result.update(transient_failure=transient.value, exception_type=type(exc).__name__)
+                if (
+                    effect_watcher is not None
+                    and effect_watcher.effect_intents == intents_before
+                    and result.get("do_not_replay") is not True
+                ):
+                    # No call reached an effectful handler during this attempt.
+                    result.setdefault("effect_state", "none")
             if result.get("status") == "completed":
                 if config.get("always_output_data") and result.get("output") in (None, [], ()):
                     result["output"] = [{}]
@@ -3018,6 +3799,11 @@ class WorkflowRunner:
             if attempt_forbids_replay(result):
                 # The failed attempt may already have taken effect; another
                 # automatic try could repeat it (publish twice, pay twice).
+                break
+            if step.get("type") == "agent" and result.get("effect_state") != "none":
+                # Agent failures retry only when the Runtime receipt ledger
+                # explicitly proves no effect. A timeout or bare exception
+                # cannot safely be treated as a no-effect result.
                 break
             if attempt + 1 < max_tries and wait_secs > 0:
                 await asyncio.sleep(wait_secs)
@@ -3109,6 +3895,8 @@ class WorkflowRunner:
         runtime_context["workflow_step_id"] = str(step.get("id") or "") or None
         if execution_node_id is not None:
             runtime_context["workflow_execution_node_id"] = execution_node_id
+        if (refusal := await self._collaborator_step_refusal(step_type, step, variables, run, db)) is not None:
+            return refusal
 
         if step_type == "stage":
             return await self._execute_stage_step(step, run, db)
@@ -3162,6 +3950,8 @@ class WorkflowRunner:
             return await self._execute_workflow_project_step(step, variables, run, db)
         elif step_type == "workflow_action_grant":
             return await self._execute_workflow_action_grant_step(step, variables, run, db)
+        elif step_type == "workflow_effect_deadline":
+            return self._execute_workflow_effect_deadline_step(step, variables, run)
         elif step_type == "browser_effect":
             return await self._execute_browser_effect_step(step, variables)
         elif step_type == "publication_receipt":
@@ -3235,10 +4025,9 @@ class WorkflowRunner:
                 entity_id,
                 user_id,
                 runtime_context,
-                run=run,
             )
         elif step_type == "code":
-            return await self._execute_code_step(step, variables)
+            return await self._execute_code_step(step, variables, run=run, runtime_context=runtime_context)
         elif step_type == "extract":
             if (step.get("config") or {}).get("batch"):
                 return await self._execute_batch_extract_step(
@@ -3283,19 +4072,22 @@ class WorkflowRunner:
         elif step_type == "merge":
             return self._execute_merge_step(step, variables, run)
         elif step_type == "end":
-            # End is the workflow's business output. A named ``input`` binding
-            # wins; otherwise pass through the most recently-recorded upstream
-            # value. This keeps terminal nodes useful without requiring every
-            # flow to repeat an explicit mapping.
-            output = variables.get("input")
+            # End is the workflow's business output: its declared ``output``,
+            # else a named ``input`` binding, else the most recently-recorded
+            # upstream value. Runtime bookkeeping (``_``-prefixed variables,
+            # such as a launch key) is never a result.
+            end_config = step.get("config") or {}
+            output = (
+                _resolve_structure(end_config["output"], variables)
+                if end_config.get("output") is not None else variables.get("input")
+            )
             if output is None:
-                upstream = [value for key, value in variables.items() if not str(key).startswith("__")]
+                upstream = [value for key, value in variables.items() if not str(key).startswith("_")]
                 output = upstream[-1] if upstream else None
             output = output if output is not None else (step.get("name") or step_type)
             # An end node may declare that reaching it is not success, e.g.
             # a publish step that finished but left platforms unpublished.
             # The output is kept so results (and any links) stay visible.
-            end_config = step.get("config") or {}
             fail_when = str(end_config.get("fail_when") or "").strip()
             if fail_when and self._eval_bool_expr(fail_when, variables):
                 failed = {
@@ -3310,10 +4102,20 @@ class WorkflowRunner:
                 if retry_from_step_id:
                     failed["retry_from_step_id"] = retry_from_step_id
                 return failed
-            return {
+            completed = {
                 "status": "completed",
                 "output": output,
             }
+            # An end that reports a needs_input outcome can say where to resume
+            # once the person supplies what was missing, and which inputs to edit.
+            retry_state = _resolve_structure(end_config.get("retry_state"), variables)
+            if isinstance(retry_state, dict):
+                retry_state = deepcopy(retry_state)
+                retry_from_step_id = str(end_config.get("retry_from_step_id") or "").strip()
+                if retry_from_step_id:
+                    retry_state.setdefault("retry_from_step_id", retry_from_step_id)
+                completed["retry_state"] = retry_state
+            return completed
         elif step_type in ("trigger", "webhook"):
             # Runtime trigger payload is the n8n-style first item. This matters
             # for chat/webhook flows where downstream nodes read fields such as
@@ -3349,6 +4151,106 @@ class WorkflowRunner:
             return self._execute_unsupported_step(step, run)
         else:
             return {"status": "failed", "error": f"Unknown step type: {step_type}"}
+
+    def _known_run_collaborators(self, run: WorkflowRun) -> frozenset[str] | None:
+        cache = getattr(self, "_run_collaborators", None)
+        return cache.get(str(run.id)) if cache is not None and run.id else None
+
+    async def _collaborators_behind_run(self, db, run: WorkflowRun) -> frozenset[str]:
+        """The collaborators behind ``run``, resolved once per run.
+
+        None behind a run outside any Workspace (collaborators work, start
+        runs and steer Tasks only inside a granted Workspace, and a child run
+        inherits its parent's), one with no human source (starter, authored
+        Workflow, Task), or one in a Workspace no collaboration access grant
+        ever covered: ordinary runs cost at most one cheap existence check per
+        run and no collaborator lookups per step.
+        """
+        from packages.core.ai.runtime.workflow_tools import runtime_workflow_run_context
+        from packages.core.services.runtime_authorization.collaborator import (
+            collaboration_access_granted,
+            workflow_run_collaborators,
+        )
+
+        known = self._known_run_collaborators(run)
+        if known is not None:
+            return known
+        has_humans = bool(run.started_by or run.workflow_id or runtime_workflow_run_context(run).get("task_id"))
+        collaborators = frozenset(
+            await workflow_run_collaborators(db, run)
+            if run.workspace_id
+            and has_humans
+            and await collaboration_access_granted(db, entity_id=run.entity_id, workspace_id=run.workspace_id)
+            else ()
+        )
+        if run.id:
+            if getattr(self, "_run_collaborators", None) is None:
+                self._run_collaborators = {}
+            self._run_collaborators[str(run.id)] = collaborators
+        return collaborators
+
+    async def _collaborator_step_refusal(
+        self,
+        step_type: str,
+        step: dict,
+        variables: dict,
+        run: WorkflowRun,
+        db,
+    ) -> dict | None:
+        """Refuse a step that names a resource outside the run's Workspace when a collaborator is behind the run.
+
+        A run an external collaborator started, a run for a Task they steered
+        and a run of a Workflow they authored call only the run Workspace's
+        Workflows, Agents, Skills, Knowledge and admitted tools. A child run
+        inherits the run's Workspace and its definition snapshot is readable
+        there, so a company Workflow named here would be read and run inside
+        the Workspace. Templated references are checked rendered.
+        """
+        from packages.core.services.collaborator_scope import WORKFLOW_REFERENCE_KEYS, workflow_steps_outside
+
+        keys = WORKFLOW_REFERENCE_KEYS.get(step_type)
+        if not keys:
+            return None
+        if not run.workspace_id:
+            return None  # see _collaborators_behind_run
+        if db is None:
+            if self._known_run_collaborators(run) == frozenset():
+                return None
+            async with async_session() as check_db:
+                return await self._collaborator_step_refusal(step_type, step, variables, run, check_db)
+        collaborators = await self._collaborators_behind_run(db, run)
+        outside: list = []
+        if collaborators:
+            config = step.get("config") or {}
+            rendered = {
+                key: (
+                    _resolve_structure(config[key], variables)
+                    if isinstance(config[key], (dict, list))
+                    else _render_template(str(config[key]), variables)
+                )
+                for key in keys
+                if config.get(key) is not None
+            }
+            outside = await workflow_steps_outside(
+                db,
+                entity_id=run.entity_id,
+                workspace_id=run.workspace_id,
+                steps=[{"type": step_type, "config": rendered}],
+                user_id=run.started_by if run.started_by in collaborators else None,
+            )
+        # The step takes its own admission slot; this check's read must not hold the run's.
+        await release_read_transaction(db)
+        if not outside:
+            return None
+        return {
+            "status": "failed",
+            "code": "collaborator_reference_outside_workspace",
+            "error": (
+                "This step names a resource outside the run's Workspace; a run an external "
+                "collaborator started, steered or authored uses only that Workspace's resources."
+            ),
+            "retry_blocked": True,
+        }
 
     async def _execute_stage_step(
         self,
@@ -3459,7 +4361,9 @@ class WorkflowRunner:
                     status="running",
                 )
 
-                result = await self._execute_step_safe(operation, proxy, db)
+                result = await self._settle_failure(
+                    operation, await self._execute_step_safe(operation, proxy, db), proxy, db,
+                )
                 _continue_failed_result(operation, result, proxy)
                 self._record_step_result(operation, result, proxy)
                 operation_results[operation_id] = _stage_operation_checkpoint(result)
@@ -3676,8 +4580,12 @@ class WorkflowRunner:
                 parse_tool_operation_denylist(denylist)
             except ValueError as exc:
                 return {"status": "failed", "error": f"Invalid config.{TOOL_OPERATION_DENYLIST_KEY}: {exc}"}
+        evidence_states: list[Any] = []
         with tool_operation_denylist_scope(denylist):
-            return await self._execute_agent_step_in_scope(step, *args, **kwargs)
+            result = await self._execute_agent_step_in_scope(
+                step, *args, evidence_states=evidence_states, **kwargs,
+            )
+        return _with_platform_failure(step, result, evidence_states)
 
     async def _execute_agent_step_in_scope(
         self,
@@ -3688,8 +4596,13 @@ class WorkflowRunner:
         runtime_context: dict[str, str | None] | None = None,
         db=None,
         previous_result: dict[str, Any] | None = None,
+        *,
+        evidence_states: list[Any] | None = None,
     ) -> dict:
         """Run agentic loop for an agent-type step.
+
+        ``evidence_states`` receives the run's tool evidence ledger, so the
+        caller can tell a platform fault from what the model wrote.
 
         Config keys:
           - skill: skill ID or slug to invoke via Runtime skill boundary
@@ -3789,8 +4702,9 @@ class WorkflowRunner:
                 runtime_context=runtime_context,
                 step_id=str(step.get("id") or ""),
             )
+            # A Skill step acts with its Skill's tools.
             input_text = runtime_prompt_with_output_schema(
-                rendered_input,
+                runtime_prompt_with_completion_rules(rendered_input, can_act=True),
                 output_schema,
             )
             configured_tools = {str(name) for name in (config.get("tools") or []) if name}
@@ -3872,6 +4786,8 @@ class WorkflowRunner:
                     hitl_resume_checkpoint=True,
                     runtime_checkpoint=approval_resume["checkpoint"] if approval_resume else None,
                 )
+            if evidence_states is not None:
+                evidence_states.append(skill_result.get("tool_evidence"))
             if (skill_result.get("stop_reason") == "hitl_required"
                 and (skill_result.get("control") or {}).get("kind") == "approval_required"
                 and parse_native_hitl(skill_result["control"].get("blocking_result")) is not None):
@@ -3993,7 +4909,8 @@ class WorkflowRunner:
                 from packages.core.ai.runtime.outcome import replay_fields_from_result
 
                 return await runtime_attach_and_persist_workflow_runner_result(
-                    {**_skill_failure_result(skill_result), **replay_fields_from_result(skill_result)},
+                    {**_skill_failure_result(skill_result), **_runtime_loop_failure_fields(skill_result),
+                     **replay_fields_from_result(skill_result)},
                     runtime_envelope,
                 )
             configured_stop_reasons = config.get("fail_on_stop_reasons") or []
@@ -4066,13 +4983,17 @@ class WorkflowRunner:
             default_system = str(config["standalone_system_prompt"])
         system_prompt = _render_template(config.get("system_prompt", default_system), variables)
         user_message = runtime_prompt_with_output_schema(
-            _render_template(
-                config.get("prompt", config.get("input", step.get("name", "Execute this step."))),
-                variables,
-            ) + _workflow_agent_resume_prompt(
-                previous_result,
-                runtime_context=runtime_context,
-                step_id=str(step.get("id") or ""),
+            runtime_prompt_with_completion_rules(
+                _render_template(
+                    config.get("prompt", config.get("input", step.get("name", "Execute this step."))),
+                    variables,
+                ) + _workflow_agent_resume_prompt(
+                    previous_result,
+                    runtime_context=runtime_context,
+                    step_id=str(step.get("id") or ""),
+                ),
+                # An llm step has no tools; an agent step acts with its tools or its agent's.
+                can_act=str(step.get("type") or "agent").lower() == "agent",
             ),
             output_schema,
         )
@@ -4137,18 +5058,28 @@ class WorkflowRunner:
             legacy_path="ai.workflow_runner.agent_step",
         )
         try:
-            appendix = await runtime_prepare_prompt_appendix_for_turn(
-                db,
-                request=runtime_request,
-                agent_id=agent_id or None,
-                bound_tool_names=bound_tool_names,
-                is_master=is_master,
-                mcp_allowed_names=mcp_allowed_names,
-                mcp_provider_scopes=mcp_provider_scopes,
-                mcp_scope_unrestricted=mcp_scope_unrestricted,
-                active_user_message=user_message,
-                configured_tool_names=tool_names,
-            )
+            if db is not None:
+                await release_read_transaction(db)
+            # Catalogue loading can refresh packaged Skills. Own that short
+            # transaction so a nested Skill call cannot wait on its parent's
+            # uncommitted refresh, and never commit the caller's unrelated work.
+            async with (
+                self._session_factory() if db is not None else nullcontext(None)
+            ) as prompt_db:
+                appendix = await runtime_prepare_prompt_appendix_for_turn(
+                    prompt_db,
+                    request=runtime_request,
+                    agent_id=agent_id or None,
+                    bound_tool_names=bound_tool_names,
+                    is_master=is_master,
+                    mcp_allowed_names=mcp_allowed_names,
+                    mcp_provider_scopes=mcp_provider_scopes,
+                    mcp_scope_unrestricted=mcp_scope_unrestricted,
+                    active_user_message=user_message,
+                    configured_tool_names=tool_names,
+                )
+                if prompt_db is not None:
+                    await prompt_db.commit()
             tool_schemas = appendix.tool_schemas
             allowed_tool_names = appendix.allowed_tool_names
             runtime_envelope = appendix.envelope
@@ -4215,6 +5146,8 @@ class WorkflowRunner:
             hitl_resume_checkpoint=True,
             runtime_checkpoint=approval_resume["checkpoint"] if approval_resume else None,
         )
+        if evidence_states is not None:
+            evidence_states.append(getattr(result, "tool_evidence", None))
 
         if (getattr(result, "stop_reason", None) == "hitl_required"
             and (getattr(result, "control", None) or {}).get("kind") == "approval_required"):
@@ -4235,7 +5168,22 @@ class WorkflowRunner:
                 "tools_used": result.tool_calls_made,
                 "rounds": result.rounds,
                 **replay_fields_from_result(result),
+                **_runtime_loop_failure_fields(result),
             }
+            child_results = (getattr(result, "control", None) or {}).get("child_skill_results")
+            if child_results:
+                failure["child_skill_results"] = child_results
+            error_detail = getattr(result, "error_detail", None)
+            if getattr(result, "error", None) == "context_budget_exceeded":
+                error_detail = dict(error_detail) if isinstance(error_detail, dict) else {}
+                logger.warning(
+                    "Workflow agent step %s exceeded its context budget: %s",
+                    step.get("id"), json.dumps(error_detail, ensure_ascii=False, default=str),
+                )
+                failure["platform_failure"] = workflow_platform_failure(
+                    {"code": "context_budget_exceeded"}, details=error_detail,
+                    step=step, message_key=CONTEXT_OVERFLOW_MESSAGE_KEY,
+                )
             return await runtime_attach_and_persist_workflow_runner_result(
                 failure,
                 runtime_envelope,
@@ -4502,6 +5450,8 @@ class WorkflowRunner:
             node-level override; falls back to the run's workspace, else
             searches entity-wide)
           - output_var: variable to store the retrieved excerpts in
+          - output_format: ``json`` keeps the result's ``sources`` readable by
+            later steps (default: the excerpts as text)
         """
         config = step.get("config", {})
         runtime_context = runtime_context or {}
@@ -4521,7 +5471,8 @@ class WorkflowRunner:
         tool_step = {
             "id": step.get("id"),
             "name": step.get("name"),
-            "config": {"tool": "rag", "args": args, "output_var": config.get("output_var")},
+            "config": {"tool": "rag", "args": args, "output_var": config.get("output_var"),
+                       **({"output_format": config["output_format"]} if config.get("output_format") else {})},
         }
         return await self._execute_tool_step(
             tool_step,
@@ -4588,7 +5539,8 @@ class WorkflowRunner:
                         "status": "failed",
                         "error": f"Loop iteration {i} failed: {res.get('error')}",
                         "outputs": outputs,
-                        **{key: res[key] for key in ("code", "do_not_replay", "retry_blocked") if key in res},
+                        **{key: res[key] for key in ("code", "do_not_replay", "retry_blocked", "platform_failure")
+                           if key in res},
                     }
                 outputs.append(res.get("output"))
 
@@ -4803,13 +5755,19 @@ class WorkflowRunner:
             current_headers = dict(headers)
             current_query: dict | None = query or None
             current_payload = payload
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                trust_env=False,
-            ) as http:
-                for redirect_index in range(_WORKFLOW_HTTP_MAX_REDIRECTS + 1):
-                    await _resolve_workflow_http_host(current_url)
+            cookies = httpx.Cookies()
+            for redirect_index in range(_WORKFLOW_HTTP_MAX_REDIRECTS + 1):
+                target = await _resolve_workflow_http_host(current_url)
+                # Resolve once per hop, then connect only to those public IPs.
+                # The shared transport also supports HTTP; HTTPS retains normal
+                # certificate/hostname verification and the original Host/SNI.
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=create_public_https_transport(target),
+                    cookies=cookies,
+                ) as http:
                     resp = await http.request(
                         current_method,
                         current_url,
@@ -4817,39 +5775,42 @@ class WorkflowRunner:
                         params=current_query,
                         json=current_payload,
                     )
-                    if not 300 <= resp.status_code < 400:
-                        break
-                    if redirect_index >= _WORKFLOW_HTTP_MAX_REDIRECTS:
-                        raise WorkflowHttpPolicyError("Public workflow HTTP request redirected too many times")
-                    location = resp.headers.get("location")
-                    if not location:
-                        raise WorkflowHttpPolicyError("Public workflow HTTP request returned an invalid redirect")
-                    next_url = urljoin(current_url, location)
-                    previous = urlsplit(current_url)
-                    previous_origin = (
-                        previous.scheme.casefold(),
-                        previous.hostname,
-                        previous.port,
-                    )
-                    next_parsed = urlsplit(_validate_workflow_http_url(next_url))
-                    next_origin = (
-                        next_parsed.scheme.casefold(),
-                        next_parsed.hostname,
-                        next_parsed.port,
-                    )
-                    if next_origin != previous_origin:
-                        current_headers = {
-                            key: value
-                            for key, value in current_headers.items()
-                            if key.casefold() not in {"authorization", "proxy-authorization", "cookie"}
-                        }
-                    if resp.status_code == 303 or (
-                        resp.status_code in {301, 302} and current_method not in {"GET", "HEAD"}
-                    ):
-                        current_method = "GET"
-                        current_payload = None
-                    current_url = next_url
-                    current_query = None
+                    # The response's jar is authoritative: merging would restore
+                    # cookies that this response deleted with Max-Age=0.
+                    cookies = http.cookies
+                if not 300 <= resp.status_code < 400:
+                    break
+                if redirect_index >= _WORKFLOW_HTTP_MAX_REDIRECTS:
+                    raise WorkflowHttpPolicyError("Public workflow HTTP request redirected too many times")
+                location = resp.headers.get("location")
+                if not location:
+                    raise WorkflowHttpPolicyError("Public workflow HTTP request returned an invalid redirect")
+                next_url = urljoin(current_url, location)
+                previous = urlsplit(current_url)
+                previous_origin = (
+                    previous.scheme.casefold(),
+                    previous.hostname,
+                    previous.port,
+                )
+                next_parsed = urlsplit(_validate_workflow_http_url(next_url))
+                next_origin = (
+                    next_parsed.scheme.casefold(),
+                    next_parsed.hostname,
+                    next_parsed.port,
+                )
+                if next_origin != previous_origin:
+                    current_headers = {
+                        key: value
+                        for key, value in current_headers.items()
+                        if key.casefold() not in {"authorization", "proxy-authorization", "cookie"}
+                    }
+                if resp.status_code == 303 or (
+                    resp.status_code in {301, 302} and current_method not in {"GET", "HEAD"}
+                ):
+                    current_method = "GET"
+                    current_payload = None
+                current_url = next_url
+                current_query = None
         except (WorkflowHttpPolicyError, httpx.HTTPError) as exc:
             return {"status": "failed", "error": f"HTTP request failed: {exc}"}
 
@@ -4961,6 +5922,7 @@ class WorkflowRunner:
     def _workflow_project_output(project: Any) -> dict[str, Any]:
         return {
             "project_id": project.id,
+            "created_by": project.created_by,
             "project_type": project.project_type,
             "project_key": project.project_key,
             "schema_version": project.schema_version,
@@ -4982,7 +5944,11 @@ class WorkflowRunner:
             claim_workflow_project,
             create_workflow_project,
             get_workflow_project,
+            list_workflow_projects,
+            lease_due_workflow_project,
+            complete_workflow_project_lease,
             patch_workflow_project,
+            unique_project_root,
         )
 
         config = step.get("config", {})
@@ -5016,6 +5982,19 @@ class WorkflowRunner:
             )
             return failure or state
 
+        async def with_folder(state: Any, project_type: str) -> Any:
+            # ``folder: {name, under}`` gives a new project its own readable
+            # folder, under its parent's when ``under`` names one.
+            folder = _resolve_structure(config.get("folder"), variables)
+            if folder is None or not isinstance(state, dict):
+                return state
+            if not isinstance(folder, dict):
+                raise ValueError("Workflow project folder must be an object")
+            return {**state, "project_root": await unique_project_root(
+                db, entity_id=run.entity_id, workspace_id=run.workspace_id,
+                name=folder.get("name"), under=folder.get("under"), fallback=project_type.replace("_", "-"),
+            )}
+
         try:
             project_type = str(_resolve_binding(config.get("project_type", ""), variables) or "").strip()
             project_id = str(_resolve_binding(config.get("project_id", ""), variables) or "").strip()
@@ -5029,7 +6008,7 @@ class WorkflowRunner:
                     raise ValueError("Workflow project claim requires project_key")
                 if not run.started_by:
                     raise ValueError("Workflow project claim requires a triggering user")
-                state = _resolve_structure(config.get("state", {}), variables)
+                state = await with_folder(_resolve_structure(config.get("state", {}), variables), project_type)
                 checked = validated_state(state)
                 if checked.get("code") == "workflow_project_state_validation_failed":
                     return checked
@@ -5053,7 +6032,7 @@ class WorkflowRunner:
                     raise ValueError("Workflow project create requires project_type")
                 if not run.started_by:
                     raise ValueError("Workflow project create requires a triggering user")
-                state = _resolve_structure(config.get("state", {}), variables)
+                state = await with_folder(_resolve_structure(config.get("state", {}), variables), project_type)
                 checked = validated_state(state)
                 if checked.get("code") == "workflow_project_state_validation_failed":
                     return checked
@@ -5086,6 +6065,65 @@ class WorkflowRunner:
                 checked = validated_state(deepcopy(project.state or {}))
                 if checked.get("code") == "workflow_project_state_validation_failed":
                     return checked
+            elif operation == "list":
+                if not project_type:
+                    raise ValueError("Workflow project list requires project_type")
+                stages = {str(value) for value in (_resolve_structure(config.get("stages", []), variables) or [])}
+                rows, next_cursor = await list_workflow_projects(
+                    db, entity_id=run.entity_id, workspace_id=run.workspace_id,
+                    project_type=project_type, stages=stages or None,
+                    parent_id=str(_resolve_binding(config.get("parent_id", ""), variables) or "") or None,
+                    parent_state_key=str(config.get("parent_state_key") or "parent_project_id"),
+                    limit=int(config.get("limit") or 100),
+                    after_id=str(_resolve_binding(config.get("after_id", ""), variables) or "") or None,
+                )
+                for row in rows:
+                    checked = validated_state(deepcopy(row.state or {}))
+                    if checked.get("code") == "workflow_project_state_validation_failed":
+                        return checked
+                return {"status": "completed", "output": {
+                    "projects": [self._workflow_project_output(row) for row in rows],
+                    "has_more": next_cursor is not None, "next_cursor": next_cursor,
+                }, "output_var": output_var}
+            elif operation == "lease_due":
+                if not project_type:
+                    raise ValueError("Workflow project lease_due requires project_type")
+                stages = {str(value) for value in (_resolve_structure(config.get("pending_stages", []), variables) or [])}
+                async with db.begin_nested():
+                    project = await lease_due_workflow_project(
+                        db, entity_id=run.entity_id, workspace_id=run.workspace_id, project_type=project_type,
+                        run_id=run.id, parent_id=str(_resolve_binding(config.get("parent_id", ""), variables) or "") or None,
+                        parent_state_key=str(config.get("parent_state_key") or "parent_project_id"),
+                        due_path=str(config.get("due_path") or "due_at"), lease_path=str(config.get("lease_path") or "lease"),
+                        pending_stages=stages or None, lease_seconds=int(config.get("lease_seconds") or 900),
+                        recovery=str(config.get("recovery") or "reclaim"), limit=int(config.get("limit") or 100),
+                    )
+                    if project is not None:
+                        if project.schema_version != int(config.get("schema_version") or 1):
+                            raise ValueError("Workflow project schema version does not match")
+                        checked = validated_state(deepcopy(project.state or {}))
+                        if checked.get("code") == "workflow_project_state_validation_failed":
+                            raise ValueError(checked["error"])
+                return {"status": "completed", "output": {"has_project": project is not None, **({"project": self._workflow_project_output(project)} if project else {})}, "output_var": output_var}
+            elif operation == "complete_lease":
+                if not project_id:
+                    raise ValueError("Workflow project complete_lease requires project_id")
+                patch = _resolve_structure(config.get("patch", {}), variables)
+                if not isinstance(patch, dict):
+                    raise ValueError("Workflow project lease patch must be an object")
+                async with db.begin_nested():
+                    project = await complete_workflow_project_lease(
+                        db, project_id=project_id, entity_id=run.entity_id, workspace_id=run.workspace_id,
+                        run_id=run.id, stage=str(_resolve_binding(config.get("current_stage", "completed"), variables) or "completed"),
+                        patch=patch, lease_path=str(config.get("lease_path") or "lease"),
+                    )
+                    if project_type and project.project_type != project_type:
+                        raise ValueError("Workflow project type does not match")
+                    if project.schema_version != int(config.get("schema_version") or 1):
+                        raise ValueError("Workflow project schema version does not match")
+                    checked = validated_state(deepcopy(project.state or {}))
+                    if checked.get("code") == "workflow_project_state_validation_failed":
+                        raise ValueError(checked["error"])
             elif operation == "patch":
                 if not project_id:
                     raise ValueError("Workflow project patch requires project_id")
@@ -5207,6 +6245,9 @@ class WorkflowRunner:
                     from packages.core.models.workflow import WorkflowActionGrant
                     from packages.core.services.workflow_action_grant_service import (
                         YOUTUBE_PUBLICATION_GRANT_TYPE,
+                        WorkflowActionGrantDenied,
+                        validate_workflow_execution_youtube_publication_step,
+                        validate_workflow_execution_youtube_upload_preparation,
                     )
 
                     existing_grant = await db.get(
@@ -5219,18 +6260,73 @@ class WorkflowRunner:
                         == YOUTUBE_PUBLICATION_GRANT_TYPE
                         and existing_grant.entity_id == run.entity_id
                         and existing_grant.workspace_id == run.workspace_id
-                        and existing_grant.workflow_run_id == run.id
                         and existing_grant.project_id == project.id
                     ):
-                        action_grant_id = existing_grant.id
+                        scope = existing_grant.scope if isinstance(existing_grant.scope, dict) else {}
+                        declaration = scope.get("declaration") if isinstance(scope.get("declaration"), dict) else {}
+                        artifact = declaration.get("artifact") if isinstance(declaration.get("artifact"), dict) else {}
+                        source = str(artifact.get("fs_path") or "").strip()
+                        upload_step_id = str(declaration.get("upload_step_id") or "").strip()
+                        post_asset_step_id = str(
+                            declaration.get("post_publish_asset_step_id") or ""
+                        ).strip()
+                        video_consumed = bool(scope.get("video_consumed_at"))
+                        if source and upload_step_id and run.started_by:
+                            try:
+                                common_scope = {
+                                    "grant_id": existing_grant.id,
+                                    "entity_id": run.entity_id,
+                                    "user_id": str(run.started_by),
+                                    "workspace_id": run.workspace_id,
+                                    "workflow_run_id": run.id,
+                                    "workflow_lineage_root_run_id": (run.lineage_root_run_id or run.id),
+                                }
+                                if video_consumed and post_asset_step_id:
+                                    await validate_workflow_execution_youtube_publication_step(
+                                        db,
+                                        **common_scope,
+                                        workflow_step_id=post_asset_step_id,
+                                        browser_action="click_element",
+                                        browser_arguments={},
+                                    )
+                                else:
+                                    await validate_workflow_execution_youtube_upload_preparation(
+                                        db,
+                                        **common_scope,
+                                        workflow_step_id=upload_step_id,
+                                        source=source,
+                                    )
+                            except WorkflowActionGrantDenied:
+                                pass
+                            else:
+                                action_grant_id = existing_grant.id
+            project_root = str(state.get("project_root") or "").strip() or None
+            takes = dict(_trusted_workflow_context(run).get("workflow_project_takes") or {})
+            # A revision is a new version made from an earlier run: it keeps
+            # that run's lineage but never its take.
+            revision = isinstance((run.trigger_data or {}).get("_workflow_revision"), dict)
+            take_key = run.id if revision else run.lineage_root_run_id or run.id
+            from packages.core.services.workspace_layout import PROJECT_TAKES_SEGMENT
+
+            take = f"{project_root}/{PROJECT_TAKES_SEGMENT}/{take_key}"
+            if str(config.get("production") or "").strip() == "take" and project_root and (
+                    project.id not in takes or (revision and takes[project.id] != take)):
+                # ``production: take`` makes the project again (a remake): this
+                # run works in a take of its own inside the project's folder, so
+                # what an earlier run made there stays as it was. Keyed by the
+                # run's lineage, a retry keeps the same take.
+                takes[project.id] = take
+            production_root = takes.get(project.id) or project_root
             _set_trusted_workflow_context(
                 run,
                 workflow_project_id=project.id,
-                workflow_project_root=state.get("project_root"),
+                workflow_project_root=production_root,
+                workflow_project_takes=takes or None,
                 workflow_action_grant_id=action_grant_id,
                 approved_plan_version=state.get("approved_plan_version"),
             )
             output = self._workflow_project_output(project)
+            output["production_root"] = production_root
             if claimed is not None:
                 output["claimed"] = claimed
             return {
@@ -5243,6 +6339,7 @@ class WorkflowRunner:
                 "status": "failed",
                 "code": "workflow_project_conflict",
                 "error": str(exc),
+                "project_id": project_id,
             }
         except Exception as exc:  # noqa: BLE001
             return {
@@ -5250,6 +6347,43 @@ class WorkflowRunner:
                 "code": "workflow_project_failed",
                 "error": str(exc),
             }
+
+    def _execute_workflow_effect_deadline_step(
+        self,
+        step: dict,
+        variables: dict,
+        run: WorkflowRun,
+    ) -> dict:
+        """Freeze a Blueprint-declared external action deadline for this run."""
+        from packages.core.ai.runtime.effect_deadline import (
+            normalize_effect_action_keys,
+            normalize_effect_deadline,
+        )
+
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        try:
+            deadline_at = normalize_effect_deadline(
+                _resolve_binding(config.get("deadline_at"), variables)
+            )
+            action_keys = normalize_effect_action_keys(
+                _resolve_structure(config.get("action_keys"), variables)
+            )
+        except ValueError as exc:
+            return {"status": "failed", "error": str(exc)}
+        trusted = _trusted_workflow_context(run)
+        existing_deadline = trusted.get("workflow_effect_deadline_at")
+        existing_keys = trusted.get("workflow_effect_deadline_action_keys")
+        if existing_deadline is not None or existing_keys is not None:
+            if existing_deadline != deadline_at or existing_keys != list(action_keys):
+                return {"status": "failed", "error": "workflow effect deadline is immutable for a run"}
+        else:
+            _set_trusted_workflow_context(
+                run,
+                workflow_effect_deadline_at=deadline_at,
+                workflow_effect_deadline_action_keys=list(action_keys),
+            )
+        output = {"deadline_at": deadline_at, "action_keys": list(action_keys)}
+        return {"status": "completed", "output": output, "output_var": config.get("output_var")}
 
     async def _execute_workflow_action_grant_step(
         self,
@@ -5260,6 +6394,7 @@ class WorkflowRunner:
     ) -> dict:
         from packages.core.services.workflow_action_grant_service import (
             create_workflow_action_grant,
+            create_workflow_execution_youtube_publication_grant,
             revoke_current_workflow_action_grant,
             revoke_workflow_action_grant,
         )
@@ -5303,6 +6438,13 @@ class WorkflowRunner:
                     workspace_id=run.workspace_id,
                 )
             elif operation == "create":
+                declaration = _resolve_structure(config.get("declaration"), variables)
+                if isinstance(declaration, dict) and declaration.get("kind") == "youtube_publication_v1" and declaration.get("source") == "workflow_execution":
+                    grant = await create_workflow_execution_youtube_publication_grant(
+                        db, run=run, grant_step_id=str(step.get("id") or ""), declaration=declaration,
+                    )
+                    _set_trusted_workflow_context(run, workflow_project_id=grant.project_id, workflow_action_grant_id=grant.id)
+                    return {"status": "completed", "output": {"grant_id": grant.id, "project_id": grant.project_id, "grant_type": grant.grant_type, "scope": deepcopy(grant.scope or {}), "granted_by": grant.granted_by, "expires_at": grant.expires_at.isoformat(), "revoked_at": None}, "output_var": output_var}
                 approval_step_id = str(config.get("approval_step_id") or "").strip()
                 approval = (run.step_results or {}).get(approval_step_id) or {}
                 if not (
@@ -5531,7 +6673,9 @@ class WorkflowRunner:
                     collected[key] = variables[key]
             response = variables.get(response_variable)
             payload = response.get("payload") if isinstance(response, dict) else None
-            answers = payload.get("inputs") if isinstance(payload, dict) else None
+            # Chat cards wrap inputs in a payload; native run forms submit
+            # the same declared fields directly under the response variable.
+            answers = payload.get("inputs") if isinstance(payload, dict) else response
             if isinstance(answers, dict):
                 for field in collection_fields:
                     if not isinstance(field, dict):
@@ -5559,8 +6703,10 @@ class WorkflowRunner:
                 per_round = max(1, min(int(config.get("fields_per_round") or 3), 12))
             except (TypeError, ValueError):
                 per_round = 3
-            requested = missing[:per_round]
+            requested = [_collection_field_for_prompt(field, variables) for field in missing[:per_round]]
             labels = [str(field.get("label") or field["key"]) for field in requested]
+            # The request line follows the language the Workflow author wrote the message in.
+            locale = text_locale(str(message))
             run.continuation_token = None
             run.continuation_due_at = None
             run.continuation_next_attempt_at = None
@@ -5568,7 +6714,7 @@ class WorkflowRunner:
             return {
                 "status": "paused",
                 "resume_strategy": "reexecute",
-                "output": f"{message}\n请补充：{'、'.join(labels)}",
+                "output": f"{message}\n{t('workflow.input.please_provide', locale=locale, fields=t('workflow.input.list_separator', locale=locale).join(labels))}",
                 "wait_type": wait_type,
                 "collection_fields": requested,
                 "collection_values": collected,
@@ -5607,7 +6753,7 @@ class WorkflowRunner:
                 "output": message,
                 "wait_type": wait_type,
                 "response_variable": response_variable,
-                "input_schema": input_schema,
+                "input_schema": _bind_schema_defaults(input_schema, variables),
             }
 
         if wait_type == "approval" and config.get("allow_always"):
@@ -5683,6 +6829,9 @@ class WorkflowRunner:
         }
         if config.get("review") is not None:
             result["review"] = _resolve_structure(config["review"], variables)
+            from packages.core.services.workflow_review_files import attach_review_document_ids
+
+            await attach_review_document_ids(db, entity_id=run.entity_id, reviews=[result["review"]])
         if config.get("review_title") is not None:
             result["review_title"] = _resolve_binding(config["review_title"], variables)
         return result
@@ -5773,6 +6922,10 @@ class WorkflowRunner:
                 "status": "failed",
                 "error": f"Parallel sub-steps failed: {', '.join(failed)}",
                 "outputs": outputs,
+                **next((
+                    {"platform_failure": result["platform_failure"]}
+                    for result in results if result.get("platform_failure")
+                ), {}),
             }
 
         return {
@@ -6099,13 +7252,26 @@ class WorkflowRunner:
 
     # ── Code step ────────────────────────────────────────────────────────
 
-    async def _execute_code_step(self, step: dict, variables: dict) -> dict:
+    async def _execute_code_step(
+        self,
+        step: dict,
+        variables: dict,
+        *,
+        run: Any = None,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict:
         """Execute a Python, JavaScript, or Bash snippet in an ephemeral sandbox.
 
         The complete workflow variable bag is written to ``inputs.json``. Python
         and JavaScript snippets also receive it as a global ``inputs`` value; Bash
         receives ``WORKFLOW_INPUTS_FILE``. The sandbox is destroyed after every
         execution and has networking disabled unless the node explicitly opts in.
+
+        The sandbox is a ONE_SHOT admitted by the sandbox session service for
+        this workflow run: under external-runner coordination it is a queued
+        background ticket the run waits on (up to the queue deadline) instead
+        of failing while every runner is busy, and it holds an instance row and
+        runner slot until it is destroyed here.
         """
         config = step.get("config", {})
         raw_language = str(config.get("language") or "python").strip().lower()
@@ -6128,8 +7294,7 @@ class WorkflowRunner:
         if not code.strip():
             return {"status": "failed", "error": "Code node has no code to execute"}
 
-        sandbox_url = _workflow_sandbox_url()
-        if not sandbox_url:
+        if not _workflow_sandbox_configured():
             return {
                 "status": "failed",
                 "error": (
@@ -6186,49 +7351,78 @@ class WorkflowRunner:
         except (TypeError, ValueError):
             code_timeout = 60
 
-        sandbox_id: str | None = None
-        try:
-            from packages.core.services.sandbox_sdk import SandboxClient
-            from packages.core.config import get_settings
+        from packages.core.services.sandbox_session_service import (
+            SandboxBinding,
+            SandboxBundle,
+            SandboxLifetime,
+            SandboxOwner,
+            SandboxSession,
+            SandboxSessionError,
+            admit_sandbox,
+            discard_one_shot_sandbox,
+            sandbox_client_for,
+            sandbox_exec_queue_params,
+        )
 
-            settings = get_settings()
-            async with SandboxClient(
-                base_url=sandbox_url,
-                timeout=float(code_timeout) + 60.0,
-                api_token=settings.SANDBOX_API_TOKEN,
-            ) as client:
-                created = await client.create_from_files(
-                    skill_name=f"workflow-code-{re.sub(r'[^a-zA-Z0-9_-]', '-', str(step.get('id') or 'node'))}",
-                    files=files,
-                    env={},
-                    allowed_sensitive_keys=[],
-                    auto_install=True,
-                    config={
-                        # Connected code uses the runner's approved default
-                        # network; do not force Docker's generic bridge.
-                        **({} if config.get("allow_network") is True else {"network": "none"}),
-                        "memory": "512m",
-                        "cpus": 1.0,
-                        "pids_limit": 128,
-                    },
-                )
-                sandbox_id = created.sandbox_id
+        context = dict(runtime_context or {})
+        workflow_run_id = str(getattr(run, "id", "") or context.get("workflow_run_id") or "")
+        try:
+            owner = SandboxOwner(
+                entity_id=str(getattr(run, "entity_id", "") or ""),
+                # Whoever started the run; a scheduled run is user-less.
+                user_id=str(getattr(run, "started_by", "") or ""),
+            )
+        except ValueError as exc:
+            return {"status": "failed", "error": f"Sandbox execution failed: {exc}"}
+        bundle = SandboxBundle(
+            skill_name=f"workflow-code-{re.sub(r'[^a-zA-Z0-9_-]', '-', str(step.get('id') or 'node'))}",
+            files=files,
+            env={},
+            source="workspace",
+            auto_install=True,
+            config={
+                # Connected code uses the runner's approved default
+                # network; do not force Docker's generic bridge.
+                **({} if config.get("allow_network") is True else {"network": "none"}),
+                **_code_node_resources(config),
+            },
+            lifetime=SandboxLifetime.ONE_SHOT,
+            purpose="workflow-code",
+        )
+        # A workflow run is a background requester: it has no durable Runtime
+        # run to park, so it waits on its own ticket like a task worker.
+        binding = SandboxBinding(
+            agent_id="",
+            workflow_run_id=workflow_run_id or "adhoc",
+        )
+        admitted = await admit_sandbox(owner=owner, bundle=bundle, binding=binding)
+        if isinstance(admitted, SandboxSessionError):
+            return {"status": "failed", "error": f"Sandbox execution failed: {admitted.message}"}
+        if not isinstance(admitted, SandboxSession):  # pragma: no cover - only durable runs park
+            return {"status": "failed", "error": "Sandbox execution failed: unexpected admission outcome"}
+
+        sandbox_id = admitted.sandbox_id
+        try:
+            async with await sandbox_client_for(sandbox_id, timeout=float(code_timeout) + 60.0) as client:
                 executed = await client.exec(
                     sandbox_id=sandbox_id,
                     command=command,
                     timeout=code_timeout,
-                    workdir=created.workdir,
+                    workdir=admitted.workdir,
+                    **sandbox_exec_queue_params(work_area=f"workflow-run:{binding.workflow_run_id}", skill=bundle.skill_name),
                 )
-                try:
-                    await client.destroy(sandbox_id)
-                    sandbox_id = None
-                except Exception:  # noqa: BLE001 - cleanup is retried in finally
-                    logger.warning("workflow code sandbox cleanup failed", exc_info=True)
 
             if executed.exit_code != 0:
+                # The runner names why it killed a command (out of memory, process
+                # limit, disk); a bare "status 137" hides which limit to raise.
+                killed = str(getattr(executed, "outcome_detail", "") or "").strip()
                 return {
                     "status": "failed",
-                    "error": executed.stderr or f"Code exited with status {executed.exit_code}",
+                    "error": (
+                        f"Code was stopped by the sandbox: {killed}"
+                        if killed
+                        else executed.stderr or f"Code exited with status {executed.exit_code}"
+                    ),
                     "output": executed.stdout,
                     "stderr": executed.stderr,
                     "exit_code": executed.exit_code,
@@ -6260,23 +7454,8 @@ class WorkflowRunner:
         except Exception as exc:  # noqa: BLE001 - convert sandbox failures to node failures
             return {"status": "failed", "error": f"Sandbox execution failed: {exc}"}
         finally:
-            if sandbox_id:
-                try:
-                    from packages.core.services.sandbox_sdk import SandboxClient
-                    from packages.core.config import get_settings
-
-                    async with SandboxClient(
-                        base_url=sandbox_url,
-                        timeout=30.0,
-                        api_token=get_settings().SANDBOX_API_TOKEN,
-                    ) as client:
-                        await client.destroy(sandbox_id)
-                except Exception:  # noqa: BLE001 - best-effort leak prevention
-                    logger.warning(
-                        "workflow code sandbox %s could not be destroyed",
-                        sandbox_id,
-                        exc_info=True,
-                    )
+            if await discard_one_shot_sandbox(sandbox_id) != "destroyed":
+                logger.warning("workflow code sandbox %s could not be destroyed", sandbox_id)
 
     # ── Information Extractor (n8n) — LLM → structured JSON ──────────────
 
@@ -6451,10 +7630,19 @@ class WorkflowRunner:
         value = _render_template(str(config.get("value") or ""), variables)
         base = _parse_dt(value) or _utc_now()
         if op in ("add", "subtract"):
+            raw_amount = _resolve_binding(config["amount"], variables) if "amount" in config else 0
             try:
-                amount = float(config.get("amount") or 0)
+                if isinstance(raw_amount, bool):
+                    raise ValueError
+                amount = float(raw_amount)
+                if not math.isfinite(amount):
+                    raise ValueError
             except (TypeError, ValueError):
-                amount = 0.0
+                return {
+                    "status": "failed",
+                    "code": "datetime_amount_invalid",
+                    "error": "Datetime amount must resolve to a number",
+                }
             unit = str(config.get("unit") or "days").lower()
             key = {
                 "second": "seconds",
@@ -6586,6 +7774,15 @@ class WorkflowRunner:
         """n8n Stop And Error — deliberately fail the run with a message."""
         config = step.get("config", {})
         msg = _render_template(str(config.get("message") or "Stopped by workflow"), variables)
+        # ``items`` keeps a list (for example, blockers) as separate lines under the message,
+        # so each one reads on its own instead of running into the next.
+        items = _resolve_structure(config.get("items"), variables)
+        if isinstance(items, list):
+            lines = list(dict.fromkeys(
+                _template_text(item).strip() for item in items if item is not None and _template_text(item).strip()
+            ))
+            if lines:
+                msg = "\n".join([msg, *(f"- {line}" for line in lines)])
         result = {"status": "failed", "error": msg}
         if config.get("retryable") is False:
             result["retryable"] = False
@@ -7036,6 +8233,11 @@ class WorkflowRunner:
                 "error": "subworkflow requires an explicit trigger or webhook entry node",
             }
 
+        # Default: the first failed item fails the step and later items never
+        # start. ``continue_on_failure`` runs every item anyway (batches whose
+        # items are independent, e.g. one episode or one platform each) and
+        # reports each item's own outcome; the step fails only if all failed.
+        continue_on_failure = config.get("continue_on_failure") is True
         retry_raw = config.get("retry_item_keys", [])
         retry_keys_value = _resolve_binding(retry_raw, variables)
         retry_keys = {str(value) for value in retry_keys_value} if isinstance(retry_keys_value, list) else set()
@@ -7076,7 +8278,8 @@ class WorkflowRunner:
                     WorkflowRunStatus.CANCELLED,
                 }
             ]
-            if failed:
+            pending = [item for item in item_states if item.get("status") == "pending"]
+            if failed and (not continue_on_failure or (not pending and len(failed) == len(item_states))):
                 progress["items"] = item_states
                 self._set_foreach_progress(run, progress_key, progress)
                 return {
@@ -7086,18 +8289,32 @@ class WorkflowRunner:
                     "output_var": config.get("output_var"),
                 }
 
-            pending = [item for item in item_states if item.get("status") == "pending"]
             if not pending:
-                outputs = [item.get("output") for item in item_states]
+                # A failed item (continue_on_failure) keeps its place in the
+                # output, carrying its key and error instead of the child's
+                # variables, so the next steps can say which item failed.
+                outputs = [
+                    item.get("output")
+                    if item.get("status") not in {WorkflowRunStatus.FAILED, WorkflowRunStatus.CANCELLED}
+                    else {
+                        "key": item.get("key"),
+                        "status": str(item.get("status")),
+                        "error": item.get("error") or "foreach_subworkflow child failed",
+                    }
+                    for item in item_states
+                ]
                 updated = dict(run.variables or {})
                 updated.pop(progress_key, None)
                 run.variables = updated
-                return {
+                result = {
                     "status": "completed",
                     "output": outputs,
                     "items": self._foreach_public_items(item_states),
                     "output_var": config.get("output_var"),
                 }
+                if failed:
+                    result["failed_count"] = len(failed)
+                return result
 
             batch = pending[:concurrency]
             child_runs: list[WorkflowRun] = []
@@ -7907,7 +9124,7 @@ class WorkflowRunner:
                 if is_input_wait:
                     try:
                         input_response_variable, input_value, _input_schema = workflow_input_wait_value(
-                            current_config, variables,
+                            current_config, variables, context=run.variables,
                         )
                     except ValueError:
                         return "invalid_input"
@@ -7968,6 +9185,11 @@ class WorkflowRunner:
             )
             if not scheduled:
                 return "resumed"
+            await cls._defer_published_continuation(
+                workflow_run_id,
+                continuation_token=resume_token,
+                session_factory=factory,
+            )
             outcome = "queued"
         if outcome != WORKFLOW_RUN_EXECUTION_CLAIM_HELD:
             await cls._clear_continuation(
@@ -7976,6 +9198,39 @@ class WorkflowRunner:
                 session_factory=factory,
             )
         return "resumed"
+
+    @staticmethod
+    async def _defer_published_continuation(
+        workflow_run_id: str,
+        *,
+        continuation_token: str,
+        session_factory: WorkflowSessionFactory,
+    ) -> None:
+        """Keep the resume sweep from republishing a continuation just sent.
+
+        The durable intent stays for recovery; only its next sweep attempt
+        moves out, so a lost publish is still redelivered.
+        """
+
+        from datetime import timedelta
+
+        from sqlalchemy import update
+
+        from packages.core.constants.execution import WORKFLOW_CONTINUATION_RETRY_SECONDS
+
+        async with session_factory() as db:
+            await db.execute(
+                update(WorkflowRun)
+                .where(
+                    WorkflowRun.id == workflow_run_id,
+                    WorkflowRun.continuation_token == continuation_token,
+                )
+                .values(
+                    continuation_next_attempt_at=_utc_now()
+                    + timedelta(seconds=WORKFLOW_CONTINUATION_RETRY_SECONDS)
+                )
+            )
+            await db.commit()
 
     @staticmethod
     async def _clear_continuation(
@@ -8008,15 +9263,34 @@ class WorkflowRunner:
             return True
 
     @staticmethod
-    def enqueue(workflow_run_id: str, delay_seconds: float = 0) -> bool:
-        """Dispatch a workflow run to Celery for async execution."""
+    def enqueue(
+        workflow_run_id: str,
+        delay_seconds: float = 0,
+        *,
+        claim_handoff_token: str | None = None,
+        scheduled_run_id: str | None = None,
+        scheduled_job_id: str | None = None,
+    ) -> bool:
+        """Dispatch a workflow run to Celery for async execution.
+
+        ``claim_handoff_token`` lets the delivery adopt a lease retained by
+        claim-loss recovery. It travels as a header: workers that predate it
+        ignore the header and acquire the lease normally once it expires.
+        """
         try:
             from packages.core.tasks.ai_tasks import run_workflow
 
             kwargs: dict = {}
             if delay_seconds > 0:
                 kwargs["countdown"] = delay_seconds
-            run_workflow.apply_async(args=[workflow_run_id], **kwargs)
+            if claim_handoff_token:
+                kwargs["headers"] = {
+                    WORKFLOW_CLAIM_HANDOFF_HEADER: claim_handoff_token,
+                }
+            args = [workflow_run_id]
+            if scheduled_run_id:
+                args.extend([scheduled_run_id, scheduled_job_id])
+            run_workflow.apply_async(args=args, **kwargs)
             return True
         except Exception as exc:
             logger.warning(

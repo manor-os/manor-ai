@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 
 import pytest
@@ -44,6 +45,28 @@ def test_detect_file_type_preserves_declared_code_extensions(tmp_path):
         assert detected.extension == filename.rsplit(".", 1)[1]
         assert detected.display_name == filename
         assert detected.mismatch is False
+
+
+def test_detect_file_type_keeps_declared_text_when_first_line_has_a_comma(tmp_path):
+    path = tmp_path / "reference-analysis.md"
+    path.write_text("Original idea, no source creator. Basis: the brief.\n\n- Hook one\n", encoding="utf-8")
+
+    detected = detect_file_type(str(path), declared_name=path.name)
+
+    assert (detected.extension, detected.display_name, detected.mismatch) == ("md", path.name, False)
+
+
+def test_detect_file_type_reads_large_json_through_a_shared_descriptor(tmp_path):
+    """Knowledge sync sniffs through /dev/fd/N; on macOS every reopen shares one offset."""
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps({"items": [{"caption": "a, b"}] * 400}), encoding="utf-8")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        detected = detect_file_type(f"/dev/fd/{descriptor}", declared_name=path.name)
+    finally:
+        os.close(descriptor)
+
+    assert (detected.extension, detected.mismatch) == ("json", False)
 
 
 def test_detect_file_type_still_upgrades_txt_html(tmp_path):

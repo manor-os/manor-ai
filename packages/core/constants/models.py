@@ -26,7 +26,7 @@ DEFAULTS = {
     # in llm_client, so it must accept image input — a text-only default
     # would push every image chat onto the hard-coded gpt-4o fallback.
     "primary":   "openai/gpt-5.6-luna",
-    # ``worker`` is used by TaskRunner for tool-using agent tasks. Keep the
+    # ``worker`` is used for tool-using worker runs. Keep the
     # factory default aligned with the first model shown in the Worker picker.
     # Text-only is fine here (unlike ``primary``): a worker task that carries
     # an image is re-routed to the primary default by the vision fallback.
@@ -156,6 +156,9 @@ CATALOG = {
         {"id": "openai/gpt-5-image-mini", "name": "GPT-5 Image Mini", "tier": "balanced", "quality": "high", "tag": ""},
         {"id": "google/gemini-3.1-flash-image-preview", "name": "Nano Banana 2", "tier": "balanced", "quality": "high", "tag": "New"},
         {"id": "openai/gpt-image-2", "name": "GPT Image 2", "tier": "premium", "quality": "highest", "tag": "Recommended"},
+        # Grok Imagine: managed through the Vercel AI Gateway, or the Account's own xAI key / relay.
+        {"id": "xai/grok-imagine-image-2.0", "name": "Grok Imagine Image 2.0", "tier": "balanced", "quality": "high", "tag": "Edits"},
+        {"id": "xai/grok-imagine-image", "name": "Grok Imagine Image", "tier": "cheap", "quality": "good", "tag": ""},
     ],
     # Keep native and OpenRouter voice choices available in addition to the
     # Vercel-compatible OpenAI speech models.
@@ -164,13 +167,21 @@ CATALOG = {
         {"id": "zyphra/zonos-v0.1-hybrid", "name": "Zonos v0.1 Hybrid", "tier": "budget", "quality": "good", "tag": ""},
         {"id": "zyphra/zonos-v0.1-transformer", "name": "Zonos v0.1 Transformer", "tier": "budget", "quality": "good", "tag": ""},
         {"id": "sesame/csm-1b", "name": "Sesame CSM 1B", "tier": "budget", "quality": "good", "tag": "Conversational"},
+        # ElevenLabs runs only through OpenRouter's /audio/speech (managed
+        # OpenRouter key or a BYOK OpenRouter key); there is no native route.
+        {"id": "elevenlabs/eleven-v4", "name": "ElevenLabs Eleven v4", "tier": "premium", "quality": "highest", "tag": "Expressive"},
+        {"id": "elevenlabs/eleven-v4-turbo", "name": "ElevenLabs Eleven v4 Turbo", "tier": "balanced", "quality": "high", "tag": "Fast"},
+        {"id": "elevenlabs/eleven-v3", "name": "ElevenLabs Eleven v3", "tier": "premium", "quality": "highest", "tag": "Audio tags"},
+        {"id": "elevenlabs/eleven-multilingual-v2", "name": "ElevenLabs Multilingual v2", "tier": "premium", "quality": "high", "tag": "Long-form"},
+        {"id": "elevenlabs/eleven-flash-v2.5", "name": "ElevenLabs Flash v2.5", "tier": "balanced", "quality": "good", "tag": "Low latency"},
         {"id": "openai/tts-1-hd", "name": "OpenAI TTS HD", "tier": "balanced", "quality": "high", "tag": "Recommended"},
         {"id": "openai/tts-1",    "name": "OpenAI TTS",    "tier": "budget",   "quality": "good", "tag": "Fast"},
     ],
     "audio": [
-        {"id": "suno/music", "name": "Suno Music", "tier": "premium", "quality": "highest", "tag": "Full song"},
         {"id": "google/lyria-3-clip-preview", "name": "Lyria 3 Clip", "tier": "balanced", "quality": "high", "tag": "Recommended"},
         {"id": "google/lyria-3-pro-preview", "name": "Lyria 3 Pro", "tier": "premium", "quality": "highest", "tag": "Full song"},
+        # Managed Vercel AI Gateway only; exact length from 3 s to 10 min.
+        {"id": "elevenlabs/music-v2.5", "name": "Eleven Music v2.5", "tier": "balanced", "quality": "highest", "tag": "Exact length"},
         {"id": "openai/gpt-audio-mini", "name": "GPT Audio Mini", "tier": "budget", "quality": "good", "tag": "Flexible"},
         {"id": "openai/gpt-audio", "name": "GPT Audio", "tier": "balanced", "quality": "high", "tag": ""},
     ],
@@ -275,6 +286,9 @@ CATALOG = {
         {"id": "kwaivgi/kling-v3.0-std", "name": "Kling v3.0 Standard", "tier": "balanced", "quality": "high", "tag": "New"},
         {"id": "kwaivgi/kling-v3.0-pro", "name": "Kling v3.0 Pro", "tier": "premium", "quality": "highest", "tag": "HQ"},
         {"id": "atlascloud/wan-2.2-turbo-spicy", "name": "Wan 2.2 Turbo I2V (Atlas)", "tier": "cheap", "quality": "basic", "tag": "Image required · BYOK"},
+        {"id": "xai/grok-imagine-video-1.5", "name": "Grok Imagine Video 1.5", "tier": "balanced", "quality": "high", "tag": "References"},
+        {"id": "xai/grok-imagine-video-1.5-lite", "name": "Grok Imagine Video 1.5 Lite", "tier": "cheap", "quality": "good", "tag": "Cheapest"},
+        {"id": "xai/grok-imagine-video", "name": "Grok Imagine Video", "tier": "budget", "quality": "good", "tag": ""},
     ],
     "embedding": [
         {
@@ -308,11 +322,11 @@ for _chat_role in ("primary", "worker"):
         )
 
 
-# These roles only accept exact product-catalog selections. Their BYOK
-# settings reuse a catalog model ID with different credentials; unlike the
-# general LLM/embedding roles, they do not support arbitrary custom model IDs.
-# Keeping the constraint here also makes preferences saved by an older catalog
-# safely fall through to the current default instead of routing a removed model.
+# These roles take a product-catalog selection, or a custom model ID that the
+# same settings document binds to its own tested BYOK key (see
+# ``model_preference_is_available``). Other preferences, such as one saved by an
+# older catalog, fall through to the current default instead of routing a
+# removed model.
 CATALOG_ONLY_ROLES = frozenset({"image", "voice", "audio", "sfx", "stt", "video"})
 
 # Text-completion roles whose models run the agent loop. Every model they
@@ -363,18 +377,34 @@ def model_preference_is_available(
     model_id: object,
     *,
     disabled_models: set[str] | frozenset[str] = frozenset(),
+    settings: dict | None = None,
 ) -> bool:
-    """Return whether a stored preference is valid for the current catalog."""
+    """Return whether a stored preference is valid for the current catalog.
+
+    A catalog-only role also accepts a custom model ID when ``settings`` (the
+    document the preference came from) binds that role's BYOK key to exactly
+    that ID: the account routes save that binding only after a live test.
+    """
 
     normalized = str(model_id or "").strip()
     if not normalized or normalized in disabled_models:
         return False
     if role not in CATALOG_ONLY_ROLES:
         return True
-    return any(
+    if any(
         str(item.get("id") or "").strip() == normalized
         for item in CATALOG.get(role, [])
-    )
+    ):
+        return True
+    return byok_custom_model_is_bound(role, normalized, settings)
+
+
+def byok_custom_model_is_bound(role: str, model_id: str, settings: dict | None) -> bool:
+    """Whether ``settings`` holds a BYOK key for ``role`` bound to ``model_id``."""
+    settings = settings or {}
+    key = str((settings.get("llm_api_keys") or {}).get(role) or "").strip()
+    bound = str((settings.get("llm_api_key_models") or {}).get(role) or "").strip()
+    return bool(key and model_id and bound == model_id)
 
 
 VIDEO_MODEL_CAPABILITIES = {
@@ -485,12 +515,93 @@ VIDEO_MODEL_CAPABILITIES = {
         "max_reference_images": 0,
         "reference_videos": False,
         "max_reference_videos": 0,
-        "native_audio": False,
+        "native_audio": True,  # sound: on (pro mode only)
         "native_dialogue": False,
         "native_narration": False,
         "native_subtitles": False,
         "audio_reference": False,
         "max_audio_references": 0,
+    },
+    # Grok Imagine through xAI or an xAI-compatible relay (e.g. Sub2API), per
+    # docs.x.ai video overview. Every model writes video from text or from a
+    # first frame and speaks dialogue from the prompt; none takes audio of ours
+    # (1.5 only has preset voices). 1.5 keeps up to 14 reference images (the
+    # same people in new scenes) and pins a last frame, at 720p when it does.
+    "xai/grok-imagine-video-1.5": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": True,
+        "reference_images": True,
+        "max_reference_images": 14,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": True,
+        "native_dialogue": True,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+    },
+    # 1.5 Lite: the cheapest; 1080p is upscaled from 720p; no references or last frame.
+    "xai/grok-imagine-video-1.5-lite": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": False,
+        "reference_images": False,
+        "max_reference_images": 0,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": True,
+        "native_dialogue": True,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+    },
+    # The first Grok video model: 720p at most, up to 7 reference images (10 s
+    # with them). It generates sound; lip sync is not documented.
+    "xai/grok-imagine-video": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": False,
+        "reference_images": True,
+        "max_reference_images": 7,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": True,
+        "native_dialogue": False,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+    },
+    # Gemini Omni through the Interactions API (BYOK): 3-10 s clips with sound,
+    # a first frame, interpolation to a last frame, and image references. Google
+    # states no reference limit; Manor sends at most the six its docs show.
+    "google/gemini-omni-1.1-flash": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": True,
+        "reference_images": True,
+        "max_reference_images": 6,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": True,
+        "native_dialogue": False,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+        "generation_schema": {
+            "duration": {
+                "text_to_video": {"type": "integer", "minimum": 3, "maximum": 10, "default": 5},
+                "image_to_video": {"type": "integer", "minimum": 3, "maximum": 10, "default": 5},
+            }
+        },
     },
     "atlascloud/wan-2.2-turbo-spicy": {
         "text_to_video": False,
@@ -538,7 +649,24 @@ def video_model_capabilities(model: str | None) -> dict:
         return dict(VIDEO_MODEL_CAPABILITIES["bytedance/seedance-2.0"])
     if lowered.startswith("kwaivgi/kling"):
         return dict(VIDEO_MODEL_CAPABILITIES["kwaivgi/kling-v3.0-std"])
+    if lowered.startswith("google/gemini-omni"):
+        return dict(VIDEO_MODEL_CAPABILITIES["google/gemini-omni-1.1-flash"])
     return dict(DEFAULT_VIDEO_MODEL_CAPABILITIES)
+
+
+def timestamped_stt_model(selected: str | None) -> str:
+    """The STT model to use when speech must come back with timings.
+
+    The selected model when the catalog knows it returns segment timestamps
+    (or does not know it at all), otherwise the catalog's timestamp-capable
+    model: a chat-audio model can transcribe but cannot say when anything was said.
+    """
+    model_id = str(selected or "").strip()
+    entries = CATALOG.get("stt", [])
+    known = next((entry for entry in entries if entry.get("id") == model_id), None)
+    if model_id and (known is None or (known.get("capabilities") or {}).get("segment_timestamps")):
+        return model_id
+    return next(entry["id"] for entry in entries if (entry.get("capabilities") or {}).get("segment_timestamps"))
 
 
 for _video_model in CATALOG.get("video", []):
@@ -587,13 +715,13 @@ def resolve_model_for_role(
     # User preference
     if user_prefs:
         m = (user_prefs.get("models") or {}).get(role)
-        if model_preference_is_available(role, m, disabled_models=disabled):
+        if model_preference_is_available(role, m, disabled_models=disabled, settings=user_prefs):
             return str(m).strip()
 
     # Entity setting
     if entity_settings:
         m = (entity_settings.get("models") or {}).get(role)
-        if model_preference_is_available(role, m, disabled_models=disabled):
+        if model_preference_is_available(role, m, disabled_models=disabled, settings=entity_settings):
             return str(m).strip()
 
     # Platform admin default override

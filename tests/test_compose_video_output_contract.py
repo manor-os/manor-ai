@@ -47,6 +47,8 @@ def composition(media_storage, monkeypatch):
     rendered = []
 
     async def render(args, **_kwargs):
+        if str(args[0]).endswith("ffprobe"):
+            return "", ""  # The final mix's peak check: this synthetic render has no audio.
         rendered.append(args)
         Path(args[-1]).write_bytes(b"synthetic rendered mp4")
         return "", ""
@@ -56,6 +58,7 @@ def composition(media_storage, monkeypatch):
     monkeypatch.setattr(media_tools, "_probe_media", AsyncMock(return_value={
         "duration_seconds": 5.0, "has_audio": False, "width": 1280, "height": 720,
     }))
+    monkeypatch.setattr(media_tools, "_video_frame_timing", AsyncMock(return_value=(30.0, 150)))
     monkeypatch.setattr(media_tools, "_lookup_documents_by_rel_paths", AsyncMock(return_value={}))
     monkeypatch.setattr(media_tools, "_register_merged_video", AsyncMock(return_value="video-document"))
     monkeypatch.setattr(media_tools, "_register_video_editor_recipe", AsyncMock(return_value="recipe-document"))
@@ -275,3 +278,22 @@ async def test_post_render_failure_reports_saved_outputs_without_replay(
         assert recipe_path.read_bytes() == b"concurrent recipe owner"
     if failure == "video_projection":
         assert not recipe_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_composition_refused_before_render_is_settled_as_no_effect(media_storage, composition):
+    """Missing required audio is found while reading the timeline: nothing is
+    rendered or written, and the handler proves it (not an uncertain effect)."""
+    from packages.core.ai.runtime.receipts import runtime_tool_effect_state
+
+    request, receipt = await _approve("final.mp4", tool_name="compose_video_timeline", task_id=None)
+    arguments = {"timeline_path": f"{HOME}/timeline.json", "output_name": "final.mp4", "require_audio": True}
+    with _authorized(request, receipt):
+        result = await media_tools._compose_video_timeline_handler(
+            entity_id=ENTITY, user_id="user_media_qa", workspace_id=WORKSPACE, **arguments,
+        )
+    assert json.loads(result)["code"] == "audio_track_missing"
+    assert composition == [] and not (media_storage / receipt.resource_ids[0]).exists()
+    assert runtime_tool_effect_state("compose_video_timeline", arguments, result).value == "none"
+    # Identical JSON from anywhere else proves nothing.
+    assert runtime_tool_effect_state("compose_video_timeline", arguments, str(result)).value == "unconfirmed"

@@ -21,6 +21,8 @@ export interface User {
   status: string;
   llm_model?: string;
   timezone?: string;
+  /** False when the zone is a default or detected one that follows the device. */
+  timezone_user_set?: boolean;
   locale?: string;
   created_at?: string;
   memberships?: {
@@ -153,22 +155,6 @@ export interface TaskBlocker {
   observed_at?: string;
 }
 
-export interface TaskInputRequest {
-  message_id: string;
-  request_id: string;
-  plan_id: string;
-  step_id: string;
-  pending_action: {
-    kind: "human_input" | "needs_input";
-    hitl_type: "input";
-    approval_request_id: string;
-    task_id: string;
-    plan_id: string;
-    step_id: string;
-    [key: string]: any;
-  };
-}
-
 export interface Task {
   id: string;
   entity_id: string;
@@ -186,8 +172,6 @@ export interface Task {
   owner_agent_name?: string | null;
   owner_agent_avatar?: string | null;
   current_blocker?: TaskBlocker | null;
-  /** Exact live INPUT cards, projected by Task detail from the Chat origin. */
-  pending_input_requests?: TaskInputRequest[];
   session_host_agent_id?: string | null;
   session_host_subscription_id?: string | null;
   session_host_name?: string | null;
@@ -240,8 +224,6 @@ export interface TaskRetryResponse {
   task: Task;
   dispatched: boolean;
   mode: string;
-  plan_id?: string | null;
-  reset_steps: number;
 }
 
 export interface TaskHITLResponse {
@@ -249,8 +231,6 @@ export interface TaskHITLResponse {
   resumed: boolean;
   dispatched: boolean;
   mode?: string | null;
-  plan_id?: string | null;
-  step_id?: string | null;
 }
 
 // Calendar settings / booking links
@@ -504,70 +484,6 @@ export interface BookingConfirmation {
   email_sent: boolean;
 }
 
-export interface ExecutionPlan {
-  id: string;
-  entity_id: string;
-  workspace_id?: string | null;
-  task_id?: string | null;
-  task_status?: string | null;
-  task_title?: string | null;
-  agent_subscription_id?: string | null;
-  status: string;
-  execution_mode: string;
-  approval_required: boolean;
-  plan_dag: Record<string, any>;
-  planner_version?: string | null;
-  parent_plan_id?: string | null;
-  cost_tracking: Record<string, any>;
-  started_at?: string | null;
-  completed_at?: string | null;
-  last_error?: Record<string, any> | null;
-  created_at: string;
-  updated_at?: string | null;
-}
-
-export interface ExecutionStep {
-  id: string;
-  plan_id: string;
-  step_key: string;
-  kind: string;
-  service_key?: string | null;
-  resolved_subscription_id?: string | null;
-  resolved_agent_id?: string | null;
-  resolved_subscription_name?: string | null;
-  resolved_agent_name?: string | null;
-  resolved_agent_avatar?: string | null;
-  provider?: string | null;
-  action_key?: string | null;
-  integration_id?: string | null;
-  params: Record<string, any>;
-  result?: Record<string, any> | null;
-  depends_on: string[];
-  step_status: string;
-  risk_level: string;
-  requires_approval: boolean;
-  attempt_count: number;
-  max_attempts: number;
-  cost: Record<string, any>;
-  error?: Record<string, any> | null;
-  human_input_prompt?: string | null;
-  human_input_response?: Record<string, any> | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-}
-
-export interface PlanRetryResponse {
-  plan: ExecutionPlan;
-  reset_steps: number;
-  dispatched: boolean;
-}
-
-export interface StepRetryResponse {
-  plan: ExecutionPlan;
-  step: ExecutionStep;
-  dispatched: boolean;
-}
-
 export interface TaskConstantsResponse {
   statuses: Record<string, { label: string; color: string; order: number }>;
   status_transitions: Record<string, string[]>;
@@ -704,6 +620,8 @@ export interface Document {
   editor_recipe_document_id?: string | null;
   editor_recipe_path?: string | null;
   editor_recipe_name?: string | null;
+  /** What the file is in one line (its generation prompt or media analysis), when its name may not say. */
+  hint?: string | null;
   current_user_capabilities?: string[];
 }
 
@@ -758,10 +676,12 @@ export interface Notification {
 
 export interface NotificationEventDescriptor {
   kind: string;
-  category: "task" | "agent" | "media" | "system" | "billing" | "calendar";
+  category: "task" | "agent" | "media" | "system" | "billing" | "calendar" | "marketplace";
   severity: "info" | "warn" | "critical";
   label: string;
   description: string;
+  /** Channels used when the user has no per-kind override (e.g. ["email"]). */
+  default_channels?: string[] | null;
 }
 
 export interface NotificationConnectedChannel {
@@ -789,6 +709,7 @@ export interface NotificationPreferences {
   default_channels: string[];
   by_kind: Record<string, NotificationKindOverride>;
   quiet_hours: NotificationQuietHours | null;
+  chat_email: { enabled: boolean; delay_minutes: 5 | 15 | 30 | 60 | 120 };
   supported_channels: string[];
   configured_channels?: string[];
   event_catalog: NotificationEventDescriptor[];
@@ -800,6 +721,7 @@ export interface NotificationPreferencesUpdate {
   /** Send `null` for a kind to drop the override. */
   by_kind?: Record<string, NotificationKindOverride | null>;
   quiet_hours?: NotificationQuietHours | null;
+  chat_email?: Partial<NotificationPreferences["chat_email"]>;
 }
 
 // Workspace
@@ -877,6 +799,11 @@ export interface WorkspaceStaff {
   expires_at?: string;
   status?: string;
   created_at?: string;
+  /** Set on seats derived from a provider's collaboration grant; the customer
+   *  manages them on the collaboration page, not in the member list. */
+  collaboration_role?: "provider_trial" | "maintainer" | null;
+  /** The seat belongs to the provider team of a delivery (any number of the provider's managers). */
+  collaboration_team?: boolean;
 }
 
 export interface WorkspaceStats {
@@ -1475,6 +1402,9 @@ export interface DocumentFolderInfo {
   id: string;
   entity_id: string;
   name: string;
+  // Readable label for an identifier-named folder (a Workspace Task/Workflow
+  // run archive); `name` stays the canonical name for rename and paths.
+  display_name?: string | null;
   parent_id?: string | null;
   document_count?: number | null;
   created_at?: string;
@@ -1483,6 +1413,8 @@ export interface DocumentFolderInfo {
   owner_id?: string;
   client_visible?: boolean;
   current_user_capabilities?: string[];
+  // Workspace artifact root (or a folder holding one): the API refuses deletion.
+  delete_blocked_by_workspace?: boolean;
 }
 
 export interface AccessRequest {

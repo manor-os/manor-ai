@@ -297,6 +297,11 @@ async def delete_integration(
     )).scalar_one_or_none()
     if not integration:
         return False
+    from packages.core.services.integration_access import revoke_all_connection_grants
+
+    await revoke_all_connection_grants(
+        db, kind="integration", connection_id=integration.id, revoked_by=user_id,
+    )
     await db.delete(integration)
     await db.flush()
     await normalize_runtime_integration_account_defaults(
@@ -1215,17 +1220,21 @@ async def get_integration_inventory(
             GrantStatus,
             ResourceGrant,
             ResourceType,
-            SubjectType,
         )
         from packages.core.models.user import OAuthAccount, User
         from packages.core.services.oauth_account_credentials import oauth_account_is_runtime_usable
 
         if user_id:
+            from packages.core.services.integration_access import (
+                grant_subject_clause,
+                use_grant_subjects,
+            )
+
+            subjects = await use_grant_subjects(db, entity_id=entity_id, user_id=user_id)
             shared_oauth_ids = select(ResourceGrant.resource_id).where(
                 ResourceGrant.entity_id == entity_id,
                 ResourceGrant.resource_type == ResourceType.OAUTH_ACCOUNT,
-                ResourceGrant.subject_type == SubjectType.USER,
-                ResourceGrant.subject_id == user_id,
+                grant_subject_clause(subjects),
                 ResourceGrant.status == GrantStatus.ACTIVE,
             )
             oauth_query = select(OAuthAccount).where(

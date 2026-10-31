@@ -154,7 +154,12 @@ async def claim_runtime_run_execution(
         if not run.checkpoint or not run.reservation_id:
             return None
         reservation = await db.get(SandboxReservation, run.reservation_id)
-        if reservation is None or reservation.status != SandboxReservationStatus.ALLOCATED.value:
+        # ALLOCATED: the container a ticket waited for exists. EXEC_READY: the
+        # command a ticket waited for left its sandbox's slot queue.
+        if reservation is None or reservation.status not in {
+            SandboxReservationStatus.ALLOCATED.value,
+            SandboxReservationStatus.EXEC_READY.value,
+        }:
             return None
         if expected_reservation_id and reservation.id != expected_reservation_id:
             return None
@@ -658,11 +663,77 @@ async def persist_runtime_run_suspension(
     return run
 
 
+async def _cancel_active_sandbox_execution(run: RuntimeRun) -> None:
+    """Stop the command the run is executing right now, wherever it runs.
+
+    The run records the sandbox and execution of its current command. That
+    container may belong to an earlier turn (warm reuse keeps the instance
+    row of the run that allocated it), and outside external-runner mode there
+    are no instance rows at all, so the command is found by the run's own
+    record, never by which run allocated the container.
+    """
+
+    if not run.active_sandbox_id or not run.active_execution_id:
+        return
+    from packages.core.services.sandbox_session_service import sandbox_client_for
+
+    try:
+        async with await sandbox_client_for(run.active_sandbox_id, timeout=30.0) as client:
+            await client.cancel_execution(run.active_sandbox_id, run.active_execution_id)
+    except Exception:
+        logger.warning(
+            "Failed to cancel active Sandbox execution run=%s sandbox=%s execution=%s",
+            run.id,
+            run.active_sandbox_id,
+            run.active_execution_id,
+            exc_info=True,
+        )
+
+
+async def _owner_runs_elsewhere(run: RuntimeRun) -> bool:
+    """True while another root run of the sandbox's owner is not terminal.
+
+    A user's sandbox serves all of the user's conversations, so a cancelled
+    run never destroys a container another live run of the same user (any
+    conversation) may be using. A run without a user falls back to its
+    conversation. Unknown (a lookup failure) counts as live: the idle reaper
+    reclaims a container that really is abandoned.
+    """
+
+    user_id = str(getattr(run, "user_id", "") or "")
+    conversation_id = str(getattr(run, "conversation_id", "") or "")
+    if user_id:
+        owner_filter = (
+            RuntimeRun.entity_id == run.entity_id,
+            RuntimeRun.user_id == user_id,
+        )
+    elif conversation_id:
+        owner_filter = (RuntimeRun.conversation_id == conversation_id,)
+    else:
+        return False
+    from packages.core.database import async_session
+
+    try:
+        async with async_session() as db:
+            other = await db.scalar(
+                select(RuntimeRun.id).where(
+                    *owner_filter,
+                    RuntimeRun.root_run_id != run.root_run_id,
+                    RuntimeRun.status.notin_(RuntimeRunStatus.terminal()),
+                ).limit(1)
+            )
+    except Exception:  # noqa: BLE001 - unknown is not idle
+        logger.warning("Could not check the owner's live runs run=%s", run.id, exc_info=True)
+        return True
+    return other is not None
+
+
 async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
     """Best-effort cancellation and cleanup after DB cancellation commits."""
 
     from packages.core.config import get_settings
 
+    await _cancel_active_sandbox_execution(run)
     settings = get_settings()
     if settings.SANDBOX_COORDINATION_MODE != "external-runner":
         return
@@ -672,8 +743,8 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
         release_sandbox_instance,
         restore_consumed_reservation,
     )
-    from packages.core.services.sandbox_sdk import SandboxClient
     from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+    from packages.core.services.sandbox_session_service import sandbox_runner_client
 
     async with async_session() as db:
         rows = list(
@@ -690,32 +761,12 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
         )
     for instance, runner in rows:
         try:
-            async with SandboxClient(
-                base_url=runner.base_url,
-                timeout=30.0,
-                api_token=settings.SANDBOX_API_TOKEN,
-            ) as client:
-                if (
-                    run.active_sandbox_id == instance.sandbox_id
-                    and run.active_execution_id
-                ):
-                    try:
-                        await client.cancel_execution(
-                            instance.sandbox_id,
-                            run.active_execution_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to cancel active Sandbox execution run=%s sandbox=%s",
-                            run.id,
-                            instance.sandbox_id,
-                            exc_info=True,
-                        )
+            async with sandbox_runner_client(runner.base_url, timeout=30.0) as client:
                 from packages.core.services.sandbox_session_service import is_sandbox_kept_warm
 
                 if await is_sandbox_kept_warm(instance.sandbox_id):
-                    # Owned by the owner's warm registry now: the execution
-                    # above was cancelled, the container stays for reuse, and
+                    # Owned by the owner's warm registry now: the run's command
+                    # was cancelled first, the container stays for reuse, and
                     # its instance row stays active because that row is how
                     # a later turn resolves the container's runner. The
                     # cancel marked the ticket release_pending, which pins a
@@ -727,6 +778,16 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
                         await restore_db.commit()
                     logger.info(
                         "Cancelled run leaves warm Sandbox in place run=%s sandbox=%s",
+                        run.id,
+                        instance.sandbox_id,
+                    )
+                    continue
+                if await _owner_runs_elsewhere(run):
+                    # The container belongs to the user: while another run of
+                    # the user (any conversation) is still live it keeps it.
+                    # Only this run's own command was cancelled above.
+                    logger.info(
+                        "Cancelled run leaves the user's Sandbox to their live runs run=%s sandbox=%s",
                         run.id,
                         instance.sandbox_id,
                     )

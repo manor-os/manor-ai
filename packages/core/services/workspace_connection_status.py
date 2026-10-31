@@ -18,7 +18,10 @@ from packages.core.models.user import OAuthAccount
 from packages.core.models.workspace import Agent, AgentSubscription, AgentToolBinding, ToolDefinition, Workspace
 from packages.core.services.provider_keys import canonical_provider_key
 from packages.core.services.workspace_integration_scope import disabled_workspace_providers
-from packages.core.services.integration_resolution import integration_provider_readiness
+from packages.core.services.integration_resolution import (
+    integration_provider_readiness,
+    is_user_facing_integration_provider,
+)
 from packages.core.services.integration_account_service import (
     IntegrationAccountKind,
     load_runtime_integration_registry,
@@ -84,7 +87,11 @@ class WorkspaceConnectionStatusFactory:
 
         def declare(provider: object, *, required: bool = True, explicit: bool = True) -> None:
             key = canonical_provider_key(provider)
-            if not key or key in disabled_providers:
+            if (
+                not key
+                or key in disabled_providers
+                or not is_user_facing_integration_provider(key)
+            ):
                 return
             if explicit:
                 declared_provider_keys.add(key)
@@ -106,7 +113,14 @@ class WorkspaceConnectionStatusFactory:
             elif kind == BlueprintInstallTodoKind.CHANNEL.value:
                 channels.append({**payload, "required": required})
             elif kind == BlueprintInstallTodoKind.BROWSER_SESSION.value:
-                sessions.append({**payload, "required": required})
+                # Captured browser sessions are not a connection people can add.
+                # A platform with an integration is offered as that integration
+                # (connected in place); the rest publish through Chrome.
+                from packages.core.ai.tools.integration_route_tools import integration_provider_for_platform
+
+                integration = integration_provider_for_platform(str(payload.get("provider") or ""))
+                if integration:
+                    declare(integration, required=False)
 
         for check in (settings.get("blocking_setup") or {}).get("checks") or []:
             if check.get("kind") == "integration_provider":
@@ -148,7 +162,11 @@ class WorkspaceConnectionStatusFactory:
 
         def infer(provider: str, agent_id: str) -> None:
             key = canonical_provider_key(provider)
-            if not key or key in disabled_providers:
+            if (
+                not key
+                or key in disabled_providers
+                or not is_user_facing_integration_provider(key)
+            ):
                 return
             if key not in providers:
                 declare(provider, explicit=False)

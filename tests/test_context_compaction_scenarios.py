@@ -72,7 +72,7 @@ async def test_later_batch_failure_keeps_original_history_and_archive(failure):
     async def complete(prompt, **kwargs):
         assert archives == [original]
         calls.append(prompt)
-        if len(calls) == 2:
+        if len(calls) >= 2:
             if failure == "timeout":
                 raise TimeoutError("provider timeout")
             if failure == "cancelled":
@@ -85,7 +85,7 @@ async def test_later_batch_failure_keeps_original_history_and_archive(failure):
     expected = {"timeout": TimeoutError, "cancelled": asyncio.CancelledError}.get(failure, ContextBudgetExceeded)
     with pytest.raises(expected):
         await compact(messages, complete, archive)
-    assert len(calls) == 2
+    assert len(calls) == (3 if failure == "invalid_second_batch" else 2)
     assert messages == original
     assert archives == [original]
     assert all(not str(m.get("content", "")).startswith(CHECKPOINT_PREFIX) for m in messages)
@@ -106,7 +106,7 @@ async def test_invalid_summary_shapes_fail_without_replacing_source(response):
     async def complete(*args, **kwargs):
         return response, {}
 
-    with pytest.raises(ContextBudgetExceeded, match="Invalid context checkpoint"):
+    with pytest.raises(ContextBudgetExceeded, match="invalid_checkpoint"):
         await compact(messages, complete)
     assert messages == original
 

@@ -19,7 +19,7 @@ from packages.core.ai.runtime.capability_refresh import (
 )
 from packages.core.ai.runtime.control import RuntimeAgentCheckpoint, RuntimeToolSuspension, RuntimeTurnAborted
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
-from packages.core.ai.runtime.harness import runtime_execute_agentic_loop, runtime_execute_worker_subagent_loop
+from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
 from packages.core.ai.runtime.principals import resolve_runtime_principal
 from packages.core.ai.runtime.profiles import RuntimeProfile
 from packages.core.ai.runtime.surfaces import ChatSurface
@@ -69,21 +69,21 @@ def test_refresh_is_not_recoverable_from_json_or_raw_typed_result() -> None:
 
 
 def test_refresh_replaces_old_scope_preserves_only_host_controls_and_trace() -> None:
-    previous = _envelope("old_tool", "acquire_capabilities", "request_input")
+    previous = _envelope("old_tool", "fixture_refresh_scope", "request_input")
     previous.discovered_tool_grants.grant(["old_discovered_tool"])
     previous.metadata["runtime_events"] = [{"type": "tool_end", "tool_name": "old_tool"}]
     fresh = _envelope("web_search")
     envelope, allowed, result = runtime_apply_capability_refresh(
         _result(fresh), current_envelope=previous,
-        control_tools=[_schema("acquire_capabilities"), _schema("request_input")],
+        control_tools=[_schema("fixture_refresh_scope"), _schema("request_input")],
     )
-    assert allowed == {"web_search", "acquire_capabilities", "request_input"}
+    assert allowed == {"web_search", "fixture_refresh_scope", "request_input"}
     assert envelope.effective_allowed_tool_names() == allowed
     assert envelope.metadata is previous.metadata
     assert not envelope.discovered_tool_grants.tool_names
     assert {schema["function"]["name"] for schema in runtime_applied_capability_schemas(result)} == allowed
     assert previous.effective_allowed_tool_names() == {
-        "old_tool", "acquire_capabilities", "request_input", "old_discovered_tool",
+        "old_tool", "fixture_refresh_scope", "request_input", "old_discovered_tool",
     }
 
 
@@ -128,6 +128,14 @@ def test_refresh_rejects_changed_principal_and_conflicting_schema_or_allowlist()
 @pytest.fixture
 def mock_runtime(monkeypatch):
     loop = importlib.import_module("packages.core.ai.agentic_loop")
+    from packages.core.ai.runtime import host_tools
+
+    # A local host fixture exercises refresh, approval and checkpoint contracts
+    # without depending on the private online-acquisition tool. Keep the real
+    # host-tool admission guard active, with this fixture explicitly registered.
+    hosts = {**host_tools.HOST_INJECTED_TOOLS, "test_refresh": frozenset({"fixture_refresh_scope"})}
+    monkeypatch.setattr(host_tools, "HOST_INJECTED_TOOLS", hosts)
+    monkeypatch.setattr(host_tools, "ALL_HOST_INJECTED_TOOLS", frozenset().union(*hosts.values()))
 
     async def route(**kwargs):
         return "test-model", {}, True
@@ -170,7 +178,9 @@ def test_refresh_cannot_remove_host_continuation_restrictions():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["unavailable", "suspend", "end_turn", "custom"])
 async def test_harness_exposes_input_only_with_a_host_continuation(mock_runtime, monkeypatch, mode):
-    expected = mode != "unavailable"
+    # The retired TaskRunner's "end_turn" bridge is no continuation any more:
+    # a context still naming it gets no request_input.
+    expected = mode in {"suspend", "custom"}
     observed = []
 
     async def completion(messages, tools, **kwargs):
@@ -201,8 +211,8 @@ async def test_harness_exposes_input_only_with_a_host_continuation(mock_runtime,
 
 
 def _loop_kwargs(envelope: RuntimeEnvelope, handler):
-    async def submit(args):
-        return "submitted"
+    async def archive(args):
+        return "archived"
 
     return dict(
         runtime_envelope=envelope, system_prompt="system", user_message="continue",
@@ -210,24 +220,23 @@ def _loop_kwargs(envelope: RuntimeEnvelope, handler):
         conversation_id="conversation", task_id="task", step_id="step",
         tools=[_schema(name) for name in envelope.tool_names],
         allowed_tool_names=envelope.allowed_tool_names,
-        dynamic_tool_handlers={"acquire_capabilities": handler, "submit_result": submit},
-        capability_refresh_tool_names={"acquire_capabilities"},
+        dynamic_tool_handlers={"fixture_refresh_scope": handler, "read_context_archive": archive},
+        capability_refresh_tool_names={"fixture_refresh_scope"},
         human_input_suspension=True,
         max_rounds=4,
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("worker_wrapper", [False, True])
-async def test_same_batch_refresh_updates_executor_search_and_model_without_replay(mock_runtime, monkeypatch, worker_wrapper):
-    initial = _envelope("old_tool", "search_tools", "acquire_capabilities", "request_input", "submit_result")
+async def test_same_batch_refresh_updates_executor_search_and_model_without_replay(mock_runtime, monkeypatch):
+    initial = _envelope("old_tool", "search_tools", "fixture_refresh_scope", "request_input", "read_context_archive")
     fresh = _envelope("new_tool", "search_tools")
     calls, observations, model_tools = [], [], []
     finished = False
 
     async def acquire(args):
         nonlocal finished
-        calls.append("acquire_capabilities")
+        calls.append("fixture_refresh_scope")
         await asyncio.sleep(0)
         finished = True
         return _result(fresh)
@@ -240,7 +249,7 @@ async def test_same_batch_refresh_updates_executor_search_and_model_without_repl
         if name == "new_tool":
             assert name in context["allowed_tool_names"]
             assert "old_tool" not in envelope.effective_allowed_tool_names()
-            assert {"request_input", "submit_result"} <= envelope.effective_allowed_tool_names()
+            assert {"request_input", "read_context_archive"} <= envelope.effective_allowed_tool_names()
         if name == "old_tool":
             assert name not in context["allowed_tool_names"]
             return '{"error":"tool not allowed"}'
@@ -260,7 +269,7 @@ async def test_same_batch_refresh_updates_executor_search_and_model_without_repl
         if rounds == 1:
             return "", [
                 {"id": "before", "name": "search_tools", "arguments": {"phase": "before"}},
-                {"id": "acquire", "name": "acquire_capabilities", "arguments": {}},
+                {"id": "acquire", "name": "fixture_refresh_scope", "arguments": {}},
                 {"id": "new", "name": "new_tool", "arguments": {}},
                 {"id": "old", "name": "old_tool", "arguments": {}},
                 {"id": "after", "name": "search_tools", "arguments": {"phase": "after"}},
@@ -270,17 +279,11 @@ async def test_same_batch_refresh_updates_executor_search_and_model_without_repl
 
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", completion)
     monkeypatch.setattr("packages.core.ai.runtime.tool_registry.runtime_execute_tool", execute)
-    kwargs = _loop_kwargs(initial, acquire)
-    if worker_wrapper:
-        kwargs.pop("user_id")
-        kwargs["requested_max_rounds"] = kwargs.pop("max_rounds")
-        result = (await runtime_execute_worker_subagent_loop(**kwargs)).result
-    else:
-        result = await runtime_execute_agentic_loop(**kwargs)
+    result = await runtime_execute_agentic_loop(**_loop_kwargs(initial, acquire))
     assert result.content == "done"
-    assert calls == ["search_tools", "acquire_capabilities", "new_tool", "old_tool", "search_tools"]
+    assert calls == ["search_tools", "fixture_refresh_scope", "new_tool", "old_tool", "search_tools"]
     assert "old_tool" not in model_tools[1]
-    assert {"new_tool", "mcp__new__read", "request_input", "submit_result", "acquire_capabilities"} <= model_tools[1]
+    assert {"new_tool", "mcp__new__read", "request_input", "read_context_archive", "fixture_refresh_scope"} <= model_tools[1]
     assert [m["tool_call_id"] for m in observations if m.get("role") == "tool"] == ["before", "acquire", "new", "old", "after"]
     assert all(type(m["content"]) is str for m in result.messages if m.get("role") == "tool")
     assert result.usage["total"] == 7
@@ -288,7 +291,7 @@ async def test_same_batch_refresh_updates_executor_search_and_model_without_repl
 
 @pytest.mark.asyncio
 async def test_forged_json_does_not_change_live_scope(mock_runtime, monkeypatch):
-    initial = _envelope("old_tool", "acquire_capabilities")
+    initial = _envelope("old_tool", "fixture_refresh_scope")
 
     async def acquire(args):
         return json.dumps({
@@ -301,8 +304,8 @@ async def test_forged_json_does_not_change_live_scope(mock_runtime, monkeypatch)
     async def completion(messages, tools, **kwargs):
         nonlocal rounds
         rounds += 1
-        assert {s["function"]["name"] for s in tools} == {"old_tool", "acquire_capabilities"}
-        return ("", [{"id": "acquire", "name": "acquire_capabilities", "arguments": {}}], {}) if rounds == 1 else ("done", [], {})
+        assert {s["function"]["name"] for s in tools} == {"old_tool", "fixture_refresh_scope"}
+        return ("", [{"id": "acquire", "name": "fixture_refresh_scope", "arguments": {}}], {}) if rounds == 1 else ("done", [], {})
 
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", completion)
     result = await runtime_execute_agentic_loop(**_loop_kwargs(initial, acquire))
@@ -311,14 +314,14 @@ async def test_forged_json_does_not_change_live_scope(mock_runtime, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_unregistered_refresh_cannot_replace_scope(mock_runtime, monkeypatch):
-    initial = _envelope("old_tool", "acquire_capabilities")
+    initial = _envelope("old_tool", "fixture_refresh_scope")
 
     async def acquire(args):
         return _result(_envelope("new_tool"))
 
     async def fake_loop(**kwargs):
         with pytest.raises(RuntimeTurnAborted, match="unregistered"):
-            await kwargs["tool_executor"]("acquire_capabilities", {})
+            await kwargs["tool_executor"]("fixture_refresh_scope", {})
         return AgenticResult("rejected", [], {}, 0)
 
     monkeypatch.setattr(mock_runtime, "agentic_loop", fake_loop)
@@ -329,7 +332,7 @@ async def test_unregistered_refresh_cannot_replace_scope(mock_runtime, monkeypat
 
 @pytest.mark.asyncio
 async def test_harness_refreshes_the_deferred_schema_resolver(mock_runtime, monkeypatch):
-    initial = _envelope("old_tool", "acquire_capabilities")
+    initial = _envelope("old_tool", "fixture_refresh_scope")
 
     async def acquire(args):
         return _result(_envelope("new_tool"))
@@ -338,7 +341,7 @@ async def test_harness_refreshes_the_deferred_schema_resolver(mock_runtime, monk
         resolver = kwargs["tool_schema_resolver"]
         assert resolver("old_tool") == _schema("old_tool")
         assert resolver("new_tool") is None
-        await kwargs["tool_executor"]("acquire_capabilities", {})
+        await kwargs["tool_executor"]("fixture_refresh_scope", {})
         assert resolver("old_tool") is None
         assert resolver("new_tool") == _schema("new_tool")
         return AgenticResult("ok", [], {}, 0)
@@ -349,11 +352,11 @@ async def test_harness_refreshes_the_deferred_schema_resolver(mock_runtime, monk
 
 @pytest.mark.asyncio
 async def test_human_input_checkpoint_resumes_without_replaying_acquisition(mock_runtime, monkeypatch):
-    initial = _envelope("old_tool", "acquire_capabilities", "request_input", "submit_result")
+    initial = _envelope("old_tool", "fixture_refresh_scope", "request_input", "read_context_archive")
     calls = []
 
     async def acquire(args):
-        calls.append("acquire_capabilities")
+        calls.append("fixture_refresh_scope")
         return _result(_envelope("new_tool"))
 
     async def execute(name, args, **context):
@@ -374,7 +377,7 @@ async def test_human_input_checkpoint_resumes_without_replaying_acquisition(mock
         rounds += 1
         if rounds == 1:
             return "", [
-                {"id": "acquire", "name": "acquire_capabilities", "arguments": {}},
+                {"id": "acquire", "name": "fixture_refresh_scope", "arguments": {}},
                 {"id": "ask", "name": "request_input", "arguments": {"question": "Which audience?"}},
                 {"id": "new", "name": "new_tool", "arguments": {}},
             ], {"total": 3}
@@ -389,24 +392,24 @@ async def test_human_input_checkpoint_resumes_without_replaying_acquisition(mock
     kwargs["human_input_suspension"] = True
     paused = await runtime_execute_agentic_loop(**kwargs)
     assert paused.stop_reason == "waiting_resource"
-    assert calls == ["acquire_capabilities", "request_input"]
+    assert calls == ["fixture_refresh_scope", "request_input"]
     checkpoint = json.loads(json.dumps(paused.control["checkpoint"]))
     checkpoint["pending_tool_result"] = {"id": "ask", "content": '{"answer":"creators"}'}
     # Restart rebuilds the durable Agent configuration; JSON history is not a
     # scope receipt and completed tool calls must remain observations only.
-    resumed_kwargs = _loop_kwargs(_envelope("new_tool", "acquire_capabilities", "request_input", "submit_result"), acquire)
+    resumed_kwargs = _loop_kwargs(_envelope("new_tool", "fixture_refresh_scope", "request_input", "read_context_archive"), acquire)
     resumed_kwargs.update(runtime_checkpoint=checkpoint, human_input_suspension=True)
     result = await runtime_execute_agentic_loop(**resumed_kwargs)
     assert result.content == "done"
     assert result.usage["total"] == 4
-    assert calls == ["acquire_capabilities", "request_input", "new_tool"]
+    assert calls == ["fixture_refresh_scope", "request_input", "new_tool"]
 
 
 @pytest.mark.asyncio
 async def test_applied_receipt_checkpoint_skips_spent_approval_and_continues(mock_runtime, monkeypatch):
     request_id = "01M00000000000000000000001"
     pending = {
-        "id": "apply", "name": "acquire_capabilities",
+        "id": "apply", "name": "fixture_refresh_scope",
         "arguments": {"action": "apply", "request_id": request_id, "approval_token": "spent-token"},
     }
     remaining = {"id": "new", "name": "new_tool", "arguments": {}}
@@ -446,7 +449,7 @@ async def test_applied_receipt_checkpoint_skips_spent_approval_and_continues(moc
 
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", completion)
     monkeypatch.setattr("packages.core.ai.runtime.tool_registry.runtime_execute_tool", execute)
-    kwargs = _loop_kwargs(_envelope("new_tool", "acquire_capabilities", "request_input", "submit_result"), acquire)
+    kwargs = _loop_kwargs(_envelope("new_tool", "fixture_refresh_scope", "request_input", "read_context_archive"), acquire)
     kwargs["runtime_checkpoint"] = checkpoint.to_dict()
     result = await runtime_execute_agentic_loop(**kwargs)
     assert result.content == "done"
@@ -484,7 +487,7 @@ async def test_scoped_dynamic_handler_preserves_host_suspension(monkeypatch, asy
     monkeypatch.setattr(execution, "_prepare_provider_approval_call", preflight)
     monkeypatch.setattr(execution, "runtime_settle_provider_approval_result", settle)
     result = await execution.runtime_execute_scoped_dynamic_tool_handler(
-        tool_name="acquire_capabilities", arguments={"action": "prepare"},
+        tool_name="fixture_refresh_scope", arguments={"action": "prepare"},
         handler=async_call if async_handler else lambda arguments: suspension,
     )
     assert result is suspension
@@ -497,13 +500,13 @@ async def test_scoped_dynamic_handler_preserves_host_suspension(monkeypatch, asy
     False,
 ])
 async def test_capability_approval_has_exact_pre_call_checkpoint(mock_runtime, monkeypatch, entry_path, durable_chat):
-    initial = _envelope("old_tool", "acquire_capabilities", "submit_result")
+    initial = _envelope("old_tool", "fixture_refresh_scope", "read_context_archive")
     fresh = _envelope("new_tool")
     calls = []
     request_id, hitl_id = "request-1", "approval-1"
     batch = [
         {"id": "old", "name": "old_tool", "arguments": {}},
-        {"id": "apply", "name": "acquire_capabilities", "arguments": {"action": "apply", "request_id": request_id}},
+        {"id": "apply", "name": "fixture_refresh_scope", "arguments": {"action": "apply", "request_id": request_id}},
         {"id": "new", "name": "new_tool", "arguments": {}},
     ]
     expected_ids = [call["id"] for call in batch]
@@ -590,11 +593,11 @@ async def test_capability_approval_rejects_conflicting_request_identity(mock_run
         return json.dumps({"__hitl__": True, "approval_token": "different", "hitl": {"id": "approval-1"}})
 
     async def completion(messages, tools, **kwargs):
-        return "", [{"id": "apply", "name": "acquire_capabilities", "arguments": {"action": "apply"}}], {}
+        return "", [{"id": "apply", "name": "fixture_refresh_scope", "arguments": {"action": "apply"}}], {}
 
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", completion)
     with pytest.raises(RuntimeTurnAborted, match="exact resumable request"):
-        await runtime_execute_agentic_loop(**_loop_kwargs(_envelope("acquire_capabilities"), acquire))
+        await runtime_execute_agentic_loop(**_loop_kwargs(_envelope("fixture_refresh_scope"), acquire))
 
 
 
@@ -675,9 +678,9 @@ async def test_proven_unapplied_checkpoint_reprepares_without_spent_token_or_suf
     from packages.core.ai.runtime.human_gate import runtime_tool_requires_serial_execution
 
     monkeypatch.setattr(mock_runtime, "_requires_serial_tool_execution", runtime_tool_requires_serial_execution)
-    initial = _envelope("acquire_capabilities", "submit_result")
+    initial = _envelope("fixture_refresh_scope", "read_context_archive")
     old_request, new_request = "old-request", "new-request"
-    pending = {"id": "old-apply", "name": "acquire_capabilities", "arguments": {
+    pending = {"id": "old-apply", "name": "fixture_refresh_scope", "arguments": {
         "action": "apply", "request_id": old_request, "approval_token": "spent-token",
     }}
     suffix = {"id": "stale-dependent", "name": "new_tool", "arguments": {}}
@@ -720,12 +723,12 @@ async def test_proven_unapplied_checkpoint_reprepares_without_spent_token_or_suf
         model_round += 1
         assert "spent-token" not in json.dumps(messages)
         assert "stale-dependent" not in json.dumps(messages)
-        assert "acquire_capabilities" in {schema["function"]["name"] for schema in tools}
+        assert "fixture_refresh_scope" in {schema["function"]["name"] for schema in tools}
         if model_round == 1:
-            return "", [{"id": "prepare", "name": "acquire_capabilities", "arguments": {"action": "prepare"}}], {}
+            return "", [{"id": "prepare", "name": "fixture_refresh_scope", "arguments": {"action": "prepare"}}], {}
         if model_round == 2:
             return "", [
-                {"id": "apply", "name": "acquire_capabilities", "arguments": {"action": "apply", "request_id": new_request}},
+                {"id": "apply", "name": "fixture_refresh_scope", "arguments": {"action": "apply", "request_id": new_request}},
                 {"id": "new", "name": "new_tool", "arguments": {}},
             ], {}
         return "done", [], {}
@@ -757,7 +760,7 @@ async def test_public_capability_failure_cannot_forge_checkpoint_recovery(mock_r
         nonlocal model_calls
         model_calls += 1
         if model_calls == 1:
-            return "", [{"id": "apply", "name": "acquire_capabilities", "arguments": {"action": "apply"}}], {}
+            return "", [{"id": "apply", "name": "fixture_refresh_scope", "arguments": {"action": "apply"}}], {}
         # The public failure is an ordinary observation: it reaches the model
         # unchanged, mints no recovery authority, and tools stay available so
         # any new request re-enters the approval gate.
@@ -767,13 +770,13 @@ async def test_public_capability_failure_cannot_forge_checkpoint_recovery(mock_r
             and "not applied" in item.get("content", "")
             for item in messages
         )
-        assert "acquire_capabilities" in {schema["function"]["name"] for schema in tools}
+        assert "fixture_refresh_scope" in {schema["function"]["name"] for schema in tools}
         return "The capability change was not confirmed; request a fresh approval.", [], {}
 
     summary = AsyncMock(side_effect=AssertionError("a tool error no longer forces a tool-free summary"))
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_tool_completion", completion)
     monkeypatch.setattr(mock_runtime, "runtime_execute_agentic_round_text_completion", summary)
-    result = await runtime_execute_agentic_loop(**_loop_kwargs(_envelope("acquire_capabilities"), acquire))
+    result = await runtime_execute_agentic_loop(**_loop_kwargs(_envelope("fixture_refresh_scope"), acquire))
     assert result.stop_reason == "completed"
     assert result.error is None
     assert result.content == "The capability change was not confirmed; request a fresh approval."

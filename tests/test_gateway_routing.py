@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import yaml
 
 from apps.api.chat_stream_routes import CHAT_STREAM_ROUTE_EXAMPLES
 
@@ -28,10 +27,39 @@ def test_group_file_upload_nginx_limit_is_route_scoped():
         block for block in _nginx_location_blocks(nginx_conf)
         if "^/api/v1/chat/rooms/[^/]+/files/?$" in block
     )
-    assert "client_max_body_size 101m;" in upload_route
+    assert "client_max_body_size 1025m;" in upload_route
     assert "proxy_request_buffering off;" in upload_route
     assert "proxy_pass http://$api_upstream;" in upload_route
     assert nginx_conf.index("location ~ ^/api/v1/chat/rooms/") < nginx_conf.index("location /api/")
+
+
+def test_group_file_download_access_log_keeps_diagnostics_without_credentials():
+    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
+    download_route = next(
+        block for block in _nginx_location_blocks(nginx_conf)
+        if "/file-downloads" in block
+    )
+    # A route override must replace the inherited combined log, which includes
+    # both the ticket-bearing request line and an arbitrary Referer header.
+    logs = re.findall(r"(?m)^\s*access_log\s+([^;]+);", download_route)
+    assert len(logs) == 1
+    destination, format_name = logs[0].split()
+    assert destination != "off"
+    log_format = re.search(
+        rf"(?ms)^log_format\s+{re.escape(format_name)}\s+(.+?);", nginx_conf,
+    )
+    assert log_format is not None
+    variables = set(re.findall(r"\$\{?([a-zA-Z_]\w*)", log_format[1]))
+    assert {"request_method", "uri", "status", "request_time", "upstream_status"} <= variables
+    assert variables <= {
+        "remote_addr", "time_local", "request_method", "uri", "server_protocol",
+        "status", "body_bytes_sent", "request_time", "upstream_status", "upstream_response_time",
+    }, "Download access logs must not include query strings or request headers"
+    # Fixed-format nginx errors append the raw signed URL. Only this location
+    # drops those lines; its safe access log still records failed transfers.
+    error_log = r"(?m)^\s*error_log\s+/dev/null(?:\s+\w+)?\s*;"
+    assert len(re.findall(error_log, download_route)) == 1
+    assert len(re.findall(error_log, nginx_conf)) == 1
 
 
 def test_group_file_body_precheck_runs_after_rate_limiters():
@@ -151,39 +179,3 @@ def test_runtime_reconnect_events_are_part_of_chat_stream_route_contract():
     assert reconnect_path in CHAT_STREAM_ROUTE_EXAMPLES
 
 
-def _caddy_stream_matcher_covers(caddyfile: str, path: str) -> bool:
-    if path.startswith("/api/v1/chat/runs/") and path.endswith("/events"):
-        return "/api/v1/chat/runs/*/events" in caddyfile
-    if path.startswith("/api/v1/public/chat/"):
-        return "/api/v1/public/chat/*/message/stream" in caddyfile
-    if path.startswith("/api/v1/workspace-drafts/") and path.endswith("/messages/stream"):
-        return "/api/v1/workspace-drafts/*/messages/stream" in caddyfile
-    if path.startswith("/api/v1/workspace-drafts/") and path.endswith("/finalize/stream"):
-        return "/api/v1/workspace-drafts/*/finalize/stream" in caddyfile
-    return path in caddyfile
-
-
-def _nginx_stream_location_covers(nginx_conf: str, path: str) -> bool:
-    if path.startswith("/api/v1/chat/runs/") and path.endswith("/events"):
-        return r"^/api/v1/chat/runs/[^/]+/events$" in nginx_conf
-    if path.startswith("/api/v1/public/chat/"):
-        return r"^/api/v1/public/chat/[^/]+/message/stream$" in nginx_conf
-    if path.startswith("/api/v1/workspace-drafts/") and (
-        path.endswith("/messages/stream") or path.endswith("/finalize/stream")
-    ):
-        return r"^/api/v1/workspace-drafts/[^/]+/(messages|finalize)/stream$" in nginx_conf
-    if path in {"/api/v1/agents/generate-stream", "/api/v1/agents/generate-draft-stream", "/api/v1/skills/generate-stream"}:
-        return r"^/api/v1/(agents/(generate-stream|generate-draft-stream)|skills/generate-stream)$" in nginx_conf
-    return f"location = {path}" in nginx_conf
-
-
-def _k8s_stream_ingress_covers(ingress_paths: list[str], path: str) -> bool:
-    if path.startswith("/api/v1/chat/runs/") and path.endswith("/events"):
-        return "/api/v1/chat/runs/[^/]+/events" in ingress_paths
-    if path.startswith("/api/v1/public/chat/"):
-        return "/api/v1/public/chat/[^/]+/message/stream" in ingress_paths
-    if path.startswith("/api/v1/workspace-drafts/") and path.endswith("/messages/stream"):
-        return "/api/v1/workspace-drafts/[^/]+/messages/stream" in ingress_paths
-    if path.startswith("/api/v1/workspace-drafts/") and path.endswith("/finalize/stream"):
-        return "/api/v1/workspace-drafts/[^/]+/finalize/stream" in ingress_paths
-    return path in ingress_paths

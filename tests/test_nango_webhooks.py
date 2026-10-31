@@ -358,3 +358,52 @@ async def test_nango_dispatch_selects_exact_connection_without_cross_account_fal
     assert unmatched["ok"] is False
     assert "connection" in unmatched["reason"]
     assert adapter.calls == [second.id]
+
+
+@pytest.mark.asyncio
+async def test_nango_auth_events_open_and_close_the_connection_incident(client, db_session, monkeypatch):
+    import packages.core.database as db_module
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Integration
+    from packages.core.services.account_incidents import INCIDENT_KEY
+
+    monkeypatch.setenv("NANGO_CONNECT_HMAC_KEY", "a" * 64)
+    monkeypatch.setattr(nango_webhooks, "async_session", db_module.async_session)
+    integration = Integration(
+        id=generate_ulid(),
+        entity_id="entity-nango-incident",
+        provider="slack",
+        config={"nango": {"connection_id": "conn-incident"}},
+        credentials={},
+    )
+    db_session.add(integration)
+    await db_session.commit()
+    token = nango_bootstrap._derive_webhook_token()
+
+    async def post(**fields):
+        response = await client.post(
+            f"/api/v1/nango/webhook?nango_webhook_token={token}",
+            json={"type": "auth", "connectionId": "conn-incident", "provider": "slack", **fields},
+        )
+        assert response.status_code == 200
+        await db_session.refresh(integration)
+
+    await post(success=False, operation="refresh", error={"type": "refresh_token_external_error"})
+    incident = integration.config[INCIDENT_KEY]
+    assert incident["reason"] == "refresh_token_external_error"
+    assert integration.config["nango"] == {"connection_id": "conn-incident"}
+
+    await post(success=True, operation="refresh")
+    assert INCIDENT_KEY not in integration.config
+
+    # A failed reconnect attempt leaves the old credentials as they were.
+    for operation in ("override", "creation"):
+        await post(success=False, operation=operation, error={"type": "oauth_error"})
+        assert INCIDENT_KEY not in integration.config
+
+    # The incident write never turns a received webhook into a 500.
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(nango_webhooks, "_apply_auth_outcome", broken)
+    await post(success=False, operation="refresh")

@@ -199,6 +199,7 @@ class ChatRateLimitMiddleware(BaseHTTPMiddleware):
         if not CHAT_RATE_LIMIT_ENABLED or request.url.path in _HEALTH_PATHS:
             return await call_next(request)
 
+
         # Dependencies authenticate after middleware. Verify the bearer token
         # here so users behind one IP do not share a chat rate-limit budget.
         user_id = authenticated_chat_user_id(request) or getattr(request.state, "user_id", None)

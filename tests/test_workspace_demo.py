@@ -461,7 +461,9 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
 
 
 @pytest.mark.asyncio
-async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, monkeypatch):
+async def test_solo_founder_content_engine_can_finish_a_work_wave(undeclared_effects_allowed, db_session, monkeypatch):
+    # Its draft check names a raw tool ("generate_file") through a legacy rule;
+    # outside a step subject that key is undeclared by construction.
     """One-person-company demo: content goals should progress as a complete work wave."""
     from datetime import datetime, timezone
     from decimal import Decimal

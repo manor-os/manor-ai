@@ -301,8 +301,7 @@ async def test_max_rounds_final_summary_is_checked_for_markup(monkeypatch, final
     )
 
     assert len(final_calls) == 1  # no retry on the final summary
-    # max_rounds stays the stop reason: plan steps force a submit_result round
-    # and Chrome reports a blocked outcome from it.
+    # max_rounds stays the stop reason: Chrome reports a blocked outcome from it.
     assert result.stop_reason == "max_rounds"
     if expect_markup:
         assert result.error == "pseudo_tool_markup"
@@ -310,52 +309,3 @@ async def test_max_rounds_final_summary_is_checked_for_markup(monkeypatch, final
         assert result.messages[-1]["content"] == PSEUDO_TOOL_MARKUP_FINAL_CONTENT
     else:
         assert result.error is None and result.content == final_text
-
-
-@pytest.mark.asyncio
-async def test_plan_step_with_real_work_still_force_submits_after_a_fabricated_summary(monkeypatch):
-    from packages.core.workers import internal
-
-    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
-    executed = []
-
-    async def tool_round(messages, tools, **_kwargs):
-        return "", [{"id": f"c{len(messages)}", "name": "web_search", "arguments": {"q": "x"}}], {"total": 1}
-
-    async def final_round(messages, **_kwargs):
-        return FAKE_CALL, {"total": 1}
-
-    async def executor(name, args):
-        executed.append(name)
-        return '{"results": [{"title": "evidence"}]}'
-
-    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", tool_round)
-    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", final_round)
-    result = await loop_module.agentic_loop(
-        system_prompt="test", user_message="research",
-        tools=[{"type": "function", "function": {
-            "name": "web_search",
-            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
-        }}],
-        tool_executor=executor, max_rounds=1,
-    )
-    assert executed == ["web_search"] and result.error == "pseudo_tool_markup"
-
-    forced = []
-
-    class Reached(Exception):
-        pass
-
-    async def force_submit(*_args, **_kwargs):
-        forced.append(True)
-        raise Reached
-
-    monkeypatch.setattr(internal, "_force_submit_result_round", force_submit)
-    with pytest.raises(Reached):
-        await internal._finish_subagent_attempt(
-            {"params": {}}, ctx=None, result=result, attempt=internal._AttemptTranscript(result),
-            is_action=False, action_state={}, prompt="research", original_prompt="research",
-            system_prompt="", output_contract=None, submit_tool={}, submit_handler=None,
-            get_submit_payload=lambda: None,
-        )
-    assert forced == [True]

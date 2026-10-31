@@ -12,7 +12,7 @@ the installable content actually changed — so shipping a corrected config
 tells every workspace installed from it that an update exists, without anyone
 remembering to touch a number.
 
-Cloud K8s runs this from the deployment's one-shot Blueprint publisher after
+Cloud runs this from the deployment's one-shot Blueprint publisher after
 every runtime rollout is complete. Single-owner API deployments, including
 OSS and Compose, keep their startup compatibility path. Idempotent: unchanged
 configs write nothing and move no version.
@@ -29,12 +29,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.blueprints import BlueprintStatus
-from packages.core.blueprints.freshness import (
-    FIRST_CONTENT_VERSION,
-    next_content_version,
-)
+from packages.core.blueprints.freshness import FIRST_CONTENT_VERSION
 from packages.core.blueprints.payload import detect_version
 from packages.core.blueprints.catalogue import get_platform_blueprints
+from packages.core.blueprints.registry import next_release_version, record_release
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.services.blueprint_listing_settings import (
     blueprint_listing_overrides,
@@ -68,6 +66,9 @@ RETIRED_PLATFORM_BLUEPRINT_SLUGS = (
     "practical-content-repurpose-v1",
     "practical-bilingual-editor-v1",
     "practical-source-brief-v1",
+    # Replaced by creative-carousel-agent-v1, the Agent-and-Skill Carousel studio.
+    # Existing installs keep working; the listing is withdrawn.
+    "creative-carousel-v1",
 )
 
 PUBLISHED = BlueprintStatus.PUBLISHED.value
@@ -268,10 +269,10 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
         overrides = listing_overrides.get(slug)
         payload = _payload_with_listing_overrides(payload, overrides)
         manifest = _manifest(payload)
-        version, fingerprint = next_content_version(
+        version = await next_release_version(
+            db, row.id if row is not None else row_id, payload,
             current_version=getattr(row, "content_version", None) or FIRST_CONTENT_VERSION,
             stored_fingerprint=getattr(row, "content_fingerprint", None),
-            payload=payload,
         )
 
         tags = manifest.get("tags")
@@ -298,11 +299,7 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
             "remixed_from_id": (
                 str(manifest.get("forked_from_id") or "").strip() or None
             ),
-            "payload": payload,
-            "payload_version": detect_version(payload),
             "status": PUBLISHED,
-            "content_version": version,
-            "content_fingerprint": fingerprint,
             **_platform_blueprint_pricing(slug, overrides),
         }
 
@@ -314,11 +311,23 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
                 **fields,
             )
             db.add(row)
+            await record_release(
+                db, row.id, payload, version, listing=row,
+                payload_version=detect_version(payload),
+            )
             logger.info("platform blueprint seeded: %s at %s", slug, version)
         else:
-            changed = version != row.content_version
+            previous_version = row.content_version
+            changed = version != previous_version
             for key, value in fields.items():
                 setattr(row, key, value)
+            # A recorded version whose content differs means the release
+            # history and this row disagree; fail the deployment rather than
+            # overwrite a published version.
+            await record_release(
+                db, row.id, payload, version, listing=row,
+                payload_version=detect_version(payload),
+            )
             if changed:
                 row.published_at = datetime.now(timezone.utc)
                 logger.info("platform blueprint republished: %s → %s", slug, version)

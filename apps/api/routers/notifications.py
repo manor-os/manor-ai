@@ -1,9 +1,10 @@
 """Notification endpoints — list, create, mark read, delete + preferences."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,7 @@ from packages.core.services.settings_service import (
     get_user_preferences,
     update_user_preferences,
 )
+from packages.core.services.signed_email_links import email_action_page_html
 from apps.api.deps import get_current_user
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
@@ -238,6 +240,7 @@ class EventDescriptorResponse(BaseModel):
     severity: str
     label: str
     description: str
+    default_channels: list[str] | None = None
 
 
 class ConnectedChannel(BaseModel):
@@ -249,12 +252,18 @@ class ConnectedChannel(BaseModel):
     last_seen_at: str | None = None
 
 
+class ChatEmailPreferences(BaseModel):
+    enabled: bool = True
+    delay_minutes: Literal[5, 15, 30, 60, 120] = 30
+
+
 class NotificationPreferencesResponse(BaseModel):
     """Snapshot of the user's notification routing config + the catalog
     the UI needs to render the (event × channel) matrix."""
     default_channels: list[str] = Field(default_factory=list)
     by_kind: dict[str, dict[str, Any]] = Field(default_factory=dict)
     quiet_hours: dict[str, Any] | None = None
+    chat_email: ChatEmailPreferences = Field(default_factory=ChatEmailPreferences)
     supported_channels: list[str] = Field(default_factory=list)
     configured_channels: list[str] = Field(default_factory=list)
     event_catalog: list[EventDescriptorResponse] = Field(default_factory=list)
@@ -267,6 +276,7 @@ class NotificationPreferencesUpdate(BaseModel):
     default_channels: list[str] | None = None
     by_kind: dict[str, dict[str, Any] | None] | None = None
     quiet_hours: dict[str, Any] | None = None
+    chat_email: ChatEmailPreferences | None = None
 
 
 def _normalise_channels(values: list[str]) -> list[str]:
@@ -346,6 +356,47 @@ async def _load_configured_notification_channels(db: AsyncSession, user: User) -
     return out
 
 
+_INVALID_UNSUBSCRIBE = ("This link is no longer valid", "Sign in to Manor AI and change email delivery in Settings → Notifications.")
+
+
+@router.get("/unsubscribe/{token}", response_class=HTMLResponse)
+async def notification_unsubscribe_confirmation(token: str, db: AsyncSession = Depends(get_db)):
+    from packages.core.constants.notification_types import EVENTS_BY_KIND
+    from packages.core.services.notification_unsubscribe import email_explicitly_disabled, resolve_unsubscribe_token
+
+    resolved = await resolve_unsubscribe_token(db, token)
+    if resolved is None:
+        return HTMLResponse(email_action_page_html(*_INVALID_UNSUBSCRIBE), status_code=400)
+    user, kind = resolved
+    label = EVENTS_BY_KIND[kind]["label"]
+    if email_explicitly_disabled(user.preferences or {}, kind):
+        return HTMLResponse(email_action_page_html(
+            "You're already unsubscribed", f"You won't get “{label}” emails. In-app notifications continue.",
+        ))
+    return HTMLResponse(email_action_page_html(
+        f"Stop “{label}” emails?",
+        "You'll still see these in Manor's notification bell, and you can turn email back on in Settings → Notifications.",
+        action=f"/api/v1/notifications/unsubscribe/{token}",
+    ))
+
+
+@router.post("/unsubscribe/{token}", response_class=HTMLResponse)
+async def notification_unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
+    """Also the RFC 8058 one-click target; the request body is ignored."""
+    from packages.core.constants.notification_types import EVENTS_BY_KIND
+    from packages.core.services.notification_unsubscribe import resolve_unsubscribe_token, unsubscribe_email
+
+    resolved = await resolve_unsubscribe_token(db, token)
+    if resolved is None:
+        return HTMLResponse(email_action_page_html(*_INVALID_UNSUBSCRIBE), status_code=400)
+    user, kind = resolved
+    await unsubscribe_email(db, user, kind)
+    await db.commit()
+    return HTMLResponse(email_action_page_html(
+        "You're unsubscribed", f"You won't get “{EVENTS_BY_KIND[kind]['label']}” emails anymore.",
+    ))
+
+
 @router.get("/preferences", response_model=NotificationPreferencesResponse)
 async def get_notification_preferences(
     user: User = Depends(get_current_user),
@@ -362,6 +413,7 @@ async def get_notification_preferences(
         default_channels=_normalise_channels(notif.get("default_channels") or []),
         by_kind={k: v for k, v in (notif.get("by_kind") or {}).items() if isinstance(v, dict)},
         quiet_hours=notif.get("quiet_hours") if isinstance(notif.get("quiet_hours"), dict) else None,
+        chat_email=ChatEmailPreferences(**(notif.get("chat_email") or {})),
         supported_channels=list(SUPPORTED_CHANNELS),
         configured_channels=configured,
         event_catalog=[EventDescriptorResponse(**e) for e in EVENT_CATALOG],
@@ -496,6 +548,10 @@ async def update_notification_preferences(
             notif.pop("quiet_hours", None)
         else:
             notif["quiet_hours"] = validated
+
+    if req.chat_email is not None:
+        current = ChatEmailPreferences(**(notif.get("chat_email") or {})).model_dump()
+        notif["chat_email"] = {**current, **req.chat_email.model_dump(exclude_unset=True)}
 
     await update_user_preferences(db, user.id, {"notifications": notif})
     await db.commit()

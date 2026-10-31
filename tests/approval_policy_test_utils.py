@@ -10,4 +10,5 @@ def evaluate_runtime_action(action, *, mode="risk_based", rules=()):
         root={"revision": 1, "policy": {"mode": mode, "rules": list(rules)}})
     return evaluate_policy(chain, action_facts(action_key=action.action_key,
         capability_id=action.capability_id, resource_kind=action.resource_kind,
-        resource_id=action.resource_id, risk_level=action.risk_level, operation=action.operation))
+        resource_id=action.resource_id, risk_level=action.risk_level, operation=action.operation,
+        **action.policy_effect()))

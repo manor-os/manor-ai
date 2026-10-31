@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.constants.notification_types import (
     NotificationChannel,
     SUPPORTED_CHANNELS,
+    event_default_channels,
     event_default_severity,
 )
 from packages.core.models.channel import ChannelConfig, ChannelContact
@@ -66,14 +67,14 @@ _INAPP = NotificationChannel.INAPP.value
 
 # ── User preference helpers ─────────────────────────────────────────────────
 
-def _user_notification_prefs(user_prefs: dict | None) -> dict:
+def user_notification_prefs(user_prefs: dict | None) -> dict:
     if not isinstance(user_prefs, dict):
         return {}
     notif = user_prefs.get("notifications")
     return notif if isinstance(notif, dict) else {}
 
 
-def _by_kind_override(notif_prefs: dict, kind: str) -> dict | None:
+def by_kind_override(notif_prefs: dict, kind: str) -> dict | None:
     by_kind = notif_prefs.get("by_kind")
     if not isinstance(by_kind, dict):
         return None
@@ -89,7 +90,7 @@ def _string_list(value: object) -> list[str]:
 
 # ── Quiet hours ────────────────────────────────────────────────────────────
 
-def _is_in_quiet_hours(notif_prefs: dict, now: datetime | None = None) -> bool:
+def is_in_quiet_hours(notif_prefs: dict, now: datetime | None = None) -> bool:
     quiet = notif_prefs.get("quiet_hours")
     if not isinstance(quiet, dict):
         return False
@@ -113,6 +114,9 @@ def _is_in_quiet_hours(notif_prefs: dict, now: datetime | None = None) -> bool:
         return start <= current < end
     # Overnight window (e.g. 22:00 → 08:00)
     return current >= start or current < end
+
+
+_is_in_quiet_hours = is_in_quiet_hours  # existing callers
 
 
 # ── Entity / workspace policy helpers ──────────────────────────────────────
@@ -151,14 +155,15 @@ def select_channels(
     workspace_settings: dict | None = None,
     entity_settings: dict | None = None,
     now: datetime | None = None,
+    apply_quiet_hours: bool = True,
 ) -> list[str]:
     """Pure function — work out which channels a notification should go to.
 
     Separated from the DB-touching resolver so tests can exercise the
     precedence rules without a database.
     """
-    notif_prefs = _user_notification_prefs(user_prefs)
-    override = _by_kind_override(notif_prefs, kind)
+    notif_prefs = user_notification_prefs(user_prefs)
+    override = by_kind_override(notif_prefs, kind)
 
     chosen: list[str] = []
     # warn / critical events bypass quiet hours by default; per-kind
@@ -174,6 +179,9 @@ def select_channels(
         chosen = _string_list(override.get("channels"))
         if "bypass_quiet_hours" in override:
             bypass_quiet = bool(override.get("bypass_quiet_hours"))
+
+    if not chosen:
+        chosen = _string_list(event_default_channels(kind))
 
     if not chosen:
         chosen = _string_list(notif_prefs.get("default_channels"))
@@ -200,11 +208,37 @@ def select_channels(
     if severity == "critical":
         return chosen
 
-    if _is_in_quiet_hours(notif_prefs, now=now) and not bypass_quiet:
+    if apply_quiet_hours and _is_in_quiet_hours(notif_prefs, now=now) and not bypass_quiet:
         # Quiet hours — only keep the in-app trail; suppress all pushes.
         return [_INAPP]
 
     return chosen
+
+
+def push_allowed_for_kind(
+    *,
+    kind: str,
+    severity: str,
+    user_prefs: dict | None,
+    now: datetime | None = None,
+) -> bool:
+    """Whether a mobile push for ``kind`` passes the user's preferences.
+
+    Push has no channel of its own in the preference model, so it follows the
+    same per-kind rules as ``select_channels``: ``by_kind[kind].enabled`` false
+    opts out of pushes (the in-app row still exists), and quiet hours suppress
+    pushes unless the severity or the kind's ``bypass_quiet_hours`` allows them.
+    """
+    notif_prefs = user_notification_prefs(user_prefs)
+    override = by_kind_override(notif_prefs, kind)
+    if override is not None and override.get("enabled") is False:
+        return False
+    if severity == "critical":
+        return True
+    bypass_quiet = severity in {"warn", "critical"}
+    if override is not None and "bypass_quiet_hours" in override:
+        bypass_quiet = bool(override.get("bypass_quiet_hours"))
+    return not (_is_in_quiet_hours(notif_prefs, now=now) and not bypass_quiet)
 
 
 # ── DB-backed resolution ───────────────────────────────────────────────────

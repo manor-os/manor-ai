@@ -71,6 +71,28 @@ async def test_oauth_initial_locale_normalizes_or_uses_request(oauth_dependencie
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_upload", [False, True])
+async def test_first_oauth_link_replaces_generated_avatar_but_keeps_upload(oauth_dependencies, has_upload):
+    # The placeholder signup used to store (its generator is gone; data may remain).
+    generated = (
+        "https://api.dicebear.com/9.x/initials/svg?seed=ee42ce31"
+        "&backgroundColor=0f766e,14b8a6,0d9488,0ea5e9,6366f1,8b5cf6"
+        "&backgroundType=gradientLinear&fontSize=40"
+    )
+    previous = "/api/v1/fs/account/avatars/upload.png" if has_upload else generated
+    existing = User(id="existing", entity_id="entity", email="amos@example.test", locale="en",
+                    avatar_url=previous, role="owner", status="active")
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[_result(None), _result(existing)]), add=Mock(), flush=AsyncMock())
+    photo = "https://lh3.googleusercontent.com/amos-photo"
+    user, created = await auth_service.get_or_create_oauth_user(
+        db, provider="google", provider_user_id="google-amos", email=existing.email,
+        email_verified=True, avatar_url=photo,
+    )
+    assert not created
+    assert user.avatar_url == (previous if has_upload else photo)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("existing_account", [False, True])
 @pytest.mark.parametrize("locale, expected", [(None, "vi"), ("fr-FR", "fr"), ("unknown", "en")])
 async def test_team_oauth_initializes_new_user_only(

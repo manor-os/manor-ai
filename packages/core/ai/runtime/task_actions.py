@@ -110,6 +110,13 @@ async def runtime_search_tasks_action(
         and value not in (None, "", [], ())
     }
     service_params.update({"limit": limit, "offset": offset})
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    if workspace_id and collaborators_acting_now(entity_id):
+        # A collaborator-involved call lists only the run Workspace's Tasks,
+        # not company-level ones or other Workspaces' that a seat might reach.
+        service_params.pop("workspace_ids", None)
+        service_params["workspace_id"] = str(workspace_id)
 
     try:
         async with async_session() as db:
@@ -257,11 +264,22 @@ async def runtime_update_task_action(
                 return json.dumps({"error": f"Task {task_id} not found"})
         elif not context.user_id:
             return json.dumps({"error": f"Task {task_id} not found"})
+        from packages.core.ai.runtime.manor_actions import collaborator_assignee_error
+
+        if error := await collaborator_assignee_error(
+            db, entity_id, existing_task.workspace_id, fields.get("assignee_id"), user_id=context.user_id,
+        ):
+            return json.dumps(error, default=str)
+        from packages.core.constants.task import CancelSource
+
         task = await task_service.update_task(
             db, task_id, entity_id, user_id=context.user_id,
             manual_execution=await runtime_tool_is_user_requested(
                 db, entity_id=entity_id, workspace_id=existing_task.workspace_id, kwargs=runtime_kwargs,
             ),
+            # The agent chose to cancel; ``manual_execution`` says the turn
+            # was started by a person, not that they asked for this cancel.
+            cancel_source=CancelSource.SYSTEM.value,
             **fields,
         )
         if not task:

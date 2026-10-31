@@ -576,9 +576,18 @@ async def test_tk_post_photo_requires_matching_review(tk_http):
     assert not tk_http.calls
 
 
-async def test_tk_get_publish_status(tk_http):
-    tk_http.response = _FakeResp(200, {"data": {"status": "PROCESSING_UPLOAD"}})
-    await tk.call_tool("get_publish_status", {"publish_id": "p1"}, _TOKEN)
+@pytest.mark.parametrize("data", [
+    {"status": "PROCESSING_UPLOAD", "downloaded_bytes": 1024},
+    {"status": "PROCESSING_DOWNLOAD", "downloaded_bytes": 512},
+    {"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": ["post1"]},
+    {"status": "PUBLISH_COMPLETE"},  # Completion need not mean publicly available.
+    {"status": "FAILED", "fail_reason": "video_pull_failed"},
+])
+async def test_tk_get_publish_status(tk_http, data):
+    tk_http.response = _FakeResp(200, {"data": data, "error": {"code": "ok"}})
+    result = await tk.call_tool("get_publish_status", {"publish_id": "p1"}, _TOKEN)
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"])["data"] == data
     call = _last(tk_http)
     path, _ = _split(call["url"])
     assert path.endswith("/v2/post/publish/status/fetch/")
@@ -603,3 +612,48 @@ async def test_auth_failure_surfaces_friendly_message(yt_http):
     yt_http.response = _FakeResp(401, None, "")
     out = await yt.call_tool("get_video", {"video_id": "v1"}, _TOKEN)
     assert "authentication failed" in out["content"][0]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_yt_upload_reads_a_workspace_knowledge_video(monkeypatch, tmp_path):
+    """A Workflow uploads the approved Knowledge video itself, through the same
+    Workspace media check other platform integrations use."""
+    source = tmp_path / "approved.mp4"
+    source.write_bytes(b"video-bytes")
+    seen = {}
+
+    async def inspect(reference, *, workspace_id, tool_name, inspect_snapshot, **_kwargs):
+        seen.update(reference=reference, workspace_id=workspace_id, tool_name=tool_name)
+        inspect_snapshot(str(source))
+        return {"rel_path": "Workspaces/w/videos/approved.mp4", "size_bytes": source.stat().st_size}
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_document_media.inspect_workspace_document_media", inspect,
+    )
+    yt.set_call_context({"entity_id": "e", "user_id": "u", "workspace_id": "w"})
+    try:
+        path, size, media_type = await yt._stage_video_source(
+            {"source_kind": "workspace_document", "document_id": "doc-1"},
+        )
+        # A Knowledge viewer reference in a Workspace resolves to the same document.
+        await yt._stage_video_source("/viewer/doc-1")
+    finally:
+        yt.clear_call_context()
+
+    assert seen == {
+        "reference": {"source_kind": "workspace_document", "document_id": "doc-1"},
+        "workspace_id": "w",
+        "tool_name": "mcp__youtube__upload_video",
+    }
+    assert path.read_bytes() == b"video-bytes" and size == len(b"video-bytes")
+    assert media_type == "video/mp4"
+    path.unlink()
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (False, False), ("false", False), ("not_made_for_kids", False),
+    (True, True), ("made_for_kids", True), (None, None), ("", None),
+])
+def test_yt_made_for_kids_reads_rendered_template_values(value, expected):
+    # A rendered template is a string: "false" must not become True.
+    assert yt._made_for_kids(value) is expected

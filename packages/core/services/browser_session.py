@@ -43,7 +43,12 @@ def clear_cookie(response: Response):
 
 def set_cookie(request: Request, response: Response, session: BrowserSession, secret: str):
     origin = urlsplit(request.headers.get("origin") or str(request.base_url))
-    secure = origin.scheme == "https"
+    # Cloud authentication cookies must retain TLS-only transport even when a
+    # client supplies an HTTP Origin or the reverse proxy uses an HTTP backend.
+    cloud_tls_required = (
+        get_settings().DEPLOYMENT_MODE.strip().lower() == "cloud"
+    )
+    secure = cloud_tls_required or origin.scheme == "https"
     response.set_cookie(COOKIE, f"{session.id}.{secret}",
                         max_age=max(0, int((session.expires_at - datetime.now(timezone.utc)).total_seconds())),
                         expires=session.expires_at, path=COOKIE_PATH,

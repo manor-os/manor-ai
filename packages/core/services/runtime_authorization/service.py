@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from packages.core.services.runtime_authorization.domain import (
@@ -74,8 +75,32 @@ class DefaultAuthorizationService(AuthorizationService):
                     "This integration is disabled for the current Workspace.",
                     AuthorizationRule.WORKSPACE_INTEGRATION_DISABLED,
                 )
+        # Before any strategy, including the system-worker one: a collaborator
+        # reaches only allowlisted subjects inside a live-granted Workspace.
+        # The denials above only narrow, so they may precede it.
+        from packages.core.services.runtime_authorization.collaborator import (
+            collaborator_runtime_gate,
+        )
+
+        roles: dict[str, str | None] = {}
+        collaborator_scope, collaborator_denial = await collaborator_runtime_gate(db, request, roles)
+        if collaborator_denial is not None:
+            return collaborator_denial
+        # Always set by the service, never trusted from the caller: a preset
+        # value would skip the company-permission step of the strategies. The
+        # gate's role resolution is reused by the strategies.
+        user_key = str(request.user_id) if request.user_id else None
+        request = replace(
+            request,
+            collaborator_workspace_ids=collaborator_scope,
+            user_role_resolved=user_key in roles,
+            resolved_user_role=roles.get(user_key) if user_key else None,
+        )
         strategy = self._runtime_factory.create(request)
-        return await strategy.authorize(db, request)
+        decision = await strategy.authorize(db, request)
+        if collaborator_scope is not None and decision.allowed:
+            decision = replace(decision, collaborator_workspace_ids=collaborator_scope)
+        return decision
 
     async def authorize_hitl(
         self,
@@ -104,6 +129,30 @@ class DefaultAuthorizationService(AuthorizationService):
             return PermissionDecision.deny(
                 "The HITL actor is not an active member of this entity.",
                 AuthorizationRule.HITL_ENTITY_MEMBERSHIP,
+            )
+        from packages.core.services.collaborator_scope import (
+            actor_workspace_scope,
+            collaborator_live_workspaces,
+        )
+        from packages.core.services.external_collaboration_access import COLLABORATOR_MEMBERSHIP_ROLE
+
+        # The derived seat answers the strategies below; a collaborator first
+        # needs a live grant on the card's own Workspace. The actor's raw
+        # membership role (or the acting context) says who is one -- never a
+        # StaffRole name -- without another query.
+        collaborator_scope = await actor_workspace_scope(
+            db, user_id=by_user_id, entity_id=request.entity_id,
+        )
+        if collaborator_scope is None and actor.membership_role == COLLABORATOR_MEMBERSHIP_ROLE:
+            collaborator_scope = await collaborator_live_workspaces(
+                db, user_id=by_user_id, entity_id=request.entity_id,
+            ) or frozenset()
+        if collaborator_scope is not None and (
+            not request.workspace_id or request.workspace_id not in collaborator_scope
+        ):
+            return PermissionDecision.deny(
+                "External collaborators resolve requests only in the Workspace their collaboration covers.",
+                AuthorizationRule.COLLABORATOR_WORKSPACE,
             )
 
         strategy = self._hitl_factory.create(request)
@@ -150,10 +199,12 @@ class DefaultAuthorizationService(AuthorizationService):
         ).scalar_one_or_none()
         if user is None:
             return None
+        membership: dict = {}
         role = await resolve_user_role(
             db,
             user_id=user_id,
             entity_id=entity_id,
+            membership_role=membership,
         )
         if role is None:
             return None
@@ -161,6 +212,9 @@ class DefaultAuthorizationService(AuthorizationService):
             id=user.id,
             entity_id=entity_id,
             role=str(role),
+            membership_role=membership.get("role") or (
+                str(role) if str(role) == "collaborator" else None
+            ),
         )
 
 

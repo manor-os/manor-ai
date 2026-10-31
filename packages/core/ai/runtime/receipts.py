@@ -11,6 +11,16 @@
 
 Only host carrier *types* prove "no mutation". Serialized tool or provider
 JSON can never downgrade an error to ``none``.
+
+A failed host call carrying ``RuntimeSettledToolResult`` takes the state its
+handler proved at that exact failure branch (``none``: refused before it ran,
+or ran only in a throwaway networkless sandbox; ``confirmed``: only completed
+steps changed anything).
+
+A call that ran a whole child loop (``invoke_skill``) takes its child ledger's
+state, carried by the host on ``RuntimeStructuredToolResult.child_effect_state``.
+An unconfirmed call can later be confirmed by reconciliation
+(``RuntimeToolEvidence``): a host observation of the exact target it reported.
 """
 
 from __future__ import annotations
@@ -48,16 +58,22 @@ _UNCLASSIFIED: Any = object()
 
 
 def _is_read_only(tool_name: str, arguments: dict | None, classification: Any = _UNCLASSIFIED) -> bool:
-    """``classification``: one the caller already made (None when it failed)."""
-    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
-    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+    """``classification``: one the caller already made (None when it failed).
+
+    True for every call that executes nothing (reads, and the CONTROL calls
+    in ``RUNTIME_NO_EFFECT_CONTROL_TOOL_NAMES``).
+    """
+    from packages.core.ai.runtime.approval_classifier import (
+        classify_runtime_tool,
+        runtime_call_executes_nothing,
+    )
 
     if classification is _UNCLASSIFIED:
         try:
             classification = classify_runtime_tool(tool_name, arguments if isinstance(arguments, dict) else {})
         except Exception:
             return False
-    return classification is not None and classification.effect is RuntimeToolEffect.READ_ONLY
+    return classification is not None and runtime_call_executes_nothing(tool_name, classification)
 
 
 # Statuses that mean "a gate / human decision / refusal", not a completed action.
@@ -126,9 +142,12 @@ def runtime_tool_effect_state(
     from packages.core.ai.runtime.tool_results import (
         RuntimeAlternatePathToolResult,
         RuntimeDelegatedPauseToolResult,
+        RuntimeDelegatedSettlementToolResult,
         RuntimeGateToolResult,
         RuntimeNoEffectToolResult,
         RuntimePreflightValidationError,
+        RuntimeSettledToolResult,
+        RuntimeStructuredToolResult,
     )
 
     # NONE comes only from host proof: these carriers are host-minted in-process
@@ -140,10 +159,24 @@ def runtime_tool_effect_state(
         RuntimeGateToolResult,
         # A delegated child's pause; its effects are in its merged ledger.
         RuntimeDelegatedPauseToolResult,
+        # A durable delegation's settled batch; its children's effects are
+        # in their merged ledgers.
+        RuntimeDelegatedSettlementToolResult,
     )):
         return EffectState.NONE
+    if isinstance(result, RuntimeSettledToolResult):
+        # The handler's own proof of what its failed call changed (nothing, or
+        # only completed steps), minted at the exact failure branch.
+        return EffectState(result.effect.value)
     if _is_read_only(tool_name, arguments, classification):
         return EffectState.NONE
+    if isinstance(result, RuntimeStructuredToolResult) and result.child_effect_state is not None:
+        # A call that ran a whole child loop (a Skill) changed exactly what its
+        # child calls changed: the host's child ledger is its effect state, not
+        # the reply's status. A Skill that reports "failed" over files it did
+        # commit is confirmed; one whose child ran no effectful call is none;
+        # an uncertain child call keeps it unconfirmed.
+        return runtime_aggregate_effect_state((result.child_effect_state,))
     if isinstance(result, RuntimeToolSuspension):
         return EffectState.UNCONFIRMED
     payload = _runtime_tool_result_payload(result)
@@ -265,6 +298,18 @@ def _import_free_music(_args: dict[str, Any], payload: dict[str, Any]) -> list[d
 def _video_edit(args: dict[str, Any], payload: dict[str, Any]) -> list[dict[str, Any]]:
     operation = str(args.get("operation") or "").strip().lower()
     status = str(payload.get("status") or "").lower()
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    if status == "error" and isinstance(details.get("uncertain_targets"), list):
+        # A failure cut off mid-write (its handler's write trace): the Workspace
+        # files it was writing, with the bytes' hash when known. The call is
+        # unconfirmed, so these are never receipts, only targets a later host
+        # read can reconcile.
+        return [
+            _receipt("file", "uncertain_write", fs_path=item.get("fs_path"), sha256=item.get("sha256"))
+            for item in details["uncertain_targets"]
+            if isinstance(item, dict) and isinstance(item.get("fs_path"), str)
+            and not item["fs_path"].startswith("sandbox:")
+        ]
     if operation == "review" and status == "ready_for_review":
         out = []
         if _clean(payload.get("review_sha256")) is not None:
@@ -319,6 +364,15 @@ def _completed_file(operation: str) -> ReceiptProjection:
         return [receipt] if receipt else []
 
     return project
+
+
+def _derived_poster(_args: dict[str, Any], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    # derive_image_aspect returns {ready, poster}; only a ready poster is an output file.
+    if not payload.get("ready"):
+        return []
+    poster = payload.get("poster") if isinstance(payload.get("poster"), dict) else {}
+    receipt = _file_from_ref("derive", {**poster, "name": poster.get("filename")})
+    return [receipt] if receipt else []
 
 
 def _compose_video_timeline(_args: dict[str, Any], payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -488,6 +542,7 @@ RECEIPT_PROJECTIONS: dict[str, ReceiptProjection] = {
     "generate_image": _generate_image,
     "merge_videos": _completed_file("merge"),
     "still_to_video": _completed_file("render"),
+    "derive_image_aspect": _derived_poster,
     "normalize_audio_loudness": _completed_file("normalize"),
     "align_subtitles": _completed_file("subtitle"),
     "compose_video_timeline": _compose_video_timeline,
@@ -499,7 +554,9 @@ RECEIPT_PROJECTIONS: dict[str, ReceiptProjection] = {
     "prepare_creative_studio": _snapshot,
     "verify_creative_studio": _verify_creative_studio,
     "compose_creative_publication": _creative_file_paths("publication"),
+    "compose_creative_deck": _creative_file_paths("deck"),
     "compose_creative_dub": _creative_file_paths("dub"),
+    "compose_creative_video": _creative_file_paths("video"),
     "patch_file": _patch_file,
     "replace_file": _replace_file,
     "archive_file_collection": _archive_file_collection,

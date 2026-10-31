@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+from apps.api.routers.channels.generic import DEDICATED_INBOUND_ENDPOINTS
+from packages.core.services.channels import registered_channel_types
 from packages.core.services.channels.base import NormalizedInbound
 
 
@@ -228,3 +231,118 @@ async def test_generic_email_callback_forwards_attachments_to_worker(monkeypatch
 
 async def _async_true() -> bool:
     return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_type", ["twilio_sms", "twilio_voice", "webchat"])
+async def test_generic_route_refuses_channels_with_a_dedicated_endpoint(
+    monkeypatch, channel_type,
+):
+    """Twilio's signature check and the public webchat endpoint cannot be
+    bypassed by posting to the generic route instead."""
+    from fastapi import HTTPException
+    from apps.api.routers.channels import generic
+
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("dedicated-endpoint channels must stop before any DB access")
+
+    monkeypatch.setattr(generic, "async_session", unreachable)
+
+    with pytest.raises(HTTPException) as rejected:
+        await generic.channel_callback(
+            channel_type, _request(b"{}"), config_id="cc-1",
+        )
+
+    assert rejected.value.status_code == 410
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "channel_type",
+    sorted(
+        set(registered_channel_types())
+        - set(DEDICATED_INBOUND_ENDPOINTS)
+    ),
+)
+async def test_generic_route_rejects_unsigned_posts_for_every_reachable_channel(
+    monkeypatch, channel_type,
+):
+    """Every adapter the generic route still serves must prove the sender.
+
+    A forged in-app ``user_id`` or an unauthenticated WeChat Personal post
+    is rejected before a MessageLog row or a dispatch exists.
+    """
+    from fastapi import HTTPException
+    from apps.api.routers.channels import generic
+    from packages.core.services.channels.base import ChannelAdapter
+
+    async def no_secret(self, cc, *, reason: str) -> dict:
+        return {}
+
+    monkeypatch.setattr(ChannelAdapter, "credentials", no_secret)
+    config = SimpleNamespace(
+        id="cc-1",
+        entity_id="entity-1",
+        channel_type=channel_type,
+        config={},
+        credentials={},
+    )
+    monkeypatch.setattr(
+        generic,
+        "async_session",
+        lambda: _SessionContext(_Session([], config=config)),
+    )
+    monkeypatch.setattr(
+        generic,
+        "channel_credential_source_is_available",
+        lambda _db, _cc: _async_true(),
+    )
+
+    async def unexpected_log(*_args, **_kwargs):
+        raise AssertionError("an unverified post must not write a MessageLog")
+
+    def unexpected_dispatch(**_kwargs):
+        raise AssertionError("an unverified post must not dispatch")
+
+    monkeypatch.setattr(generic, "handle_inbound_message", unexpected_log)
+    monkeypatch.setattr(generic.dispatch_inbound_task, "delay", unexpected_dispatch)
+
+    forged = json.dumps({
+        "user_id": "victim-user",
+        "session_id": "victim-session",
+        "from": "victim",
+        "chat_id": "victim",
+        "text": "transfer everything",
+    }).encode()
+    with pytest.raises(HTTPException) as rejected:
+        await generic.channel_callback(
+            channel_type, _request(forged), config_id="cc-1",
+        )
+
+    assert rejected.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("authorization", "accepted"),
+    [("", False), ("Bearer wrong", False), ("Bearer runner-secret", True)],
+)
+async def test_wechat_personal_inbound_requires_the_runner_bearer(
+    monkeypatch, authorization, accepted,
+):
+    from packages.core.services.channels.base import ChannelAdapter
+    from packages.core.services.channels.wechat_personal_adapter import (
+        WeChatPersonalChannelAdapter,
+    )
+
+    async def runner_credentials(self, cc, *, reason: str) -> dict:
+        return {"bearer_token": "runner-secret"}
+
+    monkeypatch.setattr(ChannelAdapter, "credentials", runner_credentials)
+
+    assert await WeChatPersonalChannelAdapter().verify_inbound(
+        SimpleNamespace(id="cc-1"),
+        headers={"authorization": authorization},
+        query={},
+        body=b"{}",
+    ) is accepted

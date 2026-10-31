@@ -8,10 +8,8 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from packages.core.constants.execution import ExecutionPlanStatus
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.runtime_run import RuntimeOutboxEvent
+from packages.core.models.runtime_run import RuntimeOutboxEvent, RuntimeRun
 from packages.core.models.task import Task
 from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
 from packages.core.services.task_coordinator_wakeup import (
@@ -32,88 +30,12 @@ from packages.core.services.task_execution import (
     TaskPlanServiceBinding,
     task_execution_intent_generation,
 )
-from packages.core.plans.coordinator import (
-    TASK_COORDINATOR_PLAN_VERSION,
-    TASK_COORDINATOR_PLAN_VERSION_KEY,
-    TASK_COORDINATOR_RUN_ID_KEY,
-)
 from packages.core.tasks.runtime_tasks import dispatch_runtime_outbox_once
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("other_terminal_run", [False, True])
-async def test_terminal_cleanup_sweep_retries_after_post_commit_failure(
-    db_session, monkeypatch, other_terminal_run,
-):
+async def test_external_task_cancel_reconciles_run(db_session, monkeypatch):
     from packages.core import database
-    from packages.core.plans.executor import PlanExecutor
-    from packages.core.tasks.runtime_tasks import recover_task_coordinator_terminal_cleanup_once
-
-    task = await _task(db_session)
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status="completed", plan_dag={},
-    )
-    db_session.add(plan)
-    run.current_plan_id = plan.id
-    run.phase = TaskCoordinatorPhase.COMPLETED.value
-    if other_terminal_run:
-        other_task = await _task(db_session)
-        other_run = await ensure_task_coordinator_run(
-            db_session, task=other_task, selection=_selection(),
-        )
-        other_plan = ExecutionPlan(
-            id=generate_ulid(), entity_id=other_task.entity_id,
-            workspace_id=other_task.workspace_id, task_id=other_task.id,
-            status="completed", plan_dag={},
-        )
-        db_session.add(other_plan)
-        other_run.current_plan_id = other_plan.id
-        other_run.phase = TaskCoordinatorPhase.COMPLETED.value
-        other_run.updated_at = datetime.now(timezone.utc) - timedelta(days=1)
-    await db_session.commit()
-
-    session_factory = async_sessionmaker(
-        db_session.bind, class_=AsyncSession, expire_on_commit=False,
-    )
-    monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    calls = []
-    target_calls = []
-
-    async def cleanup(_db, *, plan_id, task_id, reason):
-        calls.append((plan_id, task_id, reason))
-        if plan_id == plan.id:
-            target_calls.append((plan_id, task_id, reason))
-            if len(target_calls) == 1:
-                raise RuntimeError("transient HITL cleanup failure")
-
-    monkeypatch.setattr(PlanExecutor, "_cleanup_terminal_approvals_after_commit", cleanup)
-    cleaned = await recover_task_coordinator_terminal_cleanup_once()
-    # A global sweep can successfully clean other runs from this database.
-    # Only this Plan gets the injected failure, regardless of sweep order.
-    assert cleaned == len(calls) - len(target_calls)
-    assert target_calls == [(plan.id, task.id, "plan_terminal")]
-    await db_session.refresh(run)
-    assert run.terminal_cleanup_at is None
-    if other_terminal_run:
-        await db_session.refresh(other_run)
-        assert other_run.terminal_cleanup_at is not None
-    assert await recover_task_coordinator_terminal_cleanup_once() == 1
-    await db_session.refresh(run)
-    assert run.terminal_cleanup_at is not None
-    assert target_calls == [(plan.id, task.id, "plan_terminal")] * 2
-
-
-@pytest.mark.asyncio
-async def test_external_task_cancel_reconciles_v3_plan_and_run(db_session, monkeypatch):
-    from packages.core import database
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
     from packages.core.tasks.runtime_tasks import reconcile_terminal_task_coordinator_runs_once
 
     session_factory = async_sessionmaker(
@@ -127,23 +49,6 @@ async def test_external_task_cancel_reconciles_v3_plan_and_run(db_session, monke
 
     task = await _task(db_session)
     run = await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status="running", plan_dag={},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-    )
-    step = ExecutionStep(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, plan_id=plan.id,
-        step_key="work", kind="llm", step_status="pending",
-        depends_on=[], params={"prompt": "Work"},
-    )
-    db_session.add_all([plan, step])
-    run.current_plan_id = plan.id
     run.phase = TaskCoordinatorPhase.WAITING_CHILD.value
     await stage_task_coordinator_wake(
         db_session, task_id=task.id, reason="pending_child",
@@ -152,76 +57,9 @@ async def test_external_task_cancel_reconciles_v3_plan_and_run(db_session, monke
     await db_session.commit()
 
     assert await reconcile_terminal_task_coordinator_runs_once() == 1
-    await db_session.refresh(plan)
-    await db_session.refresh(step)
     await db_session.refresh(run)
-    assert plan.status == "cancelled"
-    assert step.step_status == "cancelled"
     assert run.phase == TaskCoordinatorPhase.CANCELLED.value
     assert run.wake_generation is None
-    assert await reconcile_terminal_task_coordinator_runs_once() == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_status", ["cancelled", "failed"])
-async def test_terminal_task_closes_plan_preserved_by_failed_coordinator(
-    db_session, monkeypatch, terminal_status,
-):
-    from packages.core import database
-    from packages.core.tasks.runtime_tasks import reconcile_terminal_task_coordinator_runs_once
-
-    session_factory = async_sessionmaker(
-        db_session.bind, class_=AsyncSession, expire_on_commit=False,
-    )
-    monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    # The sweep is global: drain terminal runs other tests in this shard left
-    # behind, so the counts below are about this Task only.
-    while await reconcile_terminal_task_coordinator_runs_once():
-        pass
-
-    task = await _task(db_session)
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status="running", plan_dag={},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-    )
-    step = ExecutionStep(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, plan_id=plan.id,
-        step_key="delivered", kind="llm", step_status="done",
-        depends_on=[], params={"prompt": "Deliver"},
-        result={"text": "Saved delivery"},
-        evidence_refs=[{"kind": "agent_output", "id": "saved-result"}],
-    )
-    db_session.add_all([plan, step])
-    run.current_plan_id = plan.id
-    run.phase = TaskCoordinatorPhase.FAILED.value
-    task.status = "blocked"
-    await db_session.commit()
-
-    assert await reconcile_terminal_task_coordinator_runs_once() == 0
-    await db_session.refresh(plan)
-    assert plan.status == "running"
-
-    task.status = terminal_status
-    await db_session.commit()
-    assert await reconcile_terminal_task_coordinator_runs_once() == 1
-    await db_session.refresh(plan)
-    await db_session.refresh(step)
-    await db_session.refresh(run)
-    assert plan.status == "cancelled"
-    assert step.step_status == "done"
-    assert step.result == {"text": "Saved delivery"}
-    assert step.evidence_refs == [{"kind": "agent_output", "id": "saved-result"}]
-    assert run.phase == (
-        TaskCoordinatorPhase.FAILED.value
-        if terminal_status == "failed" else TaskCoordinatorPhase.CANCELLED.value
-    )
     assert await reconcile_terminal_task_coordinator_runs_once() == 0
 
 
@@ -304,7 +142,10 @@ async def test_new_task_lifecycle_resets_stopped_run_and_rotates_old_wake(db_ses
     assert reopened.lifecycle_generation == task_execution_intent_generation(task)
     assert reopened.phase == TaskCoordinatorPhase.READY.value
     assert reopened.current_plan_id is None
-    assert reopened.checkpoint is None
+    # A paused agent loop keeps its transcript across the new lifecycle and
+    # re-checks external state on its next round.
+    assert reopened.checkpoint["messages"] == [{"role": "assistant", "content": "old"}]
+    assert reopened.checkpoint["retried_after"]["after"] == "task_resumed"
     assert reopened.root_subscription_id == new_selection.root.subscription_id
     assert reopened.selection_fingerprint == new_selection.stable_fingerprint()
     assert reopened.wake_generation != old_wake.wake_generation
@@ -325,43 +166,7 @@ async def test_new_task_lifecycle_resets_stopped_run_and_rotates_old_wake(db_ses
 
 
 @pytest.mark.asyncio
-async def test_changed_lifecycle_preserves_exact_active_v3_plan_checkpoint(db_session):
-    task = await _task(db_session)
-    selection = _selection()
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
-    plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status=ExecutionPlanStatus.RUNNING.value, plan_dag={},
-        dispatcher_state={
-            TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
-            TASK_COORDINATOR_RUN_ID_KEY: run.id,
-        },
-    )
-    db_session.add(plan)
-    await db_session.flush()
-    checkpoint = {"messages": [{"role": "assistant", "content": "inspect"}]}
-    run.current_plan_id = plan.id
-    run.checkpoint = checkpoint
-    run.phase = TaskCoordinatorPhase.WAITING_HUMAN.value
-    old_wake = await stage_task_coordinator_wake(
-        db_session, task_id=task.id, reason="old_lifecycle",
-    )
-    assert old_wake is not None
-    task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
-
-    reopened = await ensure_task_coordinator_run(
-        db_session, task=task, selection=selection,
-    )
-    assert reopened.current_plan_id == plan.id
-    assert reopened.checkpoint == checkpoint
-    assert reopened.phase == TaskCoordinatorPhase.READY.value
-    assert reopened.wake_generation != old_wake.wake_generation
-    assert (await _event(db_session, task.id)).payload["wake_generation"] == reopened.wake_generation
-
-
-@pytest.mark.asyncio
-async def test_changed_lifecycle_rejects_live_claim_and_legacy_active_plan(db_session):
+async def test_changed_lifecycle_rejects_live_claim(db_session):
     task = await _task(db_session)
     selection = _selection()
     run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
@@ -376,21 +181,6 @@ async def test_changed_lifecycle_rejects_live_claim_and_legacy_active_plan(db_se
     run.claim_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
     with pytest.raises(ValueError, match="live claim"):
-        await ensure_task_coordinator_run(db_session, task=task, selection=selection)
-    assert run.lifecycle_generation == old_lifecycle
-
-    run.claim_token = None
-    run.claim_generation = None
-    run.claim_expires_at = None
-    legacy_plan = ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id,
-        workspace_id=task.workspace_id, task_id=task.id,
-        status=ExecutionPlanStatus.RUNNING.value, plan_dag={},
-        dispatcher_state={},
-    )
-    db_session.add(legacy_plan)
-    await db_session.flush()
-    with pytest.raises(ValueError, match="legacy or foreign Plan"):
         await ensure_task_coordinator_run(db_session, task=task, selection=selection)
     assert run.lifecycle_generation == old_lifecycle
     assert run.wake_generation == wake.wake_generation
@@ -574,8 +364,10 @@ async def test_checkpoint_and_renew_require_live_exact_claim(db_session):
 
 @pytest.mark.asyncio
 async def test_publisher_redelivers_until_exact_consumer_ack(db_session, monkeypatch):
-    # Keep the publisher assertion independent from unrelated queued fixtures.
+    # The global publisher can recreate events from earlier committed runs,
+    # so reset both the queue and its recovery source before this target.
     await db_session.execute(delete(RuntimeOutboxEvent))
+    await db_session.execute(delete(RuntimeRun))
     await db_session.commit()
     task = await _task(db_session)
     selection = _selection()

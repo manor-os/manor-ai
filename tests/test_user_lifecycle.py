@@ -33,9 +33,10 @@ async def _register(
 
 
 @pytest.mark.asyncio
-async def test_self_delete_soft_deletes_user(client: AsyncClient):
+async def test_self_delete_soft_deletes_user(client: AsyncClient, db_session):
     """DELETE /auth/me marks deleted_at; subsequent /auth/me with the
-    old JWT returns 401 (user_not_found)."""
+    old JWT returns 401 (user_not_found). Its push devices are removed in the
+    same transaction, so no notification is sent to the deleted account."""
     _, headers, body = await _register(client, username="lifecycle_self")
 
     delete = await client.delete("/api/v1/auth/me", headers=headers)

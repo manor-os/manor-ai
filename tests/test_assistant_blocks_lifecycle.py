@@ -53,6 +53,34 @@ async def test_stream_start_publishes_clock_before_context_or_model_work():
         await stream.aclose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("checkpoint", "run_started_ms", "expected"), [
+    ({"messages": []}, 4_000, 4_000),  # a resumed turn keeps its start
+    (None, 4_000, 10_000),  # a fresh turn starts now
+    ({"messages": []}, None, 10_000),  # no run record: this wake
+])
+async def test_a_resumed_turn_keeps_its_clock(checkpoint, run_started_ms, expected):
+    """Staging 2026-10-20: a turn that parked for sandboxes showed "Creating 5m"
+    21 minutes in -- every resume restarted the clock at the wake."""
+
+    with (
+        patch("packages.core.services.chat_service.time", SimpleNamespace(time=lambda: 10.0)),
+        patch("packages.core.services.chat_service.resolve_runtime_chat_context", new=AsyncMock()),
+        patch(
+            "packages.core.services.chat_service._runtime_run_started_at_ms",
+            new=AsyncMock(return_value=run_started_ms),
+        ),
+    ):
+        stream = stream_chat_response(
+            "Plain reply", "conv-clock", persist_messages=False,
+            runtime_run_id="run-1", runtime_checkpoint=checkpoint,
+        )
+        first = await anext(stream)
+        process = json.loads(first.split("\ndata: ", 1)[1])["assistant_blocks"][0]
+        assert process["started_at_ms"] == expected
+        await stream.aclose()
+
+
 def test_process_clock_keeps_start_and_elapsed_floor_during_long_nested_tool():
     builder = AssistantBlocksBuilder(started_at_ms=1_000)
     builder.start_tool("invoke_skill", now_ms=2_000)

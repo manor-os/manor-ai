@@ -11,7 +11,7 @@ from packages.core.ai.runtime.capabilities import (
 )
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.file_context import check_file_context_policy
-from packages.core.ai.runtime.profiles import RuntimeProfile
+from packages.core.ai.runtime.profiles import EXTERNAL_RUNTIME_PROFILES, RuntimeProfile
 from packages.core.ai.runtime.surfaces import ChatSurface
 
 
@@ -62,21 +62,13 @@ class RuntimeInjectedTool(str, Enum):
 
     They exist only when the caller armed them for that specific run (as a
     dynamic tool handler), so the surface allowlist — which describes which
-    *capabilities* a surface may reach — must not gate them. It used to:
-    ``submit_result`` is the only way a subagent step can hand back its
-    deliverable, and on the ``scheduled_agent_run`` surface the allowlist
-    denied it. The agent produced 14 images, 12 videos and 8 files, called
-    submit_result, was refused, and the step recorded the loop's terminal
-    notice ("Result submitted.") as its entire result.
+    *capabilities* a surface may reach — must not gate them.
 
     A model cannot escalate by naming one of these: if the runtime did not
     arm it, no handler is registered and the call fails as an unknown tool.
     """
 
-    SUBMIT_RESULT = "submit_result"
     SEND_CHANNEL_ATTACHMENT = "send_channel_attachment"
-    # Armed only by an InternalWorker holding a Dispatcher action lease.
-    EXECUTE_PLANNED_ACTION = "execute_planned_action"
 
     @classmethod
     def names(cls) -> frozenset[str]:
@@ -282,10 +274,7 @@ def check_runtime_tool_policy(
             tool_name=name,
         )
 
-    if envelope.profile in {
-        RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
-        RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
-    }:
+    if envelope.profile in EXTERNAL_RUNTIME_PROFILES:
         group_file_grant = (
             envelope.surface == ChatSurface.PUBLIC_CUSTOMER_CHAT
             and name in {"generate_file", "sandbox"}
@@ -321,8 +310,8 @@ def check_runtime_tool_policy(
                 code=RuntimeToolPolicyCode.FILE_EDITOR_TOOL_DENIED.value,
                 reason=(
                     "File editor chat can only inspect its mounted context or use the "
-                    "approval-gated native patch tool; business side effects, shell, "
-                    "sandbox, and unrestricted write tools are blocked."
+                    "approval-gated native patch tool, plus the isolated sandbox; "
+                    "business side effects, shell, and unrestricted write tools are blocked."
                 ),
                 tool_name=name,
             )

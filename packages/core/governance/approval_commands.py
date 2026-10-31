@@ -1,7 +1,8 @@
 """Atomic one-time approval plus a server-derived local policy rule.
 
-Only ordinary Task-runtime requests with a signed durable checkpoint expose
-this command. Other origins keep their existing one-time decision transport.
+Only ordinary Task-runtime requests a Task agent loop parked on (its signed
+park tag) expose this command. Other origins keep their existing one-time
+decision transport.
 """
 from __future__ import annotations
 
@@ -20,11 +21,13 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.task import Conversation
 from packages.core.models.user import User
 from packages.core.services.runtime_authorization import authorize_hitl_resolution
+from packages.core.services.task_agent_loop_hitl import (
+    stage_task_agent_loop_approval_resolution,
+    task_agent_loop_approval_is_current,
+    verified_request_tag,
+)
 from packages.core.services.task_runtime_approvals import (
-    TASK_RUNTIME_CHECKPOINT_CONTEXT_KEY,
-    ensure_task_runtime_approval_resolvable,
     lock_task_runtime_approval_boundary,
-    stage_task_runtime_approval_resolution,
     task_runtime_approval_binding_digest,
 )
 
@@ -66,7 +69,7 @@ def _ordinary_task_request(request: HitlRequest) -> bool:
     context = request.context or {}
     return bool(request.origin_kind == 'tool_call' and request.origin_task_id
         and request.origin_conversation_id and request.hitl_type == 'authorize'
-        and isinstance(context.get(TASK_RUNTIME_CHECKPOINT_CONTEXT_KEY), dict)
+        and verified_request_tag(request) is not None
         and context.get('operation_id') and isinstance(context.get('approval_requirements'), list)
         and context.get('kind') != 'provider'
         and not any('coordinator' in key or 'task_comment' in key for key in context)
@@ -154,10 +157,8 @@ async def project_approval_command(db: AsyncSession, *, request_id: str, actor: 
     authority = await authorize_hitl_resolution(db, request=request, by_user_id=actor.id, standing=True)
     if not authority.allowed:
         return result
-    try:
-        if not await ensure_task_runtime_approval_resolvable(db, request=request):
-            return result
-    except RuntimeError:
+    await lock_task_runtime_approval_boundary(db, task_id=request.origin_task_id)
+    if not await task_agent_loop_approval_is_current(db, request=request):
         return result
     options = _rule_options(request)
     if options:
@@ -200,7 +201,7 @@ async def approve_and_save_rule(db: AsyncSession, *, command: ApproveAndSaveRule
         option = next((item for item in _rule_options(request) if item['id'] == command.option_id), None)
         if option is None:
             raise ApprovalCommandConflict('The offered approval rule changed')
-        if not await ensure_task_runtime_approval_resolvable(db, request=request):
+        if not await task_agent_loop_approval_is_current(db, request=request):
             raise ApprovalCommandError('The origin has no durable resume transaction')
         from packages.core.ai.runtime.approval_messages import runtime_approval_runtime_metadata
         continuation = request.context['continuation']
@@ -218,10 +219,14 @@ async def approve_and_save_rule(db: AsyncSession, *, command: ApproveAndSaveRule
         from packages.core.governance.approval_facts import action_facts
         from packages.core.governance.approval_policy import evaluate_policy
         chain, _ = await policies._load(db, scope)
+        stored = request.context.get('approval_facts') if isinstance(request.context.get('approval_facts'), dict) else {}
         facts = action_facts(action_key=request.action_key, capability_id=request.capability_id,
             resource_kind=request.resource_kind, resource_id=request.resource_id,
             account_id=request.context.get('approval_account_id'), risk_level=request.risk_level,
-            resource_ids=tuple(request.context.get('_approval_resource_ids') or ()))
+            resource_ids=tuple(request.context.get('_approval_resource_ids') or ()),
+            # The effect judged when the card was minted (dynamic MCP families
+            # carry it from their factory; declared keys re-read the table).
+            impact=stored.get('impact'), category=stored.get('category'), gate=stored.get('gate'))
         targets = _stored_targets(request)
         if targets:
             facts = facts.model_copy(update={'targets': targets})
@@ -229,7 +234,7 @@ async def approve_and_save_rule(db: AsyncSession, *, command: ApproveAndSaveRule
             raise ApprovalCommandConflict('A current policy prohibits this action')
         from packages.core.governance.approvals import grant_approval
         await grant_approval(db, request, by_user_id=actor.id, via='approval_and_save_rule', standing=False)
-        resume = await stage_task_runtime_approval_resolution(db, request=request, choice='approve', runtime_metadata=metadata)
+        resume = await stage_task_agent_loop_approval_resolution(db, request=request, choice='approve')
         if not resume:
             raise ApprovalCommandError('The origin has no durable resume transaction')
         from packages.core.ai.runtime.approval_store import mark_runtime_hitl_request_resolved

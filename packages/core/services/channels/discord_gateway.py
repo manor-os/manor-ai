@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 _READY_PATH = Path(os.getenv(
     "DISCORD_GATEWAY_READY_PATH",
-    "/tmp/discord-gateway-ready",  # nosec B108 -- container-local K8s probe contract
+    "/tmp/discord-gateway-ready",  # nosec B108 -- container-local readiness probe contract
 ))
 _RECOVERY_INTERVAL_SECONDS = 30
 

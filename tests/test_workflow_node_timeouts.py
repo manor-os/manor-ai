@@ -184,6 +184,7 @@ async def test_http_null_node_timeout_keeps_its_request_timeout(monkeypatch):
     class FakeClient:
         def __init__(self, *, timeout, **_kwargs):
             captured["timeout"] = timeout
+            self.cookies = _kwargs.get("cookies")
 
         async def __aenter__(self):
             return self

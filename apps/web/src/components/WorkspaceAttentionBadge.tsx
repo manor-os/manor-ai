@@ -17,18 +17,18 @@ export default function WorkspaceAttentionBadge({ workspaceId, name, count, comp
   const jumpingRef = useRef(false);
   const [jumping, setJumping] = useState(false);
   const label = t("component.workspace_attention.open", { count: String(count), name });
-  const jumpToUnreadMessage = async () => {
+  const jumpToPendingMessage = async () => {
     if (jumpingRef.current) return;
     jumpingRef.current = true;
     setJumping(true);
     try {
       const reminders = await queryClient.fetchQuery({
-        queryKey: ["workspace-unread-attention", workspaceId],
-        queryFn: ({ signal }) => api.workspaces.chat.listUnreadAttention(workspaceId, signal),
+        queryKey: ["workspace-pending-attention", workspaceId],
+        queryFn: ({ signal }) => api.workspaces.chat.listPendingAttention(workspaceId, signal),
         staleTime: 0,
       });
-      // Start with the oldest unread message; the viewed receipt determines
-      // the next target. Navigation itself never clears a reminder.
+      // Read receipts never remove outstanding work from this navigation.
+      // Start with the oldest open request.
       const next = reminders.items.at(-1);
       if (next) {
         navigate(`/chat?workspace=${encodeURIComponent(workspaceId)}&attention=${encodeURIComponent(next.key)}#workspace-chat-message-${encodeURIComponent(next.message_id)}`);
@@ -46,7 +46,7 @@ export default function WorkspaceAttentionBadge({ workspaceId, name, count, comp
   return (
     <button type="button" className={`conv-badge workspace-attention-badge${compact ? " workspace-attention-badge--compact" : ""}`}
       aria-label={label} title={label} aria-busy={jumping} disabled={jumping}
-      onClick={(event) => { event.stopPropagation(); void jumpToUnreadMessage(); }}>
+      onClick={(event) => { event.stopPropagation(); void jumpToPendingMessage(); }}>
       {compact && count > 9 ? "9+" : count}
     </button>
   );

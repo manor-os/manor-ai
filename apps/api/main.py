@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 def _cors_allowed_origins() -> list[str]:
     configured = os.getenv("CORS_ALLOWED_ORIGINS", "")
     cloud_mode = os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
-    local_k8s_mode = os.getenv("MANOR_ENV", "").strip().lower() == "local-k8s"
     origins = (
         [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
         if configured.strip()
@@ -81,26 +80,16 @@ def _cors_allowed_origins() -> list[str]:
         ):
             raise RuntimeError(f"Invalid CORS origin: {origin!r}")
         is_hostless_public_ipv4 = False
-        is_loopback_http = False
         if parsed.scheme == "http" and parsed.port is None and parsed.hostname:
             try:
                 address = ipaddress.ip_address(parsed.hostname)
                 is_hostless_public_ipv4 = address.version == 4 and address.is_global
             except ValueError:
                 pass
-        if parsed.scheme == "http" and parsed.hostname:
-            if parsed.hostname.lower() == "localhost":
-                is_loopback_http = True
-            else:
-                try:
-                    is_loopback_http = ipaddress.ip_address(parsed.hostname).is_loopback
-                except ValueError:
-                    pass
         if (
             cloud_mode
             and parsed.scheme != "https"
             and not is_hostless_public_ipv4
-            and not (local_k8s_mode and is_loopback_http)
         ):
             raise RuntimeError("Cloud CORS origins must use HTTPS")
     return normalized
@@ -114,7 +103,7 @@ async def lifespan(app: FastAPI):
     # Refuse to run with the built-in JWT signing key: it is published in the
     # source, so anyone could forge tokens for any user. Hard-fail in cloud;
     # warn loudly in self-hosted/OSS mode (local dev may not set it yet).
-    from packages.core.config import get_settings, is_insecure_jwt_secret
+    from packages.core.config import enforce_jwt_secret_policy, get_settings
     from packages.core.service_role import (
         SERVICE_ROLE_API,
         api_startup_side_effects_enabled,
@@ -146,17 +135,7 @@ async def lifespan(app: FastAPI):
         _run_api_side_effects,
         _run_telegram_polling,
     )
-    if is_insecure_jwt_secret(_settings.JWT_SECRET_KEY):
-        if _settings.DEPLOYMENT_MODE.strip().lower() == "cloud":
-            raise RuntimeError(
-                "JWT_SECRET_KEY is empty, too short, or a shipped placeholder; "
-                "refusing to start in cloud mode. Set at least 32 random bytes."
-            )
-        logger.warning(
-            "SECURITY: JWT_SECRET_KEY is empty, too short, or a shipped "
-            "placeholder — tokens are forgeable. Set at least 32 random bytes before "
-            "exposing this instance."
-        )
+    enforce_jwt_secret_policy(_settings, logger)
 
     startup_tasks: list[asyncio.Task] = []
 
@@ -206,9 +185,9 @@ async def lifespan(app: FastAPI):
         # by id like any contributor's — rather than a parallel code path. A
         # redeploy of unchanged configs writes nothing; a corrected one bumps its
         # version, which is what tells installed workspaces an update exists.
-        # K8s disables API startup side effects and publishes only after every
-        # runtime rollout succeeds. Single-owner Compose/OSS deployments keep
-        # the existing startup-compatible path.
+        # Multi-replica deployments disable API startup side effects and publish
+        # only after every runtime rollout succeeds. Single-owner Compose/OSS
+        # deployments keep the existing startup-compatible path.
         try:
             from packages.core.blueprints.seed import seed_platform_blueprints
             from packages.core.database import async_session
@@ -407,8 +386,9 @@ async def lifespan(app: FastAPI):
 
     if _run_telegram_polling:
         # Kick off the Telegram long-polling runner when TELEGRAM_MODE is
-        # "polling" (or "auto" + non-HTTPS PUBLIC_BASE_URL). In cloud/K8s,
-        # this must be owned by one explicit runner/worker, not every API pod.
+        # "polling" (or "auto" + non-HTTPS PUBLIC_BASE_URL). With multiple
+        # replicas, this must be owned by one explicit runner/worker, not every
+        # API pod.
         try:
             from packages.core.services.channels.telegram_poller import poller as _tg_poller
             await _tg_poller.start()
@@ -614,6 +594,7 @@ def create_app() -> FastAPI:
     # Production middleware (request ID, logging, rate limiting, error handling)
     setup_middleware(app)
 
+
     # Global exception handler: CreditExhaustedError → 402
     from packages.core.ai.llm_client import CreditExhaustedError
     from fastapi.responses import JSONResponse
@@ -626,7 +607,7 @@ def create_app() -> FastAPI:
                 "plan": exc.plan,
                 "limit": exc.limit,
                 "current": exc.current,
-                "kind": "credit",
+                "kind": exc.kind,
             }
         })
 
@@ -667,8 +648,9 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     # ── Core routers (always loaded) ──
-    from apps.api.routers import llm_gateway, auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, chat_rooms, messages, agents, agent_initiatives, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support, sites
+    from apps.api.routers import llm_gateway, auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, chat_rooms, messages, agents, agent_initiatives, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, sites
     from apps.api.routers import internal_capacity
+    from apps.api.routers import sandbox_cli
     from apps.api.routers.channels import wechat as wechat_channel
     from apps.api.routers.channels import twilio as twilio_channel
     from apps.api.routers.channels import whatsapp as whatsapp_channel
@@ -681,6 +663,7 @@ def create_app() -> FastAPI:
     from apps.api.routers.channels import generic as generic_channel
     from apps.api.routers.channels import voice_stream as voice_stream_channel
     app.include_router(internal_capacity.router)
+    app.include_router(sandbox_cli.router)  # in-sandbox manor CLI; own short-lived token auth
     app.include_router(auth.router)
     app.include_router(health.router)
     app.include_router(entities.router)
@@ -694,6 +677,8 @@ def create_app() -> FastAPI:
     app.include_router(calendar_settings.router)
     app.include_router(chat.router)
     app.include_router(chat_rooms.router)
+    from apps.api.routers import room_file_downloads
+    app.include_router(room_file_downloads.router)
     app.include_router(messages.router)
     # Cloud marketplace routes must be registered before the base agents/skills
     # routers, otherwise /marketplace and /manor are shadowed by /{id} routes.
@@ -713,10 +698,13 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(admin_oauth.router)
     app.include_router(oauth_provider.router)  # Manor as OAuth IdP (for PMS etc.)
+    from apps.api.routers import mcp as mcp_router, oauth_metadata
+    app.include_router(oauth_metadata.router)  # RFC 8414 / RFC 9728 discovery
+    app.include_router(mcp_router.router)  # hosted MCP endpoint for coding agents
     app.include_router(platform_public.router)
     app.include_router(client_errors.router)
-    app.include_router(business.router)
-    app.include_router(support.router)
+    from apps.api.routers import content_reports
+    app.include_router(content_reports.router)  # App Store guideline 1.2 content reports
     app.include_router(audio.router)
     from apps.api.chat_voice import router as chat_voice_router
     app.include_router(chat_voice_router)
@@ -736,7 +724,6 @@ def create_app() -> FastAPI:
     app.include_router(usage.router)
     app.include_router(llm_gateway.router)  # OpenAI-compatible gateway for downstream apps (Minutes etc.)
     app.include_router(goals.router)
-    app.include_router(plans.router)
     app.include_router(workspace_chat.router)
     app.include_router(workers.router)
     app.include_router(scheduler.jobs_router)
@@ -796,9 +783,10 @@ def create_app() -> FastAPI:
     )
     app.include_router(goal_templates_router.router)
     app.include_router(goal_templates_router.apply_router)
-    from apps.api.routers import approval_settings, approval_commands
+    from apps.api.routers import approval_settings, approval_commands, approval_requests
     app.include_router(approval_settings.router)
     app.include_router(approval_commands.router)
+    app.include_router(approval_requests.router)
     app.include_router(governance_router.router)
     app.include_router(humans_router.router)
     app.include_router(observability_router.router)

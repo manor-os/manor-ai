@@ -7,6 +7,7 @@ visibility policy.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -48,6 +49,12 @@ from packages.core.services.knowledge_visibility import (
     normalize_rel_path,
 )
 from packages.core.services.document_metadata import merge_document_metadata
+from packages.core.services.knowledge_media_analysis import (
+    METADATA_KEY as MEDIA_ANALYSIS_METADATA_KEY,
+    analysis_kind_for,
+    mark_media_analysis_pending,
+    schedule_media_analysis,
+)
 from packages.core.services.tool_cache_version import bump_tool_cache_version
 
 def _schedule_document_reembed(document_id: str | None) -> None:
@@ -75,6 +82,8 @@ async def _invalidate_document_previews(entity_root: str, document_id: str | Non
     )
 
 
+logger = logging.getLogger(__name__)
+
 _AUTO_CREATE_FOLDER_SOURCES = {
     "manual",
     "upload",
@@ -85,6 +94,10 @@ _AUTO_CREATE_FOLDER_SOURCES = {
     "filesystem_reconcile",
 }
 _FINAL_ARTIFACT_SOURCES = {"ai_generated", "sandbox", "bash", "agent", "mcp", "elevenlabs"}
+# Projections that are never a Chat's own output, even with a conversation.
+_NON_CHAT_SOURCES = {"manual", "upload", "startup_backfill", "filesystem_reconcile"}
+# Edits of a file the Chat did not create keep its existing filing.
+_CHAT_EDIT_TOOLS = {"patch_file", "replace_file"}
 
 
 def _sql_like_literal(value: str) -> str:
@@ -230,11 +243,21 @@ async def sync_file_to_knowledge(
         ensure_conversation_generated_folder, is_default_chat_output_path,
     )
 
+    # Whatever tool an ordinary Chat used (generate_file, media, bash,
+    # Chrome, ...), its new file in a default location is filed under that
+    # Chat's ``Chat sessions/<title>`` folder; explicit folders stay.
+    generated = source == "ai_generated" or (source == "agent" and tool_name == "subagent_text_artifact")
     chat_default = (
-        (source == "ai_generated" or (source == "agent" and tool_name == "subagent_text_artifact"))
+        source not in _NON_CHAT_SOURCES
+        and tool_name not in _CHAT_EDIT_TOOLS
         and bool(conversation_id and user_id)
         and not workspace_id and not task_id
-        and is_default_chat_output_path(rel_path)
+        and (
+            # Generators' legacy type buckets are their defaults; any other
+            # tool's visible folder (``documents/`` made by bash) is explicit.
+            is_default_chat_output_path(rel_path) if generated
+            else not is_user_visible_folder_path(os.path.dirname(rel_path) or ".")
+        )
     )
     resolved_folder_id = folder_id
     if resolved_folder_id is None and not chat_default:
@@ -299,12 +322,18 @@ async def sync_file_to_knowledge(
                 Document.fs_path == rel_path,
             ).limit(1))).scalar_one_or_none()
             if existing_document_id is None:
-                resolved_folder_id = await ensure_conversation_generated_folder(
-                    sync_db,
-                    entity_id=entity_id,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                )
+                try:
+                    resolved_folder_id = await ensure_conversation_generated_folder(
+                        sync_db,
+                        entity_id=entity_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
+                except RuntimeError:
+                    # Chat filing is presentation only: never fail the write.
+                    logger.warning(
+                        "Chat sessions filing unavailable for %s", rel_path, exc_info=True,
+                    )
         if resolved_folder_id is None:
             if target_workspace_id:
                 from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
@@ -397,11 +426,24 @@ async def sync_file_to_knowledge(
             status="ok",
             mtime_ns=new_mtime,
         )
+        media_analysis_queued = False
         if content_changed:
             doc.vector_status = VectorStatus.PENDING
             stale_meta = dict(doc.metadata_ or {})
             stale_meta.pop("content_text", None)
             stale_meta.pop("content", None)
+            stale_meta.pop(MEDIA_ANALYSIS_METADATA_KEY, None)
+            # Uploaded media has no extractable text; queue a one-time
+            # description of this version so search can find it by content.
+            media_kind = analysis_kind_for(
+                source=source,
+                mime_type=getattr(doc, "mime_type", None),
+                file_type=getattr(doc, "file_type", None),
+                name=getattr(doc, "name", None) or rel_path,
+            )
+            if media_kind:
+                stale_meta = mark_media_analysis_pending(stale_meta, kind=media_kind, mtime_ns=new_mtime)
+                media_analysis_queued = True
             doc.metadata_ = stale_meta
         if source in _FINAL_ARTIFACT_SOURCES or is_storage_only_path(rel_path):
             doc.metadata_ = merge_document_metadata(
@@ -429,6 +471,19 @@ async def sync_file_to_knowledge(
                 user_id=user_id,
                 tool_name=tool_name,
             )
+        elif upsert.created and any((task_id, agent_id, conversation_id, user_id, tool_name)):
+            # Workspace-less output (ordinary chat, Chrome captures, sandbox)
+            # still records which run produced it; access never keys on it.
+            doc.metadata_ = merge_document_metadata(
+                doc.metadata_,
+                origin={
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "tool_name": tool_name,
+                },
+            )
         await sync_db.flush()
         if content_changed:
             await _invalidate_document_previews(entity_root, getattr(doc, "id", None))
@@ -436,6 +491,8 @@ async def sync_file_to_knowledge(
             await sync_db.commit()
             if content_changed:
                 _schedule_document_reembed(doc.id)
+            if media_analysis_queued:
+                schedule_media_analysis(doc.id)
             await bump_tool_cache_version(entity_id, "documents")
         return KnowledgeSyncResult(
             True,

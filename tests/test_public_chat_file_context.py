@@ -44,9 +44,13 @@ async def test_public_document_references_do_not_inherit_internal_access(monkeyp
 
 
 async def test_public_visitor_upload_remains_available(monkeypatch):
+    from PIL import Image
+
+    png = BytesIO()
+    Image.new("RGB", (1, 1), (240, 20, 40)).save(png, format="PNG")
     monkeypatch.setattr(file_context, "_save_chat_image", lambda *_: "/api/v1/fs/entity/uploads/chat/image.png")
     upload = UploadFile(
-        filename="image.png", file=BytesIO(b"\x89PNG\r\n\x1a\n" + b"x" * 8),
+        filename="image.png", file=BytesIO(png.getvalue()),
         headers=Headers({"content-type": "image/png"}),
     )
     turn = await prepare_runtime_file_context_turn(

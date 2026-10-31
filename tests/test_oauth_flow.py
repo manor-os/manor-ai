@@ -292,8 +292,10 @@ async def test_oauth_start_tiktok_uses_client_key(client: AsyncClient, monkeypat
     # client_key, never client_id
     assert "client_key=tt_key_123" in url
     assert "client_id=" not in url
-    # comma-separated scopes survive urlencoding as %2C
-    assert "video.publish" in url
+    from urllib.parse import parse_qs, urlparse
+    assert set(parse_qs(urlparse(url).query)["scope"][0].split(",")) == {
+        "user.info.basic", "user.info.profile", "user.info.stats", "video.list", "video.publish",
+    }
 
 
 @pytest.mark.asyncio

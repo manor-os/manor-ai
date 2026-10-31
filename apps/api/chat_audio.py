@@ -19,6 +19,7 @@ from packages.core.ai.runtime import (
     RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
     runtime_assert_credit_available,
     runtime_generate_audio_media,
+    runtime_llm_billing_context,
 )
 from packages.core.services.model_resolver import resolve_llm_metadata_for_user, resolve_model_for_user
 from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
@@ -157,14 +158,19 @@ async def transcribe_chat_upload(
         )
     except UploadSecurityError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
-    model = await resolve_model_for_user("stt", user_id=scope.user_id, entity_id=scope.entity_id, db=db)
-    metadata = await resolve_llm_metadata_for_user("stt", user_id=scope.user_id, entity_id=scope.entity_id, db=db)
+    model = await resolve_model_for_user(
+        "stt", user_id=scope.user_id, entity_id=scope.entity_id, db=db, workspace_id=scope.workspace_id,
+    )
+    metadata = await resolve_llm_metadata_for_user(
+        "stt", user_id=scope.user_id, entity_id=scope.entity_id, db=db, workspace_id=scope.workspace_id,
+    )
     metadata = metadata or {}
     key = metadata.get("llm_api_key")
     if not key:
         await runtime_assert_credit_available(
             scope.entity_id,
             source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+            workspace_id=scope.workspace_id,
         )
     try:
         result = await transcribe_blob(
@@ -252,7 +258,7 @@ async def chat_speech_response(
             **scope.usage_fields(),
             kind="tts",
             model=result["model"],
-            cost_usd=estimate_audio_cost_usd(result["model"], purpose="speech"),
+            cost_usd=estimate_audio_cost_usd(result["model"], purpose="speech", characters=len(text)),
             units=len(text),
             source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
             byok=result["is_byok"],
@@ -260,22 +266,25 @@ async def chat_speech_response(
         await db.commit()
         return ""
 
-    result = json.loads(
-        await runtime_generate_audio_media(
-            **scope.usage_fields(),
-            prompt=text,
-            name="",
-            params={
-                "purpose": "speech",
-                "format": "mp3",
-                "_deliver_audio": deliver_playback,
-                **({"voice": voice} if voice else {}),
-                **({"_call_voice_profile": voice_profile} if voice_profile else {}),
-                **({"voice_instructions": voice_instructions} if voice_instructions else {}),
-                **({"language": language} if language else {}),
-            },
+    # The speech model and key are the Workspace payer's (the provider during
+    # a client delivery trial): the media helpers read it from this context.
+    async with runtime_llm_billing_context(**scope.usage_fields(), source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE):
+        result = json.loads(
+            await runtime_generate_audio_media(
+                **scope.usage_fields(),
+                prompt=text,
+                name="",
+                params={
+                    "purpose": "speech",
+                    "format": "mp3",
+                    "_deliver_audio": deliver_playback,
+                    **({"voice": voice} if voice else {}),
+                    **({"_call_voice_profile": voice_profile} if voice_profile else {}),
+                    **({"voice_instructions": voice_instructions} if voice_instructions else {}),
+                    **({"language": language} if language else {}),
+                },
+            )
         )
-    )
     if result.get("status") != "completed" or not audio:
         if result.get("code") == "audio_provider_unavailable":
             raise HTTPException(

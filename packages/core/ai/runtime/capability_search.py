@@ -10,7 +10,10 @@ from packages.core.ai.runtime.skill_capability_companion import (
 )
 
 
-_SKILL_MANIFEST_DESCRIPTION_CHARS = 360
+# A Skill's description is all a caller reads before invoke_skill, so search
+# shows it whole. Authors are held to this length when they write it (the
+# Agent Skills limit); only text stored before that is cut here.
+SKILL_DESCRIPTION_MAX_CHARS = 1024
 _SEARCH_TOKEN_RE = re.compile(
     r"[a-z0-9]+(?:[.@][a-z0-9]+)*|[\u4e00-\u9fff]+",
     re.IGNORECASE,
@@ -131,7 +134,7 @@ def _skill_search_fields(skill: Any) -> tuple[str, str, str, str, str, str, tupl
 
 
 def runtime_skill_manifest(skill: Any) -> dict[str, Any]:
-    """Return the bounded Skill catalog record safe to expose during search."""
+    """Return the Skill catalog record safe to expose during search, with its whole description."""
 
     skill_id, slug, name, description, category, _output, declared_tools = (
         _skill_search_fields(skill)
@@ -142,7 +145,7 @@ def runtime_skill_manifest(skill: Any) -> dict[str, Any]:
         "skill_id": skill_id,
         "slug": slug,
         "display_name": name,
-        "description": description[:_SKILL_MANIFEST_DESCRIPTION_CHARS],
+        "description": description[:SKILL_DESCRIPTION_MAX_CHARS],
         "source": str(getattr(skill, "source", "entity") or "entity"),
         "available": True,
         "invoke_with": "invoke_skill",
@@ -155,7 +158,7 @@ def runtime_skill_manifest(skill: Any) -> dict[str, Any]:
         manifest["required_integrations"] = metadata["required_integrations"]
     if isinstance(metadata, dict) and isinstance(metadata.get("search_terms"), list):
         manifest["search_terms"] = [str(term) for term in metadata["search_terms"]][:12]
-    if len(description) > _SKILL_MANIFEST_DESCRIPTION_CHARS:
+    if len(description) > SKILL_DESCRIPTION_MAX_CHARS:
         manifest["description_truncated"] = True
     return manifest
 

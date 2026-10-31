@@ -53,24 +53,23 @@ async def _available_name(
     parent_id: str, title: str, conversation_id: str,
     current_folder_id: str | None = None,
 ) -> str:
-    existing = (await db.execute(select(DocumentFolder.id).where(
-        DocumentFolder.entity_id == entity_id,
-        DocumentFolder.owner_id == owner_id,
-        DocumentFolder.parent_id == parent_id,
-        DocumentFolder.name == title,
-    ))).scalar_one_or_none()
-    if existing is None or existing == current_folder_id:
-        return title
-    unique_name = f"{title} · {conversation_id}"
-    collision = (await db.execute(select(DocumentFolder.id).where(
-        DocumentFolder.entity_id == entity_id,
-        DocumentFolder.owner_id == owner_id,
-        DocumentFolder.parent_id == parent_id,
-        DocumentFolder.name == unique_name,
-    ))).scalar_one_or_none()
-    if collision is not None and collision != current_folder_id:
-        raise RuntimeError("Conversation Knowledge folder name is already in use")
-    return unique_name
+    # Same-title Chats follow the Workspace folder convention: a short tag
+    # from the ID's random tail, then a counter, never the full ID.
+    candidate = title
+    suffix = conversation_id[-6:]
+    attempt = 1
+    while True:
+        existing = (await db.execute(select(DocumentFolder.id).where(
+            DocumentFolder.entity_id == entity_id,
+            DocumentFolder.owner_id == owner_id,
+            DocumentFolder.parent_id == parent_id,
+            DocumentFolder.name == candidate,
+        ))).scalar_one_or_none()
+        if existing is None or existing == current_folder_id:
+            return candidate
+        tag = suffix if attempt == 1 else f"{suffix}-{attempt}"
+        candidate = f"{title} ({tag})"
+        attempt += 1
 
 
 async def _linked_folder(

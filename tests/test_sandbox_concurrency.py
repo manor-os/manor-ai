@@ -18,11 +18,8 @@ from sandbox.concurrency import (  # noqa: E402
 from api import routes as sandbox_routes  # noqa: E402
 from sandbox.models import (  # noqa: E402
     ContainerConfig,
-    CreateFromFilesRequest,
     CreateSandboxResponse,
-    ExecRequest,
     SandboxStatus,
-    SkillRunRequest,
 )
 from sandbox.skill_runner import SkillRunner  # noqa: E402
 from sandbox.docker_backend import DockerSandbox  # noqa: E402
@@ -643,7 +640,7 @@ async def test_shutdown_waits_for_admitted_create_then_destroys_it(monkeypatch, 
     sandboxes = []
 
     class OverlapDockerSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
@@ -651,7 +648,7 @@ async def test_shutdown_waits_for_admitted_create_then_destroys_it(monkeypatch, 
             self.destroyed = False
             sandboxes.append(self)
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             nonlocal setup_calls
             setup_calls += 1
             if setup_calls == 1:
@@ -802,13 +799,13 @@ async def test_concurrent_creates_respect_local_active_limit(monkeypatch, tmp_pa
     allow_setup = asyncio.Event()
 
     class BarrierDockerSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
             self.status = SandboxStatus.CREATING
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             setup_started.set()
             await allow_setup.wait()
             self.status = SandboxStatus.READY
@@ -825,6 +822,11 @@ async def test_concurrent_creates_respect_local_active_limit(monkeypatch, tmp_pa
         for _ in range(2)
     ]
     await setup_started.wait()
+    # The skill scan runs in a worker thread, so the second create can reach
+    # admission at any point; hold the first in setup until the second has
+    # been decided, so the two creates really overlap.
+    decided, _ = await asyncio.wait(creates, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+    assert len(decided) == 1
     allow_setup.set()
 
     results = await asyncio.gather(*creates, return_exceptions=True)
@@ -835,7 +837,12 @@ async def test_concurrent_creates_respect_local_active_limit(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_container_heavy_operations_hold_and_release_execute_gate(monkeypatch, tmp_path):
+async def test_container_heavy_operations_hold_execute_gate_but_file_side_channel_does_not(
+    monkeypatch, tmp_path
+):
+    """Create and load-skill take an execute slot; file reads/writes are side-channel
+    operations that must work next to a running command, so they never wait on
+    (or get rejected by) the execute gate."""
     import sandbox.skill_runner as skill_runner_module
 
     skill_dir = tmp_path / "operation-gate-skill"
@@ -874,7 +881,7 @@ async def test_container_heavy_operations_hold_and_release_execute_gate(monkeypa
     gate = TrackingGate()
 
     class GatedSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
@@ -886,7 +893,7 @@ async def test_container_heavy_operations_hold_and_release_execute_gate(monkeypa
         def ensure_available(self) -> None:
             return None
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             assert gate.active == 1
             self.skill = skill
             self.status = SandboxStatus.READY
@@ -902,23 +909,23 @@ async def test_container_heavy_operations_hold_and_release_execute_gate(monkeypa
             self.sandbox = sandbox
 
         async def read_file(self, *args, **kwargs):
-            assert gate.active == 1
+            assert gate.active == 0
             return "content", False
 
         async def read_file_base64(self, *args, **kwargs):
-            assert gate.active == 1
+            assert gate.active == 0
             return "YmluYXJ5", 6
 
         async def write_file(self, *args, **kwargs):
-            assert gate.active == 1
+            assert gate.active == 0
             if self.fail_write:
                 raise RuntimeError("write failed")
 
         async def write_file_base64(self, *args, **kwargs):
-            assert gate.active == 1
+            assert gate.active == 0
 
         async def read_key_skill_files(self, *args, **kwargs):
-            assert gate.active == 1
+            assert gate.active == 0
             return {"main.py": "print('ok')"}
 
     monkeypatch.setattr(skill_runner_module.app_config, "MAX_SANDBOXES", 1)
@@ -946,7 +953,7 @@ async def test_container_heavy_operations_hold_and_release_execute_gate(monkeypa
     with pytest.raises(RuntimeError, match="write failed"):
         await runner.write_file(sandbox_id, "/skill/fail.txt", "value")
 
-    assert gate.acquire_count == 8
+    assert gate.acquire_count == 2  # create + load-skill
     assert gate.max_active == 1
     assert gate.active == 0
 
@@ -966,7 +973,7 @@ async def test_cancelled_create_waits_for_setup_and_cleanup(monkeypatch, tmp_pat
     sandboxes = []
 
     class CancellableDockerSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
@@ -975,7 +982,7 @@ async def test_cancelled_create_waits_for_setup_and_cleanup(monkeypatch, tmp_pat
             self.destroyed = False
             sandboxes.append(self)
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             setup_started.set()
             await allow_setup.wait()
             self.setup_finished = True
@@ -1030,14 +1037,14 @@ async def test_failed_partial_create_cleanup_retains_sandbox_and_reservations(
     sandboxes = []
 
     class FailedCleanupSandbox:
-        def __init__(self, sandbox_id, config):
+        def __init__(self, sandbox_id, config, **_):
             self.sandbox_id = sandbox_id
             self.config = config
             self.container_name = f"test-{sandbox_id}"
             self.status = SandboxStatus.CREATING
             sandboxes.append(self)
 
-        async def setup(self, skill, env, auto_install=True):
+        async def setup(self, skill, env, auto_install=True, baked=None):
             self.status = SandboxStatus.ERROR
             raise RuntimeError("setup failed")
 
@@ -1222,56 +1229,157 @@ async def test_missing_docker_container_destroy_is_idempotent(monkeypatch):
     assert sandbox.status == SandboxStatus.DESTROYED
 
 
-@pytest.mark.asyncio
-async def test_sandbox_create_route_returns_429_when_capacity_gate_rejects():
+def _runner_api_client(monkeypatch, runner):
+    import importlib.util
+
+    from fastapi.testclient import TestClient
+
+    spec = importlib.util.spec_from_file_location(
+        "_sandbox_service_main_concurrency_test", SANDBOX_SERVICE_ROOT / "main.py",
+    )
+    assert spec and spec.loader
+    main = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, main)
+    spec.loader.exec_module(main)
+    monkeypatch.setattr(main.config, "API_TOKEN", "runner-test-secret")
+    monkeypatch.setattr(sandbox_routes, "_runner", runner)
+    # Not entering the client context deliberately avoids the Docker lifespan.
+    return TestClient(
+        main.app,
+        raise_server_exceptions=False,
+        headers={"X-Manor-Sandbox-Token": "runner-test-secret"},
+    )
+
+
+@pytest.mark.parametrize(
+    "runner_method,method,path,body",
+    [
+        (
+            "create_sandbox_from_files",
+            "POST",
+            "/api/v1/sandbox/create-from-files",
+            {"skill_name": "capacity-smoke", "files": {"SKILL.md": "# Capacity Smoke"}},
+        ),
+        (
+            "exec_command",
+            "POST",
+            "/api/v1/sandbox/sandbox-1/exec",
+            {"command": "python run.py"},
+        ),
+        (
+            "run_skill",
+            "POST",
+            "/api/v1/skill/run",
+            {"skill_dir": "/tmp/capacity-smoke", "commands": ["python run.py"]},
+        ),
+    ],
+)
+def test_capacity_rejections_answer_429_with_a_code(monkeypatch, runner_method, method, path, body):
     class RejectingRunner:
-        async def create_sandbox_from_files(self, **kwargs):
-            raise SandboxConcurrencyExceeded("Max active sandbox limit reached (1)")
+        pass
 
-    sandbox_routes.set_runner(RejectingRunner())
+    def reject(*_args, **_kwargs):
+        raise SandboxConcurrencyExceeded("Max active sandbox limit reached (1)")
 
-    with pytest.raises(sandbox_routes.HTTPException) as exc_info:
-        await sandbox_routes.create_sandbox_from_files(
-            CreateFromFilesRequest(
-                skill_name="capacity-smoke",
-                files={"SKILL.md": "# Capacity Smoke"},
-            )
-        )
+    runner = RejectingRunner()
+    setattr(runner, runner_method, reject)
+    client = _runner_api_client(monkeypatch, runner)
 
-    assert exc_info.value.status_code == 429
-    assert "Max active sandbox limit reached" in exc_info.value.detail
+    response = client.request(method, path, json=body)
 
-
-@pytest.mark.asyncio
-async def test_sandbox_exec_route_returns_429_when_execute_gate_rejects():
-    class RejectingRunner:
-        async def exec_command(self, **kwargs):
-            raise SandboxConcurrencyExceeded("Max executing sandbox instance limit reached (1)")
-
-    sandbox_routes.set_runner(RejectingRunner())
-
-    with pytest.raises(sandbox_routes.HTTPException) as exc_info:
-        await sandbox_routes.exec_command("sandbox-1", ExecRequest(command="python run.py"))
-
-    assert exc_info.value.status_code == 429
-    assert "Max executing sandbox instance limit reached" in exc_info.value.detail
+    assert response.status_code == 429, response.text
+    assert response.json()["code"] == "capacity_exceeded"
+    assert "Max active sandbox limit reached" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
-async def test_skill_run_route_returns_429_when_capacity_gate_rejects():
-    class RejectingRunner:
-        async def run_skill(self, **kwargs):
-            raise SandboxConcurrencyExceeded("Max active sandbox limit reached (1)")
+async def test_operation_guard_executing_lease_is_renewed_while_held():
+    """A long exec outlives the gate TTL; the prune loop must keep its slot fresh."""
 
-    sandbox_routes.set_runner(RejectingRunner())
+    class RenewableLease:
+        def __init__(self):
+            self.renewals = 0
+            self.released = False
 
-    with pytest.raises(sandbox_routes.HTTPException) as exc_info:
-        await sandbox_routes.run_skill(
-            SkillRunRequest(
-                skill_dir="/tmp/capacity-smoke",
-                commands=["python run.py"],
-            )
-        )
+        async def renew(self):
+            self.renewals += 1
+            return True
 
-    assert exc_info.value.status_code == 429
-    assert "Max active sandbox limit reached" in exc_info.value.detail
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            self.released = True
+
+    lease = RenewableLease()
+
+    class FakeGate:
+        async def acquire_execute(self):
+            return lease
+
+    runner = SkillRunner()
+    runner._gate = FakeGate()
+    async with runner._operation_guard():
+        await runner._renew_executing_leases()
+        assert lease.renewals == 1
+    assert lease.released is True
+    await runner._renew_executing_leases()
+    assert lease.renewals == 1  # released leases are no longer tracked
+    assert runner._executing_leases == set()
+
+
+@pytest.mark.asyncio
+async def test_executing_lease_renewal_failure_is_logged_not_raised():
+    class BrokenLease:
+        async def renew(self):
+            raise RuntimeError("redis down")
+
+    runner = SkillRunner()
+    runner._executing_leases.add(BrokenLease())
+    await runner._renew_executing_leases()
+
+
+@pytest.mark.asyncio
+async def test_status_and_cancel_work_while_exec_holds_state_lock_and_executing_slot(monkeypatch):
+    """Pollers must reach status/cancel for a 1h background exec that holds every gate."""
+    from sandbox import docker_backend
+    from sandbox.models import ExecutionStatus, ExecutionStatusResponse
+
+    def fake_run(args, timeout=None, allow_failure=False, **_kw):
+        command = args[-1] if args else ""
+        if args[:4] == ["docker", "exec", "ctr", "python"]:  # event mailbox reader
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if isinstance(command, str) and command.startswith("cat "):
+            return subprocess.CompletedProcess(args, 0, stdout=b"321\n", stderr=b"")
+        if isinstance(command, str) and "kill -TERM" in command:
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if isinstance(command, str) and "kill -0" in command:
+            return subprocess.CompletedProcess(args, 1, stdout=b"", stderr=b"")
+        raise AssertionError(f"Unexpected Docker command: {args}")
+
+    monkeypatch.setattr(docker_backend, "_run_docker", fake_run)
+    runner = SkillRunner()
+    runner._gate = SandboxConcurrencyGate(SandboxGateConfig(instance_max_executing=1, wait_timeout_seconds=0))
+    sandbox = DockerSandbox("sandbox-1", ContainerConfig())
+    sandbox.container_name = "ctr"
+    sandbox.status = SandboxStatus.READY
+    # A 1h command holds the sandbox's command claim (the runner's per-sandbox
+    # exclusivity since the claim state machine replaced the state lock).
+    sandbox.claim_command("exec-1", "python long.py", 3600)
+    runner._sandboxes["sandbox-1"] = sandbox
+    key = ("sandbox-1", "exec-1")
+    runner._execution_records[key] = ExecutionStatusResponse(
+        sandbox_id="sandbox-1", execution_id="exec-1", status=ExecutionStatus.RUNNING, created_at=1.0,
+    )
+    runner._execution_locks[key] = asyncio.Lock()
+
+    assert sandbox.holds_command("exec-1")
+    async with runner._operation_guard():
+        # The executing slot is exhausted: guarded operations are refused...
+        with pytest.raises(SandboxConcurrencyExceeded):
+            async with runner._operation_guard():
+                pass
+        # ...but status and cancel still go through.
+        status = await asyncio.wait_for(runner.get_execution_status("sandbox-1", "exec-1"), timeout=2)
+        assert status.status == ExecutionStatus.RUNNING
+        assert await asyncio.wait_for(runner.cancel_execution("sandbox-1", "exec-1"), timeout=5) is True

@@ -209,16 +209,14 @@ async def test_chat_bookmark_merges_into_locked_workspace_settings(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_soft_deleted_workspaces_leave_no_membership_goal_or_plan_visibility(
+async def test_soft_deleted_workspaces_leave_no_membership_or_goal_visibility(
     db_session,
 ):
     from datetime import datetime, timezone
     from decimal import Decimal
 
-    from apps.api.routers.plans import list_plans
     from packages.core.goals.service import list_goals
     from packages.core.models.base import generate_ulid
-    from packages.core.models.execution import ExecutionPlan
     from packages.core.models.goal import Goal
     from packages.core.models.user import User
     from packages.core.models.workspace import WorkspaceStaff
@@ -301,21 +299,6 @@ async def test_soft_deleted_workspaces_leave_no_membership_goal_or_plan_visibili
             metric_key="entity_metric",
             target_value=Decimal("1"),
         ),
-        ExecutionPlan(
-            entity_id=entity_id,
-            workspace_id=active_workspace.id,
-            plan_dag={},
-        ),
-        ExecutionPlan(
-            entity_id=entity_id,
-            workspace_id=deleted_workspace.id,
-            plan_dag={},
-        ),
-        ExecutionPlan(
-            entity_id=entity_id,
-            workspace_id=None,
-            plan_dag={},
-        ),
     ])
     await db_session.commit()
 
@@ -333,13 +316,3 @@ async def test_soft_deleted_workspaces_leave_no_membership_goal_or_plan_visibili
         readable_workspace_ids=None,
     )
     assert {goal.title for goal in goals} == {"Active Goal", "Entity Goal"}
-
-    plans = await list_plans(
-        workspace_id=None,
-        task_id=None,
-        status=None,
-        limit=50,
-        user=owner,
-        db=db_session,
-    )
-    assert {plan.workspace_id for plan in plans} == {active_workspace.id, None}

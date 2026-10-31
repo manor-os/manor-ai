@@ -1,9 +1,10 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import type { Document } from "../../lib/types";
 import { IconFolder, IconUpload } from "../icons";
 import HitlKnowledgePicker from "../ui/HitlKnowledgePicker";
+import WorkflowUploadProgress, { type WorkflowUploadStatus } from "./WorkflowUploadProgress";
 
 export type WorkflowFileKind = "audio" | "image";
 
@@ -22,9 +23,10 @@ function supported(path: string, kind: WorkflowFileKind): boolean {
 }
 
 export default function WorkflowKnowledgeFileField({
-  value, kind, disabled, onChange, onBusyChange,
+  value, kind, disabled, onChange, onBusyChange, workspaceId,
 }: {
   value: string;
+  workspaceId?: string;
   kind: WorkflowFileKind;
   disabled?: boolean;
   onChange: (path: string) => void;
@@ -34,37 +36,51 @@ export default function WorkflowKnowledgeFileField({
   const knowledgeRef = useRef<HTMLButtonElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [progress, setProgress] = useState<WorkflowUploadStatus>({ phase: "queued" });
   const [error, setError] = useState("");
+  const busyChangeRef = useRef(onBusyChange);
+  busyChangeRef.current = onBusyChange;
+
+  useEffect(() => {
+    busyChangeRef.current?.(uploading);
+    return () => { if (uploading) busyChangeRef.current?.(false); };
+  }, [uploading]);
 
   const selectDocument = (document: Document) => {
     if (!document.fs_path || !supported(document.fs_path, kind)) return;
     onChange(document.fs_path);
+    setPendingFile(null);
     setError("");
     setPickerOpen(false);
   };
 
   const upload = async (file: File) => {
+    if (disabled || uploading) return;
     if (!supported(file.name, kind)) {
       setError(t("component.workflow_file.unsupported_type"));
       return;
     }
     setUploading(true);
-    onBusyChange?.(true);
+    setPendingFile(file);
+    setProgress({ phase: "uploading", percent: 0 });
     setError("");
     try {
-      const document = await api.documents.upload(file, undefined, { visibility: "private" });
+      const document = await api.documents.upload(file, undefined, { visibility: "private" }, { onProgress: setProgress });
       if (!document.fs_path) throw new Error(t("component.workflow_file.missing_path"));
       onChange(document.fs_path);
+      setPendingFile(null);
     } catch (uploadError) {
+      setProgress({ phase: "failed" });
       setError(uploadError instanceof Error ? uploadError.message : t("component.workflow_file.upload_failed"));
     } finally {
       setUploading(false);
-      onBusyChange?.(false);
     }
   };
 
   return (
     <div className="workflow-knowledge-file">
+      {pendingFile && <WorkflowUploadProgress file={pendingFile} status={progress} />}
       {value && (
         <div className="workflow-knowledge-file__selected">
           <span title={workflowFileName(value)}>{workflowFileName(value)}</span>
@@ -95,9 +111,11 @@ export default function WorkflowKnowledgeFileField({
         <HitlKnowledgePicker
           selectedIds={new Set()}
           acceptDocument={(document) => Boolean(document.fs_path && supported(document.fs_path, kind))}
+          kinds={[kind]}
           onToggle={selectDocument}
           onClose={() => setPickerOpen(false)}
           restoreFocus={() => knowledgeRef.current?.focus()}
+          workspaceId={workspaceId}
         />
       )}
     </div>

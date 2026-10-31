@@ -15,9 +15,6 @@ from typing import Any, Iterable
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.execution import (
-    WorkerStatus,
-)
 from packages.core.constants.blueprints import (
     BlueprintInstallTodoKind,
     installed_blueprint_job_id,
@@ -28,7 +25,6 @@ from packages.core.models.goal import Goal
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
 from packages.core.models.task import Task
 from packages.core.models.workspace import AgentSubscription, Workspace
-from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 
 BUILT_IN_CHANNEL_TYPES = {"webchat", "internal_chat", "in_app"}
@@ -296,7 +292,10 @@ async def task_is_authorized_workspace_setup(
         Workspace.entity_id == task.entity_id,
         Workspace.deleted_at.is_(None),
     ).execution_options(populate_existing=True))).scalar_one_or_none()
-    if workspace is None or workspace.status != "active":
+    from packages.core.services.workspace_autonomy import workspace_allows_configured_work
+
+    # A paused Workspace admits only the setup a person asked for (below).
+    if not workspace_allows_configured_work(workspace):
         return False
     settings = workspace.settings if isinstance(workspace.settings, dict) else {}
     setup = settings.get("blocking_setup")
@@ -329,6 +328,8 @@ async def task_is_authorized_workspace_setup(
         ScheduledJobRun.status == "running",
     ).execution_options(populate_existing=True))).scalar_one_or_none()
     if job is None or run is None or job.execution_type != "agent" or job.agent_id != task.agent_id:
+        return False
+    if workspace.status != "active" and run.trigger_type != "manual":
         return False
     result = run.result if isinstance(run.result, dict) else {}
     dispatch = result.get("dispatch")
@@ -648,15 +649,8 @@ async def check_workspace_readiness(
     knowledge_nets: list[dict[str, Any]] | None = None,
     governance_policy: dict[str, Any] | None = None,
     operating_memory: str = "",
-    runtime_bound_subscription_ids: set[str] | None = None,
 ) -> WorkspaceReadinessReport:
     subscription_rows = list(subscriptions or [])
-    if runtime_bound_subscription_ids is None:
-        runtime_bound_subscription_ids = await _runtime_bound_subscription_ids(
-            db,
-            workspace,
-            subscription_rows,
-        )
     channels = (
         configured_channels
         if configured_channels is not None
@@ -674,7 +668,6 @@ async def check_workspace_readiness(
         knowledge_nets=knowledge_nets or [],
         governance_policy=governance_policy,
         operating_memory=operating_memory,
-        runtime_bound_subscription_ids=runtime_bound_subscription_ids,
         blocking_setup_status=blocking_setup_status,
     )
 
@@ -691,7 +684,6 @@ def build_workspace_readiness_report(
     knowledge_nets: list[dict[str, Any]],
     governance_policy: dict[str, Any] | None,
     operating_memory: str,
-    runtime_bound_subscription_ids: set[str] | None = None,
     blocking_setup_status: WorkspaceReadinessPartStatus | None = None,
 ) -> WorkspaceReadinessReport:
     spec_by_key = {spec.key: spec for spec in WORKSPACE_READINESS_PARTS}
@@ -703,26 +695,11 @@ def build_workspace_readiness_report(
         if str(getattr(subscription, "service_key", "") or "").strip()
     }
     missing_service_keys = sorted(declared_service_keys - subscribed_service_keys)
-    subscription_ids = {
-        str(getattr(subscription, "id", "") or "").strip()
-        for subscription in subscriptions
-        if str(getattr(subscription, "id", "") or "").strip()
-    }
-    bound_ids = (
-        set(runtime_bound_subscription_ids)
-        if runtime_bound_subscription_ids is not None
-        else set(subscription_ids)
-    )
-    unbound_subscription_ids = sorted(subscription_ids - bound_ids)
-    agents_ready = bool(subscriptions) and not missing_service_keys and not unbound_subscription_ids
+    agents_ready = bool(subscriptions) and not missing_service_keys
     agent_status = "ready" if agents_ready else "partial" if subscriptions else "missing"
     agent_summary_bits: list[str] = [f"{len(subscriptions)} active service subscription(s)."]
     if missing_service_keys:
         agent_summary_bits.append("Missing services: " + ", ".join(missing_service_keys) + ".")
-    if unbound_subscription_ids:
-        agent_summary_bits.append(
-            f"{len(unbound_subscription_ids)} subscription(s) have no active worker binding."
-        )
     if not subscriptions:
         agent_summary_bits = ["No active service subscriptions; Strategist has no valid task owner."]
 
@@ -737,8 +714,6 @@ def build_workspace_readiness_report(
                 "declared_service_keys": sorted(declared_service_keys),
                 "subscribed_service_keys": sorted(subscribed_service_keys),
                 "missing_service_keys": missing_service_keys,
-                "runtime_bound_subscription_ids": sorted(bound_ids),
-                "unbound_subscription_ids": unbound_subscription_ids,
             },
         ),
         _part_status(
@@ -1172,18 +1147,15 @@ async def _blueprint_install_todo_result(
                 identity_matches = str(agent.slug or "").strip() == expected_slug
             else:
                 # Generic agent_callable post-install checks intentionally name
-                # only a service. They still require an active runtime worker;
-                # identity-specific MISSING_AGENT todos take the stricter paths
-                # above and cannot be satisfied by a different Agent.
+                # only a service; identity-specific MISSING_AGENT todos take
+                # the stricter paths above and cannot be satisfied by a
+                # different Agent.
                 identity_matches = True
             if identity_matches:
                 matching_subscriptions.append(subscription)
-        callable_subscription_ids = await _runtime_bound_subscription_ids(
-            db,
-            workspace,
-            matching_subscriptions,
-        )
-        ready = bool(callable_subscription_ids)
+        # An active subscription of an active Agent is callable: Tasks run it
+        # on the agent loop, which needs no worker binding.
+        ready = bool(matching_subscriptions)
         return {
             "ready": ready,
             "reason": "Required Agent subscription is callable." if ready else detail,
@@ -1243,12 +1215,13 @@ async def _blueprint_install_todo_result(
 
             job_id = str(check.get("job_id") or "").strip()
             scoped_job_id = installed_blueprint_job_id(job_id, workspace.id)
+            # Installed is enough: a schedule paused by a person or after failing
+            # runs must not freeze every other action in the Workspace.
             ready = (await db.execute(
                 select(ScheduledJob.id)
                 .where(
                     ScheduledJob.workspace_id == workspace.id,
                     ScheduledJob.job_id == scoped_job_id,
-                    ScheduledJob.enabled.is_(True),
                 )
                 .limit(1)
             )).scalar_one_or_none() is not None
@@ -1448,40 +1421,6 @@ async def _blueprint_install_todo_result(
     # Unknown future todo kinds remain fail-closed until a concrete evaluator
     # is added.
     return {"ready": False, "reason": detail}
-
-
-async def evaluate_current_workspace_blocking_setup(
-    db: AsyncSession,
-    *,
-    workspace_id: str,
-    entity_id: str | None = None,
-) -> WorkspaceReadinessPartStatus | None:
-    """Reload the Workspace before making a new setup admission decision."""
-
-    stmt = (
-        select(Workspace)
-        .where(
-            Workspace.id == workspace_id,
-            Workspace.deleted_at.is_(None),
-        )
-        .execution_options(populate_existing=True)
-    )
-    if entity_id:
-        stmt = stmt.where(Workspace.entity_id == entity_id)
-    workspace = (await db.execute(stmt)).scalar_one_or_none()
-    if not workspace_allows_manual_work(workspace):
-        spec = next(
-            spec for spec in WORKSPACE_READINESS_PARTS
-            if spec.key == "blocking_setup"
-        )
-        return _part_status(
-            spec,
-            status="missing",
-            summary="Workspace is unavailable for new runtime work.",
-            missing_setup_key="workspace_unavailable",
-            details={"ready": False, "incomplete_checks": []},
-        )
-    return await evaluate_workspace_blocking_setup(db, workspace)
 
 
 _BLUEPRINT_DOCUMENT_SOURCE = "blueprint"
@@ -1892,33 +1831,6 @@ def _integration_status(
             "missing": missing,
         },
     )
-
-
-async def _runtime_bound_subscription_ids(
-    db: AsyncSession,
-    workspace: Workspace,
-    subscriptions: list[AgentSubscription],
-) -> set[str]:
-    subscription_ids = {
-        str(subscription.id)
-        for subscription in subscriptions
-        if getattr(subscription, "id", None)
-    }
-    if not subscription_ids:
-        return set()
-
-    from packages.core.models.worker import SubscriptionWorker, Worker
-
-    rows = list((await db.execute(
-        select(SubscriptionWorker.subscription_id)
-        .join(Worker, Worker.id == SubscriptionWorker.worker_id)
-        .where(
-            SubscriptionWorker.subscription_id.in_(subscription_ids),
-            Worker.entity_id == workspace.entity_id,
-            Worker.status == WorkerStatus.ACTIVE,
-        )
-    )).scalars().all())
-    return {str(subscription_id) for subscription_id in rows}
 
 
 def _channel_status(

@@ -316,6 +316,48 @@ async def test_reliability_metrics_excludes_waiting_on_customer_from_terminal_se
 
 
 @pytest.mark.asyncio
+async def test_reliability_metrics_task_failure_rate_follows_shared_outcomes(db_session):
+    """Blocked is failed work (Task Coordinator V3 parks failures there);
+    a cancellation is nobody's failure and is not judged."""
+    from packages.core.models.task import Task
+
+    db_session.add_all([
+        Task(id=generate_ulid(), entity_id=generate_ulid(), title="t1", status="completed"),
+        Task(id=generate_ulid(), entity_id=generate_ulid(), title="t2", status="blocked"),
+        Task(id=generate_ulid(), entity_id=generate_ulid(), title="t3", status="cancelled"),
+    ])
+    await db_session.flush()
+
+    result = await metrics_query.reliability_metrics(db_session, days=7)
+
+    assert result["task_total"] == 2
+    assert result["task_failure_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_reliability_metrics_task_failure_rate_skips_platform_stopped_tasks(db_session):
+    """A Task the platform itself stopped (runtime migration) says nothing
+    about reliability and is not judged."""
+    from packages.core.models.task import Task, TaskLog
+
+    stopped_id = generate_ulid()
+    db_session.add_all([
+        Task(id=generate_ulid(), entity_id=generate_ulid(), title="ok", status="completed"),
+        Task(id=stopped_id, entity_id=generate_ulid(), title="stopped", status="failed"),
+    ])
+    db_session.add(TaskLog(
+        task_id=stopped_id, log_type="ai_execution_failed",
+        content="Stopped by the runtime migration", meta={"error": "runtime_migrated"},
+    ))
+    await db_session.flush()
+
+    result = await metrics_query.reliability_metrics(db_session, days=7)
+
+    assert result["task_total"] == 1
+    assert result["task_failure_rate"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
 async def test_reliability_metrics_uses_rollup_for_tool_error_buckets_beyond_live_window(db_session):
     """Beyond 7 days, tool_error_buckets come from the MetricsDailyToolCalls
     rollup, not the raw ToolCallLog — seed ONLY a rollup row and confirm

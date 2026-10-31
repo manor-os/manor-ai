@@ -17,7 +17,7 @@ from packages.core.ai.runtime import (
     subagent_specs_for_surface,
 )
 from packages.core.ai.runtime.profiles import RuntimeProfile, profile_spec_for_surface
-from packages.core.ai.runtime.subagents import PLAN_STEP_MAX_ROUNDS
+from packages.core.ai.runtime.subagents import PLAN_STEP_MAX_ROUNDS, SUBAGENT_MAX_ROUNDS
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.workspace_delegation_actions import (
     _delegation_max_rounds,
@@ -33,7 +33,7 @@ def _worker_envelope(surface: ChatSurface):
 
 
 def test_plan_step_round_cap_is_declared_once():
-    assert PLAN_STEP_MAX_ROUNDS == 80
+    assert PLAN_STEP_MAX_ROUNDS == SUBAGENT_MAX_ROUNDS == 200
 
 
 @pytest.mark.parametrize("surface", WORKER_SURFACES)
@@ -48,7 +48,6 @@ def test_worker_surfaces_expose_exactly_one_spec_with_the_plan_step_cap(surface)
     assert [spec.name for spec in specs] == ["long_research_worker"]
     (spec,) = specs
     assert spec.max_steps == PLAN_STEP_MAX_ROUNDS
-    assert spec.max_cost_credits == 60
     assert "plan step" in spec.purpose.lower()
     assert "delegate" in spec.purpose.lower()
 
@@ -72,7 +71,7 @@ def test_a_worker_step_requesting_60_rounds_keeps_60(surface):
 @pytest.mark.parametrize("surface", WORKER_SURFACES)
 def test_a_worker_step_requesting_nothing_gets_the_full_cap(surface):
     run = runtime_prepare_subagent_run(_worker_envelope(surface))
-    assert run.max_rounds == PLAN_STEP_MAX_ROUNDS == 80
+    assert run.max_rounds == PLAN_STEP_MAX_ROUNDS == 200
 
 
 def test_a_request_above_the_cap_is_still_clamped():
@@ -82,22 +81,21 @@ def test_a_request_above_the_cap_is_still_clamped():
     assert run.max_rounds == PLAN_STEP_MAX_ROUNDS
 
 
-def test_chat_surfaces_keep_their_own_tighter_caps():
-    """Raising the plan-step cap must not leak into interactive surfaces."""
+def test_chat_surface_subagents_share_the_one_round_cap():
+    """Every sub-agent, interactive or not, gets the same round cap."""
     workspace = RuntimeResolver().resolve_trace_envelope(
         AIRuntimeRequest(
             surface=ChatSurface.WORKSPACE_CHAT, entity_id="ent_1", user_id="user_1", workspace_id="ws_1",
         )
     )
-    (spec,) = runtime_subagent_specs_from_envelope(workspace)
-    assert spec.name == "workspace_strategist"
-    assert spec.max_steps == 10
+    specs = {spec.name: spec.max_steps for spec in runtime_subagent_specs_from_envelope(workspace)}
+    assert specs == {"workspace_strategist": 200, "workspace_app_designer": 200}
 
 
 def test_nested_plan_child_uses_plan_cap_and_chat_uses_general_bound():
-    assert _delegation_max_rounds(None, task_id="task", step_id="child") == 80
+    assert _delegation_max_rounds(None, task_id="task", step_id="child") == 200
     assert _delegation_max_rounds(60, task_id="task", step_id="child") == 60
-    assert _delegation_max_rounds(500, task_id="task", step_id="child") == 80
+    assert _delegation_max_rounds(500, task_id="task", step_id="child") == 200
     # Chat applies its turn-policy cap at the call site after this helper.
     assert _delegation_max_rounds(None, task_id=None, step_id=None) == 200
     assert _delegation_max_rounds(500, task_id=None, step_id=None) == 200

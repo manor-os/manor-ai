@@ -9,6 +9,7 @@ import asyncio
 from contextlib import nullcontext
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import unicodedata
@@ -25,18 +26,27 @@ from packages.core.ai.runtime.generated_files import (
     runtime_read_supported_text as _read_supported_text,
 )
 from packages.core.ai.runtime.media import (
+    runtime_document_ref_paths as _document_ref_paths,
     runtime_recording_output_scope as _scope,
     runtime_recording_source_path as _source_path,
     runtime_recording_tool_schema as _schema,
 )
+from packages.core.services.generated_artifact_service import mark_production_results
 
-MODES = ["presentation", "podcast", "carousel", "dubbing", "handbook"]
+MODES =["presentation", "podcast", "carousel", "dubbing", "handbook", "video"]
+# The one rule for a brief's length; the studio Flows' forms and run schemas use it
+# too, so a brief the form accepts is never refused when the run freezes it.
+# Two characters: a few CJK characters name a whole subject.
+BRIEF_MIN_LENGTH, BRIEF_MAX_LENGTH = 2, 12000
 PREPARE_SCHEMA = _schema(
     "prepare_creative_studio", "Freeze a creative production brief and hashes of up to five "
     "uploaded Knowledge sources in a new Workspace run folder. Readable PDF, DOCX, PPTX and "
     "text are supplied as quoted reference material; images/media remain file references. "
     "No network downloads, model calls or publishing.",
-    {"brief": {"type": "string", "minLength": 10, "maxLength": 12000},
+    {"brief": {"type": "string", "minLength": BRIEF_MIN_LENGTH, "maxLength": BRIEF_MAX_LENGTH},
+     "sources": {"type": "array", "maxItems": 5, "description": "Optional picked Knowledge Documents.",
+                 "items": {"type": "object", "required": ["document_id"],
+                           "properties": {"document_id": {"type": "string", "minLength": 1}}}},
      "source_paths": {"type": "string", "maxLength": 6000, "description": "Optional Knowledge paths, one per line."},
      "mode": {"type": "string", "enum": MODES},
      "output_directory": {"type": "string", "minLength": 1}},
@@ -54,11 +64,15 @@ VERIFY_SCHEMA = _schema(
      "output_directory": {"type": "string", "minLength": 1}},
     ["snapshot_path", "snapshot_sha256", "files", "output_directory"],
 )
+PUBLICATION_LAYOUTS = ["cover", "image", "statement", "stats", "closing"]
 PUBLICATION_SCHEMA = _schema(
     "compose_creative_publication", "Compose an illustrated editable PPTX, matching PDF and speaker/source notes "
     "from structured page content, using the existing native Office engine. No code or coordinate parameters. "
-    "Choose 3–16 short pages; generate or supply a real Knowledge illustration first. All files are new, "
-    "under the requested production directory. Returns exact paths; final review is still required.",
+    "Choose 3–16 short pages; generate or supply a real Knowledge illustration first. Each page picks a layout: "
+    "cover (full-bleed picture, title and one subtitle line), image (large picture beside the text), statement "
+    "(one big message), stats (2–3 big numbers with labels, optional one-line footnote) or closing (the ask, "
+    "picture beside it). A page may use its own picture; otherwise the main illustration is used. All files "
+    "are new, under the requested production directory. Returns exact paths; final review is still required.",
     {"output_directory": {"type": "string", "minLength": 1},
      "label": {"type": "string", "minLength": 1, "maxLength": 50},
      "theme": {"type": "string", "enum": ["terracotta", "sage", "mustard"]},
@@ -67,10 +81,65 @@ PUBLICATION_SCHEMA = _schema(
      "pages": {"type": "array", "minItems": 3, "maxItems": 16, "items": {
          "type": "object", "additionalProperties": False, "required": ["title", "bullets", "notes"],
          "properties": {"title": {"type": "string", "minLength": 1, "maxLength": 54},
-             "bullets": {"type": "array", "minItems": 1, "maxItems": 4,
+             "layout": {"type": "string", "enum": PUBLICATION_LAYOUTS},
+             "image": {"type": "string", "minLength": 1, "description": "This page's own picture."},
+             "bullets": {"type": "array", "minItems": 0, "maxItems": 4,
                          "items": {"type": "string", "minLength": 1, "maxLength": 90}},
+             "stats": {"type": "array", "minItems": 2, "maxItems": 3, "items": {
+                 "type": "object", "additionalProperties": False, "required": ["value", "label"],
+                 "properties": {"value": {"type": "string", "minLength": 1, "maxLength": 10},
+                                "label": {"type": "string", "minLength": 1, "maxLength": 40}}}},
              "notes": {"type": "string", "maxLength": 2000}}}}},
     ["output_directory", "label", "theme", "illustration_path", "source_notes", "pages"],
+)
+# The built-in pptx skill's designed deck engine: complete visual styles and
+# slot-fitted layouts, run here so a deck is rendered the same way every time.
+DECK_ENGINE_SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "pptx" / "scripts"
+DECK_STYLE_CATALOG = DECK_ENGINE_SCRIPTS.parent / "templates" / "decks" / "styles.json"
+
+
+def deck_styles() -> dict[str, dict[str, Any]]:
+    """Each designed style: its name, what it suits, its picture art direction and cover kind."""
+    styles = json.loads(DECK_STYLE_CATALOG.read_text(encoding="utf-8"))["styles"]
+    return {key: {field: style.get(field) for field in ("name", "use_for", "art_direction", "cover")}
+            for key, style in styles.items()}
+
+
+DECK_STYLES = list(deck_styles())
+DECK_SCHEMA = _schema(
+    "compose_creative_deck", "Compose an editable PPTX in a designed style, its matching PDF and speaker/source "
+    "notes, from a structured deck description. The server lays every slide out on the style's own templates "
+    "and runs the deck quality gate; no code, coordinates or colors. Write 3–16 slides; slide 1 is cover. "
+    "Each slide has a layout, its fields and notes (speaker notes). Image fields are Knowledge paths "
+    "returned by generate_file or supplied by the person (PNG/JPEG/WebP, at most eight distinct). Layouts and "
+    "their fields: cover(title; subtitle, kicker, meta, image) · section(title; subtitle, number, image) · "
+    "statement(title ≤40 chars; subtitle, image) · agenda(title, items 3–7 strings) · bullets(title, points 2–6 "
+    "strings or {title,text}) · cards(title, items 2–4 {title,text?,label?,icon?}) · numbered(title, items 2–4 "
+    "{title,text?}) · icon_grid(title, items 3–6 {icon,title,text?}) · process(title, steps 3–5 {title,text?,icon?}) · "
+    "timeline(title, events 3–6 {date,title,text?}) · stats(title, stats 2–4 {value ≤8 chars,label,note?}) · "
+    "comparison(title, columns 2–3 {heading,points 1–5}; highlight) · matrix(title, quadrants 4 {title,text?}; axes "
+    "{x,y}) · quote(title, quote ≤120 chars; attribution) · chart(title, chart {type,categories,series "
+    "[{name,values}]}; takeaways) · table(title, columns 2–6, rows 1–8) · progress(title, items 2–6 {label,value 0–100}) · "
+    "funnel(title, stages 3–5 {title,value?,text?}) · pyramid(title, levels 3–5 {title,text?}) · cycle(title, steps "
+    "3–6 {title,text?}) · venn(title, sets 2–3 {title,text?}; center) · team(title, people 2–4 {name,role,image?}) · "
+    "gallery(title, images 3–5 {image,caption?}) · image_text(title, image, points 1–5) · split_image(title, image; "
+    "points) · image_cards(title, items 2–4 {image,title,text?}) · feature(title, image; text ≤160, points 1–3, tags) · "
+    "closing(title; subtitle, points 1–4, contact). Titles state the takeaway; wrap one key word group in {braces} "
+    "for emphasis. Never invent numbers: use stats/chart/progress only with real data. A deck the engine cannot lay "
+    "out returns every problem with its JSON path; fix them all and call again. Returns exact file paths; final "
+    "review is still required.",
+    {"output_directory": {"type": "string", "minLength": 1},
+     "style": {"type": "string", "enum": DECK_STYLES},
+     "deck": {"type": "object", "required": ["title", "slides"], "properties": {
+         "title": {"type": "string", "minLength": 1, "maxLength": 120},
+         "brand": {"type": "string", "maxLength": 60},
+         "footer": {"type": "string", "maxLength": 60},
+         "slides": {"type": "array", "minItems": 3, "maxItems": 16, "items": {
+             "type": "object", "required": ["layout"],
+             "properties": {"layout": {"type": "string", "minLength": 1},
+                            "notes": {"type": "string", "maxLength": 2000}}}}}},
+     "source_notes": {"type": "string", "minLength": 1, "maxLength": 4000}},
+    ["output_directory", "style", "deck", "source_notes"],
 )
 DUB_SCHEMA = _schema(
     "compose_creative_dub", "Compose a new 10–180 second translated MP4 from an uploaded video and actual "
@@ -86,13 +155,25 @@ DUB_SCHEMA = _schema(
 )
 
 
-def _estimated_dub_srt(text, duration, *, subtitle_format="srt", width=1920, height=1080):
-    cue = media.SubtitleCue(index=1, start=0, end=duration, text=text, cue_type="narration",
-                           estimated=True, timing_source="proportional-text")
-    return media._render_subtitles([cue], subtitle_format=subtitle_format, max_chars_per_line=24,
+def _estimated_dub_srt(text, duration, *, subtitle_format="srt", width=1920, height=1080, offset=0.0):
+    portrait = height > width  # A phone-sized vertical frame needs larger captions set higher.
+    # One cue per sentence, timed by its share of the text, so a cue never ends
+    # one sentence and starts the next; long sentences still split to two lines.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?…。！？])\s*", text) if part.strip()] or [text]
+    total = sum(len(sentence) for sentence in sentences)
+    cues, start = [], 0.0
+    for index, sentence in enumerate(sentences, 1):
+        end = duration if index == len(sentences) else start + duration * len(sentence) / total
+        # ``offset`` moves the cues past an opening clip played before the narration.
+        cues.append(media.SubtitleCue(index=index, start=start + offset, end=end + offset, text=sentence, cue_type="narration",
+                                      estimated=True, timing_source="proportional-text"))
+        start = end
+    return media._render_subtitles(cues, subtitle_format=subtitle_format, max_chars_per_line=24,
         canvas_width=width, canvas_height=height,
-        style={"max_lines": 2, "font_size": max(16, min(42, round(min(width, height) * 0.04))),
-               "margin_v": max(16, round(height * 0.05)), "outline": 2, "alignment": 2})
+        style={"max_lines": 2,
+               "font_size": round(width * 0.056) if portrait else max(16, min(42, round(min(width, height) * 0.04))),
+               "margin_v": round(height * 0.14) if portrait else max(16, round(height * 0.05)),
+               "outline": 3 if portrait else 2, "alignment": 2})
 
 
 def _dub_caption_duration(video_duration, narration_duration):
@@ -176,6 +257,145 @@ async def _compose_creative_dub_handler(
         return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
 
 
+VIDEO_CANVAS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
+VIDEO_SCHEMA = _schema(
+    "compose_creative_video", "Compose one narrated MP4 episode from 2–12 scene pictures and actual narration. "
+    "Each scene shows for its share of the spoken text with a slow push-in; narration is loudness-normalized and "
+    "two-line subtitles are burned in. Timing is proportional to the text, not word aligned. An intro_path clip (a "
+    "series intro) plays first. No AI generation or publishing. Returns actual MP4 and SRT paths.",
+    {"output_directory": {"type": "string", "minLength": 1},
+     "aspect_ratio": {"type": "string", "enum": list(VIDEO_CANVAS)},
+     "narration_path": {"type": "string", "minLength": 1},
+     "scenes": {"type": "array", "minItems": 2, "maxItems": 12, "items": {
+         "type": "object", "additionalProperties": False, "required": ["image_path", "text"],
+         "properties": {"image_path": {"type": "string", "minLength": 1},
+                        "text": {"type": "string", "minLength": 1, "maxLength": 1200,
+                                 "description": "The exact narration spoken over this picture."}}}},
+     "intro_path": {"type": "string", "description": "An opening clip played before the episode, e.g. the series intro."}},
+    ["output_directory", "aspect_ratio", "narration_path", "scenes"],
+)
+VIDEO_FPS = 30
+
+
+def _scene_seconds(texts: list[str], duration: float) -> list[float]:
+    """Each picture stays for its share of the spoken text; the last one ends with the narration."""
+    weights = [max(1, len(text.strip())) for text in texts]
+    seconds = [duration * weight / sum(weights) for weight in weights]
+    if min(seconds) < 1.0:
+        raise ValueError("A scene would show for under a second; use fewer scenes or longer narration per scene")
+    return seconds
+
+
+def _picture_master_args(ffmpeg: str, pictures: list[str], seconds: list[float], width: int, height: int,
+                         output: str) -> list[str]:
+    """One silent H.264 picture track: each still scaled to fill the frame with a slow push-in."""
+    args = [ffmpeg, "-y", "-v", "error"]
+    for picture in pictures:
+        args += ["-i", picture]  # One frame each: zoompan makes the scene's frames from it.
+    filters = []
+    for index, scene_seconds in enumerate(seconds):
+        frames = max(1, round(scene_seconds * VIDEO_FPS))
+        filters.append(
+            f"[{index}:v]scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,"
+            f"crop={width * 2}:{height * 2},"
+            f"zoompan=z='min(1+0.06*on/{frames},1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d={frames}:s={width}x{height}:fps={VIDEO_FPS},setsar=1,format=yuv420p[v{index}]")
+    filters.append("".join(f"[v{index}]" for index in range(len(seconds))) + f"concat=n={len(seconds)}:v=1:a=0[out]")
+    return args + ["-filter_complex", ";".join(filters), "-map", "[out]", "-r", str(VIDEO_FPS),
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", output]
+
+
+@media._with_media_file_access
+async def _compose_creative_video_handler(
+    *, entity_id: str = "", user_id: str = "", workspace_id: str | None = None,
+    task_id: str | None = None, agent_id: str | None = None, conversation_id: str | None = None,
+    output_directory: str = "", aspect_ratio: str = "9:16", narration_path: str = "",
+    scenes: list[dict] | None = None, intro_path: str = "", **kwargs: Any,
+) -> str:
+    try:
+        validate(dict(output_directory=output_directory, aspect_ratio=aspect_ratio, narration_path=narration_path,
+                      scenes=scenes, **({"intro_path": intro_path} if intro_path else {})),
+                 VIDEO_SCHEMA["function"]["parameters"])
+        ctx, runtime = _context(entity_id, user_id, workspace_id, task_id, agent_id, conversation_id, kwargs)
+        call_context = {**ctx, "runtime_envelope": runtime.runtime_envelope}
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            raise ValueError("FFmpeg and ffprobe are required")
+        narration, narration_abs = await _source_path(narration_path, ctx)
+        pictures = []
+        for scene in scenes:
+            _, picture_abs = await _source_path(scene["image_path"], ctx)
+            if Path(picture_abs).suffix.lower() not in media.IMAGE_EXTENSIONS:
+                raise ValueError("Each scene needs an actual PNG, JPEG or WebP picture: " + scene["image_path"])
+            if Path(picture_abs).stat().st_size > 30 * 1024 * 1024:
+                raise ValueError("Each scene picture must be at most 30 MiB")
+            pictures.append(picture_abs)
+        intro, intro_seconds = None, 0.0
+        if str(intro_path or "").strip():
+            intro, intro_abs = await _source_path(intro_path, ctx)
+            intro_seconds = float((await media._probe_media_report(ffprobe, intro_abs)).get("duration_seconds") or 0)
+            if not 0.5 <= intro_seconds <= 10:
+                raise ValueError("The intro must be an actual video of 0.5 to 10 seconds")
+        audio = await media._probe_media_report(ffprobe, narration_abs)
+        if not audio.get("has_audio") or not 10 <= audio.get("duration_seconds", 0) <= 600:
+            raise ValueError("Provide 10 seconds to 10 minutes of actual narration")
+        _, directory = await _scope(entity_id, ctx["workspace_id"], task_id, output_directory)
+        normalized = json.loads(await media._normalize_audio_loudness_handler(**call_context,
+            input_path=narration, output_name=directory + "/narration.wav", output_format="wav",
+            target_lufs=-16, true_peak=-1.5))
+        if normalized.get("status") != "completed" or not normalized.get("fs_path"):
+            raise ValueError("Narration normalization failed: " + json.dumps(normalized))
+        _, normalized_abs = await _source_path(normalized["fs_path"], ctx)
+        duration = _dub_caption_duration(
+            (await media._probe_media_report(ffprobe, normalized_abs)).get("duration_seconds", 0), 10 ** 6)
+        if duration <= 0:
+            raise ValueError("Normalized narration has no measurable duration")
+        texts = [scene["text"].strip() for scene in scenes]
+        seconds = _scene_seconds(texts, duration)
+        width, height = VIDEO_CANVAS[aspect_ratio]
+        with tempfile.TemporaryDirectory(prefix="manor-creative-video-") as working:
+            rendered_picture = str(Path(working) / "picture.mp4")
+            await media._run_process(_picture_master_args(ffmpeg, pictures, seconds, width, height, rendered_picture),
+                                     timeout_seconds=900)
+            if not Path(rendered_picture).is_file() or not Path(rendered_picture).stat().st_size:
+                raise ValueError("The picture track could not be rendered")
+            picture = await _save(ctx, runtime, directory + "/picture.mp4", Path(rendered_picture).read_bytes())
+        spoken = " ".join(texts)
+        burn_subtitles = await _save(ctx, runtime, directory + "/subtitles.ass",
+            _estimated_dub_srt(spoken, duration, subtitle_format="ass", width=width, height=height).encode("utf-8"))
+        timeline = await _save(ctx, runtime, directory + "/timeline.json", _json_bytes({
+            "duration": duration, "delivery": {"clean_picture_master": picture["fs_path"]},
+            "audio_tracks": [{"id": "narration", "type": "narration", "path": normalized["fs_path"],
+                              "start": 0, "end": duration, "volume_db": 0}],
+            "subtitles": {"subtitle_path": burn_subtitles["fs_path"]}}))
+        # With an intro, the narrated part is composed first and the intro plays before it.
+        rendered = json.loads(await media._compose_video_timeline_handler(**call_context,
+            clean_video_path=picture["fs_path"], timeline_path=timeline["fs_path"],
+            subtitle_path=burn_subtitles["fs_path"],
+            output_name=directory + ("/episode-body.mp4" if intro else "/episode.mp4"),
+            include_audio=True, require_audio=True, include_source_audio=False, burn_subtitles=True))
+        if rendered.get("status") != "completed" or not rendered.get("fs_path"):
+            raise ValueError("Video composition failed: " + json.dumps(rendered))
+        if intro:
+            rendered = json.loads(await media._merge_videos_handler(**call_context,
+                paths=[intro, rendered["fs_path"]], output_name=directory + "/episode.mp4", resolution="1080p",
+                aspect_ratio=aspect_ratio, include_source_audio=True))
+            if rendered.get("status") != "completed" or not rendered.get("fs_path"):
+                raise ValueError("Adding the intro failed: " + json.dumps(rendered))
+        subtitles = await _save(ctx, runtime, directory + "/subtitles.srt", _estimated_dub_srt(
+            spoken, duration, width=width, height=height, offset=intro_seconds).encode("utf-8"))
+        checked = json.loads(await media._validate_subtitles_handler(**call_context,
+            subtitle_path=subtitles["fs_path"], media_path=rendered["fs_path"], max_lines=2))
+        if checked.get("verdict") != "pass":
+            raise ValueError("Subtitle validation failed: " + json.dumps(checked))
+        return json.dumps({"status": "completed", "files": [rendered["fs_path"], subtitles["fs_path"]],
+                           "duration_seconds": round(duration + intro_seconds, 3), "scenes": len(scenes),
+                           "intro_seconds": round(intro_seconds, 3), "requires_playback_review": True})
+    except Exception as exc:
+        return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
+
+
 def _publication_text_lines(text: str, *, size: int, width: float) -> tuple[int, int]:
     """Conservatively budget native text wrapping without changing its content."""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
@@ -226,56 +446,143 @@ def _publication_text_lines(text: str, *, size: int, width: float) -> tuple[int,
     return lines, len(paragraphs)
 
 
+PICTURE_LAYOUTS = {"cover", "image", "closing"}
+PUBLICATION_THEMES = {"terracotta": ("F7F2EA", "AB513A"), "sage": ("F2F5EF", "426549"),
+                      "mustard": ("F8F5ED", "A87918")}
+INK, BODY, ON_PHOTO = "1C1917", "44403C", "FFFFFF"
+
+
+def _page_pictures(pages):
+    """Distinct page images that will be drawn; stats and statement pages show none,
+    so an image named there is never opened (or able to fail the deck)."""
+    return list(dict.fromkeys(
+        page["image"] for index, page in enumerate(pages)
+        if page.get("image") and _page_layout(page, index, len(pages)) in PICTURE_LAYOUTS))
+
+
+def _page_layout(page, index, count):
+    """The page's chosen layout. Calls without one (older installed Workspaces) get picture
+    pages, which accept any 1–4 lines, so they never fail on a stricter layout."""
+    del index, count
+    return page.get("layout") or "image"
+
+
+def _publication_page_plan(page, *, index, count, label, accent):
+    """Pictures, shapes and text boxes of one 960×540 page, in drawing order.
+
+    Each item is ("picture", x, y, w, h), ("shape", preset, x, y, w, h, format) or
+    ("text", field, text, x, y, w, h, size, color, bold).
+    """
+    layout = _page_layout(page, index, count)
+    bullets, number = page.get("bullets") or [], f"{index + 1:02d} / {count:02d}"
+    if layout == "cover":
+        if len(bullets) > 1:
+            raise ValueError(f"layout-density: Page {index + 1} cover takes one subtitle line; "
+                             "move the other lines to a following page")
+        # A full-height shade has no visible top edge, even where a renderer flattens gradient alpha.
+        band = {"line_color": None, "shadow": None, "gradient_fill": {"angle": 90, "stops": [
+            {"position": 0, "color": INK, "opacity": 0}, {"position": 0.45, "color": INK, "opacity": 0.15},
+            {"position": 1, "color": INK, "opacity": 0.8}]}}
+        return [("picture", 0, 0, 960, 540), ("shape", "rect", 0, 0, 960, 540, band),
+                ("text", "label", label.upper(), 56, 320, 848, 26, 12, ON_PHOTO, True),
+                ("text", "title", page["title"], 56, 348, 848, 108, 40, ON_PHOTO, True),
+                *([("text", "subtitle", bullets[0], 56, 458, 848, 52, 18, "EDE9E4", False)] if bullets else [])]
+    if layout == "stats":
+        stats = page.get("stats") or []
+        if not 2 <= len(stats) <= 3 or len(bullets) > 1:
+            raise ValueError(f"layout-density: Page {index + 1} stats needs 2–3 stats and at most one footnote line")
+        gap = 24
+        width = (848 - gap * (len(stats) - 1)) / len(stats)
+        card = {"fill_color": "FFFFFF", "line_color": None, "shadow": None, "corner_radius": 16}
+        plan = [("text", "label", label.upper(), 56, 48, 848, 26, 12, accent, True),
+                ("text", "title", page["title"], 56, 80, 848, 96, 32, INK, True)]
+        for column, stat in enumerate(stats):
+            x = 56 + column * (width + gap)
+            plan += [("shape", "roundRect", x, 196, width, 210, card),
+                     ("text", "stat value", stat["value"], x + 20, 216, width - 40, 84, 56, accent, True),
+                     ("text", "stat label", stat["label"], x + 20, 306, width - 40, 84, 16, BODY, False)]
+        if bullets:
+            plan.append(("text", "footnote", bullets[0], 56, 424, 848, 48, 14, BODY, False))
+        return plan + [("text", "number", number, 56, 486, 848, 25, 11, accent, False)]
+    if not bullets:
+        raise ValueError(f"layout-density: Page {index + 1} {layout} needs 1–4 lines of text")
+    if layout == "statement":
+        rule = {"fill_color": accent, "line_color": None}
+        return [("text", "label", label.upper(), 56, 48, 848, 26, 12, accent, True),
+                ("shape", "rect", 56, 150, 56, 4, rule),
+                ("text", "title", page["title"], 56, 170, 790, 150, 44, INK, True),
+                ("text", "body", "\n".join(bullets), 56, 326, 790, 150, 20, BODY, False),
+                ("text", "number", number, 56, 486, 848, 25, 11, accent, False)]
+    # image: picture on the left; closing: the ask, picture on the right.
+    picture_x, text_x = (0, 488) if layout == "image" else (520, 56)
+    return [("picture", picture_x, 0, 440, 540),
+            ("text", "label", label.upper(), text_x, 48, 416, 26, 12, accent, True),
+            ("text", "title", page["title"], text_x, 80, 416, 132, 34 if layout == "closing" else 30, INK, True),
+            ("text", "body", "\n".join(bullets), text_x, 224, 416, 240, 18, BODY, False),
+            ("text", "number", number, text_x, 486, 416, 25, 11, accent, False)]
+
+
 def _validate_publication_layout(pages, *, label):
     # python-pptx native text boxes retain 7.2pt side and 3.6pt vertical
     # margins. Budget the existing 1.1 line spacing and inter-paragraph 12pt
     # gap; no trailing paragraph gap is drawn inside the final text line.
-    for index, page in enumerate(pages, 1):
-        for field, text, size, width, height in (
-            ("label", label.upper(), 12, 864, 26),
-            ("title", page["title"], 34, 530, 100),
-            ("body", "\n".join(page["bullets"]), 21, 530, 248),
-        ):
+    plans = []
+    for index, page in enumerate(pages):
+        plan = _publication_page_plan(page, index=index, count=len(pages), label=label, accent="000000")
+        for item in plan:
+            if item[0] != "text":
+                continue
+            _, field, text, _, _, width, height, size, _, _ = item
             try:
                 lines, paragraphs = _publication_text_lines(text, size=size, width=width - 14.4)
             except ValueError as exc:
-                raise ValueError(f"layout-density: Page {index} {field}: {exc}") from exc
+                raise ValueError(f"layout-density: Page {index + 1} {field}: {exc}") from exc
             if lines * size * 1.1 + (paragraphs - 1) * 12 > height - 7.2:
                 raise ValueError(
-                    f"layout-density: Page {index} {field} is too dense for the fixed publication layout "
-                    f"({lines} estimated lines). Shorten this text or split the content across more pages; "
-                    "no text was truncated or silently resized."
+                    f"layout-density: Page {index + 1} {field} is too dense for its "
+                    f"{_page_layout(page, index, len(pages))} layout ({lines} estimated lines). Shorten this "
+                    "text or split the content across more pages; no text was truncated or silently resized."
                 )
+        plans.append(plan)
+    return plans
 
 
-def _publication_operations(pages, *, label, theme, illustration):
-    """A bounded editorial layout, expressed as existing native Office ops."""
+def _publication_operations(pages, *, label, theme, illustration, pictures=None):
+    """Editorial page layouts, expressed as existing native Office ops.
+
+    ``illustration`` is the main picture source; ``pictures`` maps a page's own
+    ``image`` reference to its source.
+    """
     _validate_publication_layout(pages, label=label)
-    background, accent = {"terracotta": ("F7F2EA", "AB513A"), "sage": ("F2F5EF", "426549"),
-                          "mustard": ("F8F5ED", "A87918")}[theme]
+    background, accent = PUBLICATION_THEMES[theme]
     operations = [{"op": "page.setup", "format": {"width": 960, "height": 540}}]
     for index, page in enumerate(pages):
         slide, shape_id = index + 1, 2
         operations.extend([{"op": "slide.insert", "index": index, "layout_index": 6},
                            {"op": "slide.format", "slide": slide, "format": {"background_color": background}}])
-        texts = [
-            (label.upper(), 48, 28, 864, 26, 12, accent, True),
-            (page["title"], 48, 86, 530, 100, 34, "282828", True),
-            ("\n".join(page["bullets"]), 48, 204, 530, 248, 21, "383838", False),
-            (f"{slide:02d} / {len(pages):02d}", 48, 486, 864, 25, 11, accent, False),
-        ]
-        for text, x, y, width, height, size, color, bold in texts:
-            operations.append({"op": "textbox.insert", "slide": slide, "text": text,
-                "transform": {"x": x, "y": y, "width": width, "height": height}})
-            operations.append({"op": "shape.format", "slide": slide, "shape_id": shape_id,
-                               "format": {"word_wrap": True}})
-            for paragraph in range(len(text.split("\n"))):
-                operations.append({"op": "paragraph.format", "slide": slide, "shape_id": shape_id,
-                    "index": paragraph, "format": {"font_size": size, "font_color": color,
-                        "font_name": "Arial", "bold": bold, "space_after": 12, "line_spacing": 1.1}})
+        source = (pictures or {}).get(page.get("image") or "", illustration)
+        for item in _publication_page_plan(page, index=index, count=len(pages), label=label, accent=accent):
+            if item[0] == "picture":
+                _, x, y, width, height = item
+                operations.append({"op": "picture.insert", "slide": slide, "source": source,
+                                   "transform": {"x": x, "y": y, "width": width, "height": height},
+                                   "fit": "cover", "format": {"alt_text": page["title"]}})
+            elif item[0] == "shape":
+                _, preset, x, y, width, height, shape_format = item
+                operations.append({"op": "shape.insert", "slide": slide, "preset": preset,
+                                   "transform": {"x": x, "y": y, "width": width, "height": height},
+                                   "format": shape_format})
+            else:
+                _, _, text, x, y, width, height, size, color, bold = item
+                operations.append({"op": "textbox.insert", "slide": slide, "text": text,
+                    "transform": {"x": x, "y": y, "width": width, "height": height}})
+                operations.append({"op": "shape.format", "slide": slide, "shape_id": shape_id,
+                                   "format": {"word_wrap": True}})
+                for paragraph in range(len(text.split("\n"))):
+                    operations.append({"op": "paragraph.format", "slide": slide, "shape_id": shape_id,
+                        "index": paragraph, "format": {"font_size": size, "font_color": color,
+                            "font_name": "Arial", "bold": bold, "space_after": 12, "line_spacing": 1.1}})
             shape_id += 1
-        operations.append({"op": "picture.insert", "slide": slide, "source": illustration,
-                           "transform": {"x": 632, "y": 158, "width": 280, "height": 294}, "fit": "contain"})
     return operations
 
 
@@ -294,18 +601,27 @@ async def _compose_creative_publication_handler(
                  PUBLICATION_SCHEMA["function"]["parameters"])
         _validate_publication_layout(pages, label=label)
         ctx, runtime = _context(entity_id, user_id, workspace_id, task_id, agent_id, conversation_id, kwargs)
-        rel_image, absolute_image = await _source_path(illustration_path, ctx)
-        if Path(absolute_image).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-            raise ValueError("Provide a real PNG/JPEG/WebP illustration")
-        if Path(absolute_image).stat().st_size > 20 * 1024 * 1024:
-            raise ValueError("Illustration exceeds 20 MiB")
-        await asyncio.to_thread(_inspect_file, absolute_image)
-        illustration = {"path": rel_image, "expected_sha256": media._sha256_file(absolute_image)}
+
+        async def picture(reference):
+            rel_image, absolute_image = await _source_path(reference, ctx)
+            if Path(absolute_image).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                raise ValueError("Provide a real PNG/JPEG/WebP illustration")
+            if Path(absolute_image).stat().st_size > 20 * 1024 * 1024:
+                raise ValueError("Illustration exceeds 20 MiB")
+            await asyncio.to_thread(_inspect_file, absolute_image)
+            return {"path": rel_image, "expected_sha256": media._sha256_file(absolute_image)}
+
+        illustration = await picture(illustration_path)
+        page_images = _page_pictures(pages)
+        if len(page_images) > 6:
+            raise ValueError("Use at most six distinct page pictures")
+        pictures = {reference: await picture(reference) for reference in page_images}
         _, directory = await _scope(entity_id, ctx["workspace_id"], task_id, output_directory)
         call_context = {**ctx, "runtime_envelope": runtime.runtime_envelope, "storage_scope": "workspace"}
         deck_path, pdf_path = directory + "/publication.pptx", directory + "/publication.pdf"
         deck = json.loads(await runtime_generate_document_file(**call_context, name=deck_path, file_type="pptx",
-            operations=_publication_operations(pages, label=label, theme=theme, illustration=illustration)))
+            operations=_publication_operations(pages, label=label, theme=theme, illustration=illustration,
+                                               pictures=pictures)))
         if deck.get("error"):
             raise ValueError("Native presentation creation failed: " + json.dumps(deck, ensure_ascii=False))
         _, absolute_deck = await _source_path(deck_path, ctx)
@@ -319,6 +635,113 @@ async def _compose_creative_publication_handler(
         saved_notes = await _save(ctx, runtime, directory + "/notes.md", notes.encode("utf-8"))
         return json.dumps({"status": "completed", "files": [deck_path, pdf_path, saved_notes["fs_path"]],
                            "pages": len(pages), "layout": "editable-native-office", "requires_visual_review": True})
+    except Exception as exc:
+        return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
+
+
+DECK_BUILD_TIMEOUT_SECONDS = 240
+DECK_MAX_PICTURES = 8
+
+
+def _build_styled_deck(deck_json: Path) -> dict[str, Any]:
+    """Run the deck engine and its quality gate on one deck.json; its JSON summary.
+
+    The engine is the pptx skill's own builder, run as a separate process so its
+    modules stay its own; it writes ``exports/<project>.pptx`` beside deck.json.
+    """
+    import subprocess
+    import sys
+
+    built = subprocess.run(
+        [sys.executable, str(DECK_ENGINE_SCRIPTS / "build_deck.py"), str(deck_json)],
+        cwd=DECK_ENGINE_SCRIPTS, capture_output=True, text=True, timeout=DECK_BUILD_TIMEOUT_SECONDS,
+    )
+    try:
+        return json.loads(built.stdout)
+    except ValueError:
+        raise ValueError("The deck engine did not finish: " + (built.stderr or built.stdout)[-1500:]) from None
+
+
+@media._with_media_file_access
+async def _compose_creative_deck_handler(
+    *, entity_id: str = "", user_id: str = "", workspace_id: str | None = None,
+    task_id: str | None = None, agent_id: str | None = None, conversation_id: str | None = None,
+    output_directory: str = "", style: str = "", deck: dict | None = None, source_notes: str = "",
+    **kwargs: Any,
+) -> str:
+    try:
+        validate(dict(output_directory=output_directory, style=style, deck=deck, source_notes=source_notes),
+                 DECK_SCHEMA["function"]["parameters"])
+        ctx, runtime = _context(entity_id, user_id, workspace_id, task_id, agent_id, conversation_id, kwargs)
+        _, directory = await _scope(entity_id, ctx["workspace_id"], task_id, output_directory)
+        spec = json.loads(json.dumps(deck))
+        # The style is the person's choice, passed on its own; a deck cannot restyle itself.
+        spec["theme"] = style
+        spec.pop("theme_overrides", None)
+        with tempfile.TemporaryDirectory(prefix="manor-creative-deck-") as workdir:
+            project = Path(workdir) / "deck"
+            (project / "images").mkdir(parents=True)
+            pictures: dict[str, str] = {}
+
+            async def local_picture(reference: str) -> str:
+                if reference in pictures:
+                    return pictures[reference]
+                if len(pictures) >= DECK_MAX_PICTURES:
+                    raise ValueError(f"Use at most {DECK_MAX_PICTURES} distinct pictures")
+                _, absolute = await _source_path(reference, ctx)
+                suffix = Path(absolute).suffix.lower()
+                if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    raise ValueError("Pictures must be PNG, JPEG or WebP: " + reference)
+                if Path(absolute).stat().st_size > 20 * 1024 * 1024:
+                    raise ValueError("Picture exceeds 20 MiB: " + reference)
+                await asyncio.to_thread(_inspect_file, absolute)
+                local = f"images/picture-{len(pictures) + 1:02d}{suffix}"
+                await asyncio.to_thread(shutil.copyfile, absolute, project / local)
+                pictures[reference] = local
+                return local
+
+            async def localize(value: Any) -> None:
+                # Every picture field, at any depth (cover, cards, team, gallery…), is a Knowledge path.
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key == "image" and isinstance(item, str) and item.strip():
+                            value[key] = await local_picture(item.strip())
+                        else:
+                            await localize(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        await localize(item)
+
+            await localize(spec["slides"])
+            (project / "deck.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+            summary = await asyncio.to_thread(_build_styled_deck, project / "deck.json")
+            if summary.get("status") != "ready":
+                return json.dumps({
+                    "status": "failed",
+                    "error": "The deck could not be laid out as written; fix every listed problem and call again.",
+                    "engine_status": summary.get("status"),
+                    "problems": summary.get("errors") or [],
+                    **({"layouts": summary["layouts"]} if summary.get("layouts") else {}),
+                }, ensure_ascii=False)
+            data = Path(summary["pptx"]).read_bytes()
+        from packages.core.services.file_conversion import convert_office_file
+
+        # The PDF is made from the same bytes before anything is written, so a
+        # failed conversion leaves no half-delivered package behind.
+        pdf_data = await convert_office_file(data, "pptx", "pdf")
+        deck_path = directory + "/deck.pptx"
+        await _save(ctx, runtime, deck_path, data)
+        saved_pdf = await _save(ctx, runtime, directory + "/deck.pdf", pdf_data)
+        pdf_path = saved_pdf["fs_path"]
+        notes = "# " + spec["title"] + "\n\n" + "\n\n".join(
+            f"## Slide {index + 1}: {slide.get('title') or slide['layout']}\n\n{slide.get('notes') or ''}".rstrip()
+            for index, slide in enumerate(spec["slides"]))
+        notes += "\n\n## Sources and production notes\n\n" + source_notes + "\n"
+        saved_notes = await _save(ctx, runtime, directory + "/notes.md", notes.encode("utf-8"))
+        return json.dumps({"status": "completed", "files": [deck_path, pdf_path, saved_notes["fs_path"]],
+                           "pages": summary.get("slides"), "style": style,
+                           "quality_score": summary.get("quality_score"), "warnings": summary.get("warnings") or [],
+                           "requires_visual_review": True}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
 
@@ -355,16 +778,18 @@ def _json_bytes(value):
 async def _prepare_creative_studio_handler(
     *, entity_id: str = "", user_id: str = "", workspace_id: str | None = None,
     task_id: str | None = None, agent_id: str | None = None, conversation_id: str | None = None,
-    brief: str = "", source_paths: str = "", mode: str = "", output_directory: str = "", **kwargs: Any,
+    brief: str = "", sources: Any = None, source_paths: str = "", mode: str = "", output_directory: str = "",
+    **kwargs: Any,
 ) -> str:
     try:
-        validate(dict(brief=brief, source_paths=source_paths, mode=mode, output_directory=output_directory),
-                 PREPARE_SCHEMA["function"]["parameters"])
+        validate(dict(brief=brief, sources=sources or [], source_paths=source_paths, mode=mode,
+                      output_directory=output_directory), PREPARE_SCHEMA["function"]["parameters"])
         if not brief.strip():
             raise ValueError("Provide a meaningful production brief")
         ctx, runtime = _context(entity_id, user_id, workspace_id, task_id, agent_id, conversation_id, kwargs)
         _, output = await _scope(entity_id, ctx["workspace_id"], task_id, output_directory)
-        paths = [p.strip() for p in source_paths.splitlines() if p.strip()]
+        paths = await _document_ref_paths(sources, entity_id, limit=5)
+        paths += [p.strip() for p in source_paths.splitlines() if p.strip()]
         if len(paths) > 5 or len(set(paths)) != len(paths):
             raise ValueError("Provide up to five distinct source paths, one per line")
         sources, text_size = [], 0
@@ -392,7 +817,7 @@ async def _prepare_creative_studio_handler(
             raise ValueError("Dubbing requires exactly one uploaded narrated video, plus optional matching SRT")
         if mode in {"presentation", "handbook"} and not (shutil.which("soffice") and shutil.which("pdftoppm")):
             raise ValueError("The worker requires LibreOffice and pdftoppm for real PDF/page rendering")
-        if mode in {"podcast", "dubbing"} and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        if mode in {"podcast", "dubbing", "video"} and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
             raise ValueError("The worker requires FFmpeg and ffprobe for audio/video production")
         snapshot = {"schema_version": 1, "mode": mode, "brief": brief.strip(), "sources": sources,
                     "output_directory": output, "workspace_id": ctx["workspace_id"]}
@@ -517,6 +942,11 @@ def _check_package(mode: str, inspected: list[dict]) -> None:
             raise ValueError("Deliver 3–6 distinct finished image pages")
     if mode == "podcast" and (len(items(".mp3")) != 1 or not 20 <= items(".mp3")[0]["qa"].get("duration_seconds", 0) <= 600):
         raise ValueError("Deliver one decodable MP3, 20 seconds to 10 minutes")
+    if mode == "video":
+        videos = items(".mp4")
+        if len(videos) != 1 or not videos[0]["qa"].get("has_audio") or not videos[0]["qa"].get("has_video") \
+                or not 10 <= videos[0]["qa"].get("duration_seconds", 0) <= 600:
+            raise ValueError("Deliver one narrated MP4 with picture and sound, 10 seconds to 10 minutes")
     if mode == "dubbing":
         if len(items(".mp4")) != 1 or len(items(".srt")) != 1:
             raise ValueError("Deliver one dubbed MP4 and matching target-language SRT")
@@ -628,7 +1058,8 @@ async def _verify_creative_studio_handler(
         checklist = ["Open every final file and check all pages or the whole recording.",
                      "Check wording, source accuracy, visual fit, rights and privacy.",
                      "For AI speech: listen for omissions, pronunciation and timing; no voice cloning or lip sync is claimed.",
-                     "Accept retains files here only. Revise keeps this version; rerun with the files and change instructions."]
+                     "Accept retains files here only. Request changes with a note to get a new version; this one is kept."]
+        await mark_production_results(entity_id, snapshot["output_directory"], {item["fs_path"] for item in inspected})
         receipt = await _save(ctx, runtime, receipt_dir + "/verification.json", _json_bytes({
             "mode": snapshot["mode"], "snapshot_sha256": snapshot_sha256,
             "technical_checks_passed": True, "files": inspected, "previews": previews,
@@ -643,4 +1074,5 @@ async def _verify_creative_studio_handler(
 
 def get_tools():
     return [(PREPARE_SCHEMA, _prepare_creative_studio_handler), (VERIFY_SCHEMA, _verify_creative_studio_handler),
-            (PUBLICATION_SCHEMA, _compose_creative_publication_handler), (DUB_SCHEMA, _compose_creative_dub_handler)]
+            (PUBLICATION_SCHEMA, _compose_creative_publication_handler), (DECK_SCHEMA, _compose_creative_deck_handler),
+            (DUB_SCHEMA, _compose_creative_dub_handler), (VIDEO_SCHEMA, _compose_creative_video_handler)]

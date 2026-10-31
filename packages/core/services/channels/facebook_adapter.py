@@ -68,6 +68,9 @@ class FacebookChannelAdapter(ChannelAdapter):
     async def _creds(self, cc: ChannelConfig, *, reason: str) -> dict:
         return await self.credentials(cc, reason=reason)
 
+    def webhook_path(self, cc: ChannelConfig) -> str:
+        return f"/api/v1/channels/facebook/webhook?config_id={cc.id}"
+
     @staticmethod
     def _token(credentials: dict) -> str:
         token = credentials.get("page_access_token") or credentials.get("access_token")
@@ -93,17 +96,17 @@ class FacebookChannelAdapter(ChannelAdapter):
     ) -> bool:
         """Verify Meta's HMAC-SHA256 signature on the raw POST body.
 
-        When ``app_secret`` isn't configured we still accept (dev mode);
-        production deployments should always set it. The signature
-        header is ``X-Hub-Signature-256: sha256=<hex>``.
+        Without an ``app_secret`` nothing proves the sender, so the
+        request is rejected. The signature header is
+        ``X-Hub-Signature-256: sha256=<hex>``.
         """
         credentials = await self._creds(cc, reason="channel.facebook.verify_inbound")
         secret = credentials.get("app_secret", "")
         if not secret:
             secret = os.environ.get("FACEBOOK_APP_SECRET", "")
         if not secret:
-            logger.debug("facebook: app_secret missing — skipping HMAC check")
-            return True
+            logger.warning("facebook: app_secret missing — rejecting inbound webhook")
+            return False
         sig = (headers.get("x-hub-signature-256") or
                headers.get("X-Hub-Signature-256") or "")
         if not sig.startswith("sha256="):

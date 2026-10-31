@@ -77,7 +77,7 @@ check_split_services() {
   assert_absent_service "$services_file" manor-worker-embedding
   for service in redis-cache redis-celery redis-juicefs; do
     if grep -qx "$service" "$services_file"; then
-      echo "K8s-style split Redis services must not appear in single-machine compose: ${service}." >&2
+      echo "Multi-node split Redis services must not appear in single-machine compose: ${service}." >&2
       cat "$services_file" >&2
       exit 1
     fi

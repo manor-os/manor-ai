@@ -54,7 +54,6 @@ from packages.core.models.workspace import (
 )
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.strategist import service as strategist_service
-from packages.core.tasks import ai_tasks
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 pytestmark = pytest.mark.asyncio
@@ -279,7 +278,6 @@ async def _seed_cohort(
         async def _noop_post(*args, **kwargs):
             return None
         monkeypatch.setattr(strategist_service, "_post_human_request_chat", _noop_post)
-        monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
 
         result = await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
         assert not result.get("skipped"), result

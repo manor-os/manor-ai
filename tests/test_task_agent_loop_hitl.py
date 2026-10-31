@@ -16,7 +16,7 @@ import pytest
 from tests.approval_settings_test_utils import (
     action_rule, initialize_test_approval_owners, set_workspace_test_approval,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import test_task_agent_loop as base
 from packages.core.ai.runtime.approval_service import (
@@ -30,7 +30,9 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.constants.runtime_principal import RuntimePrincipalKind
 from packages.core.governance.approval_policy_service import account_defaults
 from packages.core.models.base import generate_ulid
+from packages.core.models.event import EventLog
 from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.notification import Notification
 from packages.core.models.task import Message, Task, TaskLog
 from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
 from packages.core.models.user import Entity, User, UserMembership
@@ -136,7 +138,7 @@ async def _scope(db):
 
 async def _start(db_session, monkeypatch):
     task, thread, envelope, selection = await _scope(db_session)
-    base._flag(monkeypatch, True)
+    base._requester(monkeypatch)
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value=envelope.user_id),
@@ -146,7 +148,7 @@ async def _start(db_session, monkeypatch):
     wake = await stage_task_coordinator_wake(db_session, task_id=task.id, reason="task_start")
     await db_session.commit()
     host = base._install_host(monkeypatch, db_session, selection)
-    monkeypatch.setattr(worker, "resolve_task_execution_user_id", AsyncMock(return_value=envelope.user_id))
+    monkeypatch.setattr(worker, "resolve_task_run_user_id", AsyncMock(return_value=envelope.user_id))
     host.envelope, host.thread, host.task_id, host.run_id = envelope, thread, task.id, run.id
     host.selection = selection
     return host, wake
@@ -320,6 +322,19 @@ async def test_a_declined_question_resumes_with_a_declined_result(db_session, mo
     assert (await _run(db_session, host.task_id))["status"] == "completed"
 
 
+async def _pause_and_resume(db_session, host):
+    """Put the parked Task on hold and back in progress; returns the re-readied run."""
+    task = await base._fresh(db_session, Task, host.task_id)
+    task.status, task.status_changed_at = "on_hold", datetime.now(timezone.utc)
+    await db_session.commit()
+    task = await base._fresh(db_session, Task, host.task_id)
+    task.status = "in_progress"
+    task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    run = await ensure_task_coordinator_run(db_session, task=task, selection=host.selection)
+    await db_session.commit()
+    return run
+
+
 @pytest.mark.asyncio
 async def test_pause_and_resume_waits_on_the_same_card_again(db_session, monkeypatch):
     host, wake = await _start(db_session, monkeypatch)
@@ -332,14 +347,7 @@ async def test_pause_and_resume_waits_on_the_same_card_again(db_session, monkeyp
     parked = (await base._fresh(db_session, TaskCoordinatorRun, host.run_id)).checkpoint
     cards = (await db_session.execute(select(Message).where(Message.pending_action.isnot(None)))).scalars().all()
 
-    task = await base._fresh(db_session, Task, host.task_id)
-    task.status, task.status_changed_at = "on_hold", datetime.now(timezone.utc)
-    await db_session.commit()
-    task = await base._fresh(db_session, Task, host.task_id)
-    task.status = "in_progress"
-    task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=host.selection)
-    await db_session.commit()
+    run = await _pause_and_resume(db_session, host)
 
     assert run.phase == TaskCoordinatorPhase.READY.value
     assert run.checkpoint["runtime_checkpoint"] == parked["runtime_checkpoint"]
@@ -359,6 +367,45 @@ async def test_pause_and_resume_waits_on_the_same_card_again(db_session, monkeyp
     assert (await _answer(db_session, host.task_id, host.envelope.user_id, "2026-10-10"))["resumed"] is True
     assert (await _run(db_session, host.task_id))["status"] == "completed"
     assert len(asked) == 1
+
+
+async def _hitl_requested_events(db_session, task_id):
+    rows = (await db_session.execute(select(EventLog).where(
+        EventLog.event_type == "task.hitl_requested",
+    ))).scalars().all()
+    return [row for row in rows if (row.payload or {}).get("task_id") == task_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("park", ["question", "approval"])
+async def test_a_task_waiting_on_a_person_tells_them_once(db_session, monkeypatch, park):
+    """The first park announces the wait (the event drives in-app, push and external
+    notices); parking again on the same card after a pause does not repeat it."""
+    host, wake = await _start(db_session, monkeypatch)
+    if park == "question":
+        _with_request_input(host)
+        first_round = ("", [base._call("ask", "request_input", ASK)])
+    else:
+        _with_tweet(host)
+        first_round = ("", [base._call("post", TWEET, {"text": "We launch on 2026-10-10"})])
+    base._model(monkeypatch, [first_round, ("", [base._call("done", "complete_task", base.COMPLETE_ARGS)])])
+
+    assert (await _run(db_session, host.task_id, wake))["status"] == "waiting_human"
+
+    wait = (await base._fresh(db_session, TaskCoordinatorRun, host.run_id)).checkpoint["task_loop_wait"]
+    [event] = await _hitl_requested_events(db_session, host.task_id)
+    assert event.payload["hitl_request_id"] == wait["hitl_request_id"]
+    assert event.workspace_id == host.envelope.workspace_id
+    notices = (await db_session.execute(select(Notification).where(
+        Notification.user_id == host.envelope.user_id, Notification.type == "task_hitl_requested",
+    ))).scalars().all()
+    assert len(notices) == 1 and notices[0].meta["task_id"] == host.task_id
+
+    # Pause and resume: the run parks on the very same card again.
+    await _pause_and_resume(db_session, host)
+
+    assert (await _run(db_session, host.task_id))["status"] == "waiting_human"
+    assert len(await _hitl_requested_events(db_session, host.task_id)) == 1
 
 
 # ── tool approvals ──────────────────────────────────────────────────────
@@ -431,6 +478,50 @@ async def test_approved_action_runs_once_when_the_loop_resumes(db_session, monke
 
 
 @pytest.mark.asyncio
+async def test_approve_and_save_rule_resumes_the_loop_once_and_saves_the_rule(db_session, monkeypatch):
+    from packages.core.governance import approval_commands as commands
+    from packages.core.governance import approval_policy_service as policies
+    from packages.core.models.user import User
+
+    def finish(messages, _tools):
+        assert json.loads(_result_of(messages, "post"))["tweet_id"] == "t-1"
+        return "", [base._call("done", "complete_task", base.COMPLETE_ARGS)]
+
+    host, executed, _seen, hitl_id = await _park_on_tweet(db_session, monkeypatch, finish)
+    actor = await db_session.get(User, host.envelope.user_id)
+
+    projection = await commands.project_approval_command(db_session, request_id=hitl_id, actor=actor)
+    await db_session.commit()
+
+    assert "approve_and_save_rule" in projection["available_decisions"], projection
+    option = projection["rule_options"][0]
+    command = commands.ApproveAndSaveRuleCommand(
+        request={"kind": "hitl", "id": hitl_id}, choice="approve_and_save_rule",
+        expectedDigest=projection["digest"], idempotencyKey="agent-loop-click-1",
+        expectedPolicyVersion=projection["policy_version"], optionId=option["id"],
+    )
+    result = await commands.approve_and_save_rule(db_session, command=command, actor=actor)
+    await db_session.commit()
+
+    assert result["status"] == "granted"
+    assert result["task_runtime_resume"]["choice"] == "approved"
+    run = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    assert run.phase == TaskCoordinatorPhase.READY.value
+    scope = await policies.resolve_scope(
+        db_session, entity_id=host.envelope.entity_id, workspace_id=host.envelope.workspace_id,
+    )
+    saved = await policies.read_approval_settings(db_session, scope, actor)
+    assert option["rule"]["selector"] in [rule["selector"] for rule in saved["policy"]["rules"]]
+
+    assert await _run(db_session, host.task_id) == {"status": "completed", "task_id": host.task_id}
+    assert len(executed) == 1
+    assert (await base._fresh(db_session, HitlRequest, hitl_id)).status == "consumed"
+    # A replayed click is idempotent: no second resume, no second action.
+    again = await commands.approve_and_save_rule(db_session, command=command, actor=actor)
+    assert again["idempotent"] is True and len(executed) == 1
+
+
+@pytest.mark.asyncio
 async def test_rejected_action_never_runs_and_the_loop_hears_why(db_session, monkeypatch):
     def finish(messages, _tools):
         rejected = json.loads(_result_of(messages, "post"))
@@ -497,7 +588,16 @@ async def test_a_tampered_park_tag_is_not_current(db_session, monkeypatch):
     result = await _decide(db_session, host, hitl_id, "approve")
 
     assert result.runtime_metadata["approval_outcome"] == "expired"
-    assert (await base._fresh(db_session, Task, host.task_id)).status == "waiting_on_customer"
+    assert executed == []
+    # The card closed without a decision reaching the run: the run is never
+    # stranded on it. It wakes with "closed without approval, did not run"
+    # (never the approval the forged tag asked for).
+    assert (await base._fresh(db_session, Task, host.task_id)).status == "in_progress"
+    run = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    assert run.phase == TaskCoordinatorPhase.READY.value
+    stored = run.checkpoint["runtime_checkpoint"]["pending_tool_result"]
+    assert stored["gate"] is True and json.loads(stored["content"])["action_executed"] is False
+    assert await _run(db_session, host.task_id) == {"status": "completed", "task_id": host.task_id}
     assert executed == []
 
 
@@ -813,6 +913,114 @@ async def test_the_approved_token_cannot_run_a_different_call(db_session, monkey
     assert executed == []
 
 
+# ── a policy change re-decides the parked approval ──────────────────────
+
+
+async def _change_workspace_policy(db_session, host, *, mode, user_rules=()):
+    """The settings write, then the re-decision its committed outbox row asks for."""
+    from packages.core.governance.approval_policy_reevaluation import (
+        REEVALUATE_PENDING_APPROVALS_TASK, reevaluate_pending_approvals,
+    )
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+
+    await set_workspace_test_approval(
+        db_session, entity_id=host.envelope.entity_id, workspace_id=host.envelope.workspace_id,
+        actor_id=host.envelope.user_id, mode=mode, user_rules=list(user_rules),
+    )
+    await db_session.commit()
+    event = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == REEVALUATE_PENDING_APPROVALS_TASK,
+        RuntimeOutboxEvent.aggregate_id == host.envelope.workspace_id,
+    ).order_by(RuntimeOutboxEvent.created_at.desc()).limit(1))).scalar_one()
+    staged = {"id": event.id, **event.payload}
+    assert staged["actor_id"] == host.envelope.user_id
+    return staged, await reevaluate_pending_approvals(db_session, **event.payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minted", ["current", "before_subject_snapshot"])
+async def test_switching_the_workspace_to_automatic_releases_the_parked_approval(db_session, monkeypatch, minted):
+    from packages.core.governance.approvals import APPROVAL_POLICY_SUBJECT_CONTEXT_KEY
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+
+    def finish(messages, _tools):
+        assert json.loads(_result_of(messages, "post"))["tweet_id"] == "t-1", _result_of(messages, "post")
+        return "", [base._call("done", "complete_task", base.COMPLETE_ARGS)]
+
+    host, executed, _seen, hitl_id = await _park_on_tweet(db_session, monkeypatch, finish)
+    if minted == "before_subject_snapshot":
+        request = await base._fresh(db_session, HitlRequest, hitl_id)
+        request.context = {k: v for k, v in request.context.items() if k != APPROVAL_POLICY_SUBJECT_CONTEXT_KEY}
+        await db_session.commit()
+
+    event, counts = await _change_workspace_policy(db_session, host, mode="automatic")
+
+    assert counts["released"] == 1, counts
+    request = await base._fresh(db_session, HitlRequest, hitl_id)
+    assert request.status == "granted" and request.decided_via == "policy_change"
+    assert request.decided_by_user_id == host.envelope.user_id
+    assert request.resolved_reason == (
+        f"policy_change:workspace:{host.envelope.workspace_id}:r{event['revision']}"
+    )
+    assert request.context["approval_requirements"] == []
+    assert request.context["policy_change_release"]["released_requirements"]
+    # Woken through the card's own path: the Task continues, never fails.
+    assert (await base._fresh(db_session, Task, host.task_id)).status == "in_progress"
+    run = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    assert run.phase == TaskCoordinatorPhase.READY.value
+    card = (await db_session.execute(select(Message).where(
+        Message.response_surface_event_id == f"task-runtime-hitl:{hitl_id}",
+    ))).scalar_one()
+    assert card.meta["hitl_requests"][0]["resolved"] is True
+
+    assert (await _run(db_session, host.task_id))["status"] == "completed"
+    assert len(executed) == 1
+    assert (await base._fresh(db_session, HitlRequest, hitl_id)).status == "consumed"
+
+    # A late or repeated delivery, and a write that changes nothing, are no-ops.
+    staged = (await db_session.execute(select(func.count()).select_from(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.aggregate_id == host.envelope.workspace_id,
+    ))).scalar_one()
+    again, repeat = await _change_workspace_policy(db_session, host, mode="automatic")
+    assert again["id"] == event["id"] and sum(repeat.values()) == 0
+    assert (await db_session.execute(select(func.count()).select_from(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.aggregate_id == host.envelope.workspace_id,
+    ))).scalar_one() == staged
+    assert len(executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_policy_change_that_still_asks_leaves_the_card_pending(db_session, monkeypatch):
+    host, executed, _seen, hitl_id = await _park_on_tweet(
+        db_session, monkeypatch, ("", [base._call("done", "complete_task", base.COMPLETE_ARGS)]),
+    )
+
+    # The explicit ask rule outranks the mode.
+    _event, counts = await _change_workspace_policy(
+        db_session, host, mode="automatic",
+        user_rules=[action_rule("social_post.publish", effect="ask")],
+    )
+
+    assert counts["still_required"] == 1 and counts["released"] == 0, counts
+    request = await base._fresh(db_session, HitlRequest, hitl_id)
+    assert request.status == "pending" and request.decided_via is None
+    assert (await base._fresh(db_session, Task, host.task_id)).status == "waiting_on_customer"
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_a_question_card_is_never_released_by_a_policy_change(db_session, monkeypatch):
+    host, asked, _seen, hitl_id = await _park_on_question(db_session, monkeypatch)
+
+    _event, counts = await _change_workspace_policy(db_session, host, mode="automatic")
+
+    assert counts["released"] == 0, counts
+    request = await base._fresh(db_session, HitlRequest, hitl_id)
+    assert request.status == "pending" and request.action_key == "task.request_input"
+    assert (await base._fresh(db_session, Task, host.task_id)).status == "waiting_on_customer"
+    assert len(asked) == 1
+
+
 @pytest.mark.asyncio
 async def test_a_terminal_transition_closes_the_input_card_at_once(db_session, monkeypatch):
     from packages.core.services.task_service import update_task
@@ -912,7 +1120,7 @@ async def test_the_task_page_answer_takes_the_task_boundary_before_the_task(db_s
     locked, stop = _record_locks(db_session)
     try:
         result = await _resume_hitl(
-            db_session, task, user, step_id=None, response_text="2026-10-10",
+            db_session, task, user, response_text="2026-10-10",
             payload={"response": "2026-10-10", "choice": None, "fields": {}},
         )
     finally:
@@ -920,3 +1128,255 @@ async def test_the_task_page_answer_takes_the_task_boundary_before_the_task(db_s
 
     assert result["resumed"] is True and result["mode"] == "agent_loop"
     _assert_boundary_first(locked)
+
+
+# ── a Task outside any Workspace ────────────────────────────────────────
+
+
+async def _start_standalone(db_session, monkeypatch, *, real_context: bool, user_rules=()):
+    """A Task assigned directly to an Agent, started for real: factory, start
+    intent, run admission. Only the model round and the worker session are
+    faked (and the Agent's context unless ``real_context``)."""
+
+    from packages.core import database
+    from packages.core.constants.task import TaskRuntimeKind
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services import workspace_runtime
+    from packages.core.services.task_execution import (
+        TASK_EXECUTION_OUTBOX_EVENT,
+        queue_initial_task_execution,
+        resolve_task_execution,
+    )
+    from packages.core.tasks import runtime_tasks
+    from packages.core.workers import task_run_host
+    from tests.approval_settings_test_utils import initialize_test_account_approval
+
+    entity_id, user_id, agent_id = (generate_ulid() for _ in range(3))
+    db_session.add(Entity(id=entity_id, name="Personal agent", settings={"approval_defaults": account_defaults()}))
+    db_session.add(User(
+        id=user_id, entity_id=entity_id, email=f"{user_id}@example.test",
+        password_hash="x", role="owner", status="active", display_name="Ana",
+    ))
+    db_session.add(UserMembership(user_id=user_id, entity_id=entity_id, role="owner", status="active", is_primary=True))
+    db_session.add(Agent(id=agent_id, entity_id=entity_id, name="Assistant", status="active"))
+    await db_session.flush()
+    await initialize_test_account_approval(
+        db_session, entity_id=entity_id, user_id=user_id, user_rules=list(user_rules),
+    )
+    task = Task(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=None, creator_id=user_id,
+        agent_id=agent_id, title="Write the launch note",
+        description="Record a short note that names the launch date.",
+        task_type="general", status="pending", details={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    real = {
+        "admit": task_run_host.lock_workspace_access_boundary,
+        "loop_admit": worker.lock_workspace_access_boundary,
+        "allows": task_run_host.workspace_allows_manual_work,
+        "factory": task_run_host.resolve_task_execution,
+        "requester": worker.resolve_task_run_user_id,
+        "thread": workspace_runtime.ensure_workspace_task_conversation,
+        "specialize": worker.runtime_specialize_delegate_to_agent,
+        "context": worker.build_agent_context,
+    }
+    host = base._install_host(monkeypatch, db_session, selection=None)
+    monkeypatch.setattr(task_run_host, "lock_workspace_access_boundary", real["admit"])
+    monkeypatch.setattr(worker, "lock_workspace_access_boundary", real["loop_admit"])
+    monkeypatch.setattr(task_run_host, "workspace_allows_manual_work", real["allows"])
+    monkeypatch.setattr(task_run_host, "resolve_task_execution", real["factory"])
+    monkeypatch.setattr(worker, "resolve_task_run_user_id", real["requester"])
+    monkeypatch.setattr(workspace_runtime, "ensure_workspace_task_conversation", real["thread"])
+    monkeypatch.setattr(worker, "runtime_specialize_delegate_to_agent", real["specialize"])
+    if real_context:
+        monkeypatch.setattr(worker, "build_agent_context", real["context"])
+    monkeypatch.setattr(database, "create_worker_session", lambda: host.session_factory)
+
+    task = await base._fresh(db_session, Task, task.id)
+    dispatch = await resolve_task_execution(db_session, task)
+    assert dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+    assert dispatch.coordinator.is_agent_only
+    assert (dispatch.coordinator.root.agent_id, dispatch.coordinator.root.subscription_id) == (agent_id, None)
+    assert await queue_initial_task_execution(db_session, task, user_id=user_id) is True
+    await db_session.commit()
+    intent = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task.id,
+    ))).scalar_one()
+    admitted = await runtime_tasks.consume_task_execution_intent_once(
+        event_id=intent.id, task_id=task.id, intent_generation=intent.payload["intent_generation"],
+    )
+    assert admitted["status"] == "admitted"
+    run = (await db_session.execute(
+        select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    assert (run.workspace_id, run.root_subscription_id, run.root_agent_id) == (None, None, agent_id)
+    assert run.engine == "agent_loop"
+    host.task_id, host.run_id, host.user_id, host.agent_id = task.id, run.id, user_id, agent_id
+    return host
+
+
+@pytest.mark.asyncio
+async def test_a_task_assigned_directly_to_an_agent_runs_on_the_loop_and_resumes_with_the_answer(
+    db_session, monkeypatch,
+):
+    """No Workspace and no faked admission: the real factory, start intent,
+    run admission, Agent context, Task thread and answer service carry it end
+    to end."""
+
+    from packages.core.models.task import Conversation
+
+    host = await _start_standalone(db_session, monkeypatch, real_context=True)
+    asked = _with_request_input(host)
+
+    def finish(messages, _tools):
+        answer = json.loads(_result_of(messages, "ask"))
+        assert answer["status"] == "answered" and answer["answer"] == "2026-10-10"
+        return "", [base._call("done", "complete_task", base.COMPLETE_ARGS)]
+
+    seen = base._model(monkeypatch, [("", [base._call("ask", "request_input", ASK)]), finish])
+
+    first = await _run(db_session, host.task_id)
+
+    assert first == {"status": "waiting_human", "task_id": host.task_id, "kind": "waiting_human"}
+    task = await base._fresh(db_session, Task, host.task_id)
+    assert task.status == "waiting_on_customer"
+    assert task.details["_hitl_question"]["question"] == ASK["question"]
+    thread = await base._fresh(db_session, Conversation, task.conversation_id)
+    assert (thread.workspace_id, thread.thread_ref_kind, thread.thread_ref_id) == (None, "task", task.id)
+    run = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    assert run.phase == TaskCoordinatorPhase.WAITING_HUMAN.value and run.claim_token is None
+    request = await base._fresh(db_session, HitlRequest, run.checkpoint["task_loop_wait"]["hitl_request_id"])
+    assert request.status == "pending"
+    # No Workspace Chat: the question card is in the Task's own thread.
+    card = (await db_session.execute(select(Message).where(
+        Message.pending_action["approval_request_id"].astext == request.id,
+    ))).scalar_one()
+    assert card.conversation_id == thread.id and card.resolved_at is None
+
+    applied = await _answer(db_session, task.id, host.user_id, "2026-10-10")
+
+    assert applied == {"resumed": True, "dispatch_agent_id": TASK_AGENT_LOOP_INPUT_DISPATCH}
+    assert dispatch_task_input_resume(task.id, applied["dispatch_agent_id"]) is True
+    assert (await base._fresh(db_session, HitlRequest, request.id)).status == "consumed"
+    assert (await base._fresh(db_session, Message, card.id)).resolved_at is not None
+
+    second = await _run(db_session, task.id)
+
+    assert second == {"status": "completed", "task_id": task.id}
+    assert len(asked) == 1 and len(seen) == 2
+    task = await base._fresh(db_session, Task, task.id)
+    assert task.status == "completed"
+    assert task.actual_output["response"] == base.COMPLETE_ARGS["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_task_outside_any_workspace_parks_on_an_approval_and_runs_the_action_once(
+    db_session, monkeypatch,
+):
+    """The account's approval rule gates the Agent's action; the card is in
+    the Task's thread and approving it resumes the run at that call."""
+
+    from packages.core.models.task import Conversation
+
+    host = await _start_standalone(
+        db_session, monkeypatch, real_context=False,
+        user_rules=[action_rule("social_post.publish", effect="ask")],
+    )
+    thread = await ensure_workspace_task_conversation(
+        db_session, entity_id=(await db_session.get(Task, host.task_id)).entity_id,
+        workspace_id=None, task_id=host.task_id, title="Write the launch note",
+    )
+    task = await base._fresh(db_session, Task, host.task_id)
+    task.conversation_id = thread.id
+    await db_session.commit()
+    host.thread = thread
+    host.envelope = RuntimeEnvelope(
+        surface=ChatSurface.SCHEDULED_AGENT_RUN,
+        profile=RuntimeProfile.BACKGROUND_WORKER,
+        principal=RuntimePrincipal(
+            kind=RuntimePrincipalKind.OWNER,
+            entity_id=task.entity_id, actor_user_id=host.user_id, execution_user_id=host.user_id,
+            agent_id=host.agent_id,
+        ),
+        entity_id=task.entity_id, user_id=host.user_id, agent_id=host.agent_id,
+        workspace_id=None, conversation_id=thread.id, task_id=task.id,
+        allowed_tool_names=(TWEET,),
+    )
+    executed = _with_tweet(host)
+
+    def finish(messages, _tools):
+        assert json.loads(_result_of(messages, "post"))["tweet_id"] == "t-1"
+        return "", [base._call("done", "complete_task", base.COMPLETE_ARGS)]
+
+    base._model(monkeypatch, [
+        ("", [base._call("post", TWEET, {"text": "We launch on 2026-10-10"})]),
+        finish,
+    ])
+
+    first = await _run(db_session, host.task_id)
+
+    assert first == {"status": "waiting_human", "task_id": host.task_id, "kind": "waiting_approval"}, first
+    assert executed == []
+    run = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    hitl_id = run.checkpoint["task_loop_wait"]["hitl_request_id"]
+    request = await base._fresh(db_session, HitlRequest, hitl_id)
+    assert request.status == "pending" and request.origin_task_id == host.task_id
+    assert request.workspace_id is None
+    card = (await db_session.execute(select(Message).where(
+        Message.response_surface_event_id == f"task-runtime-hitl:{hitl_id}",
+    ))).scalar_one()
+    assert card.conversation_id == thread.id
+    assert (await base._fresh(db_session, Conversation, thread.id)).workspace_id is None
+
+    await _decide(db_session, host, hitl_id, "approve")
+    second = await _run(db_session, host.task_id)
+
+    assert second == {"status": "completed", "task_id": host.task_id}
+    assert len(executed) == 1 and executed[0]["text"] == "We launch on 2026-10-10"
+    assert (await base._fresh(db_session, HitlRequest, hitl_id)).status == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_a_question_in_the_chat_a_schedule_came_from_is_answered_from_its_card(
+    db_session, monkeypatch,
+):
+    """A scheduled Agent Task runs in its schedule's chat; its question card
+    there answers the parked run."""
+
+    from apps.api.routers.chat import ResolveChatActionRequest, resolve_global_chat_action
+    from packages.core.models.task import Conversation
+
+    host = await _start_standalone(db_session, monkeypatch, real_context=False)
+    task = await base._fresh(db_session, Task, host.task_id)
+    chat = Conversation(
+        id=generate_ulid(), entity_id=task.entity_id, user_id=host.user_id,
+        agent_id=host.agent_id, scope="channel",
+    )
+    db_session.add(chat)
+    task.conversation_id = chat.id
+    await db_session.commit()
+    _with_request_input(host)
+
+    def finish(messages, _tools):
+        assert json.loads(_result_of(messages, "ask"))["answer"] == "2026-10-10"
+        return "", [base._call("done", "complete_task", base.COMPLETE_ARGS)]
+
+    base._model(monkeypatch, [("", [base._call("ask", "request_input", ASK)]), finish])
+    assert (await _run(db_session, host.task_id))["status"] == "waiting_human"
+    card = (await db_session.execute(select(Message).where(
+        Message.conversation_id == chat.id, Message.pending_action.isnot(None),
+    ))).scalar_one()
+    user = await db_session.get(User, host.user_id)
+
+    response = await resolve_global_chat_action(
+        card.id, ResolveChatActionRequest(choice="respond", note="2026-10-10"), user=user, db=db_session,
+    )
+
+    assert response.id == card.id
+    assert (await base._fresh(db_session, Message, card.id)).resolved_at is not None
+    assert (await base._fresh(db_session, Task, host.task_id)).status == "in_progress"
+    assert (await _run(db_session, host.task_id))["status"] == "completed"

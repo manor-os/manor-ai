@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from packages.core.constants.task import CancelSource
 from packages.core.constants.workflow import WORKFLOW_RUN_OPEN_STATUSES
 from packages.core.models.workflow import WorkflowRun
 
@@ -22,6 +23,18 @@ MANUAL_PAUSE_STATE = "manual_paused"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def inherited_cancel_source(value: Any) -> CancelSource:
+    """The source a cascade carries from the run that started it.
+
+    A run cancelled before sources were recorded has none; its cascade is
+    attributed to the system, which can only undercount user cancels.
+    """
+    try:
+        return CancelSource(value)
+    except ValueError:
+        return CancelSource.SYSTEM
 
 
 def control_state(run: Any) -> str | None:
@@ -48,10 +61,14 @@ def is_manually_paused(run: Any) -> bool:
     return str(current_result.get("status") or "").lower() != "paused"
 
 
-def run_resume_action(run: Any) -> dict[str, Any] | None:
-    """Project a native run-page response from the frozen execution contract."""
+def run_resume_action(run: Any, *, locale: str | None = None) -> dict[str, Any] | None:
+    """Project a native run-page response from the frozen execution contract.
+
+    ``locale`` is the viewer's: the step's name and form labels read in it.
+    """
     if run.status != "paused":
         return None
+    from packages.core.services.viewer_language import localized
     from packages.core.services.workflow_run_trace import execution_snapshot_for_run
 
     snapshot = execution_snapshot_for_run(None, run)
@@ -60,6 +77,7 @@ def run_resume_action(run: Any) -> dict[str, Any] | None:
     step = next((item for item in snapshot["steps"] if item.get("id") == run.current_step_id), None)
     if not step:
         return None
+    step = localized(step, locale) if locale else step
     action = {
         "kind": "workflow_resume",
         "workflow_run_id": run.id,
@@ -77,7 +95,24 @@ def run_resume_action(run: Any) -> dict[str, Any] | None:
     if wait_type == "event":
         return {**action, "prompt": result.get("output")}
     if wait_type == "input":
-        input_schema = config.get("input_schema")
+        collection_fields = result.get("collection_fields")
+        if isinstance(collection_fields, list):
+            return {
+                **action,
+                "kind": "workflow_input",
+                "options": ["submit"],
+                "response_variable": config.get("response_variable") or "inputs",
+                "prompt": result.get("output"),
+                "inputs": collection_fields,
+                "values": result.get("collection_values") or {},
+                "collection_round": result.get("collection_round"),
+            }
+        # The paused result carries the form with its defaults bound to this run.
+        input_schema = result.get("input_schema")
+        if not isinstance(input_schema, dict):
+            input_schema = config.get("input_schema")
+        elif locale:
+            input_schema = _labelled_like(input_schema, config.get("input_schema"))
         if not isinstance(input_schema, dict):
             return None
         return {
@@ -105,6 +140,24 @@ def run_resume_action(run: Any) -> dict[str, Any] | None:
         "review_title": result.get("review_title"),
         "review_read_only": True,
     }
+
+
+_FORM_LABEL_KEYS = ("title", "description", "x-enum-labels", "x-enum-descriptions", "x-example-labels", "x-example-groups")
+
+
+def _labelled_like(bound: dict[str, Any], labelled: Any) -> dict[str, Any]:
+    """A run's bound form with the viewer's labels; its values stay the run's."""
+    if not isinstance(labelled, dict):
+        return bound
+    result = {**bound, **{key: labelled[key] for key in _FORM_LABEL_KEYS if key in labelled and key in bound}}
+    properties = bound.get("properties")
+    source = labelled.get("properties")
+    if isinstance(properties, dict) and isinstance(source, dict):
+        result["properties"] = {
+            key: _labelled_like(value, source.get(key)) if isinstance(value, dict) else value
+            for key, value in properties.items()
+        }
+    return result
 
 
 def pause_run(run: Any, *, actor_id: str, at: datetime | None = None) -> None:
@@ -154,10 +207,15 @@ def cancel_run(
     run: Any,
     *,
     actor_id: str,
+    source: CancelSource,
     at: datetime | None = None,
     allow_problem_terminal: bool = False,
 ) -> None:
-    """Mark a cancellable run cancelled and retain an audit marker."""
+    """Mark a cancellable run cancelled and retain an audit marker.
+
+    ``source`` records who cancelled it (feeds the user-cancel quality
+    signal); it never changes the run's outcome.
+    """
     if run.status == "cancelled" or (
         run.status in {"completed", "failed"}
         and not allow_problem_terminal
@@ -175,6 +233,7 @@ def cancel_run(
     trigger_data[CONTROL_KEY] = control
     run.trigger_data = trigger_data
     run.status = "cancelled"
+    run.cancel_source = CancelSource(source).value
     run.completed_at = cancelled_at
 
 
@@ -256,8 +315,9 @@ async def cancel_active_subworkflow_descendants(
         )
         .with_for_update(skip_locked=True)
     )).scalars().all()
+    source = inherited_cancel_source(parent.cancel_source)
     for child in children:
-        cancel_run(child, actor_id=actor_id, at=cancelled_at)
+        cancel_run(child, actor_id=actor_id, source=source, at=cancelled_at)
     return list(children)
 
 
@@ -282,6 +342,7 @@ async def cancel_run_from_cancelled_ancestor(
                 WorkflowRun.status,
                 WorkflowRun.workspace_id,
                 WorkflowRun.trigger_data,
+                WorkflowRun.cancel_source,
             ).where(
                 WorkflowRun.id == parent_id,
                 WorkflowRun.entity_id == run.entity_id,
@@ -305,6 +366,7 @@ async def cancel_run_from_cancelled_ancestor(
             cancel_run(
                 run,
                 actor_id=str(control.get("cancelled_by") or run.started_by or "system"),
+                source=inherited_cancel_source(row.cancel_source),
                 at=cancelled_at,
             )
             return True

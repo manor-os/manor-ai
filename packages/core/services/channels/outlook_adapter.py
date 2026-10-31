@@ -169,11 +169,6 @@ class OutlookChannelAdapter(ChannelAdapter):
             "raw": data,
         }
 
-    async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
-        # Graph authenticates each notification through clientState; parsing
-        # performs the constant-time comparison against the stored state.
-        return True
-
     def parse_notification(
         self, cc: ChannelConfig, notification: dict,
     ) -> Optional[NormalizedInbound]:

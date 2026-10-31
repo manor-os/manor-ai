@@ -8,6 +8,7 @@ import pytest
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.task import Task, TaskLog
 from packages.core.models.task_coordinator import TaskCoordinatorRun
 from packages.core.models.worker import WorkLease
@@ -264,3 +265,19 @@ async def test_db_cross_task_plan_pointer_does_not_borrow_steps_or_errors(db_ses
     fact = next(row for row in (await read(db_session, fixture))["tasks"] if row["task_id"] == fixture.research.id)
     assert fact["plan_id"] is None and fact["step_counts"] == {}
     assert fact["current_blocker"] is None and fact["latest_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_db_open_card_or_customer_wait_marks_task_waiting_on_human(db_session):
+    fixture = await seed(db_session)
+    fixture.pending.status = "waiting_on_customer"
+    db_session.add(HitlRequest(
+        id=generate_ulid(), entity_id=fixture.workspace.entity_id, workspace_id=fixture.workspace.id,
+        action_key="external.publish", resource_kind="platform", risk_level="high", origin_kind="tool_call",
+        origin_task_id=fixture.research.id, status="pending", dedup_key=f"tool:{generate_ulid()}",
+    ))
+    await db_session.flush()
+    by_id = {row["task_id"]: row for row in (await read(db_session, fixture))["tasks"]}
+    assert by_id[fixture.research.id]["waiting_on_human"] is True
+    assert by_id[fixture.pending.id]["waiting_on_human"] is True
+    assert by_id[fixture.held.id]["waiting_on_human"] is False

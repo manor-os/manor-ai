@@ -28,18 +28,16 @@ from packages.core.services.oauth_provider_config import OAuthProviderConfig
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-async def _owner_headers(client: AsyncClient, username: str) -> tuple[dict, str, str]:
+async def _owner_headers(client: AsyncClient, username: str, password: str = "pass123") -> tuple[dict, str, str]:
     """Register a new entity (caller becomes owner). Returns (headers, user_id, token)."""
-    resp = await client.post(
-        "/api/v1/auth/register",
-        json={
-            "username": username,
-            "email": f"{username}@test.com",
-            "password": "pass123",
-            "entity_name": f"{username} Corp",
-        },
-    )
-    assert resp.status_code == 200
+    from auth_helpers import register_user_and_get_token
+
+    resp = await register_user_and_get_token(client, {
+        "username": username,
+        "email": f"{username}@test.com",
+        "password": password,
+        "entity_name": f"{username} Corp",
+    })
     data = resp.json()
     return {"Authorization": f"Bearer {data['access_token']}"}, data["user_id"], data["access_token"]
 
@@ -190,6 +188,44 @@ async def test_create_custom_role(client: AsyncClient):
     assert data["is_system"] is False
     assert set(data["permissions"]) == {"tasks.read", "docs.read", "admin.billing"}
     assert data["staff_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_collaborator_is_not_an_assignable_role(client: AsyncClient, db_session):
+    """Catches: an admin minting a collaborator membership (or a look-alike
+    role label) through a role input; only the Workspace collaboration sync
+    creates one. Holds in both deployment modes (cloud requires a longer password)."""
+    headers, owner_id, _ = await _owner_headers(client, "roles_collab", password="collab-owner-pass-123")
+    # Cloud's Free plan has one seat; the invite below needs a second.
+    entity = await db_session.get(Entity, await db_session.scalar(select(User.entity_id).where(User.id == owner_id)))
+    entity.plan_id = "plan_pro"
+    entity.settings = {**(entity.settings or {}), "plan": "plan_pro"}
+    await db_session.commit()
+    invited = await client.post(
+        "/api/v1/auth/users/invite", headers=headers, json={"email": "mate@test.com", "role": "member"},
+    )
+    assert invited.status_code == 200, invited.text
+    mate_id = invited.json()["id"]
+    staff = await client.post("/api/v1/staff", headers=headers, json={"name": "Mate"})
+    assert staff.status_code == 201, staff.text
+    custom = await client.post("/api/v1/staff/roles", headers=headers, json={"name": "Finance Lead"})
+    assert custom.status_code == 201, custom.text
+
+    for method, path, body in (
+        ("put", f"/api/v1/auth/users/{mate_id}/role", {"role": "collaborator"}),
+        ("post", "/api/v1/auth/users/invite", {"email": "other@test.com", "role": "Collaborator"}),
+        ("post", "/api/v1/staff", {"name": "Provider", "role": "collaborator"}),
+        ("put", f"/api/v1/staff/{staff.json()['id']}", {"role": "collaborator"}),
+        ("post", "/api/v1/staff/roles", {"name": "collaborator"}),
+        ("put", f"/api/v1/staff/roles/{custom.json()['id']}", {"name": "collaborator"}),
+    ):
+        response = await getattr(client, method)(path, headers=headers, json=body)
+        assert response.status_code == 422, (path, response.status_code, response.text)
+
+    role = await db_session.scalar(select(UserMembership.role).where(UserMembership.user_id == mate_id))
+    assert role == "member"
+    changed = await client.put(f"/api/v1/auth/users/{mate_id}/role", headers=headers, json={"role": "viewer"})
+    assert changed.status_code == 200, changed.text
 
 
 @pytest.mark.asyncio

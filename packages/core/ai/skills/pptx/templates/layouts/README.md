@@ -5,7 +5,7 @@ Pre-built PPT page layout templates supporting multiple styles and use cases.
 - **Full Index**: [README.md](./README.md) (human browsing — includes categories, primary colors, detailed tone)
 - **Slim Index**: [layouts_index.json](./layouts_index.json) (lightweight lookup — `summary` / `keywords` per template id)
 
-> **Template selection is opt-in by explicit path.** The main workflow defaults to free design. A template is only used when the user gives an explicit directory path (e.g. `/skill/templates/layouts/academic_defense/` or any other path) in their initial message. Bare names like "academic_defense" do not trigger — `layouts_index.json` and this README are discovery aids for finding the path, not triggers in themselves. See `SKILL.md` Step 3.
+> **These SVG layout templates belong to free-design mode** (`workflows/free-design.md`); the fast slot-based templates of template mode live in `templates/decks/`. Template selection here is opt-in by explicit path; free design otherwise designs every page. A template is only used when the user gives an explicit directory path (e.g. `/skill/templates/layouts/academic_defense/` or any other path) in their initial message. Bare names like "academic_defense" do not trigger — `layouts_index.json` and this README are discovery aids for finding the path, not triggers in themselves. See `workflows/free-design.md` Step 3.
 
 ---
 

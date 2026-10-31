@@ -9,7 +9,7 @@ from sqlalchemy import select
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.workspace import Workspace, WorkspaceStaff, AgentSubscription
-from packages.core.models.workspace_stat import WorkspaceStatObservation
+from packages.core.models.workspace_stat import WorkspaceStat, WorkspaceStatObservation
 from packages.core.goals.service import create_goal, record_measurement
 from packages.core.stats.service import create_stat, record_observation, update_stat
 from packages.core.stats.review_setup import review_stat_config, configure_review
@@ -202,6 +202,8 @@ async def test_source_version_scope_and_actor_are_checked(db_session, monkeypatc
     db_session.add(WorkspaceStaff(workspace_id=ws.id, user_id=viewer, role="viewer", status="active"))
     await db_session.flush()
     assert (await act(ws, viewer, {}, action="get_stat_status"))["stats"][0]["stat_id"] == stat.id
+    assert [row["stat_id"] for row in (await act(ws, viewer, {"stat_ids": [stat.id]}, action="get_stat_status"))["stats"]] == [stat.id]
+    assert (await act(ws, viewer, {"key_prefix": "no.such.prefix"}, action="get_stat_status"))["stats"] == []
     assert "cannot manage" in json.dumps(await act(ws, viewer, unknown(stat, "viewer-write")))
 
 
@@ -238,7 +240,8 @@ async def test_real_configuration_exports_and_reinstalls_one_shared_producer(db_
     restored_jobs = (await db_session.execute(select(ScheduledJob).where(ScheduledJob.workspace_id == restored.id))).scalars().all()
     assert len(restored_jobs) == 1
     assert restored_jobs[0].execution_target["workflow_id"] == workflow_id
-    from apps.api.routers.workspace_stats import _attach_assessment_runtime, _stat_payload
+    from apps.api.routers.workspace_stats import _stat_payload
+    from packages.core.stats.service import attach_assessment_runtime as _attach_assessment_runtime
     from packages.core.models.workflow import WorkflowRun
     original_job = (await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == configured["job_id"]))).scalar_one()
     original_job.enabled = True
@@ -324,6 +327,46 @@ def test_assessment_tool_classification_gates_persisted_writes(gateway):
     assert classify_runtime_tool(gateway, read).effect is RuntimeToolEffect.READ_ONLY
 
 
+@pytest.mark.asyncio
+async def test_agent_adds_assessed_audience_metrics_through_the_stat_action(db_session, monkeypatch):
+    from packages.core.models.user import User
+    from packages.core.services.auth_service import hash_password
+    ws, user, _ = await setup(db_session, monkeypatch, review=False)
+    db_session.add_all([
+        User(id=user, entity_id=ws.entity_id, email=f"{user}@test.com", display_name="Owner",
+             password_hash=hash_password("pass123"), role="member", status="active", locale="zh"),
+        AgentSubscription(entity_id=ws.entity_id, workspace_id=ws.id, agent_id=generate_ulid(), service_key="analyst", status="active"),
+    ])
+    await db_session.flush()
+    result = await act(ws, user, {"templates": ["latest_video_views", "followers"], "cadence": "daily"}, action="add_assessed_metrics")
+    assert result["service_key"] == "analyst" and len(result["stat_ids"]) == 2
+    stats = (await db_session.execute(select(WorkspaceStat).where(WorkspaceStat.id.in_(result["stat_ids"])))).scalars().all()
+    assert {stat.name for stat in stats} == {"最新视频播放量", "粉丝 / 订阅数"}
+    assert all(stat.collector_type == "agent_review" for stat in stats)
+    viewer = generate_ulid()
+    db_session.add(WorkspaceStaff(workspace_id=ws.id, user_id=viewer, role="viewer", status="active"))
+    await db_session.flush()
+    denied = await act(ws, viewer, {"templates": ["active_users"]}, action="add_assessed_metrics")
+    assert "cannot manage" in json.dumps(denied)
+
+
+@pytest.mark.parametrize("gateway", ["manor", "manor_workspace", "workspace_agent"])
+def test_adding_assessed_metrics_is_a_configuration_change_on_every_gateway(gateway):
+    """It creates a Workflow and schedule, so it never passes as a reversible measurement."""
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+    call = {"action": "add_assessed_metrics", "params": {"templates": ["followers"]}}
+    name = "manor" if gateway.startswith("manor") else gateway
+    if gateway == "manor":
+        call = {"action": "add_assessed_metrics", "params": {"templates": ["followers"]}}
+    elif gateway == "manor_workspace":
+        call = {"action": "workspace", "params": call}
+    classification = classify_runtime_tool(name, call)
+    assert classification.effect is RuntimeToolEffect.ACTION
+    assert classification.action.action_key == "workspace.operation.apply"
+    assert classification.action.risk_level == "high"
+
+
 @pytest.mark.oss_regression
 @pytest.mark.parametrize("fault", ["missing_workflow", "missing_schedule", "two_schedules", "double_clock", "unknown_key", "skill_delegate", "missing_service"])
 def test_public_blueprint_rejects_incomplete_assessment_producer(fault):
@@ -363,7 +406,6 @@ async def test_workspace_metrics_are_configured_as_one_exportable_batch(db_sessi
     from packages.core.stats.service import delete_stat
     ws, user, placeholder = await setup(db_session, monkeypatch, review=False)
     await delete_stat(db_session, placeholder)
-    ws.heartbeat_enabled = True
     payload = _assessment_recipe()
     rubrics = {}
     for spec in payload["stats"]:

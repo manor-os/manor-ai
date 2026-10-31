@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.approvals import ApprovalStatus
@@ -26,6 +26,13 @@ from packages.core.models.system_metrics import SystemMetricsSample
 from packages.core.models.task import Task
 from packages.core.models.tool_path_memory import ToolIntentPath
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
+from packages.core.services.workspace_health_metrics import (
+    FAILED,
+    SUCCEEDED,
+    TASK_OUTCOMES,
+    statuses_with,
+    task_platform_stopped_clause,
+)
 
 LIVE_WINDOW_DAYS = 7
 MAX_WINDOW_DAYS = 90
@@ -347,23 +354,27 @@ async def reliability_metrics(
         for r in approval_rows
     ]
 
-    # Task terminal-status failure rate — the only "success rate" this
-    # area reports, and only for request types with this real signal.
-    # "waiting_on_customer" is NOT terminal (per constants/task.py it's
-    # grouped with the active/in-flight statuses — a task can resume
-    # from it back into in_progress/completed/failed), so it's excluded
-    # from both the denominator and numerator here.
+    # Task failure rate — judged the same way as every Workspace health
+    # surface (services.workspace_health_metrics): blocked is failed work,
+    # cancellations and the platform's own stops are not judged, and
+    # in-flight statuses such as waiting_on_customer are not judged.
+    succeeded_statuses = statuses_with(TASK_OUTCOMES, SUCCEEDED)
+    failed_statuses = statuses_with(TASK_OUTCOMES, FAILED)
     task_rows = (await db.execute(
         select(Task.status.label("status"), func.count(Task.id).label("count"))
         .where(
             Task.created_at >= cutoff,
-            Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED)),
+            or_(
+                Task.status.in_(succeeded_statuses),
+                and_(Task.status.in_(failed_statuses), ~task_platform_stopped_clause()),
+            ),
         )
         .group_by(Task.status)
     )).all()
     task_counts = {r.status: int(r.count) for r in task_rows}
     task_total = sum(task_counts.values())
-    task_failure_rate = (task_counts.get("failed", 0) / task_total) if task_total else None
+    task_failed = sum(task_counts.get(status, 0) for status in failed_statuses)
+    task_failure_rate = (task_failed / task_total) if task_total else None
 
     # Stuck-loop heuristic (v1, intentionally simple): flag requests whose
     # rounds exceed 3x their source's own 30-day median. The median is a

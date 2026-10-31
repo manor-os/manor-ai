@@ -923,7 +923,6 @@ from packages.core.ai.mcp import discord as _discord_module  # noqa: E402
 from packages.core.ai.mcp import lark as _lark_module  # noqa: E402
 from packages.core.ai.mcp import nango as _nango_module  # noqa: E402
 from packages.core.ai.mcp import apify as _apify_module  # noqa: E402
-from packages.core.ai.mcp import suno as _suno_module  # noqa: E402
 from packages.core.services.official_remote_mcp import (  # noqa: E402
     OfficialRemoteMCPFactory,
     OfficialRemoteMCPProvider,
@@ -931,7 +930,6 @@ from packages.core.services.official_remote_mcp import (  # noqa: E402
 
 _SERVER_TOOL_SCHEMAS["github"] = _adapt_module_tools(_gh_module)
 _SERVER_TOOL_SCHEMAS["apify"] = _adapt_module_tools(_apify_module)
-_SERVER_TOOL_SCHEMAS["suno"] = _adapt_module_tools(_suno_module)
 # quickbooks/telegram had hardcoded catalog entries above whose tool names
 # and params had drifted from the real handlers (e.g. list_customers vs
 # query_customers; telegram send_message's `text` vs the module's `content`).
@@ -1595,6 +1593,33 @@ def _build_handler(
                 }
             )
 
+        if (
+            decision.account_id
+            and decision.account_owner_user_id
+            and decision.account_owner_user_id != user_id
+        ):
+            # The owner's credential is about to serve another member's call.
+            # Queued, not awaited: the write must not cost this call a permit.
+            from packages.core.services import connection_usage
+
+            try:
+                usage_context = runtime_tool_call_context_from_kwargs(
+                    kwargs, entity_id=entity_id, user_id=user_id,
+                )
+            except ValueError:
+                usage_context = None
+            connection_usage.record_shared_connection_use(
+                entity_id=entity_id,
+                connection_kind=decision.account_kind or "",
+                connection_id=decision.account_id,
+                owner_user_id=decision.account_owner_user_id,
+                actor_user_id=user_id,
+                server_key=server_key,
+                tool_name=tool_name,
+                agent_id=getattr(usage_context, "agent_id", None),
+                conversation_id=getattr(usage_context, "conversation_id", None),
+            )
+
         tool_kwargs = {key: value for key, value in kwargs.items() if key not in _MCP_RUNTIME_ONLY_ARGUMENT_KEYS}
 
 
@@ -2090,7 +2115,7 @@ async def _resolve_bearer_token(
                 try:
                     creds = get_credential_service().lease_integration(
                         row,
-                        requester=Requester(kind="agent", id=entity_id),
+                        requester=Requester(kind="agent", id=user_id or entity_id),
                         reason=f"mcp_builtin._resolve_bearer_token:{server_key}",
                     )
                 except Exception:

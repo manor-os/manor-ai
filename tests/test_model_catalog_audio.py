@@ -21,7 +21,6 @@ def test_media_catalog_restores_the_recent_stable_model_choices():
         "sesame/csm-1b",
     }.issubset({item["id"] for item in CATALOG["voice"]})
     assert {
-        "suno/music",
         "google/lyria-3-clip-preview",
         "google/lyria-3-pro-preview",
         "openai/gpt-audio-mini",
@@ -58,7 +57,7 @@ def test_audio_roles_keep_the_product_catalog_models():
     assert DEFAULTS["audio"] in audio_ids
     assert DEFAULTS["sfx"] in sfx_ids
     assert {"openai/tts-1", "openai/tts-1-hd"}.issubset(voice_ids)
-    assert {"suno/music", "google/lyria-3-clip-preview", "google/lyria-3-pro-preview"}.issubset(audio_ids)
+    assert {"google/lyria-3-clip-preview", "google/lyria-3-pro-preview"}.issubset(audio_ids)
     assert {"openai/gpt-audio-mini", "openai/gpt-audio"}.issubset(sfx_ids)
 
 
@@ -104,3 +103,15 @@ def test_stt_catalog_exposes_vercel_transcription_models():
         "alignment_compatible": False,
         "route": "transcription_model",
     }
+
+
+def test_timed_transcription_never_uses_a_model_that_cannot_give_timings():
+    from packages.core.constants.models import timestamped_stt_model
+
+    # The default STT model transcribes text only; recordings need when each line was said.
+    assert timestamped_stt_model(DEFAULTS["stt"]) == "openai/whisper-1"
+    assert timestamped_stt_model("openai/gpt-4o-transcribe") == "openai/whisper-1"
+    assert timestamped_stt_model("") == "openai/whisper-1"
+    # A timestamp-capable choice, or a model the catalog does not know, stays the person's choice.
+    assert timestamped_stt_model("groq/whisper-large-v3") == "groq/whisper-large-v3"
+    assert timestamped_stt_model("custom/local-whisper") == "custom/local-whisper"

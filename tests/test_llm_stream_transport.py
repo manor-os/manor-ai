@@ -44,7 +44,7 @@ def test_both_completion_paths_stream_without_a_handler():
 
     from packages.core.ai import llm_client
 
-    for fn in (llm_client.chat_completion, llm_client.chat_completion_with_tools):
+    for fn in (llm_client._chat_completion_attempt, llm_client._chat_completion_with_tools_attempt):
         source = inspect.getsource(fn)
         assert "stream_handler is not None or _llm_stream_transport_enabled()" in source, (
             f"{fn.__name__} no longer streams for background (handler-less) calls"
@@ -118,7 +118,7 @@ def test_with_tools_stream_path_estimates_from_arguments_too():
 
     from packages.core.ai import llm_client
 
-    source = inspect.getsource(llm_client.chat_completion_with_tools)
+    source = inspect.getsource(llm_client._chat_completion_with_tools_attempt)
     assert "arguments_text" in source.split("_backfill_streamed_usage")[1][:400] or (
         "streamed_completion_text" in source
     ), "tool-call-only streams would record zero tokens"

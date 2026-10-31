@@ -9,6 +9,8 @@ from packages.core.contracts.audio_generation import (
     AudioGenerationFormat,
     AudioGenerationPurpose,
     AudioGenerationRole,
+    DEFAULT_NARRATION_VOICE_ROLE,
+    REQUESTABLE_NARRATION_VOICE_MODES,
     normalize_audio_generation_purpose,
 )
 
@@ -16,6 +18,7 @@ from packages.core.contracts.audio_generation import (
 async def _existing_narration_profile(
     *, entity_id: str, workspace_id: str | None, task_id: str | None,
     conversation_id: str | None, mode: str | None,
+    project_id: str | None = None, voice_role: str | None = None,
 ) -> dict[str, Any] | None:
     """Read a pinned narrator without creating a profile or changing scope."""
     if not entity_id:
@@ -25,9 +28,21 @@ async def _existing_narration_profile(
     from packages.core.database import async_session
     from packages.core.models.task import Conversation, Task
     from packages.core.models.workspace import Workspace
+    from packages.core.services.project_references import ProjectReferenceError, read_project_reference
 
     selected_mode = str(mode or "").strip()
     async with async_session() as db:
+        if workspace_id and project_id:
+            # A project's voice wins over every other scope, as in generation.
+            try:
+                reference = await read_project_reference(
+                    db, entity_id=entity_id, workspace_id=workspace_id, project_id=project_id,
+                    kind="voices", role=str(voice_role or "").strip() or DEFAULT_NARRATION_VOICE_ROLE,
+                )
+            except ProjectReferenceError:
+                reference = None
+            if reference is not None:
+                return reference.value
         workspace = None
         if workspace_id:
             workspace = (
@@ -67,6 +82,7 @@ async def selected_media_model_contract(
     *, kind: str, entity_id: str, user_id: str, task_id: str | None = None,
     purpose: str | None = None, workspace_id: str | None = None,
     conversation_id: str | None = None, narration_voice_mode: str | None = None,
+    project_id: str | None = None, voice_role: str | None = None,
 ) -> dict[str, Any]:
     # Use the same actor and model resolution as the paid generation handlers.
     from packages.core.ai.tools import extended_tools
@@ -79,13 +95,18 @@ async def selected_media_model_contract(
         )
         account_selected_model = model
         model_source = "account_selection"
+        # Report the model generation will actually run: the selection when the
+        # caller's credentials have a route for it, else the first runnable one.
+        model, route = await extended_tools._runnable_audio_model(actor_id, entity_id, model, role)
+        if model != account_selected_model:
+            model_source = "runnable_fallback"
         if selected_purpose == AudioGenerationPurpose.NARRATION and (
             narration_voice_mode or workspace_id
         ):
             profile = await _existing_narration_profile(
                 entity_id=entity_id, workspace_id=workspace_id,
                 task_id=task_id, conversation_id=conversation_id,
-                mode=narration_voice_mode,
+                mode=narration_voice_mode, project_id=project_id, voice_role=voice_role,
             )
             if profile is not None:
                 try:
@@ -94,6 +115,7 @@ async def selected_media_model_contract(
                     return {"kind": kind, "purpose": selected_purpose.value, "status": "blocked", "error": str(exc)}
                 model = str(checked_profile["model"])
                 model_source = "pinned_narrator_profile"
+                route = ""
         provider = model.split("/", 1)[0] if model else ""
         schema: dict[str, Any] = {
             "prompt": {"type": "string", "required": True},
@@ -103,29 +125,35 @@ async def selected_media_model_contract(
             },
         }
         if role == AudioGenerationRole.VOICE:
+            voice_schema: dict[str, Any] = {"type": "string", "default": extended_tools._default_openrouter_voice(model), "note": "Provider-specific voice name."}
+            if provider == "elevenlabs":
+                voice_schema.update({
+                    "enum": list(extended_tools._ELEVENLABS_PREMADE_VOICES),
+                    "note": "ElevenLabs premade voice name, or a 20-character ElevenLabs voice ID for a custom/cloned voice (BYOK OpenRouter key with ElevenLabs BYOK). Other names fall back to the default.",
+                })
             schema.update({
-                "voice": {"type": "string", "default": extended_tools._default_openrouter_voice(model), "note": "Provider-specific voice name."},
-                "voice_instructions": {"type": "string", "supported": extended_tools._speech_model_supports_instructions(model), "note": "tts-1 and tts-1-hd do not accept delivery instructions; other routes may send them as a parameter or prompt guidance."},
+                "voice": voice_schema,
+                "voice_instructions": {"type": "string", "supported": extended_tools._speech_model_supports_instructions(model), "note": "tts-1, tts-1-hd and ElevenLabs do not accept delivery instructions (ElevenLabs v3/v4 read inline audio tags such as [whispering] in the prompt); other routes may send them as a parameter or prompt guidance."},
                 "language": {"type": "string", "note": "Language hint; defaults to Workspace audio language."},
-                "narration_voice_mode": {"type": "string", "enum": ["random_per_task", "random_per_conversation", "fixed_per_workspace"], "available_for": "narration only"},
+                "narration_voice_mode": {"type": "string", "enum": list(REQUESTABLE_NARRATION_VOICE_MODES), "available_for": "narration only", "note": "Inside a project that holds a voice (a series), that voice is used whatever is asked."},
+                "voice_role": {"type": "string", "default": DEFAULT_NARRATION_VOICE_ROLE, "note": "Inside a project, each role (narrator, host, guest) keeps its own pinned voice."},
                 "duration_seconds": {"supported_as_provider_parameter": False, "note": "No exact speech duration control through this tool."},
-            })
-        elif model == "suno/music":
-            schema.pop("response_format")  # Suno jobs retain the provider's downloaded audio format.
-            schema.update({
-                "instrumental": {"type": "boolean", "default": False},
-                "lyrics": {"type": "string", "note": "Required in custom mode when instrumental is false."},
-                "style": {"type": "string", "note": "With lyrics, enables custom mode."},
-                "title": {"type": "string"},
-                "duration_seconds": {"supported_as_provider_parameter": False},
-                "output_format": {"controlled_by_provider": True},
             })
         elif provider == "google" and "lyria-3-clip" in model:
             schema["duration_seconds"] = {"fixed_output_seconds": 30, "supported_as_provider_parameter": False}
             schema["provider_output_format"] = "mp3"
         elif provider == "google" and "lyria-3-pro" in model:
             schema["duration_seconds"] = {"supported_as_provider_parameter": False, "note": "Added to the prompt as a target, not guaranteed by the provider."}
-            schema["provider_output_formats"] = ["mp3", "wav"]
+            # WAV is a native Gemini option; OpenRouter returns MP3.
+            schema["provider_output_formats"] = ["mp3"] if route == "openrouter" else ["mp3", "wav"]
+        elif extended_tools._is_vercel_music_model(model, role.value):
+            schema["duration_seconds"] = {
+                "supported_as_provider_parameter": True,
+                "minimum": extended_tools._VERCEL_MUSIC_MIN_MS / 1000,
+                "maximum": extended_tools._VERCEL_MUSIC_MAX_MS / 1000,
+                "note": "Exact length of the generated track; omit to let the model choose.",
+            }
+            schema["provider_output_format"] = "mp3"
         else:
             schema["duration_seconds"] = {"supported_as_provider_parameter": False, "note": "Added to the prompt as a target, not an exact provider duration control."}
         return {
@@ -136,6 +164,15 @@ async def selected_media_model_contract(
             "expected_model": model,
             "model_source": model_source,
             "account_selected_model": account_selected_model,
+            **(
+                {}
+                if model_source == "pinned_narrator_profile"
+                else {
+                    "route": route or None,
+                    "runnable": bool(route),
+                    **({} if route else {"route_error": "No configured credential can run a model for this audio role; generation will report the missing key."}),
+                }
+            ),
             "generation_schema": schema,
             "route_note": "Credential and deployment choose the provider route at execution time; output formats may be converted after synthesis.",
             "narration_note": "Pass narration_voice_mode and the active Task/Conversation/Workspace context to inspect a pinned narrator model." if selected_purpose == AudioGenerationPurpose.NARRATION else None,
@@ -152,6 +189,8 @@ async def selected_media_model_contract(
                 "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536"], "default": "1024x1024", "note": "Sent as a provider parameter on native OpenAI; other routes may use aspect_ratio or prompt guidance."},
                 "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1"], "note": "Output is padded to this ratio if necessary; composition is also requested in the prompt."},
                 "reference_urls": {"type": "array", "maxItems": 16},
+                "reference_assets": {"type": "array", "items": {"type": "string"}, "note": "Names of images the project (a series) or Workspace keeps (workspace_asset_key); the runtime sends those exact files as references. An unknown name lists the names that exist."},
+                "workspace_asset_key": {"type": "string", "note": "Keeps this image under a name; inside a project that holds images (a series) the project keeps it for every episode. With reuse_if_exists=true an image already kept under the name is returned without generating."},
                 "quality": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium", "provider_parameter": provider == "openai", "note": "Native OpenAI uses this field; other routes may ignore it."},
                 "input_fidelity": {"type": "string", "enum": ["low", "high"], "provider_parameter": provider == "openai", "requires_reference": True, "note": "Native OpenAI image edits only; other routes may ignore it."},
             },
@@ -184,6 +223,7 @@ async def selected_media_model_contract(
             "aspect_ratio": {"type": "string", "enum": ["adaptive", "21:9", "16:9", "4:3", "3:4", "1:1", "9:16"], "default": "16:9", "note": "Seedance 2.5 uses adaptive for first/last-frame input."},
             "generate_audio": {"type": "boolean", "enum": [False, True] if capabilities.get("native_audio") else [False], "default": bool(capabilities.get("native_audio"))},
             "reference_urls": {"type": "array", "maxItems": capabilities.get("max_reference_images", 0)},
+            "reference_assets": {"type": "array", "items": {"type": "string"}, "note": "Names of images the project (a series) or Workspace keeps (workspace_asset_key); the runtime sends those exact files as references. An unknown name lists the names that exist."},
             "reference_video_urls": {"type": "array", "maxItems": capabilities.get("max_reference_videos", 0), "maxTotalSeconds": capabilities.get("max_reference_video_total_seconds")},
             "audio_reference_urls": {"type": "array", "maxItems": capabilities.get("max_audio_references", 0), "maxTotalSeconds": capabilities.get("max_audio_reference_total_seconds")},
         },

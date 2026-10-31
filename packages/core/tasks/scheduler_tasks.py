@@ -36,7 +36,9 @@ from packages.core.constants.task import TaskStatus
 from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.services.workspace_autonomy import (
     WorkspaceAutonomyState,
+    scheduled_job_is_independent,
     workspace_allows_manual_work,
+    workspace_allows_configured_work,
     workspace_autonomy_skip_reason,
     workspace_autonomy_state,
 )
@@ -208,6 +210,7 @@ async def _preflight_scheduled_job_credits(
             user_id=user_id,
             entity_id=entity_id,
             db=db,
+            workspace_id=workspace_id or getattr(job, "workspace_id", None),
         )
         byok = metadata_has_native_byok(metadata)
     except Exception:
@@ -557,6 +560,10 @@ async def _prepare_scheduler_parent_dispatch(
         )).scalar_one_or_none()
         if job is None or not job.enabled or not _is_due(job, now):
             await db.rollback()
+            return None
+        if job.stop_after is not None and _as_aware_utc(job.stop_after) <= _as_aware_utc(now):
+            job.enabled, job.next_run_at = False, None
+            await db.commit()
             return None
         current_occurrence_key = _scheduled_occurrence_key(job, now)
         if occurrence_key is not None and occurrence_key != current_occurrence_key:
@@ -2118,29 +2125,12 @@ async def _scheduled_agent_execution_recovery_is_suspended(
     task = (await db.execute(
         select(Task).where(Task.id == task_id)
     )).scalar_one_or_none()
-    from packages.core.services.task_state_machine import TERMINAL_STATUSES
-
-    # A terminal Task is never suspended, whatever a stale HITL marker says.
-    if task is None or task.status in TERMINAL_STATUSES:
+    if task is None or task.status not in {
+        TaskStatus.WAITING_ON_CUSTOMER.value,
+        TaskStatus.BLOCKED.value,
+    }:
         return False
     details = task.details if isinstance(task.details, dict) else {}
-    from packages.core.services.task_runtime_approvals import (
-        TASK_RUNTIME_HITL_DETAIL_KEY,
-    )
-
-    runtime_marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-    human_suspended = (
-        task.status in {
-            TaskStatus.WAITING_ON_CUSTOMER.value,
-            TaskStatus.BLOCKED.value,
-        }
-        or (
-            isinstance(runtime_marker, dict)
-            and runtime_marker.get("state") == "waiting"
-        )
-    )
-    if not human_suspended:
-        return False
     return (
         str(details.get("scheduled_run_id") or "") == str(run.id or "")
         and str(details.get("scheduled_job_id") or "") == str(run.job_id or "")
@@ -2881,6 +2871,12 @@ async def _dispatch_job(
         reconcile_scheduled_job_run_projection,
     )
 
+    stop_after = getattr(job, "stop_after", None)
+    if stop_after is not None and _as_aware_utc(now) >= _as_aware_utc(stop_after):
+        job.enabled, job.next_run_at = False, None
+        await db.flush()
+        return
+
     if manual:
         trigger_type = "manual"
     elif job.schedule_kind == "cron":
@@ -3163,10 +3159,23 @@ async def _dispatch_job(
             return
         autonomy_state = workspace_autonomy_state(workspace)
         manual_workspace_allowed = human_requested and workspace_allows_manual_work(workspace)
-        if not manual_workspace_allowed and autonomy_state not in {
+        if scheduled_job_is_independent(exec_type):
+            from packages.core.services.scheduler_service import (
+                scheduled_job_is_workspace_independent,
+            )
+
+            independent_job_allowed = (
+                not human_requested
+                and await scheduled_job_is_workspace_independent(db, job)
+                and workspace_allows_configured_work(workspace)
+            )
+        else:
+            independent_job_allowed = False
+        autonomy_job_allowed = autonomy_state in {
             WorkspaceAutonomyState.RUNNING,
             WorkspaceAutonomyState.DISABLED,
-        }:
+        }
+        if not (manual_workspace_allowed or independent_job_allowed or autonomy_job_allowed):
             await _mark_run_skipped(
                 workspace_autonomy_skip_reason(workspace) or "workspace_unavailable"
             )
@@ -3253,10 +3262,34 @@ async def _dispatch_job(
         })
         if workspace_id:
             trigger_data["workspace_id"] = workspace_id
-        if job.conversation_id:
-            trigger_data.setdefault("conversation_id", job.conversation_id)
+        conversation_id = job.conversation_id
+        if not conversation_id and workspace_id:
+            # A Workspace Flow job without its own chat (a Blueprint schedule)
+            # runs in the Workspace chat, as scheduled Flows created there do,
+            # so an approval it needs reaches Needs you instead of failing.
+            from packages.core.models.task import Conversation
+
+            conversation_id = await db.scalar(
+                select(Conversation.id).where(
+                    Conversation.entity_id == job.entity_id,
+                    Conversation.workspace_id == workspace_id,
+                    Conversation.scope == "workspace_main",
+                    Conversation.status == "active",
+                ).limit(1)
+            )
+        if conversation_id:
+            trigger_data.setdefault("conversation_id", conversation_id)
         if job.manor_task_id:
             trigger_data.setdefault("task_id", job.manor_task_id)
+        trusted_runtime_context = {
+            key: value
+            for key, value in {
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "task_id": job.manor_task_id,
+            }.items()
+            if value
+        }
         from packages.core.services.workflow_service import (
             get_binding,
             start_workflow,
@@ -3272,25 +3305,32 @@ async def _dispatch_job(
                 raise ValueError("Scheduled workflow does not match its workspace binding")
             if binding and workspace_id and binding.workspace_id != workspace_id:
                 raise ValueError("Scheduled workflow binding belongs to another workspace")
+            workflow_inputs = target.get("inputs") if isinstance(target.get("inputs"), dict) else {}
+            # payload_message belongs to the scheduler's durable job prompt.
+            # New schedules reject it as an input; preserve that authority for
+            # legacy or externally-created job rows as well.
+            variables = {**workflow_inputs, "payload_message": prompt}
             if binding:
                 wrun = await start_workflow_from_binding(
                     db,
                     binding,
-                    variables={"payload_message": prompt},
+                    variables=variables,
                     trigger_data=trigger_data,
                     started_by=execution_user_id,
                     trigger_source="manual" if human_requested else "schedule",
+                    trusted_runtime_context=trusted_runtime_context,
                 )
             else:
                 wrun = await start_workflow(
                     db,
                     entity_id=job.entity_id or "",
                     workflow_id=workflow_id,
-                    variables={"payload_message": prompt},
+                    variables=variables,
                     trigger_data=trigger_data,
                     started_by=execution_user_id,
                     workspace_id=workspace_id,
                     trigger_source="manual" if human_requested else "schedule",
+                    trusted_runtime_context=trusted_runtime_context,
                 )
         except ValueError as exc:
             await _mark_run_error(str(exc))
@@ -3304,8 +3344,8 @@ async def _dispatch_job(
 
     elif exec_type == "skill":
         # Linked to a Skill — bind the full runtime bundle to the Task. The
-        # TaskRunner forces invoke_skill on its first turn, so scripts,
-        # references, requirements and tool policy are not flattened to text.
+        # Task's run carries the Skill out (it is a required Skill), so
+        # scripts, references, requirements and tool policy are not flattened.
         skill_id = (job.execution_target or {}).get("skill_id")
         if not skill_id:
             await _mark_run_error(
@@ -3463,8 +3503,13 @@ async def _dispatch_job(
             return
         from packages.core.models.workspace_stat import WorkspaceStat
         from packages.core.stats.scheduling import should_schedule
+        # A job collects only a Stat of its own company and, when it has one,
+        # its own Workspace; an id from anywhere else is simply not found.
+        stat_scope = [WorkspaceStat.id == stat_id, WorkspaceStat.entity_id == job.entity_id]
+        if job.workspace_id:
+            stat_scope.append(WorkspaceStat.workspace_id == job.workspace_id)
         stat = (await db.execute(
-            select(WorkspaceStat).where(WorkspaceStat.id == stat_id)
+            select(WorkspaceStat).where(*stat_scope)
         )).scalar_one_or_none()
         if stat is None:
             await _mark_run_skipped("stat_not_found")
@@ -3636,8 +3681,8 @@ async def _dispatch_agent_task(
     ).strip()
     if initiative_admission is not None:
         done_when = (
-            "The final output is one valid version-1 Agent Initiative JSON "
-            "decision with decision=notify or decision=silent."
+            "The Task is completed with one valid version-1 Agent Initiative "
+            "decision (decision=notify or decision=silent) as its result."
         )
     elif not done_when:
         done_when = (
@@ -3650,8 +3695,8 @@ async def _dispatch_agent_task(
     deliverable = str(target.get("deliverable") or "").strip()
     if initiative_admission is not None:
         deliverable = (
-            "Exactly one JSON object matching the Agent Initiative Decision "
-            "contract; no markdown fences or surrounding prose."
+            "Exactly one Agent Initiative Decision object, submitted as the "
+            "Task's structured result."
         )
     elif not deliverable:
         deliverable = (
@@ -3688,10 +3733,17 @@ async def _dispatch_agent_task(
             initiative_marker_for_admission,
         )
 
+        from packages.core.contracts.agent_initiative import (
+            INITIATIVE_DECISION_RESULT_SCHEMA,
+        )
+
         marker = initiative_marker_for_admission(initiative_admission)
         details_base.update({
             "agent_initiative": marker.as_dict(),
             "blocked_tool_names": list(target.get("blocked_tool_names") or []),
+            # The run submits its decision as the Task's structured result;
+            # settlement reads it from actual_output["result"].
+            "result_schema": INITIATIVE_DECISION_RESULT_SCHEMA,
         })
         owner_subscription_id = marker.agent_subscription_id
     elif job.agent_id:
@@ -3759,6 +3811,8 @@ async def _dispatch_agent_task(
             agent_id=job.agent_id,
             owner_subscription_id=owner_subscription_id,
             details=details_base,
+            # The Task's run carries out the scheduled Skill.
+            required_skills=[scheduled_skill_id] if scheduled_skill_id else [],
             conversation_id=job.conversation_id,
             creation_logged_by_system=True,
             creation_log_metadata={
@@ -3783,6 +3837,7 @@ async def _dispatch_agent_task(
             creator_id=execution_user_id,
             agent_id=job.agent_id,
             owner_subscription_id=owner_subscription_id,
+            required_skills=[scheduled_skill_id] if scheduled_skill_id else [],
             conversation_id=job.conversation_id,
             details={**details_base, "run_at": now.isoformat()},
         )

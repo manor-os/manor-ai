@@ -20,6 +20,14 @@ def _upload(name: str, content: bytes, content_type: str = "image/png") -> Uploa
     )
 
 
+def _png() -> bytes:
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (1, 1), (240, 20, 40)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class _FakeScalars:
     def __init__(self, docs):
         self._docs = docs
@@ -158,7 +166,7 @@ async def test_large_chat_image_is_saved_for_tools_but_not_inlined(monkeypatch):
         lambda content, filename, entity_id, mime: f"/api/v1/fs/{entity_id}/uploads/chat/{filename}",
     )
 
-    content = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+    content = _png()
 
     attachments = await file_context.build_file_context(
         [_upload("storm.png", content)],
@@ -194,7 +202,7 @@ async def test_small_chat_image_is_saved_and_inlined(monkeypatch):
         lambda content, filename, entity_id, mime: f"/api/v1/fs/{entity_id}/uploads/chat/{filename}",
     )
 
-    content = b"\x89PNG\r\n\x1a\n" + b"x" * 8
+    content = _png()
 
     attachments = await file_context.build_file_context(
         [_upload("tiny.png", content)],
@@ -215,11 +223,13 @@ async def test_workspace_chat_image_is_registered_in_workspace_knowledge(monkeyp
 
     monkeypatch.setattr(file_context, "_MAX_INLINE_IMAGE_BYTES", 128)
     monkeypatch.setattr(file_context, "_MAX_INLINE_IMAGE_TOTAL_BYTES", 128)
-    monkeypatch.setattr(
-        file_context,
-        "_save_chat_image",
-        lambda content, filename, entity_id, mime, **_kwargs: f"/api/v1/fs/{entity_id}/uploads/chat/{filename}",
-    )
+    saved = []
+
+    def _save(content, filename, entity_id, mime, **_kwargs):
+        saved.append(content)
+        return f"/api/v1/fs/{entity_id}/uploads/chat/{filename}"
+
+    monkeypatch.setattr(file_context, "_save_chat_image", _save)
     registrations = []
 
     async def _register(db_arg, **kwargs):
@@ -228,7 +238,7 @@ async def test_workspace_chat_image_is_registered_in_workspace_knowledge(monkeyp
 
     monkeypatch.setattr(file_context, "_register_workspace_chat_upload", _register)
     db = object()
-    content = b"\x89PNG\r\n\x1a\n" + b"x" * 8
+    content = _png()
 
     attachments = await file_context.build_file_context(
         [_upload("cover.png", content)],
@@ -249,7 +259,7 @@ async def test_workspace_chat_image_is_registered_in_workspace_knowledge(monkeyp
         "filename": "cover.png",
         "saved_rel_path": "uploads/chat/cover.png",
         "saved_url": "/api/v1/fs/entity_1/uploads/chat/cover.png",
-        "file_size": len(content),
+        "file_size": len(saved[0]),
         "mime": "image/png",
     }]
     assert attachments.attachment_refs[0]["path"] == "uploads/chat/cover.png"

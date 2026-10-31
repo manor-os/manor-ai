@@ -12,13 +12,49 @@ from sqlalchemy import select
 from packages.core.i18n import t
 from packages.core.constants.goals import GoalStatus
 from packages.core.constants.review import ReviewSkipReason
-from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskType
+from packages.core.constants.task import CancelSource, TaskLogType, TaskRuntimeKind, TaskStatus, TaskType
 from packages.core.ai.runtime.task_actions import runtime_normalize_task_priority
 from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
 from packages.core.ai.runtime.tool_context import runtime_active_user_message_from_context
 from packages.core.services.workspace_autonomy import workspace_allows_manual_work
+from packages.core.services.task_intents import (
+    DRAFTED_NEXT,
+    STARTED_NEXT,
+    already_drafted,
+    draft_only_prepares,
+    drafted_in_open_draft,
+    open_chat_draft_preparing,
+    pending_chat_draft,
+    record_chat_task_effect,
+    resolve_task_start,
+    start_pending_task,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _workspace_chat_origin_message(
+    raw_params: dict[str, Any], *, entity_id: str, workspace_id: str,
+    conversation_id: str | None, user_id: str | None,
+) -> str | None:
+    """The user message this Workspace Chat turn answers, when the call is that turn's own.
+
+    Read from the host's runtime envelope, never from model arguments.
+    """
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    envelope = runtime_tool_call_context_from_kwargs(raw_params).runtime_envelope
+    origin = (getattr(envelope, "metadata", None) or {}).get("origin_user_message_id")
+    if (
+        origin and user_id and conversation_id
+        and getattr(envelope, "entity_id", None) == entity_id
+        and getattr(envelope, "workspace_id", None) == workspace_id
+        and getattr(envelope, "conversation_id", None) == conversation_id
+        and getattr(envelope, "user_id", None) == user_id
+        and getattr(envelope, "surface", None) == "workspace_chat"
+    ):
+        return str(origin)
+    return None
 
 
 def _dumps(payload: dict[str, Any]) -> str:
@@ -459,6 +495,24 @@ async def runtime_workspace_create_task_action(
             workspace = await _load_workspace(db, entity_id=entity_id, workspace_id=workspace_id)
             if not workspace:
                 return _dumps({"error": "workspace not found"})
+            from packages.core.ai.runtime.manor_actions import collaborator_assignee_error
+
+            if assignee_error := await collaborator_assignee_error(
+                db, entity_id, workspace_id, raw_params.get("assignee_id"), user_id=user_id,
+            ):
+                return _dumps(assignee_error)
+            if start_requested and (drafted := await pending_chat_draft(
+                db, entity_id=entity_id, workspace_id=workspace_id,
+                conversation_id=conversation_id, title=title,
+            )):
+                # "Start it" after a draft must run that Task, not a copy of it.
+                return _dumps(already_drafted(drafted))
+            open_draft = await open_chat_draft_preparing(
+                db, entity_id=entity_id, workspace_id=workspace_id,
+                conversation_id=conversation_id, title=title,
+            )
+            if open_draft and not draft_only_prepares(open_draft, title):
+                return _dumps(drafted_in_open_draft(open_draft))
             author_created_by, author_meta, author_actor = await task_service.agent_log_authorship(
                 db, actor_agent_id, fallback=creator_user_id,
             )
@@ -574,16 +628,9 @@ async def runtime_workspace_create_task_action(
             )
 
             call_context = runtime_tool_call_context_from_kwargs(raw_params)
-            envelope = call_context.runtime_envelope
-            envelope_meta = getattr(envelope, "metadata", None) or {}
-            origin_message_id = envelope_meta.get("origin_user_message_id")
-            if (
-                origin_message_id and creator_user_id and conversation_id
-                and getattr(envelope, "entity_id", None) == entity_id
-                and getattr(envelope, "workspace_id", None) == workspace_id
-                and getattr(envelope, "conversation_id", None) == conversation_id
-                and getattr(envelope, "user_id", None) == creator_user_id
-                and getattr(envelope, "surface", None) == "workspace_chat"
+            if origin_message_id := _workspace_chat_origin_message(
+                raw_params, entity_id=entity_id, workspace_id=workspace_id,
+                conversation_id=conversation_id, user_id=creator_user_id,
             ):
                 # Never copy a model-supplied details/origin object. This is
                 # provenance, not authorization, and survives a Chat resume.
@@ -591,18 +638,11 @@ async def runtime_workspace_create_task_action(
                     "kind": "workspace_chat_create", "entity_id": entity_id,
                     "workspace_id": workspace_id, "user_id": creator_user_id,
                     "conversation_id": conversation_id,
-                    "origin_user_message_id": str(origin_message_id),
+                    "origin_user_message_id": origin_message_id,
                 }}
-                from packages.core.ledger.event_types import EXECUTION_REQUESTED
-                from packages.core.ledger.service import record_event
-
-                await record_event(
-                    db, entity_id=entity_id, workspace_id=workspace_id,
-                    event_type=EXECUTION_REQUESTED, source_kind="task", source_id=task.id,
-                    idempotency_key=f"chat-task-created:{task.id}",
-                    causation_id=str(origin_message_id), root_execution_id=task.id,
-                    actor_kind="user", actor_id=creator_user_id,
-                    payload=task.details["execution_origin"],
+                await record_chat_task_effect(
+                    db, task, effect="created", origin_user_message_id=origin_message_id,
+                    user_id=creator_user_id, conversation_id=conversation_id,
                 )
             manual_request = await runtime_tool_is_user_requested(
                 db, entity_id=entity_id, workspace_id=workspace_id, kwargs=raw_params,
@@ -677,6 +717,7 @@ async def runtime_workspace_create_task_action(
                         entity_id,
                         user_id=creator_user_id,
                         manual_execution=manual_request,
+                        cancel_source=CancelSource.SYSTEM.value,  # an agent call
                         dispatch_plan=False,
                         status="in_progress",
                         details=dict(task.details or {}),
@@ -707,6 +748,13 @@ async def runtime_workspace_create_task_action(
             if dispatch_after_commit:
                 assert execution is not None
                 await stage_task_execution_intent(db, task, execution)
+            if open_draft:
+                # The user confirmed the Task in words; its draft card is done.
+                from packages.core.services.workspace_operation_service import supersede_task_draft
+
+                await supersede_task_draft(
+                    db, open_draft, conversation_id=conversation_id or "", user_id=user_id,
+                )
             await db.commit()
             await db.refresh(task)
 
@@ -718,6 +766,11 @@ async def runtime_workspace_create_task_action(
         return _dumps({
             "created": True,
             "task": _workspace_task_to_dict(task),
+            **({"superseded_draft_id": open_draft.id} if open_draft else {}),
+            "next": STARTED_NEXT if dispatched else (
+                "It waits for its predecessor Tasks and starts when they complete."
+                if dispatch_blocked_by_dependencies else DRAFTED_NEXT
+            ),
             "dispatched": dispatched,
             "dispatch_mode": "planner" if dispatch_after_commit else None,
             "dispatch_blocked_by_dependencies": dispatch_blocked_by_dependencies,
@@ -790,15 +843,49 @@ async def runtime_workspace_update_task_runtime_action(
             )
             details["runtime_context"] = runtime
 
+            execution = manual = None
+            if _truthy(raw_params.get("start")):
+                execution, refusal = await resolve_task_start(db, task, details)
+                if refusal:
+                    return _dumps(refusal)
+                manual = await runtime_tool_is_user_requested(
+                    db, entity_id=entity_id, workspace_id=workspace_id, kwargs=raw_params,
+                )
+                if manual and user_id:
+                    from packages.core.services.task_execution_origin import (
+                        MANUAL_EXECUTION_KEY,
+                        record_manual_task_execution,
+                    )
+
+                    record_manual_task_execution(task, user_id=user_id, action="workspace_chat_task_start")
+                    details[MANUAL_EXECUTION_KEY] = task.details[MANUAL_EXECUTION_KEY]
+
             updated = await task_service.update_task(
                 db,
                 task_id,
                 entity_id,
                 user_id=user_id or None,
+                cancel_source=CancelSource.SYSTEM.value,  # an agent call
                 details=details,
             )
             if not updated:
                 return _dumps({"error": "task not found"})
+            started = execution is not None
+            if started:
+                updated = await start_pending_task(
+                    db, updated, execution, user_id=user_id or None, manual_execution=bool(manual),
+                )
+                starter = _internal_task_creator_id_from_runtime_tool_kwargs(
+                    raw_params, fallback_user_id=user_id,
+                )
+                if origin_message_id := _workspace_chat_origin_message(
+                    raw_params, entity_id=entity_id, workspace_id=workspace_id,
+                    conversation_id=conversation_id, user_id=starter,
+                ):
+                    await record_chat_task_effect(
+                        db, updated, effect="started", origin_user_message_id=origin_message_id,
+                        user_id=starter, conversation_id=conversation_id,
+                    )
             author_created_by, author_meta, author_actor = await task_service.agent_log_authorship(
                 db, actor_agent_id, fallback=user_id,
             )
@@ -823,7 +910,10 @@ async def runtime_workspace_update_task_runtime_action(
             await db.commit()
             await db.refresh(updated)
 
-        return _dumps({"updated": True, "task": _workspace_task_to_dict(updated)})
+        payload = {"updated": True, "started": started, "task": _workspace_task_to_dict(updated)}
+        if started:
+            payload["next"] = STARTED_NEXT
+        return _dumps(payload)
     except Exception as exc:  # noqa: BLE001
         logger.exception("workspace_update_task_runtime failed")
         return _dumps({"error": f"failed to update task runtime requirements: {exc}"})

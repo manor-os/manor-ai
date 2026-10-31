@@ -1712,6 +1712,145 @@ async def test_visualization_tool_rejects_external_surface_before_storage(monkey
     assert result["error"]["code"] == ("ledger_visualization_not_available_on_external_surface")
 
 
+@pytest.fixture
+def run_workflow_ledger_tool_step(monkeypatch):
+    """Run a Ledger tool as a Workflow tool step in a Workspace with ``installed`` Ledgers."""
+
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from packages.core import database
+    from packages.core.ai.runtime import ChatSurface, runtime_request_for_surface_turn
+    from packages.core.ai.runtime import workflow_tools
+    from packages.core.ai.tools import ledger_query_tools as module
+
+    settings: dict = {}
+
+    class Session:
+        async def execute(self, _statement):
+            workspace = SimpleNamespace(settings=settings)
+            return SimpleNamespace(scalar_one_or_none=lambda: workspace)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield Session()
+
+    handlers = {
+        "query_ledger": module._query_ledger,
+        "visualize_workspace_ledgers": module._visualize_workspace_ledgers,
+    }
+
+    async def execute_tool(name, args, **kwargs):
+        # The registry's actor and approval gates are covered elsewhere; this
+        # hands the tool the surface the workflow tool step resolved.
+        return await handlers[name](
+            kwargs["entity_id"],
+            **args,
+            workspace_id=kwargs["workspace_id"],
+            _allowed_tool_names_from_context=sorted(kwargs["allowed_tool_names"]),
+            _runtime_envelope_from_context=kwargs["runtime_envelope"],
+        )
+
+    monkeypatch.setattr(database, "async_session", fake_session)
+    monkeypatch.setattr(workflow_tools, "runtime_execute_tool", execute_tool)
+
+    async def run(tool_name: str, arguments: dict, *, installed: list[str]):
+        settings["ledger_contracts"] = installed
+        return await workflow_tools.runtime_execute_workflow_tool_step(
+            request=runtime_request_for_surface_turn(
+                surface=ChatSurface.WORKFLOW_AGENT_STEP,
+                entity_id="entity-1",
+                user_id=None,
+                workspace_id="workspace-1",
+                message="List tracked creators",
+                legacy_path="unit.workflow_tool_step",
+            ),
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [
+        (["relationship_ledger"], "ok"),
+        (["recruiting_ledger"], "ledger_contract_not_bound"),
+    ],
+)
+async def test_workflow_tool_step_queries_ledger_installed_in_its_workspace(
+    monkeypatch,
+    run_workflow_ledger_tool_step,
+    installed,
+    expected,
+) -> None:
+    from packages.core.ai.tools import ledger_query_tools as module
+
+    queried: list[dict] = []
+
+    async def fake_query(**kwargs):
+        queried.append(kwargs)
+        return {
+            "contract_id": "manor.relationship_ledger/v1",
+            "matched_count": 1,
+            "rows": [{"identity_key": "instagram:@ada", "status": "tracked"}],
+            "aggregates": {},
+            "groups": [],
+            "group_count": 0,
+            "groups_truncated": False,
+            "next_cursor": None,
+            "as_of": "2026-10-24T08:00:00Z",
+        }
+
+    monkeypatch.setattr(module, "query_relationship_ledger", fake_query)
+
+    result = await run_workflow_ledger_tool_step(
+        "query_ledger",
+        {
+            "contract_id": "relationship_ledger",
+            "view": "current",
+            "filters": {"status": "tracked"},
+        },
+        installed=installed,
+    )
+
+    payload = json.loads(result.output)
+    if expected == "ok":
+        assert payload["ok"] is True
+        assert payload["matched_count"] == 1
+        assert queried[0]["filters"] == {"status": "tracked"}
+        assert result.allowed_tool_names == {"query_ledger", "read_relationship_ledger"}
+    else:
+        assert payload["error"]["code"] == expected
+        assert queried == []
+        assert result.allowed_tool_names == {"query_ledger"}
+
+
+@pytest.mark.asyncio
+async def test_workflow_tool_step_visualizes_ledgers_installed_in_its_workspace(
+    monkeypatch,
+    run_workflow_ledger_tool_step,
+) -> None:
+    from packages.core.ai.tools import ledger_query_tools as module
+
+    async def fake_overview(**kwargs):
+        return {"allowed": sorted(kwargs["allowed_contract_ids"])}
+
+    monkeypatch.setattr(module, "workspace_ledger_overview", fake_overview)
+
+    result = await run_workflow_ledger_tool_step(
+        "visualize_workspace_ledgers",
+        {},
+        installed=["relationship_ledger", "recruiting_ledger"],
+    )
+
+    assert json.loads(result.output)["visualization"]["data"] == {
+        "allowed": ["manor.recruiting_ledger/v1", "manor.relationship_ledger/v1"],
+    }
+
+
 def test_workspace_ledger_binding_auto_exposes_query_tool() -> None:
     from packages.core.ai.runtime.profiles import WORKSPACE_AGENT_TOOL_PROFILE
     from packages.core.ai.runtime.tool_visibility import resolve_runtime_tool_surface

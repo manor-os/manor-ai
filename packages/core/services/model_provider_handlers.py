@@ -139,6 +139,17 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
         api_shape="atlascloud_video",
         roles=("video",),
     ),
+    "xai": ModelProviderHandler(
+        provider="xai",
+        display_name="xAI Grok",
+        base_url="https://api.x.ai/v1",
+        # No platform xAI key: managed Grok runs through the Vercel AI Gateway.
+        # This handler serves the user's own xAI key, or a key for an
+        # xAI-compatible relay together with that relay's base URL.
+        env_vars=(),
+        api_shape="xai_video",
+        roles=("video", "image"),
+    ),
     "zyphra": ModelProviderHandler(
         provider="zyphra",
         display_name="Zyphra",
@@ -158,14 +169,17 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
         api_shape="openrouter_audio",
         roles=("voice",),
     ),
-    "suno": ModelProviderHandler(
-        provider="suno",
-        display_name="Suno",
-        base_url="https://api.suno.com/v0",
-        env_vars=("SUNO_API_KEY",),
-        key_prefixes=("sk_live_",),
-        api_shape="suno_audio_jobs",
-        roles=("audio",),
+    "elevenlabs": ModelProviderHandler(
+        provider="elevenlabs",
+        display_name="ElevenLabs via OpenRouter",
+        base_url="https://openrouter.ai/api/v1",
+        env_vars=(
+        ),
+        key_prefixes=("sk-or-",),
+        api_shape="openrouter_audio",
+        # Speech runs through OpenRouter; Eleven Music runs only on Manor's
+        # managed Vercel AI Gateway route (OpenRouter does not serve it).
+        roles=("voice", "audio"),
     ),
     "openrouter": ModelProviderHandler(
         provider="openrouter",
@@ -230,9 +244,12 @@ CATALOG_PROVIDER_CAPABILITIES: dict[
     ("voice", "google"): CatalogProviderCapability("model_lookup", "google_generate_content_audio"),
     ("voice", "zyphra"): CatalogProviderCapability("account_and_model_lookup", "zyphra_speech"),
     ("voice", "sesame"): CatalogProviderCapability("model_endpoint_lookup", "openrouter_audio"),
+    ("voice", "elevenlabs"): CatalogProviderCapability("model_endpoint_lookup", "openrouter_audio"),
     ("audio", "google"): CatalogProviderCapability("model_lookup", "google_interactions_audio"),
     ("audio", "openai"): CatalogProviderCapability("model_lookup", "openai_chat_audio"),
-    ("audio", "suno"): CatalogProviderCapability("account_usage", "suno_audio_jobs"),
+    # Eleven Music has no BYOK route: a user key cannot run it, so it is never
+    # live-tested; generation uses the managed Vercel Speech protocol.
+    ("audio", "elevenlabs"): CatalogProviderCapability("managed_only", "vercel_speech"),
     ("sfx", "openai"): CatalogProviderCapability("model_lookup", "openai_chat_audio"),
     ("stt", "openai"): CatalogProviderCapability("model_lookup", "openai_audio_transcriptions"),
     ("stt", "groq"): CatalogProviderCapability("model_lookup", "groq_audio_transcriptions"),
@@ -240,6 +257,8 @@ CATALOG_PROVIDER_CAPABILITIES: dict[
     ("video", "bytedance"): CatalogProviderCapability("task_list", "volcengine_video_tasks"),
     ("video", "kwaivgi"): CatalogProviderCapability("task_list", "kling_video_tasks"),
     ("video", "atlascloud"): CatalogProviderCapability("model_list", "atlascloud_video_tasks"),
+    ("video", "xai"): CatalogProviderCapability("model_list", "xai_video_tasks"),
+    ("image", "xai"): CatalogProviderCapability("model_list", "xai_images"),
 }
 
 
@@ -266,6 +285,11 @@ VERCEL_MODEL_ALIASES: dict[str, str] = {
     "qwen/qwen3.6-plus": "alibaba/qwen3.6-plus",
     "kwaivgi/kling-v3.0-std": "klingai/kling-v3.0-t2v",
     "kwaivgi/kling-v3.0-pro": "klingai/kling-v3.0-t2v",
+    "xai/grok-imagine-image": "spacexai/grok-imagine-image",
+    "xai/grok-imagine-image-2.0": "spacexai/grok-imagine-image-2.0",
+    "xai/grok-imagine-video": "spacexai/grok-imagine-video",
+    "xai/grok-imagine-video-1.5": "spacexai/grok-imagine-video-1.5",
+    "xai/grok-imagine-video-1.5-lite": "spacexai/grok-imagine-video-1.5-lite",
 }
 
 
@@ -304,6 +328,8 @@ VERCEL_CATALOG_MEDIA_MODEL_TYPES: dict[tuple[str, str], str] = {
     ("image", "openai/gpt-5-image-mini"): "image",
     ("voice", "openai/tts-1-hd"): "speech",
     ("voice", "openai/tts-1"): "speech",
+    # Vercel publishes ElevenLabs Music as a Speech-protocol model.
+    ("audio", "elevenlabs/music-v2.5"): "speech",
     ("stt", "openai/whisper-1"): "transcription",
     ("stt", "openai/gpt-4o-mini-transcribe"): "transcription",
     ("stt", "openai/gpt-4o-transcribe"): "transcription",
@@ -312,6 +338,11 @@ VERCEL_CATALOG_MEDIA_MODEL_TYPES: dict[tuple[str, str], str] = {
     ("video", "bytedance/seedance-v1.0-pro-fast"): "video",
     ("video", "kwaivgi/kling-v3.0-std"): "video",
     ("video", "kwaivgi/kling-v3.0-pro"): "video",
+    ("image", "xai/grok-imagine-image"): "image",
+    ("image", "xai/grok-imagine-image-2.0"): "image",
+    ("video", "xai/grok-imagine-video"): "video",
+    ("video", "xai/grok-imagine-video-1.5"): "video",
+    ("video", "xai/grok-imagine-video-1.5-lite"): "video",
     ("embedding", "openai/text-embedding-3-small"): "embedding",
 }
 
@@ -439,6 +470,32 @@ def catalog_provider_capability(
     return CATALOG_PROVIDER_CAPABILITIES.get((normalized_role, provider or ""))
 
 
+# Catalog media models that OpenRouter serves with the same request contract
+# Manor uses on its managed OpenRouter route, so a BYOK OpenRouter key can run
+# them: Sesame and ElevenLabs speech (OpenRouter is their only route) and
+# Google Lyria music (OpenRouter chat-completions audio output, used when no
+# native Google key is configured).
+_OPENROUTER_BYOK_MEDIA_PROVIDERS: dict[str, frozenset[str]] = {
+    "voice": frozenset({"sesame", "elevenlabs"}),
+}
+_OPENROUTER_BYOK_MEDIA_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "audio": ("google/lyria-3-",),
+}
+
+
+def openrouter_byok_media_model(role: str, model_id: str) -> bool:
+    """Whether a BYOK OpenRouter key may Test/Save/run this catalog media model."""
+
+    normalized_role = str(role or "").strip().lower()
+    normalized_model = str(model_id or "").strip().lower()
+    provider = provider_for_model_id(normalized_model) or ""
+    if provider in _OPENROUTER_BYOK_MEDIA_PROVIDERS.get(normalized_role, frozenset()):
+        return True
+    return normalized_model.startswith(
+        _OPENROUTER_BYOK_MEDIA_MODEL_PREFIXES.get(normalized_role, ())
+    )
+
+
 def catalog_byok_contract_issues(
     catalog: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[str]:
@@ -494,8 +551,6 @@ def detect_provider_from_key(api_key: str) -> str | None:
     """Best-effort provider detection from API key prefix."""
 
     key = str(api_key or "").strip()
-    if key.startswith("sk_live_"):
-        return "suno"
     if key.startswith("sk-or-"):
         return "openrouter"
     if key.startswith("gsk_"):

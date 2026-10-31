@@ -3,13 +3,19 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   api,
+  type OAuthConnection,
 } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import { useDisplayPreferences } from "../stores/displayPreferences";
 import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
+import Select from "../components/ui/Select";
+import Toggle from "../components/ui/Toggle";
+import Card from "../components/ui/Card";
 import EmptyState from "../components/ui/EmptyState";
+import Chip from "../components/ui/Chip";
+import ConfirmDialog from "../components/ui/ConfirmDialog";
 import PageHeader from "../components/ui/PageHeader";
 import { ListRowsSkeleton, PanelLoading } from "../components/ui/Skeleton";
 import DeveloperTab from "../components/settings/DeveloperTab";
@@ -33,7 +39,20 @@ import {
   SecuritySection as PasswordSection,
 } from "./Account";
 import { t } from "../lib/i18n";
+import { formatDateOnly, relativeTime } from "../lib/format";
 import { formatUserFacingLabel } from "../lib/taskDisplay";
+import type { UsageBySourceRow } from "../lib/api";
+import { getPreferredTimeZone } from "../lib/format";
+
+/** A usage source's name; a client trial this company paid for names its customer. */
+function usageSourceLabel(row: UsageBySourceRow): string {
+  if (row.source === "customer_trial") {
+    return row.trial_name
+      ? t("page.settings.customer_trial_usage").replace("{name}", row.trial_name)
+      : row.label || row.source;
+  }
+  return formatUserFacingLabel(row.source) || row.source;
+}
 
 /** One bar of the daily consumption chart with a styled hover tooltip. */
 function DailyUsageBar({
@@ -310,6 +329,7 @@ function NotificationsTab() {
       queryClient.invalidateQueries({ queryKey: ["notification-preferences"] });
       toast.success(t("page.settings.settings_saved"));
     },
+    onError: (error: Error) => toast.error(t("page.settings.settings_save_failed"), error.message),
   });
 
   if (isLoading || !data) {
@@ -338,6 +358,7 @@ function NotificationsTab() {
   const defaults = new Set(data.default_channels || []);
   const byKind = data.by_kind || {};
   const quiet = data.quiet_hours || null;
+  const chatEmail = data.chat_email ?? { enabled: true, delay_minutes: 30 };
 
   const effectiveChannelsForKind = (kind: string): Set<string> => {
     const usable = new Set(visibleChannels);
@@ -346,7 +367,9 @@ function NotificationsTab() {
     if (override?.channels && override.channels.length > 0) {
       return new Set(["inapp", ...override.channels.filter((ct) => usable.has(ct))]);
     }
-    return new Set(["inapp", ...Array.from(defaults).filter((ct) => usable.has(ct))]);
+    const kindDefaults = catalog.find((entry) => entry.kind === kind)?.default_channels;
+    const base = kindDefaults && kindDefaults.length > 0 ? kindDefaults : Array.from(defaults);
+    return new Set(["inapp", ...base.filter((ct) => usable.has(ct))]);
   };
 
   const toggleDefault = (channel: string, checked: boolean) => {
@@ -361,7 +384,11 @@ function NotificationsTab() {
     const next = new Set(current);
     if (checked) next.add(channel); else next.delete(channel);
     next.delete("inapp");
-    const override = { channels: Array.from(next), enabled: true };
+    // An empty list reads as "no override" server-side and falls back to the
+    // kind's default channels. Keep ["inapp"] so unchecking the last external
+    // channel really stops it.
+    const external = Array.from(next);
+    const override = { channels: external.length > 0 ? external : ["inapp"], enabled: true };
     updateMutation.mutate({ by_kind: { [kind]: override } });
   };
 
@@ -392,10 +419,35 @@ function NotificationsTab() {
     (acc[entry.category] ||= []).push(entry);
     return acc;
   }, {});
-  const categoryOrder = ["task", "calendar", "agent", "media", "system", "billing"];
+  const categoryOrder = ["task", "calendar", "agent", "media", "system", "billing", "marketplace"];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
+      <section aria-labelledby="chat-email-heading">
+        <h3 id="chat-email-heading" className="manor-section-title">{t("page.settings.chat_email_title")}</h3>
+        <Card minHeight={0} hoverable={false} className="flex flex-col gap-4 p-4">
+          <div className="flex items-start justify-between gap-4">
+            <p className="m-0 text-sm text-[var(--text-muted)]">{t("page.settings.chat_email_description")}</p>
+            <Toggle
+              checked={chatEmail.enabled}
+              disabled={updateMutation.isPending}
+              aria-label={t("page.settings.chat_email_title")}
+              onChange={() => updateMutation.mutate({ chat_email: { enabled: !chatEmail.enabled } })}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <label htmlFor="chat-email-delay" className="text-sm text-[var(--text-default)]">{t("page.settings.chat_email_delay")}</label>
+            <Select
+              id="chat-email-delay"
+              ariaLabel={t("page.settings.chat_email_delay")}
+              value={String(chatEmail.delay_minutes)}
+              disabled={!chatEmail.enabled || updateMutation.isPending}
+              onChange={(value) => updateMutation.mutate({ chat_email: { delay_minutes: Number(value) } })}
+              options={[5, 15, 30, 60, 120].map((minutes) => ({ value: String(minutes), label: t("page.settings.chat_email_minutes", { count: minutes }) }))}
+            />
+          </div>
+        </Card>
+      </section>
       <section
         style={{
           display: "grid",
@@ -711,6 +763,80 @@ function SecurityTab() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   Security — connected coding agents (MCP OAuth sign-ins)
+   ═══════════════════════════════════════════════════════════════════ */
+
+function ConnectedAgentsSection() {
+  const queryClient = useQueryClient();
+  const toast = useToastStore();
+  const [pending, setPending] = useState<OAuthConnection | null>(null);
+  const { data: connections, isLoading } = useQuery({
+    queryKey: ["oauth-connections"],
+    queryFn: () => api.oauthConnections.list(),
+  });
+  const revoke = useMutation({
+    mutationFn: (id: string) => api.oauthConnections.revoke(id),
+    onSuccess: () => {
+      toast.success(t("page.settings.connected_agent_revoked"));
+      setPending(null);
+    },
+    onError: (e: any) => toast.error(t("page.settings.connected_agent_revoke_failed"), String(e?.message || e)),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["oauth-connections"] }),
+  });
+
+  return (
+    <div className="glass-card" style={{ padding: "24px 28px" }}>
+      <h4 className="manor-section-title" style={{ margin: 0 }}>{t("page.settings.connected_agents")}</h4>
+      <p className="manor-section-subtitle" style={{ marginTop: 4 }}>{t("page.settings.connected_agents_desc")}</p>
+      {isLoading ? (
+        <ListRowsSkeleton rows={2} action />
+      ) : !connections?.length ? (
+        <EmptyState compact title={t("page.settings.connected_agents_empty")} />
+      ) : (
+        <div style={{ marginTop: 8 }}>
+          {connections.map((c, i) => (
+            <div
+              key={c.id}
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+                padding: "12px 0", borderTop: i ? "1px solid rgba(28,25,23,0.06)" : undefined,
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontWeight: 600, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                  {!c.verified && <Chip size="sm" variant="slate">{t("page.settings.connected_agent_unverified")}</Chip>}
+                </div>
+                <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                  {t("page.settings.connected_agent_meta")
+                    .replace("{connected}", formatDateOnly(c.connected_at))
+                    .replace("{last}", relativeTime(c.last_used_at))}
+                </div>
+              </div>
+              <Button size="sm" variant="outline" onClick={() => setPending(c)}>
+                {t("page.settings.connected_agent_revoke")}
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+      <ConfirmDialog
+        open={pending !== null}
+        onClose={() => setPending(null)}
+        onConfirm={() => pending && revoke.mutate(pending.id)}
+        closeOnConfirm={false}
+        loading={revoke.isPending}
+        danger
+        title={t("page.settings.connected_agent_revoke_title").replace("{name}", pending?.name ?? "")}
+        message={t("page.settings.connected_agent_revoke_message")}
+        confirmLabel={t("page.settings.connected_agent_revoke")}
+        cancelLabel={t("action.cancel")}
+      />
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    Main Settings Page
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -854,6 +980,7 @@ export default function Settings() {
         <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
           <PasswordSection />
           <SecurityTab />
+          <ConnectedAgentsSection />
         </div>
       );
     }

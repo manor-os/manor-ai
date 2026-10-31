@@ -53,6 +53,12 @@ _SANDBOX_QUEUE_TIMEOUT_MESSAGE = (
     "No work environment became available in time, so the request stopped "
     "before it finished. Please try again."
 )
+# A ticket that waited out its budget -- in the queue, turned away by full
+# runners, or waiting for its runner to come back the whole time -- ran out
+# of time; nothing failed to start.
+_SANDBOX_WAIT_TIMEOUT_CODES = frozenset(
+    {"sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable"}
+)
 _HUMAN_INPUT_TIMEOUT_MESSAGE = (
     "The question in this request was not answered in time, so the request "
     "stopped. Send a new message to continue."
@@ -72,7 +78,7 @@ def runtime_run_failure_message(reason: str | None) -> str:
     from packages.core.ai.runtime.output_policy import PUBLIC_REQUEST_FAILURE_MESSAGE
 
     code = str(reason or "")
-    if code == "sandbox_queue_timeout":
+    if code in _SANDBOX_WAIT_TIMEOUT_CODES:
         return _SANDBOX_QUEUE_TIMEOUT_MESSAGE
     if code.startswith("sandbox_"):
         return _SANDBOX_START_FAILED_MESSAGE

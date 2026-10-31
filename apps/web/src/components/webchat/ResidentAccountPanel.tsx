@@ -1,6 +1,7 @@
 import Button from "../ui/Button";
 import { tForLocale } from "../../lib/i18n";
 import type { useResidentWebchat } from "../../lib/useResidentWebchat";
+import { getPreferredTimeZone } from "../../lib/format";
 
 export default function ResidentAccountPanel({ resident, enabled, language, onNewConversation }: {
   resident: ReturnType<typeof useResidentWebchat>; enabled: boolean; language?: string | null; onNewConversation: () => void;
@@ -8,7 +9,7 @@ export default function ResidentAccountPanel({ resident, enabled, language, onNe
   const text = (key: string) => tForLocale(`webchat_resident.${key}`, language || "en");
   const busy = ["checking", "redirecting", "disconnecting"].includes(resident.phase);
   const verified = resident.phase === "verified" && resident.historyAllowed;
-  return <section aria-label={text("title")} style={{ padding: "12px 16px", background: "var(--surface-muted)", display: "flex", flexDirection: "column", gap: 8, flexShrink: 0, maxHeight: 220, overflowY: "auto" }}>
+  return <section className="public-chat-panel" aria-label={text("title")} style={{ padding: "12px 16px", background: "var(--public-chat-soft, var(--surface-muted))", color: "var(--public-chat-text, inherit)", display: "flex", flexDirection: "column", gap: 8, flexShrink: 0, maxHeight: 220, overflowY: "auto" }}>
     <strong style={{ fontSize: 13 }}>{text("title")}</strong>
     <p role="status" style={{ margin: 0, fontSize: 12 }}>{text(resident.phase)}</p>
     {resident.notice && <p role="alert" style={{ margin: 0, fontSize: 12 }}>{text(resident.notice)}</p>}
@@ -23,7 +24,7 @@ export default function ResidentAccountPanel({ resident, enabled, language, onNe
       </>}
     </div>
     {verified && <>
-      {resident.expiresAt && <small>{text("expires")} {new Date(resident.expiresAt).toLocaleTimeString(language || "en")}</small>}
+      {resident.expiresAt && <small>{text("expires")} {new Date(resident.expiresAt).toLocaleTimeString(language || "en", { timeZone: getPreferredTimeZone() })}</small>}
       {resident.loadingItems ? <p role="status">{text("loading")}</p> : resident.itemsError ? <p role="alert">{text("load_failed")}</p> : resident.items.length === 0 ? <p>{text("empty")}</p> : <ul style={{ margin: 0, paddingLeft: 20, fontSize: 12 }}>
         {resident.items.map(item => <li key={item.id} style={{ padding: "4px 0", overflowWrap: "anywhere" }}><strong>{item.title}</strong> — {item.status.replaceAll("_", " ")}</li>)}
       </ul>}

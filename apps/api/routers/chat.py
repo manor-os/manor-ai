@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.errors import CodedError
 
+from packages.core.services.workspace_app_sections import WORKSPACE_APP_ACTION_META_KEY
 from packages.core.database import get_db
 from packages.core.constants.agents import is_master_agent
 from packages.core.constants.conversation import (
@@ -130,7 +131,7 @@ from packages.core.services.workspace_access import (
     user_readable_workspace_ids,
 )
 from apps.api.chat_audio import SpeechRequest, acquire_audio_lease, authenticated_audio_scope, chat_speech_response
-from apps.api.deps import get_current_user, require_plan
+from apps.api.deps import enforce_plan_resource, get_current_user
 from apps.api.streaming_concurrency import acquire_chat_stream_lease
 from packages.core.services.runtime_run_service import (
     RuntimeRunNotFoundError,
@@ -890,25 +891,31 @@ async def _workflow_run_accessibility_by_message_id(
     db: AsyncSession,
     user: User,
     messages: list[Message],
-) -> dict[str, bool]:
+) -> tuple[dict[str, bool], dict[str, dict]]:
+    """Whether each Flow card's run is readable, and its names in the viewer's language."""
+    from packages.core.i18n import get_locale
+    from packages.core.services.viewer_language import RUN_DISPLAY_I18N_KEY, run_names_for
+
     run_id_by_message_id = {
         message.id: run_id
         for message in messages
         if (run_id := _workflow_run_id_for_message(message))
     }
     if not run_id_by_message_id:
-        return {}
+        return {}, {}
 
     runs = (await db.execute(
-        select(WorkflowRun.id, WorkflowRun.workspace_id).where(
+        select(WorkflowRun.id, WorkflowRun.workspace_id, WorkflowRun.trigger_data[RUN_DISPLAY_I18N_KEY]).where(
             WorkflowRun.id.in_(set(run_id_by_message_id.values())),
             WorkflowRun.entity_id == user.entity_id,
         )
     )).all()
     workspace_id_by_run_id = {
         str(run_id): str(workspace_id) if workspace_id else None
-        for run_id, workspace_id in runs
+        for run_id, workspace_id, _ in runs
     }
+    locale = get_locale()
+    names_by_run_id = {str(run_id): run_names_for(translations, locale) for run_id, _, translations in runs if translations}
     readable_workspace_ids = await user_readable_workspace_ids(
         db,
         entity_id=user.entity_id,
@@ -926,6 +933,9 @@ async def _workflow_run_accessibility_by_message_id(
             or workspace_id_by_run_id[run_id] in readable_workspace_ids
         )
         for message_id, run_id in run_id_by_message_id.items()
+    }, {
+        message_id: names_by_run_id[run_id]
+        for message_id, run_id in run_id_by_message_id.items() if run_id in names_by_run_id
     }
 
 
@@ -978,18 +988,30 @@ async def _chat_message_responses(
     from packages.core.services.runtime_message_projection import cancelled_runtime_message_snapshots
 
     messages = await cancelled_runtime_message_snapshots(db, messages, entity_id=user.entity_id)
-    workflow_run_accessibility = await _workflow_run_accessibility_by_message_id(
+    workflow_run_accessibility, run_names = await _workflow_run_accessibility_by_message_id(
         db,
         user,
         messages,
     )
     return [
-        _to_chat_message_response(
+        _in_viewer_language(_to_chat_message_response(
             message,
             workflow_run_accessible=workflow_run_accessibility.get(message.id),
-        )
+        ), run_names.get(message.id))
         for message in messages
     ]
+
+
+def _in_viewer_language(message: MessageResponse, names: dict | None) -> MessageResponse:
+    """A Flow card names its Flow and steps in the viewer's language (see viewer_language)."""
+    if not names:
+        return message
+    from packages.core.services.viewer_language import localize_run_names
+
+    return message.model_copy(update={
+        field: localize_run_names(getattr(message, field), names)
+        for field in ("refs", "meta", "pending_action", "hitl_requests", "workflow_result")
+    })
 
 
 def _reference_url_variants(ref_url: str | None) -> set[str]:
@@ -1292,13 +1314,22 @@ def _is_runtime_approval_rejected_message(content: str | None) -> bool:
     return bool(isinstance(content, str) and _RUNTIME_APPROVAL_REJECTED_RE.match(content.strip()))
 
 
+def _background_approval_reply_meta(conv: Conversation) -> dict | None:
+    """A Workflow or Task resumed by an approval click says nothing more in a
+    Workspace conversation: the card's "You chose" line is the receipt. The row
+    stays for the audit trail; clients never show it."""
+
+    return {"approval_receipt": True} if conv.workspace_id else None
+
+
 async def _runtime_approval_rejected_stream(conversation_id: str, content: str, message_id: str | None = None):
     yield format_sse("stream_start", {"conversation_id": conversation_id, "message_id": message_id})
-    yield format_sse("text_delta", {
-        "conversation_id": conversation_id,
-        "message_id": message_id,
-        "content": content,
-    })
+    if content:
+        yield format_sse("text_delta", {
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "content": content,
+        })
     yield format_sse(
         "stream_end",
         {
@@ -1317,8 +1348,13 @@ async def _require_chat_budget_unless_pending_approval(
     user: User,
     conversation_id: str | None,
     message: str,
+    workspace_id: str | None,
 ) -> bool:
-    """Apply the AI-credit gate unless this turn resolves a live HITL card."""
+    """Apply the AI-credit gate unless this turn resolves a live HITL card.
+
+    ``workspace_id`` must be the resolved, authorized scope of the turn
+    (``_resolve_chat_workspace_scope``): its payer is gated.
+    """
 
     pending_approval = await chat_hitl_action_is_pending(
         db,
@@ -1327,7 +1363,7 @@ async def _require_chat_budget_unless_pending_approval(
         message=message,
     )
     if not pending_approval:
-        await require_plan("ai_budget_usd")(user=user, db=db)
+        await enforce_plan_resource("ai_budget_usd", user=user, db=db, workspace_id=workspace_id)
     return pending_approval
 
 
@@ -1517,18 +1553,22 @@ async def answer_chat_runtime_run_input(
             status = 422
         raise HTTPException(status, exc.detail) from exc
     # The answer is part of the conversation, not only of the checkpoint: a
-    # reload must show what the person said.
-    answer_text = (req.answer or "").strip()
-    if not answer_text and req.fields:
-        answer_text = "; ".join(f"{key}: {value}" for key, value in req.fields.items())
-    if not answer_text and req.choice:
-        answer_text = str(req.choice)
+    # reload must show what the person said — the option they picked and
+    # any note or field they filled in.
+    choice = str(req.choice or "").strip()
+    note = (req.answer or "").strip()
+    filled = "; ".join(
+        f"{key}: {value}" for key, value in (req.fields or {}).items() if str(value or "").strip()
+    )
+    answer_text = "\n".join(part for part in (
+        choice, note if note != choice else "", filled,
+    ) if part)
     if answer_text:
         from packages.core.services.runtime_human_input import (
             record_human_input_answer_message,
         )
 
-        await record_human_input_answer_message(db, run=run, answer_text=answer_text)
+        await record_human_input_answer_message(db, run=run, answer_text=answer_text, user_id=user.id)
     await db.commit()
     from packages.core.tasks.runtime_tasks import dispatch_runtime_outbox_once
 
@@ -2217,16 +2257,12 @@ async def _live_video_sandbox_matches_skill(
     if not normalized_id:
         return False
     try:
-        from packages.core.services.sandbox_sdk import SandboxClient
+        # Both the video-edit Skill sandbox and the Video Edit session
+        # container are admitted by the sandbox session service and live on
+        # whichever runner allocated them.
+        from packages.core.ai.runtime.sandbox import runtime_sandbox_client
 
-        sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
-        if not sandbox_url:
-            return False
-        client = SandboxClient(
-            base_url=sandbox_url,
-            timeout=10.0,
-            api_token=get_settings().SANDBOX_API_TOKEN.strip(),
-        )
+        client = await runtime_sandbox_client(normalized_id)
         try:
             info = await client.status(normalized_id)
         finally:
@@ -2247,16 +2283,18 @@ async def _conversation_video_edit_route_state(
     *,
     entity_id: str,
     user_id: str,
+    agent_id: str | None = None,
 ) -> _VideoEditRouteState:
     """Resolve Auto-mode continuation from owned, live session state only."""
 
+    del agent_id  # the conversation's sandboxes are shared by all of its agents
     normalized_conversation_id = str(conversation_id or "").strip()
     if not normalized_conversation_id:
         return _VideoEditRouteState.INACTIVE
 
     from packages.core.ai.runtime import (
-        runtime_load_sandbox_context,
-        runtime_sandbox_context_owner_matches,
+        runtime_sandbox_scope,
+        runtime_work_skill_sandbox,
     )
     from packages.core.ai.runtime.video_edit_sessions import (
         assert_video_edit_session_owner,
@@ -2282,19 +2320,22 @@ async def _conversation_video_edit_route_state(
         ):
             return _VideoEditRouteState.EDIT_SESSION
 
-    skill_context = await runtime_load_sandbox_context(normalized_conversation_id)
-    if (
-        runtime_sandbox_context_owner_matches(
-            skill_context,
-            entity_id=entity_id,
-            user_id=user_id,
-        )
-        and str((skill_context or {}).get("skill_id") or "").strip()
-        == _VideoSandboxSkill.EDIT_SKILL.value
-        and await _live_video_sandbox_matches_skill(
-            str((skill_context or {}).get("sandbox_id") or ""),
-            _VideoSandboxSkill.EDIT_SKILL,
-        )
+    # A live video-edit Skill this conversation opened (the container is the
+    # user's, shared by all of their conversations; the route follows only
+    # this conversation's Skill), whichever of its agents opened it.
+    skill_scope = runtime_sandbox_scope(
+        entity_id=entity_id,
+        user_id=user_id,
+        binding_key=normalized_conversation_id,
+    )
+    found = (
+        await runtime_work_skill_sandbox(skill_scope, _VideoSandboxSkill.EDIT_SKILL.value)
+        if skill_scope is not None
+        else None
+    )
+    if found is not None and await _live_video_sandbox_matches_skill(
+        found[0],
+        _VideoSandboxSkill.EDIT_SKILL,
     ):
         return _VideoEditRouteState.SKILL_SANDBOX
 
@@ -2705,7 +2746,6 @@ async def stream_global_chat_flow_entrypoint(
     local_worker_id: str | None = Form(None),
     document_ids: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
-    _gate=Depends(require_plan("ai_budget_usd")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2726,6 +2766,8 @@ async def stream_global_chat_flow_entrypoint(
     if resolved is None:
         raise HTTPException(404, "Flow not found")
     entrypoint, binding, _workflow, workspace = resolved
+    # Gated once the Flow's Workspace is known: its payer runs the Flow.
+    await enforce_plan_resource("ai_budget_usd", user=user, db=db, workspace_id=workspace.id)
     file_context_turn = await _build_attachments(
         message,
         document_ids,
@@ -2829,6 +2871,11 @@ async def chat_stream(
     client_message_id: str | None = Form(None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
     agent_id: str | None = Form(None),
     workspace_id: str | None = Form(None),
+    # The Workspace App entry that sent this request: presentation only, so the
+    # App can list the request and its reply under that entry.
+    workspace_app_action: str | None = Form(
+        None, max_length=140, pattern=r"^(workflow|service|automation|action):[A-Za-z0-9_.:-]{1,128}$",
+    ),
     workspace_context: bool = Form(False),
     thread_ref_kind: str | None = Form(None),
     thread_ref_id: str | None = Form(None),
@@ -2855,6 +2902,7 @@ async def chat_stream(
     """
     # A correlation receipt only: it never selects a row or authorizes a retry.
     client_message_id = client_message_id if isinstance(client_message_id, str) else None
+    workspace_app_action = workspace_app_action if isinstance(workspace_app_action, str) else None
     requested_conversation_surface = _parse_chat_conversation_surface(
         conversation_surface
     )
@@ -2944,12 +2992,6 @@ async def chat_stream(
         if parsed_response_surface_submission is not None
         else None
     )
-    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
-        db,
-        user=user,
-        conversation_id=conversation_id,
-        message=message,
-    )
     workspace_id, thread_ref_kind, thread_ref_id = await _resolve_chat_workspace_scope(
         db,
         user,
@@ -2958,6 +3000,13 @@ async def chat_stream(
         thread_ref_kind=thread_ref_kind,
         thread_ref_id=thread_ref_id,
         workspace_context=workspace_context,
+    )
+    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
+        db,
+        user=user,
+        conversation_id=conversation_id,
+        message=message,
+        workspace_id=workspace_id,
     )
     if parsed_response_surface_submission is not None:
         task_session_agent_id = await _resolve_task_session_request_agent(
@@ -2995,6 +3044,7 @@ async def chat_stream(
         conversation_id,
         entity_id=user.entity_id,
         user_id=user.id,
+        agent_id=agent_id,
     )
     lease = await acquire_chat_stream_lease(scope="chat")
     block_immediate_workflow_tools = False
@@ -3327,7 +3377,7 @@ async def chat_stream(
         elif pending_approval_turn:
             # The card changed between the preflight lookup and resolution. Do
             # not let a stale structured action become an ungated AI prompt.
-            await require_plan("ai_budget_usd")(user=user, db=db)
+            await enforce_plan_resource("ai_budget_usd", user=user, db=db, workspace_id=workspace_id)
 
         # Approval resolution is host control flow.  The typed outcome is
         # authoritative; the legacy marker remains only as a compatibility
@@ -3398,12 +3448,17 @@ async def chat_stream(
                 conv.id,
                 role="assistant",
                 content=replacement,
+                meta=_background_approval_reply_meta(conv),
             )
             await db.commit()
             return await _chat_streaming_response(
                 db,
                 lease,
-                _runtime_approval_rejected_stream(conv.id, replacement, assistant_msg.id),
+                _runtime_approval_rejected_stream(
+                    conv.id,
+                    "" if conv.workspace_id else replacement,
+                    assistant_msg.id,
+                ),
                 conversation_id=conv.id,
                 user_message_id=origin_user_message.id if origin_user_message else None,
                 client_message_id=client_message_id,
@@ -3482,6 +3537,11 @@ async def chat_stream(
                     **(
                         {"response_surface_submission": parsed_response_surface_submission}
                         if parsed_response_surface_submission is not None
+                        else {}
+                    ),
+                    **(
+                        {WORKSPACE_APP_ACTION_META_KEY: workspace_app_action}
+                        if workspace_app_action and workspace_id
                         else {}
                     ),
                 },
@@ -3680,13 +3740,6 @@ async def chat_message(
         if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
         else None
     )
-    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
-        db,
-        user=user,
-        conversation_id=conversation_id,
-        message=voice_approval_action or message,
-    )
-
     workspace_id, thread_ref_kind, thread_ref_id = await _resolve_chat_workspace_scope(
         db,
         user,
@@ -3695,6 +3748,13 @@ async def chat_message(
         thread_ref_kind=thread_ref_kind,
         thread_ref_id=thread_ref_id,
         workspace_context=bool(workspace_context),
+    )
+    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
+        db,
+        user=user,
+        conversation_id=conversation_id,
+        message=voice_approval_action or message,
+        workspace_id=workspace_id,
     )
     agent_id = await _resolve_task_session_request_agent(
         db,
@@ -3709,6 +3769,7 @@ async def chat_message(
         conversation_id,
         entity_id=user.entity_id,
         user_id=user.id,
+        agent_id=agent_id,
     )
     file_context_turn = await _build_attachments(
         message, document_ids, files, user.entity_id, db,
@@ -3858,7 +3919,7 @@ async def chat_message(
     elif pending_approval_turn:
         # The card changed between the preflight lookup and resolution.  Do not
         # let a stale structured action become an ungated AI prompt.
-        await require_plan("ai_budget_usd")(user=user, db=db)
+        await enforce_plan_resource("ai_budget_usd", user=user, db=db, workspace_id=workspace_id)
 
     # See the streaming path above: a resolved host decision is not a new
     # natural-language turn for the model to reinterpret.
@@ -3918,6 +3979,7 @@ async def chat_message(
             conv.id,
             role="assistant",
             content=replacement,
+            meta=_background_approval_reply_meta(conv),
         )
         await db.commit()
         return ChatMessageResponse(
@@ -4308,6 +4370,37 @@ async def resolve_global_chat_action(
     )).scalar_one_or_none()
     if conversation is None:
         raise HTTPException(404, "message not found")
+    from packages.core.constants.pending_actions import PendingActionKind
+
+    pending = message.pending_action if isinstance(message.pending_action, dict) else {}
+    if (
+        pending.get("kind") == PendingActionKind.HUMAN_INPUT.value
+        and pending.get("task_id")
+        and not pending.get("step_id")
+        and message.resolved_at is None
+    ):
+        # The question card of a Task outside any Workspace lives in the
+        # Task's own conversation; it answers through the Task page's path.
+        from apps.api.routers.tasks import _resume_hitl
+        from packages.core.models.task import Task
+
+        task = (await db.execute(select(Task).where(
+            Task.id == str(pending["task_id"]),
+            Task.entity_id == user.entity_id,
+            Task.conversation_id == conversation.id,
+        ))).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(404, "message not found")
+        payload = dict(req.payload or {})
+        response_text = str(req.note or payload.get("response") or "").strip()
+        result = await _resume_hitl(
+            db, task, user, response_text=response_text,
+            payload={**payload, "choice": req.choice, "source": "chat_card"},
+        )
+        if not result.get("resumed"):
+            raise HTTPException(409, result.get("detail") or "This Task is not waiting for an answer.")
+        await db.refresh(message)
+        return _to_chat_message_response(message)
     from packages.core.services.workflow_message_actions import (
         WorkflowMessageActionError,
         resolve_workflow_message_action,
@@ -4445,7 +4538,7 @@ async def _load_pending_tiktok_review(db, user, hitl_id: str, *, lock: bool = Fa
         raise HTTPException(404, "Approval not found")
     context = dict(pending.context or {})
     if (
-        context.get("tool") != "mcp__tiktok__post_video"
+        context.get("tool") not in {"mcp__tiktok__post_video", "mcp__tiktok__post_photo"}
         or context.get("requested_by") != user.id
         or not pending.origin_conversation_id
     ):
@@ -4459,6 +4552,21 @@ async def _load_pending_tiktok_review(db, user, hitl_id: str, *, lock: bool = Fa
     return pending, context
 
 
+async def _tiktok_workflow_publication_window(db, pending):
+    from packages.core.services.workflow_runtime_approvals import (
+        WorkflowRuntimeApprovalError, ensure_workflow_approval_current,
+        workflow_approval_effect_window, workflow_approval_owned,
+    )
+
+    if not workflow_approval_owned(pending):
+        return None
+    try:
+        run = await ensure_workflow_approval_current(db, request=pending)
+    except WorkflowRuntimeApprovalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return workflow_approval_effect_window(run, pending)
+
+
 @router.post("/approvals/{hitl_id}/tiktok-review")
 async def refresh_tiktok_publish_review(
     hitl_id: str,
@@ -4470,6 +4578,9 @@ async def refresh_tiktok_publish_review(
 
     entity_id, user_id = user.entity_id, user.id
     pending, context = await _load_pending_tiktok_review(db, user, hitl_id)
+    window = await _tiktok_workflow_publication_window(db, pending)
+    if window and window["expired"]:
+        return {"publication_window": window}
     continuation = context.get("continuation")
     if (
         not isinstance(continuation, dict)
@@ -4486,7 +4597,7 @@ async def refresh_tiktok_publish_review(
     await db.commit()
     try:
         fresh = await prepare_tiktok_publish_review(
-            tool_name="mcp__tiktok__post_video", arguments=arguments,
+            tool_name=str(context["tool"]), arguments=arguments,
             entity_id=entity_id, user_id=user_id,
             conversation_id=conversation_id, workspace_id=workspace_id,
         )
@@ -4506,6 +4617,9 @@ async def refresh_tiktok_publish_review(
 
         await lock_task_runtime_approval_boundary(db, task_id=task_id)
     pending, current = await _load_pending_tiktok_review(db, user, hitl_id, lock=True)
+    window = await _tiktok_workflow_publication_window(db, pending)
+    if window and window["expired"]:
+        return {"publication_window": window}
     if (
         current.get("args_hash") != original_hash
         or current.get("continuation") != continuation
@@ -4518,10 +4632,7 @@ async def refresh_tiktok_publish_review(
         from packages.core.services.task_comment_approval_origin import (
             has_task_comment_origin, validate_task_comment_approval_origin,
         )
-        from packages.core.services.task_runtime_approvals import (
-            TaskRuntimeApprovalError, ensure_task_runtime_approval_resolvable,
-        )
-
+        from packages.core.services.task_runtime_approvals import TaskRuntimeApprovalError
         from packages.core.services.task_agent_loop_hitl import (
             task_agent_loop_approval_is_current,
             verified_request_tag,
@@ -4530,28 +4641,30 @@ async def refresh_tiktok_publish_review(
         try:
             if has_task_comment_origin(pending):
                 await validate_task_comment_approval_origin(db, request=pending)
-            elif verified_request_tag(pending) is not None:
-                # A Task agent loop parked on this review: it must still be
-                # parked on exactly this request (no TaskRunner checkpoint).
-                if not await task_agent_loop_approval_is_current(db, request=pending):
-                    raise TaskRuntimeApprovalError("Task agent loop is no longer parked on this review")
-            else:
-                await ensure_task_runtime_approval_resolvable(db, request=pending)
+            elif verified_request_tag(pending) is None:
+                # Every Task runs on the agent loop: an untagged Task review
+                # has no run that could resume it.
+                raise TaskRuntimeApprovalError("No Task agent loop is parked on this review")
+            elif not await task_agent_loop_approval_is_current(db, request=pending):
+                raise TaskRuntimeApprovalError("Task agent loop is no longer parked on this review")
         except (ValueError, TaskRuntimeApprovalError) as exc:
             raise HTTPException(409, "The origin Task is no longer awaiting this review") from exc
-    fresh["review"]["media"]["url"] = (
-        f"/api/v1/chat/approvals/{hitl_id}/tiktok-preview"
-        f"?review_id={fresh['review']['review_id']}"
-    )
+    preview_base = f"/api/v1/chat/approvals/{hitl_id}/tiktok-preview?review_id={fresh['review']['review_id']}"
+    if fresh["review"]["media"].get("type") == "photo":
+        for index, item in enumerate(fresh["review"]["media"].get("items", [])):
+            item["url"] = f"{preview_base}&index={index}"
+    else:
+        fresh["review"]["media"]["url"] = preview_base
     pending.context = {**current, **fresh, "tiktok_review_refreshed": True}
     await db.commit()
-    return fresh["review"]
+    return {**fresh["review"], **({"publication_window": window} if window else {})}
 
 
 @router.get("/approvals/{hitl_id}/tiktok-preview")
 async def preview_tiktok_publish_media(
     hitl_id: str,
     review_id: str,
+    index: int = 0,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -4574,6 +4687,15 @@ async def preview_tiktok_publish_media(
         or evidence.get("workspace_id") != pending.workspace_id
     ):
         raise HTTPException(409, "The preview changed; reopen the publication review")
+    sources = evidence.get("media_sources") if evidence.get("media_type") == "photo" else None
+    if sources is not None:
+        if not isinstance(sources, list) or not 0 <= index < len(sources) or not isinstance(sources[index], dict):
+            raise HTTPException(409, "The original photo is unavailable; prepare it again")
+        source = sources[index]
+    elif index == 0:
+        source = evidence
+    else:
+        raise HTTPException(409, "The requested preview does not exist")
     try:
         # Reuse the existing guarded attachment response and digest validation.
         # This capability stays server-side; clients need Bearer authentication.
@@ -4581,11 +4703,13 @@ async def preview_tiktok_publish_media(
             entity_id=user.entity_id, user_id=user.id,
             conversation_id=pending.origin_conversation_id,
             workspace_id=pending.workspace_id,
-            rel_path=evidence.get("rel_path", ""),
-            source_sha256=evidence.get("source_sha256", ""),
+            rel_path=source.get("rel_path", ""),
+            source_sha256=source.get("source_sha256", ""),
+            source_kind=("workspace_document" if source.get("source_kind") == "workspace_document" else None),
+            document_id=source.get("document_id"),
         )
     except ValueError as exc:
-        raise HTTPException(409, "The original video is unavailable; prepare it again") from exc
+        raise HTTPException(409, "The original media is unavailable; prepare it again") from exc
     return await serve_signed_entity_file(token=token, filename=None, db=db)
 
 

@@ -61,9 +61,17 @@ async def _running_workflow(db, *, with_workspace=True, mode="confirm_changes"):
 @pytest.mark.parametrize("with_workspace", [True, False])
 async def test_running_workflow_is_identity_not_blanket_consent(db_session, with_workspace):
     from packages.core.governance.service import workflow_run_is_executable
+    from packages.core.models.workspace import Workspace
 
     ids, run = await _running_workflow(db_session, with_workspace=with_workspace)
     assert await workflow_run_is_executable(db_session, **ids, workflow_run_id=run.id)
+    if with_workspace:
+        workspace = await db_session.get(Workspace, ids["workspace_id"])
+        workspace.status = "paused"
+        await db_session.flush()
+        assert await workflow_run_is_executable(
+            db_session, **ids, workflow_run_id=run.id,
+        )
     assert not await automated_run_always_allowed(db_session, **ids, workflow_run_id=run.id)
     decision = await check_step_policy(db_session, **ids, kind="action", action_key="social_post.publish", risk_level="medium")
     assert decision.pause_for_hitl

@@ -368,19 +368,65 @@ def runtime_run_state_round_observer(
     return _round_end_with_run_state
 
 
+def _runtime_restore_sandbox_handoff_grant(
+    runtime_envelope: Any,
+    tools: list[dict[str, Any]],
+    *,
+    run_state: RuntimeRunState | None,
+    runtime_checkpoint: Mapping[str, Any] | None,
+    tool_evidence: Any,
+    schema_for: Any,
+) -> list[dict[str, Any]]:
+    """Re-grant ``sandbox`` to a resumed run whose Skill handed one off.
+
+    A sandbox Skill grants ``sandbox`` on the live envelope when it hands its
+    container to the model; that grant is run-local and the schema is added by
+    the loop, so neither survives a park. The ledger's handoff record is
+    server-observed (it opens only on a ``sandbox_ready`` Skill result), so the
+    resumed run gets back exactly that one tool, as the live run had it.
+    """
+
+    from packages.core.ai.runtime.tool_gateway import runtime_schema_tool_name
+
+    ledgers = [
+        (runtime_checkpoint or {}).get("tool_evidence"),
+        getattr(run_state, "tool_evidence", None),
+    ]
+    handed_off = bool(getattr(tool_evidence, "sandbox_handoffs", None)) or any(
+        isinstance(ledger, Mapping) and ledger.get("sandbox_handoffs") for ledger in ledgers
+    )
+    grants = getattr(runtime_envelope, "discovered_tool_grants", None)
+    if not handed_off or not callable(getattr(grants, "grant", None)):
+        return tools
+    if "sandbox" in set(getattr(runtime_envelope, "blocked_tool_names", None) or ()):
+        return tools
+    grants.grant(["sandbox"])
+    if any(runtime_schema_tool_name(schema) == "sandbox" for schema in tools):
+        return tools
+    schema = schema_for("sandbox")
+    if schema is None:
+        from packages.core.ai.runtime.tool_registry import runtime_tool_schema
+
+        schema = runtime_tool_schema("sandbox")
+    return [*tools, schema] if schema else tools
+
+
 def _runtime_gateway_names_to_restore(
     *,
     run_state: RuntimeRunState | None,
     runtime_checkpoint: Mapping[str, Any] | None,
     tools: list[dict[str, Any]],
     gateway_tool_schemas: list[dict] | None,
+    preloaded_tool_names: Iterable[str] = (),
 ) -> list[str]:
-    """Tools a resumed run had loaded through discovery, not yet present.
+    """Tools a run starts with loaded through discovery, not yet present.
 
     Only names recorded from real discovery results (``loaded_gateway_tools``)
-    are candidates, and only for a surface that can discover tools at all
-    (``search_tools`` or ``call_tool``): a name the model merely called is
-    never restored, and a host without discovery restores nothing.
+    and the host's ``preloaded_tool_names`` are candidates, and only for a
+    surface that can discover tools at all (``search_tools`` or
+    ``call_tool``): a name the model merely called is never restored, and a
+    host without discovery restores nothing. Preloaded names come first (the
+    oldest), so the run's own later loads win the bound.
     """
 
     from packages.core.ai.runtime.tool_gateway import CALL_TOOL_NAME, runtime_schema_tool_name
@@ -389,7 +435,10 @@ def _runtime_gateway_names_to_restore(
     if not declared & {"search_tools", CALL_TOOL_NAME}:
         return []
     present = declared | {runtime_schema_tool_name(schema) for schema in gateway_tool_schemas or ()}
-    names: list[str] = []
+    names: list[str] = [
+        name for name in (str(raw or "").strip() for raw in preloaded_tool_names or ())
+        if name and name not in present
+    ]
     states = [run_state] if run_state is not None else []
     if isinstance(runtime_checkpoint, Mapping):
         # A parked RuntimeAgentCheckpoint records the same loaded set.
@@ -437,6 +486,7 @@ async def _runtime_execute_agentic_loop(
     tool_result_max_chars: int | None = None,
     turn_context: str | None = None,
     gateway_tool_schemas: list[dict] | None = None,
+    preloaded_tool_names: Iterable[str] = (),
     on_tool_start: Callable[[str, dict[str, Any]], Any] | None = None,
     on_tool_end: Callable[..., Any] | None = None,
     on_llm_call: Callable[..., Any] | None = None,
@@ -476,6 +526,14 @@ async def _runtime_execute_agentic_loop(
     receives a snapshot that already holds them. Tools the resumed run had
     loaded through discovery (from ``run_state`` or a parked
     ``runtime_checkpoint``) are re-authorized here by exact discovery.
+
+    ``preloaded_tool_names`` are tools the run starts with loaded, as if its
+    first round had loaded them with ``search_tools(mode="exact")``: e.g. the
+    declared tools of the Skills whose work the run carries out. Names, never
+    grants: each goes through the same exact discovery under this run's
+    envelope, so scope, availability and plan gates still apply, approval
+    still applies per call, and a name the scope refuses is not loaded. On a
+    ``call_tool`` surface they stay out of the tool list (the cached prefix).
     """
 
     if run_state is not None:
@@ -491,6 +549,10 @@ async def _runtime_execute_agentic_loop(
         initial_tool_calls_made = resumed["initial_tool_calls_made"]
         initial_tool_evidence = run_state.tool_evidence or None
 
+    # Every host-armed tool is enumerated by the effect-contract guard.
+    from packages.core.ai.runtime.host_tools import runtime_check_host_tools
+
+    runtime_check_host_tools(None, dynamic_tool_handlers or {})
     from packages.core.ai.agentic_loop import _add_usage, agentic_loop
     from packages.core.ai.runtime.billing import runtime_ensure_billing_context
     from packages.core.ai.runtime.completions import runtime_resolve_text_completion_route
@@ -531,6 +593,7 @@ async def _runtime_execute_agentic_loop(
         source=billing_source,
         model=model,
         metadata=metadata,
+        workspace_id=workspace_id,
     )
     resolved_final_model: str | None = None
     resolved_final_metadata: dict[str, Any] | None = None
@@ -545,6 +608,7 @@ async def _runtime_execute_agentic_loop(
             source=billing_source,
             model=final_model,
             metadata=metadata,
+            workspace_id=workspace_id,
         )
     billing_kwargs: dict[str, Any] = {
         "user_id": user_id,
@@ -596,17 +660,11 @@ async def _runtime_execute_agentic_loop(
         dynamic_handlers["read_context_archive"] = context_archive_reader
         if allowed_tool_set is not None:
             allowed_tool_set.add("read_context_archive")
-    from packages.core.ai.runtime.human_input import (
-        HUMAN_INPUT_MODE_END_TURN,
-        human_input_mode_from_kwargs,
-    )
-
     # Registration is not a continuation capability. Keep prompt schemas,
-    # progressive discovery and execution on the same per-run scope. Task
-    # hosts with an explicit end-turn bridge/custom handler retain their tool.
+    # progressive discovery and execution on the same per-run scope. Hosts
+    # with a custom handler retain their tool.
     can_request_input = (
         human_input_suspension
-        or human_input_mode_from_kwargs(dict(runtime_tool_context or {})) == HUMAN_INPUT_MODE_END_TURN
         or "request_input" in dynamic_handlers
     )
     if not can_request_input:
@@ -721,6 +779,34 @@ async def _runtime_execute_agentic_loop(
 
     base_tool_executor = tool_executor or _runtime_tool_executor
 
+    async def _preview_tool_call_gate(call: dict[str, Any]) -> Any:
+        from packages.core.ai.runtime.tool_execution import runtime_preview_tool_gate
+
+        tool_name = str(call.get("name") or "")
+        if tool_name in dynamic_handlers:
+            # Host-armed handlers carry their own gating contract.
+            return None
+        arguments = dict(call.get("arguments") or {})
+        arguments.update(registered_tool_context)
+        return await runtime_preview_tool_gate(
+            tool_name=tool_name,
+            arguments=arguments,
+            entity_id=entity_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            step_id=step_id,
+            active_user_message=tool_context_message,
+            runtime_envelope=runtime_envelope,
+        )
+
+    async def _plan_tool_batch(calls: list[dict[str, Any]]) -> Any:
+        from packages.core.ai.runtime.tool_batch_concurrency import runtime_plan_tool_batch
+
+        return await runtime_plan_tool_batch(calls, preview=_preview_tool_call_gate)
+
     async def _artifact_tracking_tool_executor(name: str, args: dict[str, Any]) -> Any:
         nonlocal runtime_envelope, allowed_tool_set, resolved_tool_schema
         executor = _runtime_tool_executor if name == "read_context_archive" and context_archive_reader is not None else base_tool_executor
@@ -802,7 +888,10 @@ async def _runtime_execute_agentic_loop(
         and final_response_contract is not tool_evidence
     ):
         restore_final_evidence(run_state.final_response_evidence)
-    if isinstance(runtime_envelope, RuntimeEnvelope) and (run_state is not None or runtime_checkpoint):
+    preloaded_tool_names = tuple(preloaded_tool_names or ())
+    if isinstance(runtime_envelope, RuntimeEnvelope) and (
+        run_state is not None or runtime_checkpoint or preloaded_tool_names
+    ):
         from packages.core.ai.runtime.capability_continuation import (
             CAPABILITY_SCHEMA_CHAR_BUDGET,
             runtime_restore_gateway_tools,
@@ -814,6 +903,7 @@ async def _runtime_execute_agentic_loop(
             runtime_checkpoint=runtime_checkpoint,
             tools=tools,
             gateway_tool_schemas=gateway_tool_schemas,
+            preloaded_tool_names=preloaded_tool_names,
         )
         gateway_mode = any(runtime_schema_tool_name(schema) == CALL_TOOL_NAME for schema in tools)
         restored_schemas: list[dict[str, Any]] = []
@@ -854,6 +944,10 @@ async def _runtime_execute_agentic_loop(
                 tools = [*tools, *restored_schemas]
             # Loaded again in this run.
             tool_evidence.observe_loaded_tools(reversed(restored_names))
+        tools = _runtime_restore_sandbox_handoff_grant(
+            runtime_envelope, tools, run_state=run_state, runtime_checkpoint=runtime_checkpoint,
+            tool_evidence=tool_evidence, schema_for=_current_tool_schema,
+        )
     loop_kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
         "user_message": user_message,
@@ -931,6 +1025,10 @@ async def _runtime_execute_agentic_loop(
     }.items():
         if _agentic_loop_accepts_keyword(keyword):
             loop_kwargs[keyword] = value
+    if tool_executor is None and _agentic_loop_accepts_keyword("tool_batch_planner"):
+        # Only the Runtime executor's own approval gate can be previewed; a
+        # caller-supplied executor keeps every non-read round serial.
+        loop_kwargs["tool_batch_planner"] = _plan_tool_batch
     if hitl_resume_checkpoint and _agentic_loop_accepts_keyword("hitl_resume_checkpoint"):
         # Only a durable host that parks approval stops asks for this; every
         # other loop's approval control stays exactly as it was.
@@ -974,7 +1072,16 @@ async def _runtime_execute_agentic_loop(
         and getattr(result, "messages", None)
         and getattr(result, "stop_reason", None) != "cancelled"
     ):
-        await on_context_checkpoint(result.messages)
+        from packages.core.ai.runtime.control import RuntimeTurnAborted
+
+        try:
+            await on_context_checkpoint(result.messages)
+        except RuntimeTurnAborted:
+            raise
+        except Exception:
+            # The answer is complete; the next run resumes from the previous
+            # checkpoint instead of failing this one.
+            logger.warning("Runtime context checkpoint not saved after the turn", exc_info=True)
     if nested_usages and isinstance(getattr(result, "usage", None), dict):
         nested_summary = {
             "prompt": 0,
@@ -1116,11 +1223,14 @@ async def runtime_execute_subagent_loop(
     agent_id: str | None,
     workspace_id: str | None,
     conversation_id: str | None,
+    user_id: str | None = None,
     task_id: str | None = None,
     step_id: str | None = None,
     active_user_message: str | None = None,
     tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
+    tool_executor: ToolExecutor | None = None,
+    tool_schema_resolver: Callable[[str], dict[str, Any] | None] | None = None,
     model: str | None = None,
     metadata: dict[str, Any] | None = None,
     billing_source: str = RUNTIME_SUBAGENT_SOURCE,
@@ -1159,11 +1269,14 @@ async def runtime_execute_subagent_loop(
         agent_id=agent_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        user_id=user_id,
         task_id=task_id,
         step_id=step_id,
         active_user_message=active_user_message,
         tool_profile=tool_profile,
         allowed_tool_names=allowed_tool_names,
+        tool_executor=tool_executor,
+        tool_schema_resolver=tool_schema_resolver,
         model=model,
         max_rounds=subagent_run.max_rounds or default_max_rounds,
         initial_messages=initial_messages,
@@ -1185,32 +1298,6 @@ async def runtime_execute_subagent_loop(
     )
     subagent_run.record_end(rounds=getattr(result, "rounds", None))
     return RuntimeSubAgentLoopResult(result=result, run=subagent_run)
-
-
-async def runtime_execute_worker_subagent_loop(**loop_kwargs: Any) -> RuntimeSubAgentLoopResult:
-    """Run an InternalWorker subagent loop with Runtime-owned billing source."""
-
-    return await runtime_execute_subagent_loop(
-        **loop_kwargs,
-        billing_source=RUNTIME_WORKER_SUBAGENT_BILLING_SOURCE,
-    )
-
-
-async def runtime_execute_worker_subagent_followup(**loop_kwargs: Any) -> Any:
-    """One bounded follow-up round continuing a worker subagent transcript.
-
-    Used by the forced submit_result finalization: when the main loop ends
-    without a submission, the InternalWorker asks for exactly one more round
-    whose only tool is submit_result. Runtime-owned so the worker never
-    touches the loop layer directly; billing stays on the worker-subagent
-    source.
-    """
-
-    loop_kwargs.setdefault("max_rounds", 1)
-    return await runtime_execute_agentic_loop(
-        **loop_kwargs,
-        billing_source=RUNTIME_WORKER_SUBAGENT_BILLING_SOURCE,
-    )
 
 
 def runtime_wrap_tool_executor(

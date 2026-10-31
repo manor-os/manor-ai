@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
 import anyio
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.audit import AuditLog
@@ -499,10 +499,15 @@ async def project_room_generated_document(
         ):
             raise RoomGeneratedFileError("media_result_unavailable")
         if not job.byok and int(job.credits or 0) > 0:
+            # A sponsored trial holds the reservation against its payer and
+            # records the job's entity as the data owner.
             reservation_status = (await db.execute(select(CreditReservation.status).where(
                 CreditReservation.source_kind == "media_job",
                 CreditReservation.source_id == job.id,
-                CreditReservation.entity_id == job.entity_id,
+                or_(
+                    CreditReservation.entity_id == job.entity_id,
+                    CreditReservation.meta["data_owner_entity_id"].astext == job.entity_id,
+                ),
             ).order_by(CreditReservation.created_at.desc()).limit(1))).scalar_one_or_none()
             if reservation_status != "consumed":
                 raise RoomGeneratedFileError("media_credits_unsettled")

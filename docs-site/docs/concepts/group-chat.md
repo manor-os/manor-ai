@@ -30,6 +30,18 @@ cancel or reissue their own pending invitations; owners and admins can
 manage all pending invitations. A new member sees only messages sent after
 joining; the invitation never grants company or Workspace access.
 
+## Share a Public Invitation Link
+
+Group owners and administrators can open **Group details → Members → Invite →
+Public link** and select **Create public link**. Copy the link and share it with
+anyone. Visitors sign in or register and then join automatically, without
+approval or an invitation tied to a specific email address.
+
+The same link works for multiple people until an owner or administrator selects
+**Disable link** or **Reset link**. Resetting immediately invalidates the old
+link. Existing members keep their access. New or returning members only see
+messages sent after they join; joining never grants company or Workspace access.
+
 ## Messages, Notifications, and Files
 
 Type `@` to mention a member or an AI agent. You can attach images and other
@@ -44,6 +56,16 @@ files. Generated files are also stored in a private Knowledge subfolder under
 file, or remove it when you have the delete control. Removing a group file
 does not delete its original Knowledge document. Retracting a message does
 not separately remove a file shared in that message.
+
+Hover over a message timestamp to see its full date and time, including seconds.
+Click the timestamp to expand it in place; click again to show only the time.
+Dates use the same language and time-zone preferences as ordinary Chat.
+
+In **Files**, select multiple files and choose **Download selected** to save a ZIP.
+A selection can contain up to 100 files totaling 5 GiB. Uploads and copies from
+Knowledge support up to 1 GiB per file, with up to 10 GiB of retained copies per
+group. The owning account's Knowledge storage allowance still applies. Files
+above 100 MiB are downloaded for viewing instead of previewed inline.
 
 ## Work with AI
 

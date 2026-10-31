@@ -35,6 +35,14 @@ def test_api_image_installs_same_office_fonts_used_by_generated_artifacts():
         "fonts-noto-core",
         "fonts-noto-cjk",
         "fonts-roboto",
+        # Display faces named by animated lyric and caption styles.
+        "fonts-bebas-neue",
+        "fonts-league-spartan",
+        "fonts-courier-prime",
+        "fonts-dancingscript",
+        "fonts-kaushanscript",
+        "fonts-comfortaa",
+        "fonts-ebgaramond",
     }
 
     assert {package for package in required_fonts if package not in dockerfile} == set()

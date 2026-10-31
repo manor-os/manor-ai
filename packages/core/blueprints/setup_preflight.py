@@ -17,7 +17,10 @@ from packages.core.constants.blueprints import BlueprintInstallRequirementKind
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel
 from packages.core.models.integration_session import IntegrationSession
-from packages.core.services.integration_resolution import integration_provider_readiness
+from packages.core.services.integration_resolution import (
+    integration_provider_readiness,
+    is_user_facing_integration_provider,
+)
 from packages.core.services.provider_keys import canonical_provider_key
 
 
@@ -180,7 +183,7 @@ class BlueprintSetupPreflightFactory:
             item
             for item in ((contract.get("requires") or {}).get("mcp_servers") or [])
             if isinstance(item, dict)
-            and canonical_provider_key(item.get("slug"))
+            and is_user_facing_integration_provider(item.get("slug"))
         ]
         specs_by_provider: dict[str, list[dict[str, Any]]] = {}
         for spec in integration_specs:

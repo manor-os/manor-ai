@@ -36,14 +36,18 @@ class TaskCoordinatorPhase(str, Enum):
 
 
 class TaskCoordinatorEngine(str, Enum):
-    """Which execution host drives a Task run. Frozen when the run is created."""
+    """Which execution host drives a Task run.
+
+    Every run is an agent loop. ``plan_dag`` names historical runs of the
+    retired Plan/Step engine (closed by migration 20261025_10).
+    """
 
     PLAN_DAG = "plan_dag"
     AGENT_LOOP = "agent_loop"
 
 
 class TaskCoordinatorRun(Base, TimestampMixin):
-    """One fenced coordinator loop for a Workspace Task across Plan versions."""
+    """One fenced agent-loop run of a Workspace Task."""
 
     __tablename__ = "task_coordinator_runs"
     __table_args__ = (
@@ -69,19 +73,19 @@ class TaskCoordinatorRun(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     task_id: Mapped[str] = mapped_column(String(26), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    workspace_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # None for a Task assigned directly to an Agent, outside any Workspace.
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
 
     # Frozen factory identity.  A replacement Workspace subscription must
-    # never silently take over an existing coordinator checkpoint.
-    root_subscription_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # never silently take over an existing coordinator checkpoint. A Task
+    # outside any Workspace has a subscription only for a personal hire.
+    root_subscription_id: Mapped[Optional[str]] = mapped_column(String(26))
     root_agent_id: Mapped[str] = mapped_column(String(26), nullable=False)
     selection_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     lifecycle_generation: Mapped[str] = mapped_column(String(64), nullable=False)
-    # Chosen once from the task_agent_loop flag when the row is first created;
-    # a flag flip never moves an in-flight run to another engine.
     engine: Mapped[str] = mapped_column(
-        String(20), nullable=False, default=TaskCoordinatorEngine.PLAN_DAG.value,
-        server_default=TaskCoordinatorEngine.PLAN_DAG.value,
+        String(20), nullable=False, default=TaskCoordinatorEngine.AGENT_LOOP.value,
+        server_default=TaskCoordinatorEngine.AGENT_LOOP.value,
     )
 
     phase: Mapped[str] = mapped_column(

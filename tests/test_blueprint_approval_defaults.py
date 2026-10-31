@@ -462,3 +462,32 @@ async def test_default_governance_roundtrips_and_survives_live_promotion(db_sess
     roundtripped = await export_workspace(db_session, second.workspace_id, title="Approval defaults")
     assert roundtripped["policy"]["governance"] == exported["policy"]["governance"]
     assert roundtripped["recipe"]["operating_model"]["rules"] == exported["recipe"]["operating_model"]["rules"]
+
+
+def test_no_builtin_blueprint_imports_as_a_review_of_everything():
+    """A selector the import cannot represent (a wildcard, a capability), or a risk
+    ceiling below high, turns into an ask rule on every category: file writes then
+    wait for a person even in automatic mode, and background work stalls on them."""
+    import json
+    from pathlib import Path
+    from typing import get_args
+
+    from packages.core.governance.approval_policy import ApprovalCategory
+    from packages.core.governance.approval_policy_migration import _rule_id, normalize_legacy_workspace_policy
+
+    blanket = {_rule_id("template_review", category) for category in get_args(ApprovalCategory)}
+    configs = Path(__file__).resolve().parents[1] / "packages/core/blueprints/configs"
+    offenders = {}
+    for path in sorted(configs.rglob("*.json")):
+        governance = (json.loads(path.read_text()).get("policy") or {}).get("governance")
+        if not isinstance(governance, dict):
+            continue
+        rules = normalize_legacy_workspace_policy(governance, safe_import=True)["approval"]["rules"]
+        if blanket & {rule["id"] for rule in rules}:
+            offenders[path.name] = governance
+        # A risk ceiling below high installs as author-risk-review asks on every
+        # category: the same review of everything, and it reached a metric
+        # assessment's record writes.
+        if governance.get("max_risk_level", "high") != "high":
+            offenders[path.name] = {"max_risk_level": governance["max_risk_level"]}
+    assert not offenders, offenders

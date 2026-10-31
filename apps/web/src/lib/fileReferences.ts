@@ -908,6 +908,26 @@ export function isOpenableFileReference(value: unknown): boolean {
   return false;
 }
 
+/**
+ * The entity-relative storage path (`Document.fs_path` form) a structured
+ * field such as an approval's `paths` names, or "" when it names anything
+ * else. Runtime approvals can carry raw model arguments, so only a relative
+ * file path qualifies: sandbox, host, URL and parent-escaping paths do not.
+ * The caller may open the result as a trusted reference; the FS read and the
+ * exact `fs_path` Document match still enforce access.
+ */
+export function entityStoragePath(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text || isInternalFileTarget(text) || decodeFileReferenceHref(text)) return "";
+  const parsed = parseFileReference(text);
+  // The sandbox mounts entity storage at /workspace/; an entity-scoped URL
+  // already opens without trust.
+  const path = parsed
+    ? parsed.kind === "fs" && !parsed.entity ? parsed.fs_path : ""
+    : canonicalGeneratedFilePath(text);
+  return path && FILE_LIKE_RE.test(path) ? path : "";
+}
+
 export function looksLikeFileReference(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -1011,4 +1031,20 @@ export function linkifyFileReferencesInMarkdown(source: string): string {
       return isFence ? part : processOutsideMarkdownLinks(part);
     })
     .join("");
+}
+
+// Run, artifact and storage ids in a path name nothing a person recognises.
+const ID_SEGMENT = /^(?:[0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|_by_id)$/i;
+
+/**
+ * Where a file lives, in words a person can tell apart: its nearest named
+ * folder, then its Workspace (or top folder), e.g. "video · Video Studio" —
+ * nearest first, so a long Workspace name is what gets cut. The full path
+ * stays in the tooltip.
+ */
+export function documentFolderLabel(folder: string): string {
+  const parts = folder.split("/").filter((part) => part && !ID_SEGMENT.test(part));
+  if (parts.length <= 2) return parts.join("/");
+  const scope = parts[0] === "Workspaces" ? parts[1] : parts[0];
+  return `${parts[parts.length - 1]} · ${scope}`;
 }

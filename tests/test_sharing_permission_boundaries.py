@@ -2050,6 +2050,67 @@ async def test_browse_final_folder_gate_reloads_current_policy(client, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["membership_revoked", "workspace_deleted"])
+async def test_browse_page_rechecks_workspace_access_after_folder_scan(client, monkeypatch, change):
+    from apps.api.routers import documents as routes
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+
+    _headers, owner, member_headers, member = await _actors(client)
+    doc_id, folder_id = await _document(owner, in_folder=True)
+    async with db_module.async_session() as session:
+        folder = await session.get(DocumentFolder, folder_id)
+        folder.visibility = "entity"
+        document = await session.get(Document, doc_id)
+        document.visibility = "entity"
+        workspace = Workspace(
+            entity_id=owner["entity_id"], name="Browse Workspace access",
+            artifact_folder_id=folder_id, settings={"access_mode": "members_only"},
+        )
+        session.add(workspace)
+        await session.flush()
+        membership = WorkspaceStaff(
+            workspace_id=workspace.id, user_id=member["user_id"],
+            role="viewer", status="active",
+        )
+        session.add(membership)
+        await session.commit()
+        workspace_id, membership_id = workspace.id, membership.id
+
+    ready, proceed = asyncio.Event(), asyncio.Event()
+    original_folders = routes._visible_document_folders_for_user
+
+    async def after_initial_folder_scan(*args, **kwargs):
+        result = await original_folders(*args, **kwargs)
+        if not ready.is_set() and folder_id in result[1]:
+            ready.set()
+            await proceed.wait()
+        return result
+
+    monkeypatch.setattr(routes, "_visible_document_folders_for_user", after_initial_folder_scan)
+    pending = asyncio.create_task(client.get(
+        "/api/v1/documents/browse-page", params={"folder_id": folder_id}, headers=member_headers,
+    ))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=60)
+        async with db_module.async_session() as session:
+            if change == "membership_revoked":
+                membership = await session.get(WorkspaceStaff, membership_id)
+                membership.status = "inactive"
+            else:
+                workspace = await session.get(Workspace, workspace_id)
+                workspace.deleted_at = datetime.now(timezone.utc)
+            await session.commit()
+        proceed.set()
+        response = await asyncio.wait_for(pending, timeout=60)
+        assert response.status_code == 404, response.text
+    finally:
+        proceed.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["folders", "folder-tree"])
 async def test_folder_counts_recheck_document_grant_before_response(
     client,

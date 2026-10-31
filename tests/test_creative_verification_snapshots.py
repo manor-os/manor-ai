@@ -71,9 +71,15 @@ def verification_run(tmp_path, monkeypatch):
         saved.append((path, data))
         return {"document_id": "verification-receipt", "fs_path": path}
 
+    marked = []
+
+    async def mark(_entity_id, output_directory, final_paths):
+        marked.append((output_directory, set(final_paths)))
+
     monkeypatch.setattr(studio, "_source_path", source)
     monkeypatch.setattr(studio, "_scope", scope)
     monkeypatch.setattr(studio, "_save", save)
+    monkeypatch.setattr(studio, "mark_production_results", mark)
     monkeypatch.setattr(studio, "_inspect_file", inspect_snapshot)
     monkeypatch.setattr("packages.core.database.async_session", session)
 
@@ -97,7 +103,7 @@ def verification_run(tmp_path, monkeypatch):
         return path
 
     return SimpleNamespace(verify=verify, write=write, saved=saved, directory=directory,
-                           entity_root=entity_root, inspected_paths=inspected_paths)
+                           entity_root=entity_root, inspected_paths=inspected_paths, marked=marked)
 
 
 def _assert_private_snapshots_cleaned(run):
@@ -193,6 +199,8 @@ async def test_valid_mixed_image_package_keeps_original_paths_and_hashes(verific
     assert len(run.saved) == 1
     receipt = json.loads(run.saved[0][1])
     assert receipt["files"] == result["final_files"]
+    # The verified files are the production's results; the rest of its folder is how they were made.
+    assert run.marked == [(run.directory, {run.directory + "/" + name for name in outputs})]
     assert receipt["technical_checks_passed"] is True
     _assert_private_snapshots_cleaned(run)
 

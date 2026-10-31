@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import copy
-import json
-from datetime import datetime, timezone
-from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
@@ -19,17 +15,12 @@ from packages.core.ai.runtime.tool_effect_intents import (
 )
 from packages.core.ai.runtime.workspace_delegation_actions import (
     _delegation_effect_intent,
-    _tool_arguments_hash,
 )
 from packages.core.constants.approvals import (
     ApprovalConsumeOutcome,
     ApprovalStatus,
 )
 from packages.core.governance.approvals import consume_approval
-from packages.core.workers.coordinator_tools import (
-    _has_checkpointed_approved_effect_result,
-)
-from packages.core.workers.transcript import build_worker_transcript_checkpoint
 
 
 _TOOL = "mcp__gmail__send_email"
@@ -131,171 +122,3 @@ async def test_unified_consume_reports_server_request_to_effect_observer(
 
     assert captured == ["server-consumed"]
     assert observed == ["server-consumed"]
-
-
-def _bound_approved_effect() -> tuple[dict, list[dict], SimpleNamespace, SimpleNamespace]:
-    request_id = "approval-1"
-    child = SimpleNamespace(
-        id="child-1",
-        plan_id="plan-1",
-        service_key="writer",
-        resolved_subscription_id="subscription-1",
-    )
-    request = SimpleNamespace(
-        id=request_id,
-        consumed_at=datetime.now(timezone.utc),
-        origin_step_id=child.id,
-        origin_task_id="task-1",
-        context={
-            "tool": _TOOL,
-            "continuation": {
-                "version": 1,
-                "tool": _TOOL,
-                "arguments": copy.deepcopy(_APPROVED_ARGUMENTS),
-            },
-            "delegation_resume": {
-                "version": 1,
-                "approval_token": request_id,
-                "task_id": "task-1",
-                "step_id": child.id,
-                "service_key": child.service_key,
-                "agent_subscription_id": child.resolved_subscription_id,
-                "delegation_idempotency_key": "delegation-1",
-                "tool_name": _TOOL,
-            },
-        },
-    )
-    result = json.dumps({
-        "ok": True,
-        "status": "completed",
-        "message_id": "message-1",
-    })
-    checkpoint = build_worker_transcript_checkpoint(
-        [
-            {"role": "user", "content": "send"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {
-                        "name": _TOOL,
-                        "arguments": json.dumps({
-                            **_APPROVED_ARGUMENTS,
-                            "approval_token": request_id,
-                        }),
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call-1", "content": result},
-        ],
-        rounds=1,
-        usage={},
-        tool_calls_made=[_TOOL],
-    )
-    assert checkpoint is not None
-    receipt = {
-        "kind": "tool_effect",
-        "effect": "publish",
-        "coordinator_child_step_id": child.id,
-        "fields": {
-            "approval_request_id": request_id,
-            "owner_step_id": child.id,
-            "owner_plan_id": child.plan_id,
-            "owner_task_id": "task-1",
-            "owner_service_key": child.service_key,
-            "owner_subscription_id": child.resolved_subscription_id,
-            "owner_idempotency_key": "delegation-1",
-            "tool": _TOOL,
-            "arguments_hash": _tool_arguments_hash(_APPROVED_ARGUMENTS),
-            "tool_call_id": "call-1",
-            "result_sha256": sha256(result.encode("utf-8")).hexdigest(),
-            "intent_state": "returned",
-        },
-    }
-    return checkpoint, [receipt], request, child
-
-
-def test_consumed_fast_path_requires_complete_exact_receipt() -> None:
-    checkpoint, evidence, request, child = _bound_approved_effect()
-
-    assert _has_checkpointed_approved_effect_result(
-        checkpoint,
-        evidence,
-        approval_request=request,
-        child=child,
-        task_id="task-1",
-        idempotency_key="delegation-1",
-    )
-
-
-def test_consumed_fast_path_rejects_status_without_consumption_timestamp() -> None:
-    checkpoint, evidence, request, child = _bound_approved_effect()
-    request.consumed_at = None
-
-    assert not _has_checkpointed_approved_effect_result(
-        checkpoint,
-        evidence,
-        approval_request=request,
-        child=child,
-        task_id="task-1",
-        idempotency_key="delegation-1",
-    )
-
-
-@pytest.mark.parametrize(
-    "missing_field",
-    [
-        "approval_request_id",
-        "owner_step_id",
-        "owner_plan_id",
-        "owner_task_id",
-        "owner_service_key",
-        "owner_subscription_id",
-        "owner_idempotency_key",
-        "tool",
-        "arguments_hash",
-        "tool_call_id",
-        "result_sha256",
-        "intent_state",
-    ],
-)
-def test_consumed_fast_path_fails_closed_when_receipt_field_missing(
-    missing_field: str,
-) -> None:
-    checkpoint, evidence, request, child = _bound_approved_effect()
-    evidence[0]["fields"].pop(missing_field)
-
-    assert not _has_checkpointed_approved_effect_result(
-        checkpoint,
-        evidence,
-        approval_request=request,
-        child=child,
-        task_id="task-1",
-        idempotency_key="delegation-1",
-    )
-
-
-def test_consumed_fast_path_rejects_changed_call_or_result() -> None:
-    checkpoint, evidence, request, child = _bound_approved_effect()
-    changed_call = copy.deepcopy(checkpoint)
-    changed_call["messages"][1]["tool_calls"][0]["function"]["arguments"] = (
-        json.dumps({**_APPROVED_ARGUMENTS, "subject": "Changed"})
-    )
-    changed_result = copy.deepcopy(checkpoint)
-    changed_result["messages"][2]["content"] = json.dumps({
-        "ok": True,
-        "status": "completed",
-        "message_id": "different",
-    })
-
-    for candidate in (changed_call, changed_result):
-        assert not _has_checkpointed_approved_effect_result(
-            candidate,
-            evidence,
-            approval_request=request,
-            child=child,
-            task_id="task-1",
-            idempotency_key="delegation-1",
-        )

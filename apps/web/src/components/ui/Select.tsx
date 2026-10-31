@@ -248,7 +248,7 @@ export default function Select({
   }, [open, filterable]);
 
   return (
-    <div ref={ref} style={{ position: "relative", ...style }}>
+    <div ref={ref} style={{ position: "relative", minWidth: 0, ...style }}>
       {/* Trigger */}
       <button
         ref={triggerRef}
@@ -289,7 +289,8 @@ export default function Select({
             {selectedIcon}
           </span>
         )}
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {/* A long label is cut with an ellipsis; it never widens the field. */}
+        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {selectedLabel}
         </span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" strokeWidth={2.5} style={{ flexShrink: 0, transition: "transform 0.2s", transform: open ? "rotate(180deg)" : "none" }}>

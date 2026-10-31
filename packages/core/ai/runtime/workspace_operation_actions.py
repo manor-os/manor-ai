@@ -7,7 +7,9 @@ import logging
 from typing import Any
 
 from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+from packages.core.constants.workspace_operations import WorkspaceOperationDraftStatus
 from packages.core.services.hitl_options import one_time_approval_options
+from packages.core.services.workspace_app_view import APP_SECTION_BLOCKS
 
 logger = logging.getLogger(__name__)
 
@@ -261,23 +263,6 @@ async def runtime_workspace_resolve_hitl_action(
             if resolved is not None:
                 resolved_message_ids.append(target.id)
 
-        db.add(Message(
-            conversation_id=conversation_id,
-            role="system",
-            content=str(
-                result.get("message")
-                or "Workspace operation review resolved."
-            ),
-            author_kind="system",
-            message_kind="system",
-            refs=[
-                {"type": "message", "id": primary.id},
-                {
-                    "type": "workspace_operation_draft",
-                    "id": result.get("draft_id"),
-                },
-            ],
-        ))
         await db.commit()
         return _dumps({
             "resolved": True,
@@ -529,6 +514,8 @@ _WORKSPACE_OPERATION_ACTION_ALIASES = {
     "discard": "discard_draft",
     "reject": "discard_draft",
     "cancel": "discard_draft",
+    "design": "design_app",
+    "design_app_view": "design_app",
 }
 
 
@@ -540,10 +527,16 @@ WORKSPACE_OPERATION_ACTIONS: tuple[str, ...] = (
     "preview_diff",
     "apply_draft",
     "discard_draft",
+    "design_app",
 )
 
 
 _WORKSPACE_OPERATION_APP_VIEW_GUIDANCE = (
+    "To design or redesign the App page (its layout, entries, card actions and data views), command the "
+    "App designer with action=design_app and params brief:<what the person wants to do from the App>; "
+    "it returns a checked candidate as an app_view.update draft with its design notes. Accept it with "
+    "apply_draft (the review card), send it back with design_app plus feedback and that draft_id, or "
+    "discard_draft. Use app_view.update yourself only for a small named change (a title, a label, one target). "
     "The Workspace App connects directly to Agents, active Workflow bindings, and Automations. "
     "It does not require a Service. When asked to add an App action, first call get_current. "
     "Use app_view.update with entries:{'action:<unique entry id>':{title:<name>}} and "
@@ -560,15 +553,46 @@ _WORKSPACE_OPERATION_APP_VIEW_GUIDANCE = (
     "labels:{<key>:<display name>}, descriptions:{<key>:<short description>}, "
     "forms:{<action key>:[{key:<id>,label:<question>,type:'text'|'long_text'|'file'|'number'|'select',required:true|false,placeholder:<hint>,options:[<choices>]}]}, "
     "entries:{'action:<id>':{title:<name>}}, prompts:{<action key>:<Agent command>}, "
+    "presets:{<action key>:{<Flow input key>:<prefilled text>}} (one Flow offered as several entries, e.g. deck types), "
     "targets:{<action key>:'agent:<id>'|'agent:default'|'workflow:<binding_id>'|'automation:<job_id>'}, "
-    "visual:'auto'|'image'|'motion'|'plain', layout:'feature'|'cover'|'list'}. "
+    "visual:'auto'|'image'|'motion'|'plain', layout:'feature'|'cover'|'list', "
+    "data_sources:{<source key>:<declared source>}, components:[{type:'data_view',schema_version:1,key:<id>,context:{kind:'workspace'|'project'|'launch_run',source?:<source key>},blocks:[...],display:{layout:'stack'|'tabs',groups:[{key:<id>,title:<name>,blocks:[<block keys>]}],hidden:true|false,hidden_blocks:[<block keys>],calendar?:{block:<all-stage progress block>,date_field:[<ordered datetime path>],rollup_block:<same-source count-by-stage rollup>,context_block:<context summary>,attention_stages:[<stage>],collection_title:<label>}}]}. "
+    "A data-view display defaults to stack and renders blocks in declared order; groups affect tabs only. Tabs requires groups, and groups must cover every component block exactly once. "
+    "Project source label_fields holds 1–3 declared string paths. Omit or empty launch_workflows selects actual projects only. "
+    "To display metrics per publication, bind a records block's metrics_source to a declared publication_stats source whose parent is the block's project_records source and whose subject is its project ancestor. "
+    "Data views are generic: name contexts for the tracked object. Ordinary project rows or typed project_records need no platform or metrics. "
+    "visibility:{block:<records key>,when:'has_records'} displays contexts with records in that source. has_observations is specifically for verified publication receipts with matching publication_stats and real observations (zero qualifies). Page-editable. "
+    "Optional record_display is {title:{source:<owner or ancestor project source>,field:[<state path>]},fields:[{label:<caption>,source:<owner or ancestor project source>,field:[<state path>],labels?:{<stored value>:<display label>}}],media:[{source:<project_documents source>,label?:<caption>}]}. "
+    "Media supports at most four unique document sources parented to the record owner or a declared ancestor; exact Document IDs are resolved from that project's state and checked against Knowledge access. Never infer association from filenames or platform. Media preview does not prove external application. "
+    "For a selected-project context, use a summary block only with the component's project source: "
+    "{type:'summary',source:<context source>,fields:[{label:<caption>,field:[<declared state path>],format:'text'|'status'|'date'|'link'|'link_list'|'document',hide_when_empty:true|false,labels?:{<stored value>:<display label>}}]}. "
+    "Summary fields are read-only declared state, never a query or a runtime control; link and link_list render only safe public HTTP(S) URLs; document takes a stored Document ID and opens it in the viewer. "
+    "A calendar display is read-only: its progress source must contain every stage, use the source's declared datetime order, and share its source with a count-by-stage rollup. It returns one batch summary per listed context and never changes dates, posts, or approval state. "
+    "Any data block may set empty_message for an honest empty state. project_rollup may set "
+    "completion:{stages:[<completed stages>],label:<caption>} to derive a displayed completed count, and "
+    "project_rollup or progress may set stage_labels:{<stored stage>:<caption>}. These are presentation-only "
+    "configuration and are validated by the shared App normalizer; they never advance project state or prove output. "
+    "Use only declared source fields backed by producer state_schema. Preserve publication identity and subject scope; never group different works solely by platform. These bindings display existing receipts and Stats; collection schedules belong in Workflows. "
+    "payload.app_view.sections replaces the page's block order: [{id,block:"
+    + "|".join(f"'{block}'" for block in APP_SECTION_BLOCKS)
+    + ",source,view,limit}]; outputs source is 'workspace' or 'workflow:<binding_id>' with view "
+    + "|".join(f"'{view}'" for view in APP_SECTION_BLOCKS["outputs"]["views"])
+    + "; connections lists what the Blueprint needs connected; queue lists pending decisions; metrics shows "
+    "tracked Workspace stats and goals (limit = how many show at once); actions holds the entries and is always kept; "
+    "The page always runs in four zones, notices (connections, queue), functions (actions), data (metrics), "
+    "outputs; blocks are ordered within their zone. sections:null restores the default page. "
     "Use the returned workflow_options, agent_options and automation_options for exact target IDs. "
     "Choose a Workflow for the main action. If no App configuration exists, the page defaults to the Workspace name and description, "
     "and uses the first available bound Workflow as its main action. If no Workflow is available, keep the main action empty and help select or create a Workflow. "
+    "Entries not named in order or hidden follow a default that leaves out what a Workflow already covers (its "
+    "services, automations that only schedule a listed Workflow, the metric assessment); app_view.config.hidden "
+    "shows the effective list, and naming an entry in order or hidden makes its place explicit. "
     "Any App entry can select Agent, Flow, or Automation. An entry connected to 'workflow:<binding_id>' uses that Workflow's run_inputs instead of its chat form. "
     "To attach a saved active Workflow listed in attachable_workflow_options, use "
-    "workflow_binding.attach with payload={workflow_id:<id>,action_key:<optional existing App action key>,primary:<optional boolean>}. "
+    "workflow_binding.attach with payload={workflow_id:<id>,action_key:<optional existing App action key>,primary:<optional boolean>,"
+    "slug:<optional portable Workflow slug>}. "
     "It creates a manual Workspace binding on approved apply and optionally connects that App entry. "
+    "slug names the Workflow for Blueprint export and for agent_review Stats (their collector_config.workflow_slug); once set it stays. "
     "Set primary=true to make the attached Workflow the App's main action, including in a Workspace with no App configuration or services. "
     "It never runs the Workflow or creates a definition. Re-read get_current after apply to find the binding_id. "
     "Only include fields the user asked to change. app_view.update edits presentation and target selection; "
@@ -624,14 +648,15 @@ WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE = (
 
 WORKSPACE_OPERATION_EAGER_CONFIGURATION_GUIDANCE = (
     "For App edits, first call get_current before Workspace/Knowledge search; "
-    "empty search hits do not prove runners absent. Use returned available_actions, "
+    "empty search hits do not prove runners absent. Use available_actions and returned "
     "workflow_options, agent_options, automation_options and attachable_workflow_options. "
-    "app_view.update payload.app_view: entries:{'action:<id>':{title}}, "
+    "app_view.update supports entries, sources, components, display, targets and prompts/forms; "
+    "stack uses block order and tabs groups cover every block, "
     "targets:{<key>:'agent:<id>'|'agent:default'|'workflow:<binding_id>'|'automation:<job_id>'}, "
-    "prompts and forms. No Service needed; commands may share an Agent. entries:{<key>:null} removes only the entry. "
-    "workflow_binding.attach payload={workflow_id,action_key:<optional existing App action key>,primary:<boolean>} creates a manual "
-    "binding only on approved apply and never runs the Workflow. Workflow actions use run_inputs. "
-    "Default main action: first bound Workflow; if none, leave empty and help select/create. "
+    "prompts/forms. Commands may share an Agent. entries:{<key>:null} removes it. "
+    "workflow_binding.attach payload={workflow_id,action_key:<optional existing App action key>,primary:<boolean>} "
+    "binding only on approved apply and never runs the Workflow. "
+    "Default main action: first bound Workflow; else leave empty. "
     + _WORKSPACE_OPERATION_COMMON_GUIDANCE
 )
 
@@ -662,14 +687,17 @@ def describe_operation_patch_ops() -> str:
     """Runtime-boundary re-export of the implementation-derived op vocabulary.
 
     Thin AI tools must not import business layers directly; they read the
-    vocabulary through here.
+    vocabulary through here, with this tool's call shape appended.
     """
 
     from packages.core.services.workspace_operation_service import (
         describe_operation_patch_ops as _describe,
     )
 
-    return _describe()
+    return _describe() + (
+        ' The exact create_draft argument shape is {"action":"create_draft",'
+        '"patches":[{"op":"integration.remove","payload":{"provider":"elevenlabs"}}]}.'
+    )
 
 
 def supported_operation_patch_ops() -> tuple[str, ...]:
@@ -689,6 +717,47 @@ def _resolve_workspace_operation_patches(raw_params: dict[str, Any]) -> list[dic
         if key in raw_params:
             return _normalise_workspace_operation_patches(raw_params.get(key))
     return []
+
+
+async def _runtime_design_app(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    user_id: str | None,
+    raw_params: dict[str, Any],
+) -> str:
+    """Command the App designer; its page comes back as a draft to accept or discard."""
+    from packages.core.database import async_session
+    from packages.core.services.workspace_app_designer import design_workspace_app_view
+
+    try:
+        async with async_session() as db:
+            result = await design_workspace_app_view(
+                db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id or None,
+                brief=str(raw_params.get("brief") or ""), feedback=raw_params.get("feedback"),
+                replaces_draft_id=str(raw_params.get("draft_id") or "").strip() or None,
+            )
+            if not result.get("ok"):
+                await db.rollback()
+                return _dumps({"error": result.get("error"), "design_notes": result.get("design_notes")})
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("workspace App design failed")
+        return _dumps({"error": f"failed to design the App page: {exc}"})
+    draft = result["draft"]
+    return _dumps({
+        "draft_id": draft.get("id"),
+        "candidate": result["candidate"],
+        "recipes": result["recipes"],
+        "warnings": result["warnings"],
+        "design_notes": result["design_notes"],
+        "validation": draft.get("validation"),
+        "next": (
+            "Review the candidate against the request. Accept it with apply_draft on this draft_id "
+            "(the person approves it on the review card), send it back with design_app plus feedback and "
+            "this draft_id, or discard_draft."
+        ),
+    })
 
 
 async def runtime_workspace_operation_action(
@@ -719,6 +788,11 @@ async def runtime_workspace_operation_action(
         OperationConflictError,
         OperationValidationError,
     )
+
+    if action == "design_app":
+        return await _runtime_design_app(
+            entity_id=entity_id, workspace_id=workspace_id, user_id=user_id, raw_params=raw_params,
+        )
 
     try:
         from packages.core.database import async_session
@@ -760,10 +834,6 @@ async def runtime_workspace_operation_action(
             if action == "create_draft" and not patches:
                 # An empty draft only produces an empty review card. The
                 # caller meant to change something; tell it how to say so.
-                from packages.core.services.workspace_operation_service import (
-                    describe_operation_patch_ops,
-                )
-
                 return _dumps({
                     "error": (
                         "create_draft requires patches as [{op, payload}] "
@@ -780,6 +850,7 @@ async def runtime_workspace_operation_action(
                     user_id=user_id or None,
                     source_event_id=str(raw_params.get("source_event_id") or "workspace_agent.operation"),
                     initial_patches=patches,
+                    origin_conversation_id=conversation_id or None,
                 )
                 if not draft:
                     return _dumps({"error": "workspace not found"})
@@ -837,6 +908,16 @@ async def runtime_workspace_operation_action(
                 return _dumps({"draft_id": draft.id, "diff": diff})
 
             if action == "apply_draft":
+                if draft.status != WorkspaceOperationDraftStatus.OPEN:
+                    # Nothing left to review: say so, with the draft's Tasks,
+                    # so "start it" is not read as "apply it again".
+                    from packages.core.services.workspace_operation_service import (
+                        resolved_operation_draft_result,
+                    )
+
+                    payload = await resolved_operation_draft_result(db, draft)
+                    await db.commit()
+                    return _dumps(payload)
                 if not _truthy(raw_params.get("user_confirmation")):
                     # "Apply" from the model without the user's confirmation
                     # means "ask the user": hand back the review card (or the
@@ -942,6 +1023,7 @@ async def runtime_workspace_add_rule_action(
                 user_id=user_id or None,
                 source_event_id="workspace_agent.add_rule",
                 initial_patches=[{"op": "rule.add", "payload": {"rule": rule}}],
+                origin_conversation_id=conversation_id or None,
             )
             if not draft:
                 return _dumps({"error": "workspace not found"})

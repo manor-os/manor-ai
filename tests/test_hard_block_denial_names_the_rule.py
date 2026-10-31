@@ -5,8 +5,8 @@ social_post.publish" and stopped. Every denial surface carried only the glob
 pattern that matched; the rule that produced it — the thing the operator can
 change — was never named, and no surface offered the one-line fix (retype the
 rule to approval_required). This pins that both the chat-tool denial and the
-plan-step denial now carry ``blocking_rules`` and ``fix``, and that a plan-step
-denial parks the task for a human instead of replanning into the same wall.
+dispatcher step denial now carry ``blocking_rules`` and ``fix``, and that a
+hard block opens no approvable request.
 """
 from __future__ import annotations
 
@@ -61,12 +61,12 @@ def test_finds_the_hard_block_rule_by_action_and_skips_approval_rules():
 
 
 def test_category_rule_names_the_source_for_each_matching_publication():
-    for action in ("social_post.publish", "content.publish"):
+    for action in ("social_post.publish", "workspace.site.publish"):
         found = hard_block_rules_for([_CATEGORY_DENY], action_key=action)
         assert [r["rule_key"] for r in found] == ["no_publishing"]
         assert found[0]["kind"] == "category"
         assert found[0]["pattern"] == "publishing"
-    assert hard_block_rules_for([_CATEGORY_DENY], action_key="data.read") == []
+    assert hard_block_rules_for([_CATEGORY_DENY], action_key="tool.read_file.read") == []
 
 
 @pytest.mark.parametrize("legacy", [
@@ -119,7 +119,7 @@ def test_message_names_the_rule_and_the_soften_path():
     assert "rules page" in context["message"]
 
 
-# ── the plan-step denial ──────────────────────────────────────────────
+# ── the dispatcher step denial ───────────────────────────────────────
 
 
 async def _gated_step(db, *, rules):
@@ -181,13 +181,12 @@ async def _gated_step(db, *, rules):
 
 
 @pytest.mark.asyncio
-async def test_plan_step_denial_names_the_rule_and_parks_for_a_human(db_session, monkeypatch):
+async def test_dispatcher_step_denial_names_the_rule(db_session, monkeypatch):
     from sqlalchemy import select
 
     from packages.core.dispatcher.service import Dispatcher
     from packages.core.models.execution import ExecutionStep
     from packages.core.models.hitl_request import HitlRequest
-    from packages.core.plans.executor import _human_required_failure_issue
 
     cards: list[dict] = []
 
@@ -216,55 +215,7 @@ async def test_plan_step_denial_names_the_rule_and_parks_for_a_human(db_session,
     # A policy denial is not a pending question or approval request.
     assert step.error["failure"]["requires_human"] is True
     assert step.error["failure"]["retryable"] is False
-    issue = _human_required_failure_issue([step])
-    assert issue is None
 
-
-def test_unsupported_file_operation_requires_human_does_not_park_the_plan():
-    from types import SimpleNamespace
-
-    from packages.core.constants.execution import ExecutionStepStatus
-    from packages.core.plans.executor import _human_required_failure_issue
-
-    step = SimpleNamespace(
-        step_key="patch_document",
-        step_status=ExecutionStepStatus.FAILED,
-        error={
-            "type": "ToolError",
-            "message": "unsupported_operation_for_file_type",
-            "failure": {
-                "requires_human": True,
-                "reason": "unsupported_operation_for_file_type",
-                "blockers": ["text.set"],
-            },
-        },
-        result=None,
-    )
-    assert _human_required_failure_issue([step]) is None
-
-
-def test_model_file_not_found_flag_is_not_a_human_request():
-    from types import SimpleNamespace
-
-    from packages.core.constants.execution import ExecutionStepStatus
-    from packages.core.plans.executor import _human_required_failure_issue
-
-    step = SimpleNamespace(
-        step_key="patch_document",
-        step_status=ExecutionStepStatus.FAILED,
-        error={
-            "type": "ToolError",
-            "message": "File not found",
-            "failure": {
-                "requires_human": True,
-                "reason": "File not found",
-                "blockers": ["documents/missing.md"],
-            },
-        },
-        result=None,
-    )
-    issue = _human_required_failure_issue([step])
-    assert issue is None
 
 
 # ── the chat-tool denial ──────────────────────────────────────────────

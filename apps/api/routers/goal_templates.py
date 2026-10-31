@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_workspace_writable
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services.entity_service import get_workspace
@@ -103,6 +103,8 @@ async def apply_goal_template(
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
+    # A recipe writes Goals, Tasks, schedules and Agents into the Workspace.
+    await require_workspace_writable(db, user, workspace_id)
 
     inp = TemplateInput(
         entity_id=user.entity_id,

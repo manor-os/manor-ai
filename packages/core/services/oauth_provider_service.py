@@ -23,10 +23,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import bcrypt
-from sqlalchemy import select, update
+from urllib.parse import urlsplit
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp
+from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp, OAuthRefreshToken
 from packages.core.models.user import User
 from packages.core.services.actor_authorization import AuthenticatedUserCredential, resolve_current_user_actor
 from packages.core.services.auth_service import create_access_token
@@ -36,6 +37,20 @@ logger = logging.getLogger(__name__)
 
 # How long an authorization code lives before it can no longer be redeemed
 AUTHORIZATION_CODE_TTL_MINUTES = 10
+
+# Public (native) clients keep a session alive with rotating refresh tokens.
+REFRESH_TOKEN_TTL_DAYS = 30
+
+# Audience of tokens issued to dynamically registered clients: the hosted MCP
+# endpoint accepts it, every REST route rejects it.
+MCP_TOKEN_AUDIENCE = "manor-mcp"
+
+REGISTRATION_SOURCE_CONFIGURED = "configured"
+REGISTRATION_SOURCE_DYNAMIC = "dynamic"
+
+
+def is_public_client(client: OAuthClientApp) -> bool:
+    return not client.client_secret_hash
 
 
 # ── Client credential helpers ──
@@ -62,20 +77,147 @@ async def get_client_by_id(db: AsyncSession, client_id: str) -> Optional[OAuthCl
 
 
 async def verify_client_credentials(
-    db: AsyncSession, client_id: str, client_secret: str
+    db: AsyncSession, client_id: str, client_secret: Optional[str]
 ) -> Optional[OAuthClientApp]:
+    """Authenticate a token-endpoint client.
+
+    Confidential clients must present their secret. Public clients present none
+    (PKCE proves possession instead); a secret sent by a public client fails.
+    """
     client = await get_client_by_id(db, client_id)
     if not client or not client.active:
         return None
-    if not _verify_client_secret(client_secret, client.client_secret_hash):
+    if is_public_client(client):
+        return None if client_secret else client
+    if not _verify_client_secret(client_secret or "", client.client_secret_hash):
         return None
     return client
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+
+
+def _loopback_without_port(uri: str) -> Optional[tuple[str, str, str]]:
+    """(host, path, query) of an http loopback redirect URI, else None."""
+    try:
+        parts = urlsplit(uri)
+        parts.port  # noqa: B018 — raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if parts.scheme != "http" or parts.fragment or parts.username or parts.password:
+        return None
+    host = (parts.hostname or "").lower()
+    if parts.netloc.startswith("[") and host == "::1":
+        host = "[::1]"
+    if host not in _LOOPBACK_HOSTS:
+        return None
+    return host, parts.path or "/", parts.query
+
+
 def validate_redirect_uri(client: OAuthClientApp, redirect_uri: str) -> bool:
-    """Exact-match redirect URI against the whitelist."""
+    """Match the redirect URI against the client's whitelist.
+
+    Exact match, except that a public client's loopback URI may use any port
+    (RFC 8252 §7.3): native apps bind an ephemeral port per sign-in.
+    """
     allowed = client.redirect_uris or []
-    return redirect_uri in allowed
+    if redirect_uri in allowed:
+        return True
+    if not is_public_client(client):
+        return False
+    requested = _loopback_without_port(redirect_uri)
+    return requested is not None and any(
+        _loopback_without_port(uri) == requested for uri in allowed
+    )
+
+
+# ── Dynamic client registration (RFC 7591) ──
+
+# Hosted (non-loopback) callbacks a self-registered client may use. Loopback
+# http URIs are always allowed: only the user's own machine can receive them.
+_DEFAULT_DYNAMIC_REDIRECT_URIS = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
+
+
+def dynamic_redirect_allowlist() -> tuple[str, ...]:
+    configured = os.getenv("MANOR_OAUTH_DYNAMIC_REDIRECT_URIS")
+    if configured is None:
+        return _DEFAULT_DYNAMIC_REDIRECT_URIS
+    return tuple(u.strip() for u in configured.split(",") if u.strip())
+
+
+class ClientRegistrationError(ValueError):
+    """RFC 7591 §3.2.2 error: ``code`` is the OAuth error, ``description`` safe to echo."""
+
+    def __init__(self, code: str, description: str):
+        super().__init__(code)
+        self.code = code
+        self.description = description
+
+
+_MAX_CLIENT_NAME = 100
+_MAX_REDIRECT_URIS = 10
+
+
+async def register_dynamic_client(db: AsyncSession, metadata: dict) -> OAuthClientApp:
+    """Register a public PKCE client for the MCP resource (RFC 7591).
+
+    Only public clients are issued (``token_endpoint_auth_method=none``); their
+    tokens are bound to :data:`MCP_TOKEN_AUDIENCE`, so a self-registered client
+    can never obtain a general REST API token.
+    """
+    redirect_uris = metadata.get("redirect_uris")
+    if (not isinstance(redirect_uris, list) or not redirect_uris
+            or len(redirect_uris) > _MAX_REDIRECT_URIS
+            or not all(isinstance(u, str) and len(u) <= 2048 for u in redirect_uris)):
+        raise ClientRegistrationError("invalid_redirect_uri", "redirect_uris must list 1-10 URIs")
+    hosted = set(dynamic_redirect_allowlist())
+    for uri in redirect_uris:
+        if uri not in hosted and _loopback_without_port(uri) is None:
+            raise ClientRegistrationError(
+                "invalid_redirect_uri",
+                "redirect URIs must be http loopback (localhost/127.0.0.1) or an allowed hosted callback",
+            )
+
+    auth_method = metadata.get("token_endpoint_auth_method", "none")
+    if auth_method != "none":
+        raise ClientRegistrationError("invalid_client_metadata", "only public clients (token_endpoint_auth_method=none) may register")
+    grant_types = metadata.get("grant_types", ["authorization_code"])
+    if not isinstance(grant_types, list) or not set(grant_types) <= {"authorization_code", "refresh_token"}:
+        raise ClientRegistrationError("invalid_client_metadata", "unsupported grant_types")
+    response_types = metadata.get("response_types", ["code"])
+    if not isinstance(response_types, list) or not set(response_types) <= {"code"}:
+        raise ClientRegistrationError("invalid_client_metadata", "unsupported response_types")
+
+    name = metadata.get("client_name")
+    name = name.strip()[:_MAX_CLIENT_NAME] if isinstance(name, str) and name.strip() else "MCP client"
+
+    client = OAuthClientApp(
+        client_id=f"mcp-{secrets.token_urlsafe(18)}",
+        client_secret_hash=None,
+        name=name,
+        description=None,
+        redirect_uris=list(dict.fromkeys(redirect_uris)),
+        # A self-registered client may ask only for what the MCP server offers.
+        allowed_scopes=list(MCP_SCOPES),
+        active=True,
+        require_pkce=True,
+        require_verified_email=False,
+        access_token_ttl_minutes=60,
+        registration_source=REGISTRATION_SOURCE_DYNAMIC,
+        token_audience=MCP_TOKEN_AUDIENCE,
+    )
+    db.add(client)
+    await db.flush()
+    return client
+
+
+# What the MCP resource offers (advertised in its OAuth metadata).
+MCP_SCOPES: tuple[str, ...] = (
+    "mcp",
+)
 
 
 # RFC 7636: S256 is unpadded base64url(SHA256(verifier)); verifier is 43..128 unreserved ASCII.
@@ -137,6 +279,8 @@ async def create_authorization_code(
     validate_pkce_authorization(client, code_challenge, code_challenge_method)
     code_str = _generate_code()
     expires = datetime.now(timezone.utc) + timedelta(minutes=AUTHORIZATION_CODE_TTL_MINUTES)
+    # /authorize echoes client-owned state directly; code redemption does not use it.
+    # Leave the legacy nullable column empty: opaque relay state can exceed 255 chars.
     code = OAuthAuthorizationCode(
         code=code_str,
         client_id=client.client_id,
@@ -144,7 +288,6 @@ async def create_authorization_code(
         entity_id=user.entity_id,
         redirect_uri=redirect_uri,
         scope=scope or [],
-        state=state,
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
         expires_at=expires,
@@ -159,7 +302,7 @@ async def exchange_code_for_token(
     *,
     code: str,
     client_id: str,
-    client_secret: str,
+    client_secret: Optional[str],
     redirect_uri: str,
     code_verifier: Optional[str] = None,
 ) -> dict:
@@ -247,8 +390,21 @@ async def exchange_code_for_token(
     if redeemed.scalar_one_or_none() is None:
         raise ValueError("invalid_grant")
 
+    result = _token_response(client, user, actor, code_row.scope or [])
+    if is_public_client(client):
+        result["refresh_token"] = await _issue_refresh_token(
+            db, client=client, user=user, entity_id=actor.entity_id,
+            scope=code_row.scope or [], family_id=None,
+        )
+    return result
+
+
+def _token_response(client: OAuthClientApp, user: User, actor, scope: list[str]) -> dict:
+    from packages.core.services.user_email_proof import email_is_verified
+
     # OAuth clients receive the same short-lived, revocable API token as the
-    # first-party web app. Access-token TTLs are capped at 60 minutes.
+    # first-party web app, bound to the client's resource audience if it has
+    # one. Access-token TTLs are capped at 60 minutes.
     ttl_minutes = min(max(1, client.access_token_ttl_minutes or 60), 60)
     access_token = create_access_token(
         user.id,
@@ -256,14 +412,15 @@ async def exchange_code_for_token(
         actor.display_role,
         token_version=user.token_version,
         expires_minutes=ttl_minutes,
+        audience=client.token_audience,
+        scopes=scope,
+        authorized_party=client.client_id,
     )
-    expires_in = ttl_minutes * 60
-
     return {
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": expires_in,
-        "scope": " ".join(code_row.scope or []),
+        "expires_in": ttl_minutes * 60,
+        "scope": " ".join(scope),
         # Convenience claims so the client doesn't have to decode the JWT
         "user": {
             "id": user.id,
@@ -274,6 +431,244 @@ async def exchange_code_for_token(
             "role": actor.display_role,
         },
     }
+
+
+# ── Refresh tokens (public clients) ──
+
+def _hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def _issue_refresh_token(
+    db: AsyncSession,
+    *,
+    client: OAuthClientApp,
+    user: User,
+    entity_id: str,
+    scope: list[str],
+    family_id: Optional[str],
+) -> str:
+    from packages.core.models.base import generate_ulid
+
+    token = secrets.token_urlsafe(48)
+    db.add(OAuthRefreshToken(
+        token_hash=_hash_refresh_token(token),
+        family_id=family_id or generate_ulid(),
+        client_id=client.client_id,
+        user_id=user.id,
+        entity_id=entity_id,
+        scope=list(scope),
+        token_version=int(user.token_version or 0),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_TTL_DAYS),
+    ))
+    await db.flush()
+    return token
+
+
+class RefreshTokenReuse(ValueError):
+    """A rotated refresh token was presented again; its family is now revoked.
+
+    The caller must commit (persist the revocation) before reporting invalid_grant.
+    """
+
+    def __init__(self):
+        super().__init__("invalid_grant")
+
+
+async def refresh_access_token(
+    db: AsyncSession,
+    *,
+    refresh_token: str,
+    client_id: str,
+    client_secret: Optional[str] = None,
+) -> dict:
+    """Rotate a refresh token: revoke-on-reuse, re-admit the user, mint new tokens."""
+    client = await verify_client_credentials(db, client_id, client_secret)
+    if not client or not is_public_client(client):
+        raise ValueError("invalid_client")
+
+    row = (await db.execute(
+        select(OAuthRefreshToken)
+        .where(OAuthRefreshToken.token_hash == _hash_refresh_token(refresh_token or ""))
+        .with_for_update()
+    )).scalar_one_or_none()
+    if row is None or row.client_id != client.client_id or row.revoked_at is not None:
+        raise ValueError("invalid_grant")
+    now = datetime.now(timezone.utc)
+    if row.rotated_at is not None:
+        await db.execute(
+            update(OAuthRefreshToken)
+            .where(OAuthRefreshToken.family_id == row.family_id, OAuthRefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        raise RefreshTokenReuse()
+    expires = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
+    if expires <= now:
+        raise ValueError("invalid_grant")
+
+    user = (await db.execute(
+        select(User).where(User.id == row.user_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if user is None or user.status != "active" or int(user.token_version or 0) != int(row.token_version):
+        raise ValueError("invalid_grant")
+    actor = await resolve_current_user_actor(
+        db,
+        AuthenticatedUserCredential(
+            user_id=user.id,
+            entity_id=row.entity_id,
+            token_version=int(user.token_version or 0),
+        ),
+    )
+    if actor is None:
+        raise ValueError("invalid_grant")
+
+    rotated = await db.execute(
+        update(OAuthRefreshToken)
+        .where(OAuthRefreshToken.id == row.id, OAuthRefreshToken.rotated_at.is_(None),
+               OAuthRefreshToken.revoked_at.is_(None))
+        .values(rotated_at=now)
+        .returning(OAuthRefreshToken.id)
+        .execution_options(synchronize_session=False)
+    )
+    if rotated.scalar_one_or_none() is None:
+        raise ValueError("invalid_grant")
+
+    result = _token_response(client, user, actor, row.scope or [])
+    result["refresh_token"] = await _issue_refresh_token(
+        db, client=client, user=user, entity_id=actor.entity_id,
+        scope=row.scope or [], family_id=row.family_id,
+    )
+    return result
+
+
+# ── Connected clients (refresh-token families) ──
+
+def _live_refresh_token(now: datetime):
+    return and_(
+        OAuthRefreshToken.revoked_at.is_(None),
+        OAuthRefreshToken.rotated_at.is_(None),
+        OAuthRefreshToken.expires_at > now,
+    )
+
+
+async def list_connected_clients(db: AsyncSession, user: User) -> list[dict]:
+    """The user's live refresh-token families, one per signed-in client.
+
+    ``connected_at`` is the family's first sign-in; ``last_used_at`` is when the
+    client last obtained tokens (sign-in or refresh). Families from before the
+    user's last "sign out everywhere" are dead and therefore not listed.
+    """
+    now = datetime.now(timezone.utc)
+    rows = (await db.execute(
+        select(OAuthRefreshToken, OAuthClientApp)
+        .join(OAuthClientApp, OAuthClientApp.client_id == OAuthRefreshToken.client_id)
+        .where(
+            OAuthRefreshToken.user_id == user.id,
+            OAuthRefreshToken.token_version == int(user.token_version or 0),
+            _live_refresh_token(now),
+        )
+        .order_by(OAuthRefreshToken.created_at.desc())
+    )).all()
+    if not rows:
+        return []
+    families = [token.family_id for token, _ in rows]
+    first_seen = dict((await db.execute(
+        select(OAuthRefreshToken.family_id, func.min(OAuthRefreshToken.created_at))
+        .where(OAuthRefreshToken.family_id.in_(families))
+        .group_by(OAuthRefreshToken.family_id)
+    )).all())
+    return [
+        {
+            "id": token.family_id,
+            "client_id": client.client_id,
+            "name": client.name,
+            "verified": client.registration_source != REGISTRATION_SOURCE_DYNAMIC,
+            "entity_id": token.entity_id,
+            "connected_at": first_seen.get(token.family_id) or token.created_at,
+            "last_used_at": token.created_at,
+            "expires_at": token.expires_at,
+        }
+        for token, client in rows
+    ]
+
+
+async def revoke_connected_client(db: AsyncSession, user: User, family_id: str) -> bool:
+    """Revoke one of the user's refresh-token families. False when none was live.
+
+    Access tokens already issued to that client stay valid until they expire
+    (at most an hour); the client can no longer renew them.
+    """
+    revoked = await db.execute(
+        update(OAuthRefreshToken)
+        .where(
+            OAuthRefreshToken.family_id == family_id,
+            OAuthRefreshToken.user_id == user.id,
+            OAuthRefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
+    return bool(revoked.rowcount)
+
+
+# ── Unused dynamic client cleanup ──
+
+def dynamic_client_unused_ttl_hours() -> int:
+    try:
+        return max(1, int(os.getenv("MANOR_OAUTH_DYNAMIC_CLIENT_TTL_HOURS", "24")))
+    except ValueError:
+        return 24
+
+
+async def cleanup_unused_dynamic_clients(
+    db: AsyncSession, *, now: Optional[datetime] = None, limit: int = 500,
+) -> int:
+    """Delete self-registered clients nobody is using. The caller commits.
+
+    A dynamic client older than the TTL is unused when it has no live refresh
+    token and no pending authorization code: it either never finished a
+    sign-in or every session it had has expired or been revoked. A client that
+    returns later simply registers again. Configured clients are never touched.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=dynamic_client_unused_ttl_hours())
+    live_token = select(OAuthRefreshToken.id).where(
+        OAuthRefreshToken.client_id == OAuthClientApp.client_id,
+        _live_refresh_token(now),
+    )
+    pending_code = select(OAuthAuthorizationCode.id).where(
+        OAuthAuthorizationCode.client_id == OAuthClientApp.client_id,
+        OAuthAuthorizationCode.redeemed_at.is_(None),
+        OAuthAuthorizationCode.expires_at > now,
+    )
+    unused = (
+        OAuthClientApp.registration_source == REGISTRATION_SOURCE_DYNAMIC,
+        OAuthClientApp.created_at < cutoff,
+        ~live_token.exists(),
+        ~pending_code.exists(),
+    )
+    candidates = list((await db.execute(
+        select(OAuthClientApp.client_id).where(*unused)
+        .order_by(OAuthClientApp.created_at).limit(limit)
+    )).scalars())
+    if not candidates:
+        return 0
+    # Re-check in the DELETE itself: a sign-in that started after the scan keeps its client.
+    deleted = list((await db.execute(
+        delete(OAuthClientApp)
+        .where(OAuthClientApp.client_id.in_(candidates), *unused)
+        .returning(OAuthClientApp.client_id)
+        .execution_options(synchronize_session=False)
+    )).scalars())
+    if deleted:
+        for model in (OAuthRefreshToken, OAuthAuthorizationCode):
+            await db.execute(
+                delete(model).where(model.client_id.in_(deleted))
+                .execution_options(synchronize_session=False)
+            )
+    return len(deleted)
 
 
 # ── Startup bootstrap from env vars ──

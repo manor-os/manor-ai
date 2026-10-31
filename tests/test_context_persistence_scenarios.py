@@ -5,9 +5,10 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from packages.core.ai.runtime.context_compaction import CHECKPOINT_PREFIX
+from packages.core.ai.runtime.control import RuntimeContextWriterFenced
 from packages.core.models.agent_delegation_session import AgentContextArchive
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_run import RuntimeRun
@@ -57,7 +58,7 @@ async def test_each_scope_dimension_blocks_archive_and_checkpoint_disclosure(db_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lost_lease", ["version", "owner", "expired", "missing_expiry", "cancelled"])
+@pytest.mark.parametrize("lost_lease", ["owner", "expired", "missing_expiry", "cancelled"])
 async def test_stale_main_writer_cannot_append_archive_or_replace_checkpoint(db_session, lost_lease):
     owner_scope = scope()
     pending_tool = {"pending_tool": {"name": "publish", "requires_approval": True}, "rounds": 17}
@@ -67,21 +68,67 @@ async def test_stale_main_writer_cannot_append_archive_or_replace_checkpoint(db_
     saved = checkpoint("verified checkpoint")
     await save([saved])
     changes = {
-        "version": {"version": 2}, "owner": {"lease_owner": "replacement-worker"},
+        "owner": {"lease_owner": "replacement-worker"},
         "expired": {"lease_expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
         "missing_expiry": {"lease_expires_at": None}, "cancelled": {"status": "cancelled"},
     }
     await db_session.execute(update(RuntimeRun).where(RuntimeRun.id == row.id).values(**changes[lost_lease]))
     await db_session.commit()
-    with pytest.raises(RuntimeError, match="no longer owns"):
+    with pytest.raises(RuntimeContextWriterFenced):
         await archive([{"role": "user", "content": "stale extra record"}])
-    with pytest.raises(RuntimeError, match="no longer owns"):
+    with pytest.raises(RuntimeContextWriterFenced):
         await save([checkpoint("stale summary")])
     await db_session.refresh(row)
     assert row.context_state["checkpoint"] == saved
     assert row.checkpoint == pending_tool
     archives = (await db_session.execute(select(AgentContextArchive).where(AgentContextArchive.runtime_run_id == row.id))).scalars().all()
     assert len(archives) == 1
+
+
+@pytest.mark.asyncio
+async def test_context_writes_retry_only_transient_database_faults(monkeypatch):
+    from sqlalchemy.exc import DataError
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+    from packages.core.services import runtime_context_archive as archive_module
+
+    monkeypatch.setattr(archive_module, "_TRANSIENT_RETRY_DELAYS_SECONDS", (0, 0))
+    attempts = []
+
+    async def flaky():
+        attempts.append("try")
+        if len(attempts) < 3:
+            raise PoolTimeout("pool exhausted")
+        return "archive-1"
+
+    assert await archive_module._with_transient_retry(flaky) == "archive-1"
+    assert len(attempts) == 3
+
+    attempts.clear()
+
+    async def bad_data():
+        attempts.append("try")
+        raise DataError("INSERT", {}, Exception("invalid input syntax for type json"))
+
+    with pytest.raises(DataError):
+        await archive_module._with_transient_retry(bad_data)
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_version_bump_keeps_the_lease_holder_writing(db_session):
+    # Many legitimate mid-turn updates bump ``version``; only the lease decides
+    # who owns the run. Fencing on version failed healthy turns.
+    owner_scope = scope()
+    row = await run_row(db_session, owner_scope)
+    archive, _, save, _ = await runtime_context_archive_callbacks(run_id=row.id, **owner_scope)
+    await db_session.execute(update(RuntimeRun).where(RuntimeRun.id == row.id).values(version=RuntimeRun.version + 1))
+    await db_session.commit()
+
+    assert await archive([{"role": "user", "content": "original after a version bump"}])
+    saved = checkpoint("checkpoint after a version bump")
+    await save([saved])
+    await db_session.refresh(row)
+    assert row.context_state["checkpoint"] == saved
 
 
 @pytest.mark.asyncio
@@ -242,3 +289,56 @@ async def test_sandbox_execution_pointers_preserve_context_writer_claim(db_sessi
         assert row.version == version
         assert row.context_state["checkpoint"] == checkpoint(execution_id)
         assert row.checkpoint == pending_tool
+
+
+@pytest.mark.asyncio
+async def test_sandbox_reacquire_mid_turn_keeps_the_writer_until_the_run_parks(db_session):
+    """Regression (staging 2026-10-14): a skill sandbox reclaimed while the
+    model thought was re-acquired mid-turn; the pending-checkpoint ticket
+    bumped the run version, the turn's own checkpoint write raised "no longer
+    owns", the run never parked and the ticket expired unqueued."""
+    from packages.core.models.runtime_run import SandboxReservation, SandboxReservationStatus
+    from packages.core.services.runtime_run_service import persist_runtime_run_suspension
+    from packages.core.services.sandbox_queue_service import enqueue_sandbox_reservation
+
+    owner_scope = scope()
+    row = await run_row(db_session, owner_scope)
+    run_id = row.id
+    try:
+        _, _, save, _ = await runtime_context_archive_callbacks(run_id=run_id, **owner_scope)
+
+        reservation = await enqueue_sandbox_reservation(
+            db_session, run=row, tool_call_id="call-reacquire",
+            request_payload={"skill_name": "oloso-growth-notes-episode"}, activate=False,
+        )
+        await db_session.commit()
+        assert reservation.status == SandboxReservationStatus.PENDING_CHECKPOINT.value
+
+        saved = checkpoint("context before parking")
+        await save([saved])  # the turn still owns its run
+
+        await persist_runtime_run_suspension(db_session, run_id=run_id, control={
+            "kind": "waiting_resource", "reservation_id": reservation.id,
+            "checkpoint": {"pending_tool_call": {"id": "call-reacquire", "name": "invoke_skill"}},
+        })
+        await db_session.commit()
+        await db_session.refresh(row)
+        parked = await db_session.get(SandboxReservation, reservation.id)
+        await db_session.refresh(parked)
+        assert (row.status, row.reservation_id, row.lease_owner) == ("waiting_resource", reservation.id, None)
+        assert parked.status == SandboxReservationStatus.QUEUED.value
+        assert row.context_state["checkpoint"] == saved
+        with pytest.raises(RuntimeError, match="no longer owns"):
+            await save([checkpoint("after parking")])
+    finally:
+        # These rows are committed to exercise the independent context writer.
+        # The fixture's rollback cannot remove them from later queue scans.
+        await db_session.rollback()
+        await db_session.execute(delete(SandboxReservation).where(
+            SandboxReservation.runtime_run_id == run_id,
+            SandboxReservation.entity_id == owner_scope["entity_id"],
+        ))
+        await db_session.execute(delete(RuntimeRun).where(
+            RuntimeRun.id == run_id, RuntimeRun.entity_id == owner_scope["entity_id"],
+        ))
+        await db_session.commit()

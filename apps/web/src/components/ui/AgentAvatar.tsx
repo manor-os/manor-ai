@@ -224,7 +224,9 @@ function AgentFace({ seedKey, size }: { seedKey: string; size: number }) {
   );
 
   return (
-    <svg viewBox="0 0 100 100" width={size} height={size} style={{ display: "block" }} aria-hidden>
+    // Fill the frame's inner box: a caller's border would otherwise push a
+    // fixed-size face right and down, off the centre of the circle.
+    <svg viewBox="0 0 100 100" width="100%" height="100%" style={{ display: "block" }} aria-hidden>
       {/* head — big & round for cuteness */}
       {head === 0 && <circle cx={50} cy={54} r={29} {...stroke} fill={faceFill} />}
       {head === 1 && <rect x={22} y={26} width={56} height={57} rx={24} {...stroke} fill={faceFill} />}

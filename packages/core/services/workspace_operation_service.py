@@ -791,8 +791,8 @@ def _enrich_rules(rules: Any) -> list[dict[str, Any]]:
 
 _INTEGRATION_REMOVE_EXAMPLE = (
     'Use patches=[{"op":"integration.remove","payload":{"provider":"elevenlabs"}}] '
-    "for a workspace-wide removal. The current workspace is already supplied by the runtime; "
-    "omit scope, owner_scope, service_key, agent_id, task_id, and binding_key. "
+    "for a workspace-wide removal. The draft already names the Workspace; omit scope, "
+    "owner_scope, service_key, agent_id, task_id, and binding_key from the payload. "
     "This preserves shared account credentials and Agent definitions automatically."
 )
 
@@ -928,14 +928,42 @@ def _op_app_view_update(state, payload, raw_patch):
     update = payload.get("app_view", payload)
     if not isinstance(update, dict):
         raise ValueError("app_view.update requires an app_view object")
-    unknown = set(update) - {"eyebrow", "title", "description", "hero", "order", "hidden", "labels", "descriptions", "forms", "targets", "entries", "prompts", "visual", "layout", "motion_cover_url", "motion_cover_source_url"}
+    unknown = set(update) - {"eyebrow", "title", "description", "hero", "order", "hidden", "labels", "descriptions", "forms", "targets", "entries", "prompts", "presets", "asks", "choices", "icons", "visual", "layout", "cover_image_url", "motion_cover_url", "motion_cover_source_url", "data_sources", "components", "sections", "open_as", "i18n", "theme"}
     if unknown:
         raise ValueError(f"unsupported app_view update fields: {', '.join(sorted(unknown))}")
     model = _as_dict(state.get("operating_model"))
     config = normalize_app_view_config(model.get("app_view"))
-    for key in ("eyebrow", "title", "description", "hero", "order", "hidden", "visual", "layout", "motion_cover_url", "motion_cover_source_url"):
+    for key in ("eyebrow", "title", "description", "hero", "order", "hidden", "visual", "layout", "motion_cover_url", "motion_cover_source_url", "components", "sections"):
         if key in update:
             config[key] = update[key]
+    if "theme" in update:
+        # null clears it, so the App takes the platform's look again.
+        if update["theme"]:
+            config["theme"] = update["theme"]
+        else:
+            config.pop("theme", None)
+    if "cover_image_url" in update:
+        # null clears it, so the App opens under the Workspace's or the Blueprint's cover.
+        if update["cover_image_url"]:
+            config["cover_image_url"] = update["cover_image_url"]
+        else:
+            config.pop("cover_image_url", None)
+    if "open_as" in update:
+        # null clears it, so the Workspace opens the way each viewer last left it.
+        if update["open_as"] is None:
+            config.pop("open_as", None)
+        else:
+            config["open_as"] = update["open_as"]
+    if "data_sources" in update:
+        if not isinstance(update["data_sources"], dict):
+            raise ValueError("app_view.data_sources must be an object")
+        sources = dict(config.get("data_sources", {}))
+        for key, value in update["data_sources"].items():
+            if value is None:
+                sources.pop(key, None)
+            else:
+                sources[key] = value
+        config["data_sources"] = sources
     if "labels" in update:
         if not isinstance(update["labels"], dict):
             raise ValueError("app_view.labels must be an object")
@@ -976,7 +1004,20 @@ def _op_app_view_update(state, payload, raw_patch):
             else:
                 targets[key] = target
         config["targets"] = targets
-    for field in ("entries", "prompts"):
+    if "i18n" in update:
+        # The page in another language, one language at a time; a person's
+        # version replaces a machine translation, and null removes it.
+        if not isinstance(update["i18n"], dict):
+            raise ValueError("app_view.i18n must map a language to translated page text")
+        overlays = dict(config.get("i18n") or {})
+        for language, overlay in update["i18n"].items():
+            if overlay is None:
+                overlays.pop(language, None)
+            else:
+                overlays[language] = overlay
+        config["i18n"] = overlays
+    config.setdefault("icons", {})
+    for field in ("entries", "prompts", "presets", "asks", "choices", "icons"):
         if field not in update:
             continue
         if not isinstance(update[field], dict):
@@ -989,7 +1030,7 @@ def _op_app_view_update(state, payload, raw_patch):
             if value is None:
                 config[field].pop(key, None)
                 if field == "entries":
-                    for mapping in ("labels", "descriptions", "forms", "targets", "prompts"):
+                    for mapping in ("labels", "descriptions", "forms", "targets", "prompts", "presets", "asks", "choices", "icons"):
                         config[mapping].pop(key, None)
                     for collection in ("order", "hidden"):
                         config[collection] = [item for item in config[collection] if item != key]
@@ -1002,6 +1043,9 @@ def _op_app_view_update(state, payload, raw_patch):
     return _sync_operating_model_from_state(state)
 
 
+# The Workflow's portable identity in this Workspace: Blueprint export uses it
+# as the recipe slug, and Stats, schedules and upgrades refer to it by name.
+_WORKFLOW_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]")
 _WORKFLOW_ATTACH_PAYLOAD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1009,6 +1053,7 @@ _WORKFLOW_ATTACH_PAYLOAD_SCHEMA = {
         "service_key": {"type": ["string", "null"], "minLength": 1, "pattern": r"\S"},
         "action_key": {"type": ["string", "null"], "pattern": _ACTION_KEY.pattern},
         "primary": {"type": "boolean"},
+        "slug": {"type": "string", "pattern": f"^{_WORKFLOW_SLUG.pattern}$"},
     },
     "required": ["workflow_id"],
     "additionalProperties": False,
@@ -1017,11 +1062,12 @@ _WORKFLOW_ATTACH_PAYLOAD_SCHEMA = {
 }
 
 
-@_patch_op("workflow_binding.attach", summary="attach a saved Workflow and optionally make it the App's main action or an entry target",
+@_patch_op("workflow_binding.attach", summary="attach a saved Workflow and optionally make it the App's main action or an entry target; "
+                   "slug gives it the portable name Blueprint export and agent_review Stats use",
            payload_schema=_WORKFLOW_ATTACH_PAYLOAD_SCHEMA)
 def _op_workflow_binding_attach(state, payload, raw_patch):
     if set(payload) - _WORKFLOW_ATTACH_PAYLOAD_SCHEMA["properties"].keys():
-        raise ValueError("workflow_binding.attach accepts workflow_id, optional action_key, service_key and primary")
+        raise ValueError("workflow_binding.attach accepts workflow_id, optional action_key, service_key, primary and slug")
     workflow_id = payload.get("workflow_id")
     service_key = payload.get("service_key")
     action_key = payload.get("action_key")
@@ -1037,7 +1083,12 @@ def _op_workflow_binding_attach(state, payload, raw_patch):
             raise ValueError("workflow_binding.attach accepts either action_key or service_key")
     if "primary" in payload and not isinstance(payload["primary"], bool):
         raise ValueError("workflow_binding.attach primary must be boolean")
+    slug = payload.get("slug")
+    if slug is not None and (not isinstance(slug, str) or not _WORKFLOW_SLUG.fullmatch(slug)):
+        raise ValueError("workflow_binding.attach slug must be 3-120 lowercase letters, digits, - or _")
     row = {"workflow_id": workflow_id.strip()}
+    if slug is not None:
+        row["slug"] = slug
     if service_key is not None:
         row["service_key"] = service_key.strip()
     if action_key is not None:
@@ -1485,6 +1536,25 @@ def operation_patch_payload_schema(op: str) -> dict[str, Any] | None:
     return None
 
 
+def canonical_operation_patch_op(op: str) -> str | None:
+    for entry in OPERATION_PATCH_OP_CATALOG:
+        if op in (entry.canonical, *entry.aliases):
+            return entry.canonical
+    return None
+
+
+def _require_allowed_patch_operations(patches: list[dict[str, Any]], allowed: list[str] | None) -> None:
+    """An entry surface may narrow its operations, never widen authorization."""
+    if allowed is None:
+        return
+    allowed_names = set(allowed)
+    for patch in patches:
+        op, _ = _normalise_patch(patch)
+        canonical = canonical_operation_patch_op(op)
+        if canonical is None or canonical not in allowed_names:
+            raise OperationConflictError(f"operation {op!r} is not exposed by this client; review through a supported operation")
+
+
 def operation_patch_item_schema() -> dict[str, Any]:
     """Keep typed patch payloads tied to the executable dispatcher catalog."""
     typed_names = set()
@@ -1541,7 +1611,11 @@ _RULE_DERIVED_GUARDRAIL_NOTE = (
 
 
 def describe_operation_patch_ops() -> str:
-    """Compact, implementation-derived vocabulary for prompts and errors."""
+    """Compact, implementation-derived vocabulary for prompts and errors.
+
+    Interface-neutral: it is shared by the in-product agent and the MCP
+    endpoint, so each caller adds its own call shape.
+    """
 
     lines = [f"{entry.canonical} ({entry.summary})" for entry in OPERATION_PATCH_OP_CATALOG]
     return (
@@ -1553,9 +1627,7 @@ def describe_operation_patch_ops() -> str:
         "removes one existing operation binding_key, not inherited Agent bindings. "
         "Use integration.enable alone to undo a workspace integration removal. "
         "Inherited connection requirements return automatically; do not add capability bindings "
-        "or recreate requirements unless the user separately requests new configuration."
-        ' The exact create_draft argument shape is {"action":"create_draft",'
-        '"patches":[{"op":"integration.remove","payload":{"provider":"elevenlabs"}}]}. '
+        "or recreate requirements unless the user separately requests new configuration. "
         + _INTEGRATION_REMOVE_EXAMPLE
         + " integration_scope.update accepts only disabled_providers:string[]; fields such as "
         "remove_bindings, remove_required_connections, preserve_integrations, credentials, "
@@ -2008,17 +2080,6 @@ def operation_review_hitl_payload(
         )
     if set(diff.get("changed_keys") or []) == {"rules"}:
         reason += " Rules alone do not modify integration bindings or connection requirements."
-    recovery = _as_dict(_as_dict(draft_data.get("current_state")).get("task_capability_recovery"))
-    if recovery.get("task_id"):
-        reason += (
-            " Configure this Agent deployment: "
-            + str(recovery.get("agent_name") or "selected Agent")
-            + "; tools: " + ", ".join(_unique_list(recovery.get("tool_names"))) + "."
-            " After applying, continue the existing task: "
-            + str(recovery.get("task_title") or recovery["task_id"])
-            + ". It will resume only if its Agent deployment and stopped execution still match this review."
-        )
-        diff["resume_task_id"] = recovery["task_id"]
     changes = _as_dict(_as_dict(draft_data.get("diff")).get("changes"))
     for section in ("services", "agent_mappings"):
         change = _as_dict(changes.get(section))
@@ -2079,7 +2140,11 @@ async def create_operation_draft(
     user_id: str | None = None,
     source_event_id: str | None = None,
     initial_patches: list[dict[str, Any]] | None = None,
+    allowed_patch_operations: list[str] | None = None,
+    origin_conversation_id: str | None = None,
 ) -> WorkspaceOperationDraft | None:
+    """``origin_conversation_id`` is host provenance (the drafting chat), never a patch field."""
+    _require_allowed_patch_operations(initial_patches or [], allowed_patch_operations)
     # Match purge/apply order before taking a snapshot or adding references.
     if operation_patches_require_lifecycle_lock(initial_patches or []):
         await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
@@ -2107,6 +2172,7 @@ async def create_operation_draft(
         entity_id=workspace.entity_id,
         created_by_user_id=user_id,
         source_event_id=source_event_id,
+        origin_conversation_id=origin_conversation_id,
         base_revision=int(workspace.operation_revision or 0),
         status=WorkspaceOperationDraftStatus.OPEN,
         current_state=_json_safe(state),
@@ -2146,6 +2212,8 @@ async def patch_operation_draft(
     entity_id: str,
     workspace_id: str,
     patches: list[dict[str, Any]],
+    *,
+    allowed_patch_operations: list[str] | None = None,
 ) -> WorkspaceOperationDraft | None:
     if operation_patches_require_lifecycle_lock(patches):
         await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
@@ -2157,6 +2225,7 @@ async def patch_operation_draft(
         return None
     if draft.status != WorkspaceOperationDraftStatus.OPEN:
         raise OperationConflictError(f"cannot patch {draft.status} operation draft")
+    _require_allowed_patch_operations([*_as_list(draft.patches), *patches], allowed_patch_operations)
     state = _copy_json(draft.current_state or {})
     base_skill_ids = reusable_skill_ids_from_runtime_state(state)
     appended = _as_list(draft.patches)
@@ -2368,6 +2437,21 @@ async def _collect_operation_draft_issues(
             from packages.core.models.user import User
             actor_id = user_id or draft.created_by_user_id
             actor = await db.get(User, actor_id) if actor_id else None
+            if requested_config.get("components") or requested_config.get("data_sources"):
+                from packages.core.services.workspace_app_view import (
+                    load_workspace_app_data_catalog,
+                    validate_app_view_data_contract,
+                )
+                workspace = await db.get(Workspace, draft.workspace_id)
+                if actor is None or workspace is None:
+                    errors.append({"path": "app_view", "code": "unavailable_app_scope",
+                                   "message": "App data configuration requires a Workspace actor."})
+                else:
+                    try:
+                        catalog = await load_workspace_app_data_catalog(db, workspace, user=actor)
+                        validate_app_view_data_contract(requested_config["data_sources"], requested_config["components"], catalog=catalog)
+                    except ValueError as exc:
+                        errors.append({"path": "app_view", "code": "invalid_app_data_contract", "message": str(exc)})
             entrypoints = await list_workspace_chat_entrypoints(
                 db, entity_id=draft.entity_id, workspace_id=draft.workspace_id,
                 user=actor, require_control=True, include_unpublished=True,
@@ -2378,10 +2462,9 @@ async def _collect_operation_draft_issues(
                 ScheduledJob.workspace_id == draft.workspace_id,
                 ScheduledJob.agent_initiative_id.is_(None),
             ))).scalars().all()
-            job_ids = {
-                job.job_id for job in job_rows
-                if (job.execution_target or {}).get("managed_by") != "agent_initiative"
-            }
+            from packages.core.services.workspace_app_view import app_lists_scheduled_job
+
+            job_ids = {job.job_id for job in job_rows if app_lists_scheduled_job(job)}
             agent_ids = set((await db.execute(select(AgentSubscription.agent_id).join(
                 Agent, Agent.id == AgentSubscription.agent_id,
             ).where(
@@ -2718,6 +2801,11 @@ async def _collect_operation_draft_issues(
             "message": "cadence must be hourly/daily/weekly/biweekly or a cron expression",
         })
 
+    from packages.core.services.workspace_setup_service import (
+        ENFORCING_RULE_TYPES as _ENFORCING_RULE_TYPES,
+        ungateable_rule_action_keys,
+    )
+
     rules = [row for row in _as_list(state.get("rules")) if isinstance(row, dict)]
     for idx, rule in enumerate(rules):
         if not rule.get("description") and not rule.get("rule_key"):
@@ -2731,6 +2819,22 @@ async def _collect_operation_draft_issues(
             warnings.append({
                 "path": f"rules[{idx}].capability_patterns",
                 "message": "runtime rule has no action or capability patterns",
+            })
+        if str(rule.get("rule_type") or "").strip().lower() in _ENFORCING_RULE_TYPES and (
+            ungateable := ungateable_rule_action_keys(rule)
+        ):
+            errors.append({
+                "path": f"rules[{idx}].action_patterns",
+                "code": "rule_action_not_gateable",
+                "message": (
+                    f"{', '.join(ungateable)} name no action Manor runs, so this rule would "
+                    "gate nothing. Use declared action keys (for example social_post.publish, "
+                    "external_message.send, workspace.file.create) or a category: "
+                    '"approval_selectors": [{"kind": "category", "category": "publishing"}] '
+                    "(categories: files, publishing, communication, deletion, purchases, automation). "
+                    "A limit or condition such as 'at most 6 per person' is guidance: "
+                    "omit rule_type and action_patterns."
+                ),
             })
 
     edited_governance_keys = _draft_edited_governance_keys(draft.patches)
@@ -2766,8 +2870,50 @@ async def _collect_operation_draft_issues(
             db, state, entity_id=draft.entity_id, workspace_id=draft.workspace_id,
             user_id=user_id or draft.created_by_user_id,
         ))
+    errors.extend(await _collaborator_reference_errors(db, draft, state))
 
     return errors, warnings, missing_setup
+
+
+async def _operation_collaborator_scope(db: AsyncSession, draft: Any) -> frozenset[str] | None:
+    """Live-granted Workspaces when a collaborator writes or applies the draft, else None.
+
+    Decided from the request or run context only: the HTTP boundary and the
+    runtime gate mark the collaborators acting now (whoever validates or
+    applies, and any collaborator behind the current runtime call). A draft
+    nobody marked acts on costs no query.
+    """
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+    from packages.core.services.runtime_authorization.collaborator import runtime_collaborator_scope
+
+    actors = collaborators_acting_now(draft.entity_id)
+    if not actors:
+        return None
+    return await runtime_collaborator_scope(db, entity_id=draft.entity_id, user_ids=actors)
+
+
+async def _collaborator_reference_errors(
+    db: AsyncSession, draft: Any, state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """A collaborator's draft may name only the Workspace's own Agents, Skills and Workflows.
+
+    Checked over the whole resulting state at validation and again at apply;
+    references the live Workspace already carried are inherited, not new.
+    """
+    scope = await _operation_collaborator_scope(db, draft)
+    if scope is None:
+        return []
+    code = "collaborator_reference_outside_workspace"
+    if draft.workspace_id not in scope:
+        return [{"path": "workspace_id", "code": code, "message": "this Workspace is outside the collaboration"}]
+    from packages.core.services.collaborator_scope import operation_references_outside
+
+    return [
+        {"path": path, "code": code, "message": f"{kind} {value!r} is not part of this Workspace"}
+        for path, kind, value in await operation_references_outside(
+            db, entity_id=draft.entity_id, workspace_id=draft.workspace_id, state=state,
+        )
+    ]
 
 
 def _validate_capability_bindings(
@@ -3178,6 +3324,27 @@ async def _sync_agent_mappings_from_operation_state(
             Agent.deleted_at.is_(None),
         )
     )).scalars().all())
+    reusable_by_collaborator: dict[str, bool] = {}
+
+    async def reusable(agent: Agent) -> bool:
+        """A collaborator's name-only mapping reuses only an Agent already in
+        this Workspace, never a company Agent that happens to share the name.
+        A collaborator is one the request or run context marks as acting."""
+        from packages.core.services.collaborator_steering import collaborators_acting_now
+
+        acting = collaborators_acting_now(workspace.entity_id)
+        if not acting:
+            return True
+        if agent.id not in reusable_by_collaborator:
+            from packages.core.services.collaborator_scope import agent_workspace_ids
+            from packages.core.services.runtime_authorization.collaborator import runtime_collaborator_scope
+
+            scope = await runtime_collaborator_scope(db, entity_id=workspace.entity_id, user_ids=acting)
+            reusable_by_collaborator[agent.id] = scope is None or workspace.id in await agent_workspace_ids(
+                db, agent_id=agent.id, entity_id=workspace.entity_id,
+            )
+        return reusable_by_collaborator[agent.id]
+
     existing_auto_agent_by_name: dict[str, Agent] = {}
     for agent in existing_auto_agents:
         name_key = str(agent.name or "").strip().lower()
@@ -3232,7 +3399,7 @@ async def _sync_agent_mappings_from_operation_state(
                 sub.agent_id == existing_auto_agent_by_name[agent_name.lower()].id
                 and str(sub.service_key or "").strip() != service_key
                 for sub in existing_by_service.values()
-            ):
+            ) and await reusable(existing_auto_agent_by_name[agent_name.lower()]):
                 # An earlier apply (or finalize_setup) already auto-provisioned
                 # an agent with this exact name for this entity. Reuse it
                 # instead of creating duplicates that pile up across applies.
@@ -3630,6 +3797,16 @@ async def _resolve_workflow_attachment(db, attachment, *, entity_id, workspace_i
     existing = next((row for row in bindings if row.trigger_type == "manual"), None)
     if existing is not None and (not existing.enabled or existing.status != "active"):
         raise ValueError("The existing Workspace Workflow binding is inactive; enable it before connecting it")
+    slug = attachment.get("slug")
+    if slug:
+        current = str((existing.config or {}).get("workspace_blueprint_workflow_slug") or "") if existing else ""
+        if current and current != slug:
+            raise ValueError(f"This Workflow already has the slug {current!r}; keep it")
+        if any(
+            (row.config or {}).get("workspace_blueprint_workflow_slug") == slug and row.workflow_id != workflow.id
+            for row in await workflow_service.list_bindings(db, entity_id, workspace_id=workspace_id)
+        ):
+            raise ValueError(f"Another Workflow in this Workspace already has the slug {slug!r}")
     return workflow, existing
 
 
@@ -3643,12 +3820,15 @@ async def _materialize_workflow_attachments(db, workspace, attachments, *, user_
         workflow, binding = await _resolve_workflow_attachment(
             db, attachment, entity_id=workspace.entity_id, workspace_id=workspace.id, user_id=user_id,
         )
+        slug_config = {"workspace_blueprint_workflow_slug": attachment["slug"]} if attachment.get("slug") else {}
         if binding is None:
             binding = await create_workflow_binding(
                 db, workspace.entity_id, workflow.id, workspace_id=workspace.id,
                 name=workflow.name, trigger_type="manual",
-                config={"workspace_attached": True, "chat_entrypoint": {"enabled": True}},
+                config={"workspace_attached": True, "chat_entrypoint": {"enabled": True}, **slug_config},
             )
+        elif slug_config and (binding.config or {}).get("workspace_blueprint_workflow_slug") != attachment["slug"]:
+            binding.config = {**dict(binding.config or {}), **slug_config}
         action_key = attachment.get("action_key") or (f"service:{attachment['service_key']}" if attachment.get("service_key") else None)
         if action_key or attachment.get("primary"):
             config = normalize_app_view_config(model.get("app_view"))
@@ -3677,6 +3857,7 @@ async def apply_operation_draft(
     user_id: str | None = None,
     user_confirmation: bool = False,
     expected_review_fingerprint: str | None = None,
+    allowed_patch_operations: list[str] | None = None,
     origin_task_id: str | None = None,
 ) -> dict[str, Any] | None:
     """``origin_task_id``: the Task run applying the draft (host provenance).
@@ -3701,6 +3882,7 @@ async def apply_operation_draft(
         return None
     if draft.status != WorkspaceOperationDraftStatus.OPEN:
         raise OperationConflictError(f"cannot apply {draft.status} operation draft")
+    _require_allowed_patch_operations(_as_list(draft.patches), allowed_patch_operations)
     if int(draft.base_revision or 0) != int(workspace.operation_revision or 0):
         raise OperationConflictError(
             "workspace operation draft is stale; create a new draft before applying"
@@ -3722,12 +3904,6 @@ async def apply_operation_draft(
     ):
         raise OperationConflictError("workspace operation draft changed; review the updated draft before applying")
     changed_keys = set((applied_diff or {}).get("changed_keys") or [])
-    from packages.core.services.task_capability_recovery import recovery_task_for_operation
-
-    recovery_task = await recovery_task_for_operation(db, draft)
-    if recovery_task is not None and not expected_review_fingerprint:
-        raise OperationConflictError("Review the task configuration request before applying and continuing it.")
-
     state = _effective_operation_state(current_state, draft)
     operating_model = _as_dict(state.get("operating_model"))
 
@@ -3761,6 +3937,13 @@ async def apply_operation_draft(
         )
 
     heartbeat = _as_dict(state.get("heartbeat_policy"))
+    previous_heartbeat = _as_dict(current_state.get("heartbeat_policy"))
+    heartbeat_disabled_by_operation = (
+        "heartbeat_policy" in changed_keys
+        and previous_heartbeat.get("enabled") is True
+        and heartbeat.get("enabled") is False
+        and workspace.status == "active"
+    )
     if "enabled" in heartbeat:
         workspace.heartbeat_enabled = bool(heartbeat.get("enabled"))
     cadence = str(heartbeat.get("cadence") or "").strip()
@@ -3768,6 +3951,11 @@ async def apply_operation_draft(
         workspace.heartbeat_cadence = cadence
     elif workspace.heartbeat_enabled and not workspace.heartbeat_cadence:
         workspace.heartbeat_cadence = "daily"
+    if heartbeat_disabled_by_operation:
+        from packages.core.workspaces import is_sandbox_workspace
+
+        if not is_sandbox_workspace(workspace):
+            workspace.status = "paused"
     await sync_workspace_runtime_schedules(db, workspace, user_id=user_id)
 
     if {"rules", "governance_policy"} & changed_keys:
@@ -3856,6 +4044,7 @@ async def apply_operation_draft(
         draft_id=draft.id,
         user_id=user_id,
         origin_task_id=origin_task_id,
+        conversation_id=draft.origin_conversation_id,
     )
 
     workspace.operation_revision = int(workspace.operation_revision or 0) + 1
@@ -3864,19 +4053,6 @@ async def apply_operation_draft(
     draft.validation = validation
     draft.diff = applied_diff
     invalidate(workspace.id)
-    if recovery_task is not None:
-        from packages.core.services.task_retry_service import TaskRetryError, prepare_task_retry
-
-        await db.flush()
-        try:
-            await prepare_task_retry(
-                db, task=recovery_task, user_id=user_id or draft.created_by_user_id,
-                user_label="Configuration review",
-                note="Continue the same task after its reviewed capability configuration was applied.",
-            )
-        except TaskRetryError as exc:
-            raise OperationConflictError(exc.detail) from exc
-
     await record_activity(
         db,
         workspace.id,
@@ -3898,7 +4074,11 @@ async def apply_operation_draft(
         user_id=user_id,
     )
     await db.flush()
-    return {
+    # Its App page and Flows read in each viewer's language (workspace_translation).
+    from packages.core.services.workspace_translation import schedule_workspace_translation
+
+    schedule_workspace_translation(workspace.id)
+    result = {
         "draft": draft_to_dict(draft),
         "workspace_revision": workspace.operation_revision,
         "pre_existing_issues": _pre_existing_issue_summary(validation),
@@ -3909,6 +4089,12 @@ async def apply_operation_draft(
         "workflow_attachments": workflow_attachments,
         "batch": task_result.get("batch"),
     }
+    if task_result["task_ids"]:
+        result["started_task_ids"] = task_result["started_task_ids"]
+        result["next"] = task_result["next"]
+        if task_result.get("start_refusals"):
+            result["start_refusals"] = task_result["start_refusals"]
+    return result
 
 
 async def repair_workspace_operation_runtime(
@@ -4039,52 +4225,54 @@ async def _materialize_immediate_tasks(
     draft_id: str,
     user_id: str | None,
     origin_task_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
+    """Create the draft's immediate Tasks; ``conversation_id`` is the draft's host origin.
+
+    A Task already drafted as pending under the same title in that conversation
+    is reused rather than copied. ``start: true`` starts it through the shared
+    Task start contract, the same gates as the Workspace ``start_task`` action.
+    """
     from packages.core.services import task_service
+    from packages.core.services.task_intents import (
+        DRAFTED_NEXT, STARTED_NEXT, pending_chat_draft, resolve_task_start, start_pending_task,
+    )
+    from packages.core.services.task_execution_origin import record_manual_task_execution
 
     task_payloads = [row for row in _as_list(raw_tasks) if isinstance(row, dict)]
     if not task_payloads:
         return {"tasks_created": [], "task_ids": [], "batch": None, "batch_id": None}
 
     tasks_created: list[Task] = []
+    started_ids: list[str] = []
+    start_refusals: list[dict[str, Any]] = []
     for payload in task_payloads:
-        details = _as_dict(payload.get("details"))
-        details.update({
-            "workspace_operation_draft_id": draft_id,
-            "runtime_context": _as_dict(payload.get("runtime_context")),
-        })
-        task = await task_service.create_task(
-            db,
-            workspace.entity_id,
-            title=str(payload.get("title") or "").strip(),
-            description=str(payload.get("description") or ""),
-            priority=int(payload.get("priority") or 3),
-            task_type=str(payload.get("task_type") or "general"),
-            workspace_id=workspace.id,
-            assignee_id=payload.get("assignee_id"),
-            agent_id=payload.get("agent_id"),
-            agent_type=payload.get("agent_type"),
-            creator_id=user_id,
-            origin_task_id=origin_task_id,
-            owner_service_key=(
-                str(payload["owner_service_key"])
-                if payload.get("owner_service_key")
-                else None
-            ),
-            owner_subscription_id=(
-                str(payload["owner_subscription_id"])
-                if payload.get("owner_subscription_id")
-                else None
-            ),
-            delegate_service_keys=(
-                _unique_list(payload.get("delegate_service_keys"))
-                if isinstance(payload.get("delegate_service_keys"), list)
-                else None
-            ),
-            details=details,
-            deadline=payload.get("deadline"),
+        task_type = str(payload.get("task_type") or "general")
+        task_conversation_id = None if task_type == "interactive" else conversation_id
+        title = str(payload.get("title") or "").strip()
+        task = await pending_chat_draft(
+            db, entity_id=workspace.entity_id, workspace_id=workspace.id,
+            conversation_id=task_conversation_id, title=title,
         )
+        if task is None:
+            task = await _create_immediate_task(
+                db, workspace, payload, draft_id=draft_id, user_id=user_id,
+                origin_task_id=origin_task_id, conversation_id=task_conversation_id,
+            )
         tasks_created.append(task)
+        if payload.get("start") is True or str(payload.get("start") or "").strip().lower() in {"true", "1", "yes"}:
+            details = _as_dict(task.details)
+            execution, refusal = await resolve_task_start(db, task, details)
+            if refusal:
+                start_refusals.append({"task_id": task.id, **refusal})
+                continue
+            if user_id:
+                # Applying a draft is a person's confirmation.
+                record_manual_task_execution(task, user_id=user_id, action="workspace_operation_task_start")
+                details.update({key: value for key, value in task.details.items() if key not in details})
+            task.details = details
+            await start_pending_task(db, task, execution, user_id=user_id, manual_execution=bool(user_id))
+            started_ids.append(task.id)
 
     batch = await create_work_batch(
         db,
@@ -4102,12 +4290,72 @@ async def _materialize_immediate_tasks(
         task.details = details
     await db.flush()
 
-    return {
+    result = {
         "tasks_created": [_task_to_dict(task) for task in tasks_created],
         "task_ids": [task.id for task in tasks_created],
+        "started_task_ids": started_ids,
         "batch": work_batch_to_dict(batch),
         "batch_id": batch.id,
     }
+    if start_refusals:
+        result["start_refusals"] = start_refusals
+    pending = [task.id for task in tasks_created if task.id not in started_ids]
+    result["next"] = " ".join(filter(None, (
+        STARTED_NEXT if started_ids else "",
+        DRAFTED_NEXT if pending else "",
+    )))
+    return result
+
+
+async def _create_immediate_task(
+    db: AsyncSession,
+    workspace: Workspace,
+    payload: dict[str, Any],
+    *,
+    draft_id: str,
+    user_id: str | None,
+    origin_task_id: str | None,
+    conversation_id: str | None,
+) -> Task:
+    from packages.core.services import task_service
+
+    details = _as_dict(payload.get("details"))
+    details.update({
+        "workspace_operation_draft_id": draft_id,
+        "runtime_context": _as_dict(payload.get("runtime_context")),
+    })
+    return await task_service.create_task(
+        db,
+        workspace.entity_id,
+        title=str(payload.get("title") or "").strip(),
+        description=str(payload.get("description") or ""),
+        priority=int(payload.get("priority") or 3),
+        task_type=str(payload.get("task_type") or "general"),
+        workspace_id=workspace.id,
+        assignee_id=payload.get("assignee_id"),
+        agent_id=payload.get("agent_id"),
+        agent_type=payload.get("agent_type"),
+        creator_id=user_id,
+        conversation_id=conversation_id,
+        origin_task_id=origin_task_id,
+        owner_service_key=(
+            str(payload["owner_service_key"])
+            if payload.get("owner_service_key")
+            else None
+        ),
+        owner_subscription_id=(
+            str(payload["owner_subscription_id"])
+            if payload.get("owner_subscription_id")
+            else None
+        ),
+        delegate_service_keys=(
+            _unique_list(payload.get("delegate_service_keys"))
+            if isinstance(payload.get("delegate_service_keys"), list)
+            else None
+        ),
+        details=details,
+        deadline=payload.get("deadline"),
+    )
 
 
 async def create_work_batch(
@@ -4300,6 +4548,78 @@ async def discard_operation_draft(
     return draft
 
 
+async def supersede_task_draft(
+    db: AsyncSession, draft: WorkspaceOperationDraft, *, conversation_id: str, user_id: str | None,
+) -> None:
+    """Close an open draft whose one Task was just created directly.
+
+    The draft and its review cards close together: approving the card later
+    would otherwise create the Task a second time.
+    """
+    from packages.core.services.hitl_requests import mark_hitl_request_resolved
+
+    await discard_operation_draft(db, draft.id, draft.entity_id, draft.workspace_id, user_id=user_id)
+    await _resolve_operation_review_pending_actions(
+        db, conversation_id=conversation_id, draft_id=draft.id, user_id=user_id or "", choice="superseded",
+    )
+    rows = (await db.execute(select(Message).where(
+        Message.conversation_id == conversation_id, Message.meta.isnot(None),
+    ))).scalars().all()
+    card_ids = {
+        str(card.get("id"))
+        for row in rows
+        for card in _as_list(_as_dict(row.meta).get("hitl_requests"))
+        if isinstance(card, dict) and _normalise_operation_review_draft_id(card.get("id")) == draft.id
+    }
+    for card_id in card_ids:
+        await mark_hitl_request_resolved(
+            db, conversation_id=conversation_id, hitl_id=card_id, choice="superseded",
+        )
+
+
+async def draft_task_outcome(db: AsyncSession, draft: WorkspaceOperationDraft) -> str:
+    """What an applied draft's Tasks are and how each one goes on.
+
+    Told to the Agent with every apply outcome, so "start it" after an
+    approval starts the drafted Task instead of re-applying the draft.
+    """
+    from packages.core.constants.task import TaskStatus
+    from packages.core.services.task_intents import DRAFTED_NEXT, STARTED_NEXT
+
+    tasks =(await db.execute(
+        select(Task).where(
+            Task.entity_id == draft.entity_id,
+            Task.workspace_id == draft.workspace_id,
+            Task.details["workspace_operation_draft_id"].astext == draft.id,
+        ).order_by(Task.created_at)
+    )).scalars().all()
+    if not tasks:
+        return ""
+    listed = "; ".join(f"{task.title} (task_id {task.id}, {task.status})" for task in tasks)
+    pending = any(task.status == TaskStatus.PENDING.value for task in tasks)
+    return f" Tasks from this draft: {listed}. " + (DRAFTED_NEXT if pending else STARTED_NEXT)
+
+
+async def resolved_operation_draft_result(
+    db: AsyncSession, draft: WorkspaceOperationDraft,
+) -> dict[str, Any]:
+    """An apply of a draft that is no longer open: nothing to review or apply."""
+    changed = _changed_key_summary(_as_dict(draft.diff))
+    return {
+        "status": f"already_{draft.status}",
+        "action": "approve" if draft.status == WorkspaceOperationDraftStatus.APPLIED else "reject",
+        "draft_id": draft.id,
+        "draft": draft_to_dict(draft),
+        "message": f"Workspace operation draft is already {draft.status}.",
+        "llm_message": (
+            "[Workspace operation already resolved]\n"
+            f"Draft {draft.id} is already {draft.status}. Changed: {changed}. "
+            "Briefly tell the user no new apply was performed."
+            + await draft_task_outcome(db, draft)
+        ),
+    }
+
+
 async def resolve_workspace_operation_review(
     db: AsyncSession,
     *,
@@ -4426,21 +4746,10 @@ async def resolve_workspace_operation_review(
                     f"Applied draft {draft.id}. Changed: {changed}. "
                     "Do not re-apply this draft. Briefly confirm the result to the user."
                     + inherited
+                    + await draft_task_outcome(db, draft)
                 ),
             }
-        changed = _changed_key_summary(_as_dict(draft.diff))
-        return {
-            "status": f"already_{draft.status}",
-            "action": "approve" if draft.status == WorkspaceOperationDraftStatus.APPLIED else "reject",
-            "draft_id": draft.id,
-            "draft": draft_to_dict(draft),
-            "message": f"Workspace operation draft is already {draft.status}.",
-            "llm_message": (
-                "[Workspace operation already resolved]\n"
-                f"Draft {draft.id} is already {draft.status}. Changed: {changed}. "
-                "Briefly tell the user no new apply was performed."
-            ),
-        }
+        return await resolved_operation_draft_result(db, draft)
 
     if draft.status == WorkspaceOperationDraftStatus.OPEN:
         discarded = await discard_operation_draft(
@@ -4620,7 +4929,7 @@ async def _resolve_operation_review_pending_actions(
             message_id=row.id,
             user_id=user_id,
             resolution={"choice": choice},
-            emit_followup=False,
+            publish_resolution=False,
         )
         resolved += 1
     return resolved

@@ -61,6 +61,10 @@ RECORD_YOUTUBE_PUBLICATION_SCHEMA = {
                     "type": "string",
                     "description": "Optional channel name only when it was independently verified in Studio; otherwise the authoritative public page value is recorded.",
                 },
+                "expected_channel_id": {
+                    "type": "string",
+                    "description": "Optional exact UC channel ID verified in Studio; reject a public video from another channel.",
+                },
                 "source_kind": {
                     "type": "string",
                     "enum": ["workspace_publication", "verified_backfill"],
@@ -232,6 +236,7 @@ async def _record_youtube_publication(
     expected_channel_name = str(
         kwargs.get("expected_channel_name") or ""
     ).strip()
+    expected_channel_id = str(kwargs.get("expected_channel_id") or "").strip()
     source_kind = str(kwargs.get("source_kind") or "").strip()
     if not public_url or not expected_title or not expected_video_id:
         return _service_error(
@@ -261,6 +266,7 @@ async def _record_youtube_publication(
             expected_title=expected_title,
             expected_video_id=expected_video_id,
             expected_channel_name=expected_channel_name,
+            expected_channel_id=expected_channel_id,
             source_kind=source_kind,
             source_task_id=source_task_id,
             source_workflow_run_id=context.workflow_run_id,
@@ -293,6 +299,8 @@ async def _record_youtube_publication(
             "public_url": receipt["public_url"],
             "title": receipt["title"],
             "channel_name": receipt["channel_name"],
+            "channel_id": receipt.get("channel_id"),
+            "published_at": receipt.get("published_at"),
             "source_kind": receipt["source_kind"],
             "path": written["path"],
             "display_path": written["display_path"],

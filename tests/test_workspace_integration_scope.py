@@ -161,6 +161,11 @@ async def test_current_workspace_policy_denies_before_all_authorization_strategi
     monkeypatch.setattr(service, "_workspace_exists", AsyncMock(return_value=True))
     load = AsyncMock(return_value=frozenset({"elevenlabs"}))
     monkeypatch.setattr(scope, "load_disabled_workspace_providers", load)
+    # The collaborator gate reads the actor's role; it has its own tests.
+    gate = AsyncMock(return_value=(None, None))
+    monkeypatch.setattr(
+        "packages.core.services.runtime_authorization.collaborator.collaborator_runtime_gate", gate,
+    )
     request = RuntimeAuthorizationRequest.create(
         entity_id="entity", user_id="user", workspace_id="workspace",
         action_key="", capability_id="", tool_name="mcp__elevenlabs__speak",
@@ -170,6 +175,7 @@ async def test_current_workspace_policy_denies_before_all_authorization_strategi
     assert not denied.allowed
     assert denied.matched_rule == "permission.workspace.integration_disabled"
     factory.create.assert_not_called()
+    gate.assert_not_awaited()
     load.return_value = frozenset()
     assert (await service.authorize_runtime(object(), request)).allowed
     assert load.await_count == 2  # Re-enable/retry sees durable policy, not a cached run grant.

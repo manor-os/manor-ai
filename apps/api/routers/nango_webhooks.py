@@ -117,6 +117,12 @@ async def nango_webhook(request: Request) -> dict:
 
     # ── Auth events: connection lifecycle. Just record; no dispatch. ──
     if nango_type in ("auth", "auth_connection"):
+        if integration_id and isinstance(envelope.get("success"), bool):
+            try:
+                await _apply_auth_outcome(integration_id, success=envelope["success"], envelope=envelope)
+            except Exception:
+                # The event is still recorded; a failed incident write must not 500 the webhook.
+                logger.warning("Nango auth event %s: incident update failed", evt_id, exc_info=True)
         await _mark_status(evt_id, "dispatched", f"Auth event ({nango_type}) recorded")
         return {"ok": True, "type": nango_type, "event_id": evt_id}
 
@@ -167,6 +173,35 @@ async def _mark_status(event_id: str, status: str, detail: str) -> None:
             evt.processing_status = status
             evt.processing_detail = detail
             await db.commit()
+
+
+async def _apply_auth_outcome(integration_id: str, *, success: bool, envelope: dict[str, Any]) -> None:
+    """Nango reports a connection's auth outcome: a failed refresh opens its incident, success closes it.
+
+    A failed "creation"/"override" is a reconnect attempt that left the old
+    credentials as they were, so it opens nothing.
+    """
+    from datetime import datetime, timezone
+
+    from packages.core.services.account_incidents import close_incident, open_incident
+
+    if not success and envelope.get("operation") not in (None, "refresh"):
+        return
+
+    async with async_session() as db:
+        row = (await db.execute(
+            select(Integration).where(Integration.id == integration_id).with_for_update()
+        )).scalar_one_or_none()
+        if row is None:
+            return
+        config = dict(row.config or {})
+        if success:
+            row.config = close_incident(config)
+        else:
+            error = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+            reason = str(error.get("type") or envelope.get("operation") or "auth_failed")
+            row.config = open_incident(config, reason=reason, now=datetime.now(timezone.utc))
+        await db.commit()
 
 
 # Map Nango provider keys → Manor channel adapter type. Add rows here

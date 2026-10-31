@@ -788,7 +788,7 @@ async def test_mcp_catalog_bulk_authorization_has_constant_grant_queries(
     assert response.status_code == 200, response.text
     linkedin = next(row for row in response.json() if row["server_key"] == "linkedin")
     assert {row["id"] for row in linkedin["entity_accounts"]} >= set(account_ids)
-    assert len(statements) == 3
+    assert len(statements) == 2
 
 
 @pytest.mark.asyncio

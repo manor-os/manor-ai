@@ -220,7 +220,7 @@ async def test_semantic_compaction_reads_every_character_and_preserves_route(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [
-    "archive", "malformed_summary", "oversized_summary", "fenced_invalid_fields", "trailing_text",
+    "malformed_summary", "oversized_summary", "fenced_invalid_fields", "trailing_text",
 ])
 async def test_failed_compaction_never_rewrites_source(monkeypatch, failure):
     import importlib
@@ -231,8 +231,6 @@ async def test_failed_compaction_never_rewrites_source(monkeypatch, failure):
     original = deepcopy(messages)
     calls = []
     async def archive(source):
-        if failure == "archive":
-            raise RuntimeError("archive unavailable")
         return "archive-1"
     async def summarize(prompt, **kwargs):
         calls.append(prompt)
@@ -247,8 +245,98 @@ async def test_failed_compaction_never_rewrites_source(monkeypatch, failure):
         await loop._compact_messages(messages, None, 0, metadata={"context_window_tokens": 8000},
                                      output_reserve_tokens=500, on_context_compacted=archive)
     assert messages == original
-    if failure == "archive":
-        assert not calls
+
+
+def _between_trigger_and_limit(window, reserve):
+    """History over the compaction trigger that still fits the model window."""
+    from packages.core.ai.runtime.context_compaction import request_tokens
+    for repeats in range(200, 20000, 100):
+        messages = [{"role": "system", "content": "rules"},
+                    {"role": "user", "content": "Old request"},
+                    {"role": "assistant", "content": "source " * repeats},
+                    {"role": "user", "content": "Current request"}]
+        if request_tokens(messages) + reserve > int(window * 0.75):
+            assert request_tokens(messages) + reserve <= window
+            return messages
+    raise AssertionError("no size between trigger and limit")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("room", ["fits", "overflows"])
+async def test_archive_failure_degrades_compaction_instead_of_failing_the_turn(monkeypatch, room):
+    import importlib
+    import json
+    from packages.core.ai.runtime.context_compaction import ARCHIVE_UNAVAILABLE_NOTE
+    loop = importlib.import_module("packages.core.ai.agentic_loop")
+    messages = (
+        _between_trigger_and_limit(8000, 500) if room == "fits"
+        else [{"role": "system", "content": "rules"},
+              {"role": "user", "content": "Old request"},
+              {"role": "assistant", "content": "source " * 20000},
+              {"role": "user", "content": "Current request"}]
+    )
+    original = deepcopy(messages)
+    summaries = []
+    async def archive(source):
+        raise RuntimeError("invalid input syntax for type json")
+    async def summarize(prompt, **kwargs):
+        summaries.append(prompt)
+        return _summary(evidence=["fact"]), {}
+    monkeypatch.setattr(loop, "runtime_execute_agentic_compaction_completion", summarize)
+
+    compacted = await loop._compact_messages(
+        messages, None, 0, metadata={"context_window_tokens": 8000}, output_reserve_tokens=500,
+        active_user_message="Current request", on_context_compacted=archive,
+    )
+
+    assert messages == original
+    if room == "fits":
+        # Room left: keep the history as is and compact on a later round.
+        assert compacted == original
+        assert not summaries
+    else:
+        # No room: summarize anyway and tell the model what cannot be read back.
+        assert summaries
+        checkpoint = next(m for m in compacted if m is not original[-1] and "source_digest" in str(m.get("content")))
+        payload = json.loads(checkpoint["content"].split("\n", 2)[2])
+        assert payload["archive_id"] is None
+        assert payload["note"] == ARCHIVE_UNAVAILABLE_NOTE
+        assert compacted[-1] == original[-1]
+
+
+@pytest.mark.asyncio
+async def test_lossless_compaction_keeps_records_when_archive_fails(monkeypatch):
+    monkeypatch.setattr("packages.core.ai.agentic_loop.MESSAGE_COUNT_COMPACT_THRESHOLD", 40)
+    import json
+    from packages.core.ai.agentic_loop import _compact_messages
+    from packages.core.ai.runtime.context_compaction import CHECKPOINT_PREFIX
+    messages = [{"role": "system", "content": "rules"}]
+    for index in range(60):
+        messages.append({"role": "user" if index % 2 == 0 else "assistant", "content": f"record {index}"})
+    async def archive(source):
+        raise RuntimeError("database unavailable")
+
+    compacted = await _compact_messages(messages, None, 0, on_context_compacted=archive)
+
+    checkpoint = next(m for m in compacted if str(m.get("content", "")).startswith(CHECKPOINT_PREFIX))
+    payload = json.loads(checkpoint["content"].split("\n", 2)[2])
+    assert payload["archive_id"] is None
+    assert {m["content"] for m in messages[1:]} <= {m["content"] for m in payload["records"] + compacted[2:]}
+
+
+@pytest.mark.asyncio
+async def test_writer_that_lost_its_run_stops_instead_of_degrading(monkeypatch):
+    import importlib
+    from packages.core.ai.runtime.control import RuntimeContextWriterFenced
+    loop = importlib.import_module("packages.core.ai.agentic_loop")
+    messages = _between_trigger_and_limit(8000, 500)
+    async def archive(source):
+        raise RuntimeContextWriterFenced("Runtime context writer no longer owns the active run.")
+    with pytest.raises(RuntimeContextWriterFenced):
+        await loop._compact_messages(
+            messages, None, 0, metadata={"context_window_tokens": 8000}, output_reserve_tokens=500,
+            active_user_message="Current request", on_context_compacted=archive,
+        )
 
 
 @pytest.mark.asyncio

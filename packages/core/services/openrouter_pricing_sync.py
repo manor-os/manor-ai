@@ -19,6 +19,7 @@ from packages.core.services.runtime_paths import atomic_write_text, private_runt
 logger = logging.getLogger(__name__)
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OPENROUTER_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 def pricing_cache_path() -> str:
     configured = (os.getenv("OPENROUTER_PRICING_CACHE_PATH") or "").strip()
     return configured or str(private_runtime_dir("cache") / "openrouter-pricing.json")
@@ -53,7 +54,9 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
             "output_per_m": float | null,
             "image_per_1k": float | null,
             "request_usd": float | null,
-            "context_window": int | null
+            "context_window": int | null,
+            "reasoning_efforts": [str] | null,  # efforts the model accepts
+            "reasoning_toggle": bool            # unified reasoning object accepted
           }
         }
       }
@@ -88,6 +91,14 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
                 ) if value is not None),
                 default=None,
             ),
+            # OpenRouter lists the parameter, not its values; these are the
+            # efforts its reasoning_effort parameter documents.
+            "reasoning_efforts": (
+                list(OPENROUTER_REASONING_EFFORTS)
+                if "reasoning_effort" in (row.get("supported_parameters") or ())
+                else None
+            ),
+            "reasoning_toggle": "reasoning" in (row.get("supported_parameters") or ()),
         }
 
     payload = {

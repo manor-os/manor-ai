@@ -1,5 +1,23 @@
 {
  "_comment": "Search metadata for tools, Manor operations and MCP providers, by catalog id. English only. See capability_search_metadata.py; tests/test_capability_registration_contract.py ranks every example against the built-in catalog.",
+ "manor_action:add_assessed_metrics": {
+  "terms": [
+   "audience metrics",
+   "video views",
+   "followers",
+   "subscribers",
+   "comment count",
+   "likes",
+   "active users",
+   "channel stats"
+  ],
+  "examples": [
+   "track video views and followers",
+   "add audience metrics for this channel",
+   "monitor comments and likes on new videos",
+   "track active users every day"
+  ]
+ },
  "manor_action:add_task_comment": {
   "terms": [
    "note",
@@ -1175,6 +1193,8 @@
  },
  "manor_action:search_documents": {
   "terms": [
+   "folder filter",
+   "file type",
    "files",
    "knowledge base",
    "uploads",
@@ -2168,23 +2188,6 @@
    "check stripe account balance"
   ]
  },
- "provider:suno": {
-  "terms": [
-   "ai music",
-   "song",
-   "music generation",
-   "audio track",
-   "lyrics",
-   "remix",
-   "soundtrack"
-  ],
-  "examples": [
-   "generate a song with suno",
-   "create music cover",
-   "make mashup of two songs",
-   "check suno generation status"
-  ]
- },
  "provider:tavily": {
   "terms": [
    "web search",
@@ -2466,6 +2469,42 @@
    "is my audio too quiet"
   ]
  },
+ "tool:analyze_music_structure": {
+  "terms": [
+   "tempo",
+   "bpm",
+   "beats",
+   "downbeats",
+   "song structure",
+   "energy sections",
+   "chorus",
+   "beat sync"
+  ],
+  "examples": [
+   "find the tempo and beats of a song",
+   "find the high energy sections of a song",
+   "cut a promo on the downbeats",
+   "find the best 30 second window of the song"
+  ]
+ },
+ "tool:listen_to_audio": {
+  "terms": [
+   "listen to song",
+   "singer gender",
+   "instruments",
+   "genre",
+   "mood",
+   "emotion",
+   "vocals",
+   "describe audio"
+  ],
+  "examples": [
+   "listen to this song and tell me who is singing",
+   "what instruments and mood does this track have",
+   "describe the voices and tone in this recording",
+   "understand a song before planning its music video"
+  ]
+ },
  "tool:archive_file_collection": {
   "terms": [
    "backup media",
@@ -2489,7 +2528,9 @@
    "script",
    "run command",
    "linux",
-   "sandbox"
+   "sandbox",
+   "execute command",
+   "python"
   ],
   "examples": [
    "run shell command in workspace",
@@ -2640,6 +2681,26 @@
    "make slide deck with speaker notes",
    "compose pptx and pdf from pages",
    "build illustrated booklet from content"
+  ]
+ },
+ "tool:compose_creative_deck": {
+  "terms": [
+   "slides",
+   "presentation",
+   "deck",
+   "pptx",
+   "pdf",
+   "template",
+   "theme",
+   "style",
+   "pitch deck",
+   "report"
+  ],
+  "examples": [
+   "make a pitch deck in a designed style",
+   "create a styled presentation with pdf and notes",
+   "build a consulting style business review deck",
+   "compose slides with charts timeline and process"
   ]
  },
  "tool:compose_video_timeline": {
@@ -3326,23 +3387,8 @@
   "examples": [
    "list files in folder",
    "show directory contents recursively",
-   "what files exist in path",
+   "what files are in this folder",
    "browse workspace filesystem"
-  ]
- },
- "tool:list_sandbox_files": {
-  "terms": [
-   "output files",
-   "generated files",
-   "sandbox directory",
-   "created files",
-   "artifacts"
-  ],
-  "examples": [
-   "list files created by sandbox",
-   "what files did the command produce",
-   "check sandbox output folder",
-   "show generated output files"
   ]
  },
  "tool:list_scheduled_jobs": {
@@ -4144,22 +4190,6 @@
    "read or write file in sandbox"
   ]
  },
- "tool:save_sandbox_file": {
-  "terms": [
-   "export file",
-   "persist output",
-   "save result file",
-   "store generated file",
-   "download from sandbox",
-   "produced by code"
-  ],
-  "examples": [
-   "save generated file from sandbox to knowledge",
-   "store pptx created by script",
-   "register sandbox output as document",
-   "keep pdf produced by python code"
-  ]
- },
  "tool:search_documents": {
   "terms": [
    "files",
@@ -4184,6 +4214,7 @@
    "bgm",
    "soundtrack",
    "openverse",
+   "wikimedia commons",
    "creative commons",
    "audio track",
    "song"
@@ -4257,6 +4288,20 @@
    "convert still picture to mp4 scene",
    "make video from a single photo",
    "image to mp4 with duration"
+  ]
+ },
+ "tool:derive_image_aspect": {
+  "terms": [
+   "centre crop",
+   "change aspect ratio",
+   "16:9 thumbnail",
+   "landscape thumbnail"
+  ],
+  "examples": [
+   "crop a portrait cover to 16:9",
+   "make a 9:16 cover into a landscape thumbnail",
+   "derive another aspect ratio from a cover",
+   "centre crop to 4:5"
   ]
  },
  "tool:take_screenshot": {
@@ -4729,22 +4774,6 @@
    "workspace setup basics"
   ]
  },
- "tool:ws_configure_app_view": {
-  "terms": [
-   "workspace home",
-   "dashboard layout",
-   "landing panel",
-   "ui layout",
-   "form fields",
-   "display labels"
-  ],
-  "examples": [
-   "configure workspace home panel title",
-   "set hero service and labels for workspace",
-   "customize workspace app view layout",
-   "add guided input form to workspace home"
-  ]
- },
  "tool:ws_confirm_creation_preferences": {
   "terms": [
    "autopilot",
@@ -4905,6 +4934,132 @@
    "replace service in workspace plan"
   ]
  },
+ "tool:collect_workspace_stats": {
+  "terms": [
+   "collect metrics",
+   "refresh workspace statistics",
+   "run stat collectors",
+   "gather current measurements"
+  ],
+  "examples": [
+   "collect the configured workspace metrics",
+   "refresh all current statistics",
+   "run the native collectors for these stats",
+   "gather latest measurements for this workspace"
+  ]
+ },
+ "tool:configure_workspace_stat": {
+  "terms": [
+   "create metric",
+   "configure statistic",
+   "metric collector",
+   "reporting measure"
+  ],
+  "examples": [
+   "create a workspace metric for post views",
+   "configure a statistic collector",
+   "add a reporting measure with a collection cadence",
+   "define a metric that tracks public post likes"
+  ]
+ },
+ "tool:expand_schedule_occurrences": {
+  "terms": [
+   "cron preview",
+   "recurrence dates",
+   "schedule instances",
+   "calendar occurrences"
+  ],
+  "examples": [
+   "preview the next cron occurrences",
+   "expand this recurring schedule into dates",
+   "show the calendar instances for this recurrence",
+   "expand cron occurrences between two dates"
+  ]
+ },
+ "tool:measure_media_audio_alignment": {
+  "terms": [
+   "audio offset",
+   "soundtrack sync",
+   "align audio tracks",
+   "subtitle timing offset"
+  ],
+  "examples": [
+   "measure the audio offset between two media documents",
+   "find the soundtrack sync difference for subtitle timing",
+   "align the reference audio with the edited video",
+   "calculate a local audio timing offset"
+  ]
+ },
+ "tool:query_workflow_projects": {
+  "terms": [
+   "workflow project list",
+   "project execution status",
+   "workflow run receipts",
+   "project state"
+  ],
+  "examples": [
+   "list workflow projects in this workspace",
+   "show the execution status of workflow projects",
+   "find workflow project receipts and current state",
+   "query projects of this workflow type"
+  ]
+ },
+ "tool:query_workspace_stat_observations": {
+  "terms": [
+   "metric observations",
+   "statistics report",
+   "compare measurements",
+   "reporting window"
+  ],
+  "examples": [
+   "compare workspace metric observations this week",
+   "show statistics for a reporting window",
+   "query the measurements collected for these stats",
+   "report how the configured metrics changed"
+  ]
+ },
+ "tool:verify_media_sources": {
+  "terms": [
+   "source audio verification",
+   "video soundtrack proof",
+   "media provenance",
+   "audio source match"
+  ],
+  "examples": [
+   "verify that the final video soundtrack matches its source audio",
+   "check media provenance for the completed video",
+   "prove the video audio comes from the declared source span",
+   "validate the final video hash and source audio alignment"
+  ]
+ },
+ "tool:ws_propose_stat": {
+  "terms": [
+   "draft metric",
+   "stat definition",
+   "workspace statistic",
+   "portable collector"
+  ],
+  "examples": [
+   "add a statistic definition to the workspace draft",
+   "propose a workspace metric and collector",
+   "define a portable stat in this draft",
+   "replace the draft metric configuration"
+  ]
+ },
+ "tool:ws_propose_workflow": {
+  "terms": [
+   "draft workflow",
+   "workflow definition",
+   "workflow steps",
+   "automation blueprint"
+  ],
+  "examples": [
+   "add a workflow definition to the workspace draft",
+   "propose workflow steps for this automation",
+   "create a portable workflow in the draft",
+   "replace the draft workflow blueprint"
+  ]
+ },
  "tool:ws_read_source": {
   "terms": [
    "uploaded file",
@@ -5063,6 +5218,23 @@
    "select published blueprint"
   ]
  },
+ "workspace_action:add_assessed_metrics": {
+  "terms": [
+   "audience",
+   "views",
+   "subscribers",
+   "followers",
+   "likes",
+   "comments",
+   "active users"
+  ],
+  "examples": [
+   "track views and subscribers for this workspace",
+   "add follower and comment metrics",
+   "assess audience numbers daily",
+   "measure how many likes the latest video gets"
+  ]
+ },
  "workspace_action:add_knowledge_documents": {
   "terms": [
    "attach document",
@@ -5084,6 +5256,7 @@
    "guardrail",
    "policy",
    "approval",
+   "require approval",
    "never do",
    "always do"
   ],
@@ -5330,6 +5503,32 @@
    "give the running task extra guardrails",
    "attach reference document to task",
    "update task runtime instructions"
+  ]
+ },
+ "workspace_action:start_task": {
+  "terms": [
+   "start task",
+   "run task",
+   "execute task",
+   "begin drafted task"
+  ],
+  "examples": [
+   "start the task I drafted earlier",
+   "run this pending task now",
+   "execute the existing workspace task"
+  ]
+ },
+ "workspace_action:hold_for_approval": {
+  "terms": [
+   "hold for approval",
+   "stop at approval card",
+   "this conversation",
+   "this chat"
+  ],
+  "examples": [
+   "any write to Knowledge needs my approval first",
+   "stop at the approval card before saving",
+   "ask me before publishing anything in this chat"
   ]
  },
  "workspace_action:visualize_ledgers": {
@@ -5651,6 +5850,7 @@
    "rule",
    "guardrail",
    "approval rule",
+   "require approval",
    "add rule"
   ],
   "examples": [
@@ -5784,6 +5984,62 @@
    "make the lead intake workflow the main action",
    "link a saved workflow to the app button",
    "set workflow as app entry"
+  ]
+ },
+ "tool:resolve_platform_routes": {
+  "terms": [
+   "integration or chrome",
+   "publishing route",
+   "connected integration",
+   "platform connection",
+   "prefer api"
+  ],
+  "examples": [
+   "should this post use the youtube integration or chrome",
+   "is the instagram integration connected before publishing",
+   "pick the publishing route for tiktok"
+  ]
+ },
+ "tool:compose_creative_video": {
+  "terms": [
+   "narrated video",
+   "episode video",
+   "video series",
+   "slideshow video",
+   "explainer video",
+   "scene pictures to video"
+  ],
+  "examples": [
+   "make a narrated video from scene images",
+   "compose an episode video with narration and subtitles",
+   "turn pictures and voiceover into an mp4"
+  ]
+ },
+ "tool:ws_design_app_view": {
+  "terms": [
+   "workspace app page",
+   "app page design",
+   "app designer",
+   "page layout",
+   "home panel layout",
+   "app entries"
+  ],
+  "examples": [
+   "design the workspace app page layout",
+   "command the app designer to lay out the home panel",
+   "design app page entries for a series workspace"
+  ]
+ },
+ "tool:ws_accept_app_view": {
+  "terms": [
+   "accept app design",
+   "app page candidate",
+   "approve app page design"
+  ],
+  "examples": [
+   "accept the app page candidate",
+   "accept the designed workspace app page",
+   "approve the app designer candidate page"
   ]
  }
 }

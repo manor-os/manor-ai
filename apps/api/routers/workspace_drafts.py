@@ -240,7 +240,7 @@ async def _hydrate_response(
         status=draft.status,
         fields=strip_source_text({
             key: value for key, value in (draft.fields or {}).items()
-            if key != "_blueprint_source_payload"
+            if key not in {"_blueprint_source_payload", draft_service.TURN_CLAIM_FIELD}
         }),
         messages=visible_messages,
         missing=list(draft.missing or []),
@@ -832,6 +832,11 @@ async def finalize(
         raise HTTPException(402, detail=exc.detail)
     except MarketplaceIdentityConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except draft_service.WorkspaceDraftMaterializationError as exc:
+        # The Workspace shell and resource rows share this transaction.  A
+        # resource failure must not be committed as a stale-ready correction.
+        await db.rollback()
+        raise HTTPException(400, str(exc)) from exc
     except draft_service.WorkspaceDraftNotReadyError as exc:
         # Finalize has not started materialization. Persist only the verified
         # lint-derived readiness correction before the HTTP error rolls back.
@@ -920,6 +925,10 @@ async def finalize_stream(
                         user_id=user.id,
                         progress=progress,
                     )
+                except draft_service.WorkspaceDraftMaterializationError as exc:
+                    await db.rollback()
+                    await queue.put(("error", {"message": str(exc)}))
+                    return
                 except draft_service.WorkspaceDraftNotReadyError as exc:
                     # The stream owns this session, so commit the same
                     # readiness correction before returning its error event.

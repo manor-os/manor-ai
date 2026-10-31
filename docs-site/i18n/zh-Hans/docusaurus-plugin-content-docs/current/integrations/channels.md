@@ -88,13 +88,36 @@ GET/POST /api/v1/channels/whatsapp/webhook
 POST /api/v1/channels/twilio/sms | /twilio/voice | /twilio/status
 GET/POST /api/v1/channels/wechat/callback?config_id=...   # 公众号；明文模式
 GET/POST /api/v1/channels/facebook/webhook
-POST /api/v1/channels/{channel_type}/callback?config_id=...   # generic (Slack, Discord, …)
+POST /api/v1/channels/{channel_type}/callback?config_id=...   # 通用：邮件入站、个人微信 runner
 ```
 
 所有这些端点都要求 `PUBLIC_BASE_URL` 能被提供商访问——生产环境必须是
 HTTPS。签名验证（Meta HMAC、Discord Ed25519、Twilio 签名）会拒绝未签名的
-流量；从提供商的角度看，签名不匹配会静默失败，所以当消息迟迟不到时，
+流量。通用回调只接受能证明发送方的请求：个人微信 runner 需要配置
+`WECHAT_RUNNER_BEARER_TOKEN`，Facebook 主页需要应用密钥；上面有专用端点的渠道
+在通用回调上会返回 `410`。从提供商的角度看，签名不匹配会静默失败，所以当消息迟迟不到时，
 请务必仔细检查应用密钥。
+
+### 带签名的邮件入站 {#signed-email-inbound}
+
+邮件渠道只接受转发器（IMAP 轮询程序或入站解析服务）对
+`/api/v1/channels/email/callback?config_id=...` 发出的带签名 POST。连接的
+所有者通过 `GET /api/v1/integrations/{integration_id}/email-inbound` 读取回调
+地址和签名密钥（首次调用时生成密钥），并可通过
+`POST .../email-inbound/rotate` 更换密钥。每个请求都要带上：
+
+```text
+X-Manor-Timestamp: <unix 秒>
+X-Manor-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>." + 原始请求体)>
+```
+
+签名无效、或时间戳与服务器时钟相差超过五分钟的请求会被以 `403` 拒绝，
+不会写入日志，也不会分发。
+
+每个渠道对同一个 `message_id` 只接受一次。重试一封已收到的邮件，或在五分钟
+窗口内重放一个带签名的请求，都会返回 `200` 和
+`{"ok": true, "noop": true, "reason": "duplicate_event"}`，不会再触发一次回复，
+所以转发器可以放心重试。
 
 ## 内部私信 {#internal-direct-messages}
 

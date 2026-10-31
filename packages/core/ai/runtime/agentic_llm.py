@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from packages.core.ai.llm_client import chat_completion, chat_completion_with_tools
+from packages.core.ai.provider_retry import withhold_stream_events
 from packages.core.ai.runtime.response_language import current_response_language_messages
 from packages.core.constants.models import DEFAULTS
 
@@ -20,8 +21,34 @@ RUNTIME_AGENTIC_COMPACTION_MAX_TOKENS = 4096
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
+def runtime_agentic_output_tokens(
+    metadata: dict[str, Any] | None,
+    *,
+    model: str | None,
+    tools: bool,
+) -> int:
+    """``max_tokens`` for one agentic round, also its compaction reserve.
+
+    A BYOK credential's declared ``max_output_tokens`` replaces the default
+    (clamped to fit the window); every other route keeps the default.
+    """
+
+    from packages.core.services.model_context_window import effective_output_tokens
+
+    return effective_output_tokens(
+        RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS if tools else RUNTIME_AGENTIC_TEXT_MAX_TOKENS,
+        model=model,
+        metadata=metadata,
+    )
+
+
 async def _noop_stream_handler(_event_name: str, _payload: dict[str, Any]) -> None:
     return None
+
+
+# Streams only for the streaming deadlines; nothing it receives reaches anyone,
+# so a dropped stream stays retryable.
+withhold_stream_events(_noop_stream_handler)
 
 
 def runtime_agentic_tool_streaming_enabled() -> bool:
@@ -76,7 +103,7 @@ async def runtime_execute_agentic_round_tool_completion(
         metadata=metadata,
         **({"response_format": response_format} if response_format is not None else {}),
         max_tokens=(
-            RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS
+            runtime_agentic_output_tokens(metadata, model=model, tools=True)
             if max_tokens is None
             else max_tokens
         ),
@@ -100,7 +127,7 @@ async def runtime_execute_agentic_round_text_completion(
         temperature=temperature,
         model=model,
         max_tokens=(
-            RUNTIME_AGENTIC_TEXT_MAX_TOKENS
+            runtime_agentic_output_tokens(metadata, model=model, tools=False)
             if max_tokens is None
             else max_tokens
         ),
@@ -126,7 +153,7 @@ async def runtime_execute_agentic_final_completion(
         temperature=temperature,
         model=model,
         max_tokens=(
-            RUNTIME_AGENTIC_TEXT_MAX_TOKENS
+            runtime_agentic_output_tokens(metadata, model=model, tools=False)
             if max_tokens is None
             else max_tokens
         ),

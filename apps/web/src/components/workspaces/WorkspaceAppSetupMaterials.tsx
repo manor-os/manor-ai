@@ -101,6 +101,7 @@ export default function WorkspaceAppSetupMaterials({ workspaceId, checkKey, acce
         <Button variant="primary" onClick={() => save.mutate()} disabled={!canStart || save.isPending || (!hasSelection && !(acceptsText && answer.trim()))} loading={save.isPending}>{t("component.workspace_app_view.setup_save_check")}</Button>
       </div>
       {pickerOpen && <HitlKnowledgePicker
+        workspaceId={workspaceId}
         selectedIds={new Set(documents.map((document) => document.id))}
         onToggle={(document) => {
           setDocuments((previous) => previous.some((item) => item.id === document.id)

@@ -33,14 +33,13 @@ from packages.core.governance.approvals import (
     consume_approval,
     count_open_requests,
     grant_approval,
-    grant_open_request_for_step,
     resolve_origin_requests,
 )
 from packages.core.ledger import event_types as ledger_et
 from packages.core.models.base import generate_ulid
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.user import Entity, User, UserMembership
-from packages.core.models.workspace import Workspace, WorkspaceStaff
+from packages.core.models.workspace import Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.services.runtime_authorization import (
     AuthorizationRule,
@@ -405,119 +404,6 @@ async def test_versioned_exact_rule_applies_to_future_operations_without_resolvi
 
 
 @pytest.mark.asyncio
-async def test_explicit_operator_resume_grants_the_steps_open_request__317(db_session):
-    """An explicit HITL Resume on an approval-paused step records the
-    approval and lets the reparked step through the gate."""
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    e, w = await _ws(db_session)
-    step = generate_ulid()
-    plan = generate_ulid()
-    db_session.add(ExecutionPlan(
-        id=plan,
-        entity_id=e,
-        workspace_id=w,
-        status="paused",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    ))
-    db_session.add(ExecutionStep(
-        id=step,
-        plan_id=plan,
-        entity_id=e,
-        workspace_id=w,
-        step_key="publish",
-        kind="subagent",
-        params={},
-        depends_on=[],
-        step_status="waiting_human",
-    ))
-    await db_session.flush()
-    subject = _subject(e, w, risk_level="high")
-
-    d1 = await resolve_approval(db_session, subject=subject, origin=_step_origin(step_id=step))
-    assert d1.outcome == "needs_human"
-
-    granted = await grant_open_request_for_step(
-        db_session, entity_id=e, step_id=step, by_user_id="op", via="task_resume",
-    )
-    assert granted is not None and granted.id == d1.request.id
-    assert granted.status == "granted"
-
-    d2 = await resolve_approval(db_session, subject=subject, origin=_step_origin(step_id=step))
-    assert d2.outcome == "allow"
-
-    # No open request → helper is a harmless no-op (plain failed-step retry).
-    await consume_approval(db_session, granted)
-    assert await grant_open_request_for_step(
-        db_session, entity_id=e, step_id=generate_ulid(), by_user_id="op",
-    ) is None
-
-
-@pytest.mark.asyncio
-async def test_requestless_inline_review_requires_explicit_decision(db_session):
-    from packages.core.governance.approvals import ApprovalDecisionRequiredError
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    e, w = await _ws(db_session)
-    viewer_id = generate_ulid()
-    db_session.add_all([
-        User(
-            id=viewer_id,
-            entity_id=e,
-            email=f"viewer-{viewer_id}@example.com",
-            password_hash="x",
-            role="member",
-        ),
-        UserMembership(
-            user_id=viewer_id,
-            entity_id=e,
-            role="member",
-            status="active",
-        ),
-        WorkspaceStaff(
-            workspace_id=w,
-            staff_id=None,
-            user_id=viewer_id,
-            role="viewer",
-            status="active",
-        ),
-    ])
-    plan_id, step_id = generate_ulid(), generate_ulid()
-    db_session.add(ExecutionPlan(
-        id=plan_id,
-        entity_id=e,
-        workspace_id=w,
-        status="paused",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    ))
-    db_session.add(ExecutionStep(
-        id=step_id,
-        plan_id=plan_id,
-        entity_id=e,
-        workspace_id=w,
-        step_key="review",
-        kind="human",
-        params={"review": {"summary": "Review this output."}},
-        depends_on=[],
-        step_status="waiting_human",
-    ))
-    await db_session.flush()
-
-    with pytest.raises(ApprovalDecisionRequiredError):
-        await grant_open_request_for_step(
-            db_session,
-            entity_id=e,
-            step_id=step_id,
-            by_user_id=viewer_id,
-            via="task_resume",
-        )
-
-
-@pytest.mark.asyncio
 async def test_standing_grant_cannot_override_hard_block(db_session):
     """A standing grant never beats never_allow — hard blocks stay hard."""
     e, w = await _ws(db_session)
@@ -526,39 +412,3 @@ async def test_standing_grant_cannot_override_hard_block(db_session):
                         changed_by="t")
     d = await resolve_approval(db_session, subject=_subject(e, w, risk_level="high"), origin=_step_origin())
     assert d.outcome == "deny"
-
-
-@pytest.mark.asyncio
-async def test_explicit_retry_intent_is_durable_and_does_not_reuse_consumed_grant(db_session):
-    from apps.api.routers.plans import _reset_step_for_retry
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.plans.step_reset import reset_step_to_retry_ready, step_approval_operation_id
-
-    entity_id, workspace_id = await _ws(db_session)
-    plan = ExecutionPlan(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id,
-        status="paused", execution_mode="live", approval_required=False, plan_dag={"steps": []})
-    step = ExecutionStep(id=generate_ulid(), plan_id=plan.id, entity_id=entity_id, workspace_id=workspace_id,
-        step_key="publish", kind="action", action_key="social_post.publish", risk_level="high",
-        params={}, depends_on=[], step_status="failed", attempt_count=1)
-    db_session.add_all([plan, step])
-    await db_session.flush()
-    original = step_approval_operation_id(step)
-    db_session.add(HitlRequest(entity_id=entity_id, workspace_id=workspace_id,
-        action_key="social_post.publish", resource_id=None, capability_id="external.social", risk_level="high",
-        origin_kind="step", origin_step_id=step.id, origin_plan_id=plan.id, status="consumed",
-        dedup_key=f"operation:{original}", context={"operation_id": original, "args_hash": "same"}))
-    await db_session.flush()
-    reset_step_to_retry_ready(step)
-    denied = await resolve_approval(db_session, subject=_subject(entity_id, workspace_id, risk_level="high"),
-        origin=_step_origin(step_id=step.id, plan_id=plan.id, operation_id=step_approval_operation_id(step), args_hash="same"))
-    assert denied.outcome == "deny"
-    _reset_step_for_retry(step, user=await db_session.get(User, "op"))
-    await db_session.commit()
-    await db_session.refresh(step)
-    assert step.approval_operation_revision == 1
-    assert step_approval_operation_id(step) == f"{original}:intent:1"
-    reviewed = await resolve_approval(db_session, subject=_subject(entity_id, workspace_id, risk_level="high"),
-        origin=_step_origin(step_id=step.id, plan_id=plan.id, operation_id=step_approval_operation_id(step), args_hash="same"))
-    assert reviewed.outcome == "needs_human"
-    assert reviewed.request.status == "pending"
-    assert reviewed.request.context["operation_id"] == f"{original}:intent:1"

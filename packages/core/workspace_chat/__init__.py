@@ -20,9 +20,6 @@ from packages.core.workspace_chat.service import (
     resolve_pending_action,
 )
 from packages.core.workspace_chat.notifiers import (
-    notify_plan_started,
-    notify_plan_completed,
-    notify_plan_failed,
     notify_step_done,
     notify_step_failed,
     notify_step_needs_human,
@@ -39,9 +36,6 @@ __all__ = [
     "publish_workspace_chat_message_event",
     "list_messages",
     "resolve_pending_action",
-    "notify_plan_started",
-    "notify_plan_completed",
-    "notify_plan_failed",
     "notify_step_done",
     "notify_step_failed",
     "notify_step_needs_human",

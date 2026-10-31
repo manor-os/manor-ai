@@ -186,12 +186,19 @@ the registration regression verifies the persisted production work factor and
 real correct/incorrect login behavior. Do not replace password verification,
 authorization, or persistence with constant success stubs for speed.
 
+The root `client` reuses an assembled API app for an identical process
+environment and clears `dependency_overrides` before each test. Configure an
+environment-dependent app through `client` parameters or `monkeypatch.setenv`
+before requesting `client`. Never add routes, middleware, or handlers to the
+shared app; a test that needs a custom app builds its own.
+
 ## Select verification by impact
 
 Use the checked-out [workflow](../.github/workflows/ci.yml),
 [Makefile](../Makefile), and package scripts for actual commands and required
 environment. When they differ, reproduce the failing job's exact selection
 and environment; a smaller local suite is not proof that CI passes.
+
 
 Use `make test-setup` to validate the lock and install the Python 3.12 test
 environment. `scripts/run_python_tests.py` owns Python lane expressions;

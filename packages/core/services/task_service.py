@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.ai.response_language import normalize_response_locale
 from packages.core.i18n import get_locale, t
 
-from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskType
+from packages.core.constants.task import CancelSource, TaskLogType, TaskRuntimeKind, TaskStatus, TaskType
 from packages.core.constants.agents import (
     MANOR_AGENT_NAME,
     is_legacy_agent_author_placeholder,
@@ -379,6 +379,35 @@ async def ensure_workspace_agent_assignment(
         raise ValueError("Selected Agent is not subscribed to this Workspace")
 
 
+async def ensure_workspace_owner_subscription(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    subscription_id: str | None,
+) -> None:
+    """Reject owning a Workspace Task by another Workspace's service.
+
+    Same contract as ``ensure_workspace_agent_assignment``: a Workspace Task
+    runs through that Workspace's own active deployments. A service key is
+    already resolved within the Task's Workspace.
+    """
+    if not workspace_id or not subscription_id:
+        return
+    found = (
+        await db.execute(
+            select(AgentSubscription.id).where(
+                AgentSubscription.id == subscription_id,
+                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.workspace_id == workspace_id,
+                AgentSubscription.status == "active",
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        raise ValueError("Selected service is not part of this Workspace")
+
+
 async def create_task(
     db: AsyncSession, entity_id: str, *,
     title: str,
@@ -396,6 +425,7 @@ async def create_task(
     owner_service_key: str | None = None,
     owner_subscription_id: str | None = None,
     delegate_service_keys: list[str] | None = None,
+    required_skills: list[str] | None = None,
     details: dict | None = None,
     creation_log_metadata: dict | None = None,
     creation_logged_by_system: bool = False,
@@ -413,6 +443,9 @@ async def create_task(
     """
     from packages.core.services.task_execution_origin import ORIGIN_TASK_KEY, record_task_origin
 
+    await ensure_workspace_owner_subscription(
+        db, entity_id=entity_id, workspace_id=workspace_id, subscription_id=owner_subscription_id,
+    )
     if agent_id and not is_master_agent(agent_id):
         await lock_reusable_resource_references(
             db,
@@ -443,6 +476,8 @@ async def create_task(
         owner_service_key=owner_service_key,
         owner_subscription_id=owner_subscription_id,
         delegate_service_keys=list(delegate_service_keys or []),
+        # Caller-validated Skill refs; the Workspace service's are merged below.
+        required_skills=list(required_skills or []),
         details=merged_details,
         deadline=_coerce_datetime(deadline) if deadline else None,
     )
@@ -540,6 +575,7 @@ async def update_task(
     dispatch_plan: bool = True,
     require_nonterminal: bool = False,
     log_locale: str | None = None,
+    cancel_source: str | None = None,
     **fields,
 ) -> Optional[Task]:
     task = await get_task(db, task_id, entity_id)
@@ -621,6 +657,13 @@ async def update_task(
             ).with_for_update().execution_options(populate_existing=True)
         )).scalar_one()
 
+    if fields.get("owner_subscription_id") or (fields.get("workspace_id") and task.owner_subscription_id):
+        await ensure_workspace_owner_subscription(
+            db,
+            entity_id=entity_id,
+            workspace_id=fields.get("workspace_id") or task.workspace_id,
+            subscription_id=fields.get("owner_subscription_id") or task.owner_subscription_id,
+        )
     next_agent_id = fields.get("agent_id") if "agent_id" in fields else None
     if (
         next_agent_id
@@ -654,15 +697,6 @@ async def update_task(
 
     old_status = task.status
     old_assignee_id = task.assignee_id
-    terminal_runtime_marker = None
-    if entering_terminal and isinstance(task.details, dict):
-        from packages.core.services.task_runtime_approvals import (
-            TASK_RUNTIME_HITL_DETAIL_KEY,
-        )
-
-        current_marker = task.details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-        if isinstance(current_marker, dict):
-            terminal_runtime_marker = dict(current_marker)
     new_status = fields.get("status")
     start_execution = None
     if new_status is not None and new_status != old_status:
@@ -675,6 +709,7 @@ async def update_task(
         await apply_task_status_transition(
             task, new_status, db=db,
             actor_kind="user" if user_id else "system", actor_id=user_id,
+            cancel_source=cancel_source,
         )
     elif fields:
         # Keep API responses deterministic after non-status updates. Relying
@@ -718,21 +753,6 @@ async def update_task(
         from packages.core.services.task_execution_origin import record_manual_task_execution
 
         record_manual_task_execution(task, user_id=user_id, action="task_start")
-
-    if entering_terminal:
-        details = dict(task.details or {})
-        from packages.core.services.task_runtime_approvals import (
-            TASK_RUNTIME_HITL_DETAIL_KEY,
-        )
-
-        marker = terminal_runtime_marker or details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-        if isinstance(marker, dict):
-            details[TASK_RUNTIME_HITL_DETAIL_KEY] = {
-                **marker,
-                "state": "finished",
-                "result_status": requested_status,
-            }
-            task.details = details
 
     if task.task_type == TaskType.INTERACTIVE.value:
         from packages.core.services.task_session import resolve_task_session_host
@@ -808,9 +828,8 @@ async def update_task(
             "workspace_id": task.workspace_id,
         })
 
-        # First execution uses the same route as manual recovery. A Workspace
-        # team can plan without a pinned owner. Assigned TaskRunner tasks are
-        # still dispatched by their existing API/scheduler entrypoints.
+        # First execution uses the same route as manual recovery: the Task's
+        # durable run, in a Workspace or assigned directly to an Agent.
         if (
             new_status == "in_progress"
             and old_status != "in_progress"
@@ -1144,7 +1163,16 @@ async def move_task(db: AsyncSession, task_id: str, entity_id: str, new_status: 
             start_execution = await _require_task_start_runtime(db, task, fields)
         if "details" in fields:
             task.details = fields["details"]
-    await apply_task_status_transition(task, new_status, db=db)
+    # A Kanban move is always a person's drag (the only caller is the board
+    # endpoint), so a move to cancelled is a user cancel — unless the card was
+    # still a proposal: dragging that away rejects it, which the state machine
+    # records as a proposal cancel.
+    await apply_task_status_transition(
+        task, new_status, db=db,
+        cancel_source=(
+            None if old_status == TaskStatus.PROPOSED.value else CancelSource.USER.value
+        ),
+    )
 
     if (
         new_status == "in_progress"
@@ -1163,21 +1191,6 @@ async def move_task(db: AsyncSession, task_id: str, entity_id: str, new_status: 
             and start_execution.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
         ):
             await stage_task_execution_intent(db, task, start_execution)
-
-    if new_status in TERMINAL_STATUSES:
-        from packages.core.services.task_runtime_approvals import (
-            TASK_RUNTIME_HITL_DETAIL_KEY,
-        )
-
-        details = dict(task.details or {})
-        marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-        if isinstance(marker, dict):
-            details[TASK_RUNTIME_HITL_DETAIL_KEY] = {
-                **marker,
-                "state": "finished",
-                "result_status": new_status,
-            }
-            task.details = details
 
     await db.flush()
     if new_status in TERMINAL_STATUSES:

@@ -3303,3 +3303,48 @@ async def test_external_calendar_events_read_visible_calendars_and_skip_bookings
     assert failed_sync.json()["detail"] == (
         "External calendars could not be synced. Please try again"
     )
+
+
+@pytest.mark.asyncio
+async def test_recording_picker_selects_owned_account_without_changing_defaults(client, db_session, monkeypatch):
+    headers = await _auth(client, "minutes_calendar_picker")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    user = (await db_session.execute(select(User).where(User.id == me["id"]))).scalar_one()
+    default = OAuthAccount(user_id=user.id, provider="google_calendar", provider_user_id="default@example.test", access_token="default-token", profile={"is_default": True})
+    selected = OAuthAccount(user_id=user.id, provider="google_calendar", provider_user_id="selected@example.test", access_token="selected-token", profile={})
+    db_session.add_all([default, selected]); await db_session.flush()
+    preferences = {"calendar_settings": {"provider": "google_calendar", "connection_id": "default@example.test",
+        "visible_calendar_ids": ["default-only"], "timezone": "America/Los_Angeles"}}
+    user.preferences = preferences
+    selected_id, default_id = selected.id, default.id
+    await db_session.commit()
+    from packages.core.ai.mcp import google_calendar
+    calls = []
+    async def events(token, args):
+        calls.append((token, args))
+        return {"items": [{"id": "one", "summary": "Design review", "location": "Room 2", "start": {"dateTime": "2026-10-29T10:00:00-07:00"}, "end": {"dateTime": "2026-10-29T11:00:00-07:00"}}]}
+    monkeypatch.setattr(google_calendar, "list_events_data", events)
+    path = f"/api/v1/calendar-settings/events?start=2026-10-28&end=2026-10-31&provider=google_calendar&connection_id={selected_id}&include_bookings=true"
+    result = await client.get(path, headers=headers)
+    assert result.status_code == 200, result.text
+    assert result.json()["events"][0]["location"] == "Room 2"
+    assert calls[0][0] == "selected-token"
+    assert calls[0][1]["calendar_id"] == "primary"
+    await db_session.refresh(user)
+    assert user.preferences == preferences
+
+    # The same connection id presented by another account cannot fall back to
+    # that person's default or disclose the original user's calendar events.
+    other_headers = await _auth(client, "minutes_calendar_other")
+    denied = await client.get(path, headers=other_headers)
+    assert denied.status_code == 503
+    assert len(calls) == 1
+    invalid = await client.get(path.replace(selected_id, "missing-account"), headers=headers)
+    assert invalid.status_code == 503
+    assert len(calls) == 1
+    # Legacy email aliases and canonical account IDs refer to the same source;
+    # preserve that source's visible-calendar selection.
+    same = await client.get(path.replace(selected_id, default_id), headers=headers)
+    assert same.status_code == 200
+    assert calls[-1][0] == "default-token"
+    assert calls[-1][1]["calendar_id"] == "default-only"

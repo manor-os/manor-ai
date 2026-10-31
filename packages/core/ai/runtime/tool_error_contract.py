@@ -24,15 +24,25 @@ TOOL_ERROR_MAX_CHARS = 12000
 
 def tool_error_payload(
     *, tool_name: str, code: str, message: str, details: dict[str, Any] | None = None,
+    internal_error: bool = False,
 ) -> dict[str, Any]:
-    """Describe a failure, without selecting repairs or granting retry authority."""
+    """Describe a failure, without selecting repairs or granting retry authority.
+
+    Who can resolve it: by default the agent (another call, another path).
+    ``internal_error=True`` declares a Manor platform fault that no person can
+    resolve, read back by ``runtime_platform_error``: the run records it, and
+    ``request_input`` refuses to park on a person until it is resolved.
+    """
+    details = dict(details or {})
+    if internal_error:
+        details.update(internal_error=True, requires_human=False, retryable=False)
     return {
         "contract": TOOL_ERROR_CONTRACT,
         "status": "error",
         "tool": tool_name,
         "error": code,
         "message": message,
-        "details": dict(details or {}),
+        "details": details,
     }
 
 # Under context pressure keep actionable diagnostics ahead of bulky output.
@@ -40,7 +50,7 @@ def tool_error_payload(
 _DIAGNOSTIC_KEYS = (
     # Preserve execution/verification evidence before bulky locator or output
     # diagnostics. These remain observations, never host retry authority.
-    "ok", "status", "action_executed", "retryable", "do_not_replay", "verified",
+    "ok", "status", "internal_error", "action_executed", "retryable", "do_not_replay", "verified",
     "website_upload_confirmed", "next_required_tool", "event_receipt",
     "action_receipt", "action_verification", "pending_verification",
     "contract", "action_id", "execution", "verification",
@@ -48,7 +58,7 @@ _DIAGNOSTIC_KEYS = (
     "code", "message", "reason", "cause", "detail", "error",
     "field_paths", "source_saved", "contract_valid", "violations", "contract_violations",
     "validation_errors", "issues", "diagnostics",
-    "file", "rule", "pointer", "repair_hint", "hint", "recovery_hint",
+    "file", "rule", "pointer", "repair_hint", "manor_hint", "fix_hint", "hint", "recovery_hint",
     "retry_policy", "next_step", "repair_strategy", "stderr", "exit_code",
 )
 
@@ -169,6 +179,62 @@ def model_tool_error_result(tool_name: str, result: Any, *, max_chars: int) -> s
     budget = max(64, max_chars - len(_dump(compacted)) - 14)
     compacted["details"] = _bounded(envelope.get("details", {}), budget)
     return _dump(compacted)
+
+
+PLATFORM_ERROR_DETAILS_MAX_CHARS = 4000
+_ERROR_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}")
+
+
+def tool_error_summary(result: Any) -> str | None:
+    """One line naming a failed tool result: ``code: message`` for this
+    contract (its ``error`` field is only the code), else the decoder's detail."""
+    detail = runtime_tool_call_error(result)
+    if detail is None:
+        return None
+    payload = result.structured_content if isinstance(result, RuntimeStructuredToolResult) else result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return detail
+    if not isinstance(payload, dict) or payload.get("contract") != TOOL_ERROR_CONTRACT:
+        return detail
+    message = str(payload.get("message") or "").strip()
+    return f"{detail}: {message}" if message and message != detail else detail
+
+
+def runtime_platform_error(tool_name: str, result: Any) -> dict[str, Any] | None:
+    """A Manor platform fault a failed tool result declares, or None.
+
+    Only Manor's own handlers mark ``internal_error: true``: an invariant broke
+    on the platform side, so no grant, approval or repeated call repairs it.
+    ``retryable: false`` alone is not this; setup and governance blockers the
+    user can resolve use it too. An external MCP provider cannot declare a
+    Manor fault. Returns the error code and the bounded, redacted payload.
+    """
+    if runtime_tool_call_error(result) is None:
+        return None
+    if tool_name.startswith("mcp__") and not tool_name.startswith("mcp__manor_"):
+        return None
+    payload = result.structured_content if isinstance(result, RuntimeStructuredToolResult) else result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    parts = [part for part in (payload, payload.get("details"), payload.get("error")) if isinstance(part, dict)]
+    marked = next((part for part in parts if part.get("internal_error") is True), None)
+    if marked is None or any(part.get("retryable") is True for part in parts):
+        return None
+    candidates = [part.get(key) for part in parts for key in ("error", "code")]
+    code = next(
+        (value for value in candidates if isinstance(value, str) and _ERROR_CODE_RE.fullmatch(value)),
+        "internal_error",
+    )
+    details = sanitize_sensitive_payload(sanitize_approval_credentials(payload))
+    return {"code": code, "details": _bounded(details, PLATFORM_ERROR_DETAILS_MAX_CHARS)}
 
 
 def model_tool_diagnostic_result(tool_name: str, result: Any, *, max_chars: int) -> str | None:

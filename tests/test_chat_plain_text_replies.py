@@ -303,6 +303,33 @@ async def test_tasks_created_this_turn_are_appended_with_verified_status():
 
 
 @pytest.mark.asyncio
+async def test_a_task_started_this_turn_is_appended_as_started():
+    fact = {"kind": "task", "id": "T1", "title": "周报", "state": "planning", "url": "/tasks/T1",
+            "origin": "existing_record", "revision": "r"}
+    gate = _workspace_gate(
+        references=[{"kind": "task", "id": "T1", "scope": "current_turn", "effect": "started"}], facts=[fact],
+    )
+    decision = await gate.validate("已开始执行。")
+    assert decision.content.endswith("- [周报](/tasks/T1) — 本轮启动 · 协调器正在处理")
+
+
+@pytest.mark.asyncio
+async def test_verified_status_follows_the_users_reply_language_not_the_request():
+    """A worker turn has no request locale: the section came out in English for Chinese users."""
+    from packages.core.ai.runtime.response_language import (
+        RuntimeResponseLanguage, runtime_response_language_scope,
+    )
+
+    fact = {"kind": "task", "id": "T1", "title": "周报", "state": "running", "url": "/tasks/T1",
+            "origin": "current_turn", "revision": "r"}
+    gate = _workspace_gate(references=[{"kind": "task", "id": "T1", "scope": "current_turn"}], facts=[fact])
+    gate.locale = "en"
+    with runtime_response_language_scope(RuntimeResponseLanguage("E1", "U1", locale="zh")):
+        decision = await gate.validate("已创建。")
+    assert "已核实的任务状态：" in decision.content and "Verified" not in decision.content
+
+
+@pytest.mark.asyncio
 async def test_no_created_task_or_a_failed_lookup_leaves_the_answer_as_written():
     assert (await _workspace_gate(references=[], facts=[]).validate("Hi")).content == "Hi"
     assert (await _workspace_gate(references=[{"kind": "task", "id": "T1", "scope": "current_turn"}],
@@ -628,34 +655,46 @@ def test_history_returns_known_failure_codes_in_meta(code, kept):
 
 
 
-# ── Asking the user a question is a read, not an approval ────────────
+# ── Asking the user a question needs no approval ────────────────────
 
 
-def test_request_input_is_evaluated_as_a_read_and_needs_no_approval():
+def test_request_input_is_human_input_and_needs_no_approval():
+    """request_input is declared human input (leaf_only): no mode asks for it."""
     from packages.core.ai.runtime.approval_classifier import (
         classify_runtime_tool, runtime_policy_action_for_classification,
     )
+    from packages.core.governance.action_effects import declared_action_effect
     from packages.core.governance.approval_facts import action_facts
-    from packages.core.governance.approval_policy import _baseline
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
 
     action, impact = runtime_policy_action_for_classification(classify_runtime_tool("request_input", {"fields": []}))
-    assert impact == "read"
+    declared = declared_action_effect(action.action_key)
+    assert action.action_key == "human.input.request"
+    assert (impact, action.gate) == (declared.impact, "leaf_only")
     facts = action_facts(
         action_key=action.action_key, capability_id=action.capability_id,
         resource_kind=action.resource_kind, operation=action.operation,
-        risk_level=action.risk_level, impact=impact,
+        risk_level=action.risk_level, **action.policy_effect(),
     )
-    for mode in ("confirm_changes", "automatic", "balanced"):
-        assert _baseline(mode, facts) == "allow"
+    for mode in ("confirm_changes", "automatic", "risk_based"):
+        chain = build_policy_chain(scope=ApprovalScope(kind="account", id="a", entity_id="e"),
+                                   root={"revision": 1, "policy": {"mode": mode, "rules": []}})
+        assert evaluate_policy(chain, facts).outcome == "allow", mode
 
 
-def test_a_classified_write_action_keeps_its_impact_undecided():
+def test_a_classified_write_action_carries_its_declared_impact():
+    """The runtime never invents an impact: a write is judged by its declaration."""
     from packages.core.ai.runtime.approval_classifier import (
         classify_runtime_tool, runtime_policy_action_for_classification,
     )
+    from packages.core.governance.action_effects import declared_action_effect
 
-    _action, impact = runtime_policy_action_for_classification(classify_runtime_tool("generate_image", {"prompt": "x"}))
-    assert impact is None
+    action, impact = runtime_policy_action_for_classification(classify_runtime_tool("generate_image", {"prompt": "x"}))
+    declared = declared_action_effect(action.action_key)
+    assert declared is not None
+    assert (impact, action.category) == (declared.impact, declared.category)
+    assert impact != "read"
 
 
 # ── Live view of a tool call the model is still writing ──────────────

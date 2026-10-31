@@ -39,7 +39,16 @@ def repair_context(monkeypatch):
             }],
         },
     )
-    db = SimpleNamespace(flush=AsyncMock(), refresh=AsyncMock())
+    savepoint = SimpleNamespace(
+        is_active=True,
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    db = SimpleNamespace(
+        flush=AsyncMock(),
+        refresh=AsyncMock(),
+        begin_nested=AsyncMock(return_value=savepoint),
+    )
     lint = AsyncMock(side_effect=[
         {"ok": True, "issues": [binding_issue()]}, {"ok": True, "issues": []},
     ])
@@ -59,7 +68,10 @@ def repair_context(monkeypatch):
     monkeypatch.setattr(service, "runtime_run_workspace_architect_turn", architect)
     monkeypatch.setattr(service, "finalize_setup", create)
     monkeypatch.setattr("packages.core.services.plan_gate.enforce_workspace_capacity", gate)
-    return SimpleNamespace(draft=draft, db=db, lint=lint, architect=architect, create=create, gate=gate)
+    return SimpleNamespace(
+        draft=draft, db=db, lint=lint, architect=architect, create=create,
+        gate=gate, savepoint=savepoint,
+    )
 
 
 async def finalize(ctx, progress=None):

@@ -118,6 +118,12 @@ PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE = (
     "The Chrome browser task already finished. Start a new Chrome task before doing more browser work."
 )
 PUBLIC_TOOL_BLOCKED_MESSAGE = "This operation was blocked."
+#: A transient failure on a Manor-managed route that outlasted the retries.
+LLM_PROVIDER_UNAVAILABLE_ERROR_CODE = "llm_provider_unavailable"
+PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE = (
+    "The AI model provider stopped responding. This looks like a temporary "
+    "outage. Try again in a few minutes."
+)
 _PUBLIC_TYPED_ERROR_MESSAGES = {
     "website_access_denied": PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE,
     "blocked_by_authorization_configuration": PUBLIC_AUTHORIZATION_BLOCKED_MESSAGE,
@@ -126,6 +132,7 @@ _PUBLIC_TYPED_ERROR_MESSAGES = {
     "approval_origin_not_executable": PUBLIC_APPROVAL_ORIGIN_NOT_EXECUTABLE_MESSAGE,
     "workflow_origin_not_executable": PUBLIC_WORKFLOW_ORIGIN_NOT_EXECUTABLE_MESSAGE,
     "chrome_tabs_already_finalized": PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE,
+    LLM_PROVIDER_UNAVAILABLE_ERROR_CODE: PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE,
 }
 _PUBLIC_TYPED_ERROR_SENTENCES = frozenset(_PUBLIC_TYPED_ERROR_MESSAGES.values())
 MODEL_OUTPUT_LIMIT_ERROR_CODE = "model_output_limit"
@@ -146,14 +153,28 @@ PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE = (
     "Your BYOK model provider returned an error. Check the model, API key, "
     "and base URL in your AI settings and the provider's status, then try again."
 )
+#: The same route failed transiently (no response, dropped stream, 429/5xx)
+#: and kept failing through Manor's automatic retries. Same code, but the
+#: owner is not sent to settings that are not the problem.
+PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE = (
+    "Your BYOK model provider stopped responding. This looks like a temporary "
+    "outage at the provider, not a problem with your AI settings. Try again "
+    "in a few minutes."
+)
 _PUBLIC_ERROR_DETAIL_PREFIX = "\n\nError detail: "
+_PUBLIC_RETRY_SUMMARY = r" after \d{1,3} attempts? over \d{1,6}s"
 #: The only detail shape allowed after the BYOK sentence: the HTTP status (or
-#: "no response"), the provider host the owner configured, and the model id.
-#: Anything else — provider bodies, request diagnostics, secrets — is dropped
-#: by every layer, whichever one sees the text first.
+#: "no response"), the provider host the owner configured, the model id, and
+#: for a transient failure how many attempts over how long. Anything else —
+#: provider bodies, request diagnostics, secrets — is dropped by every layer,
+#: whichever one sees the text first.
 _PUBLIC_BYOK_DETAIL_RE = re.compile(
     r"^(?:HTTP [1-5]\d{2}|no response) from [A-Za-z0-9.-]{1,253}(?::\d{1,5})? "
-    r"\(model [A-Za-z0-9._:/-]{1,120}\)$"
+    r"\(model [A-Za-z0-9._:/-]{1,120}\)"
+    rf"(?:{_PUBLIC_RETRY_SUMMARY})?$"
+)
+_PUBLIC_PROVIDER_UNAVAILABLE_DETAIL_RE = re.compile(
+    rf"^(?:HTTP [1-5]\d{{2}}|no response){_PUBLIC_RETRY_SUMMARY}$"
 )
 PUBLIC_TOOL_NAME = "operation"
 _PUBLIC_RAW_RESULT_TOOL_NAMES = frozenset({
@@ -288,13 +309,27 @@ def _runtime_executor_failure_is_public_actionable(detail: str) -> bool:
     return bool(_PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE.fullmatch(detail.strip()))
 
 
-def runtime_public_byok_failure_message(detail: str | None = None) -> str:
-    """Owner-facing BYOK failure: the fixed sentence plus only a structured detail."""
+def runtime_public_byok_failure_message(detail: str | None = None, *, transient: bool = False) -> str:
+    """Owner-facing BYOK failure: the fixed sentence plus only a structured detail.
 
+    ``transient`` picks the outage sentence for a failure that kept failing
+    through automatic retries; it never points the owner at their settings.
+    """
+
+    sentence = PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE if transient else PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE
     candidate = str(detail or "").strip()
     if candidate and _PUBLIC_BYOK_DETAIL_RE.fullmatch(candidate):
-        return f"{PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE}{_PUBLIC_ERROR_DETAIL_PREFIX}{candidate}"
-    return PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE
+        return f"{sentence}{_PUBLIC_ERROR_DETAIL_PREFIX}{candidate}"
+    return sentence
+
+
+def runtime_public_provider_unavailable_message(detail: str | None = None) -> str:
+    """Manor-managed route outage: the fixed sentence plus only the retry summary."""
+
+    candidate = str(detail or "").strip()
+    if candidate and _PUBLIC_PROVIDER_UNAVAILABLE_DETAIL_RE.fullmatch(candidate):
+        return f"{PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE}{_PUBLIC_ERROR_DETAIL_PREFIX}{candidate}"
+    return PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE
 
 
 def _runtime_byok_failure_projection(message: str) -> str | None:
@@ -302,9 +337,26 @@ def _runtime_byok_failure_projection(message: str) -> str | None:
 
     if message == BYOK_PROVIDER_ERROR_CODE or message == PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE:
         return PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE
-    prefix = f"{PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE}{_PUBLIC_ERROR_DETAIL_PREFIX}"
+    if message == PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE:
+        return PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE
+    for sentence, transient in (
+        (PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE, False),
+        (PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE, True),
+    ):
+        prefix = f"{sentence}{_PUBLIC_ERROR_DETAIL_PREFIX}"
+        if message.startswith(prefix):
+            return runtime_public_byok_failure_message(message[len(prefix):], transient=transient)
+    return None
+
+
+def _runtime_provider_unavailable_projection(message: str) -> str | None:
+    """Recognise the Manor-route outage contract in any error text."""
+
+    if message in {LLM_PROVIDER_UNAVAILABLE_ERROR_CODE, PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE}:
+        return PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE
+    prefix = f"{PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE}{_PUBLIC_ERROR_DETAIL_PREFIX}"
     if message.startswith(prefix):
-        return runtime_public_byok_failure_message(message[len(prefix):])
+        return runtime_public_provider_unavailable_message(message[len(prefix):])
     return None
 
 
@@ -1153,6 +1205,9 @@ def runtime_public_assistant_message_content(
         byok_message = _runtime_byok_failure_projection(str(content or "").strip())
         if byok_message is not None:
             return byok_message
+        outage_message = _runtime_provider_unavailable_projection(str(content or "").strip())
+        if outage_message is not None:
+            return outage_message
         limit_detail = message_meta.get("limit_detail") or {}
         if not isinstance(limit_detail, dict):
             limit_detail = {}
@@ -1223,6 +1278,9 @@ def runtime_assistant_stream_error_content(error_message: str) -> str:
     byok_message = _runtime_byok_failure_projection(message)
     if byok_message is not None:
         return byok_message
+    outage_message = _runtime_provider_unavailable_projection(message)
+    if outage_message is not None:
+        return outage_message
     if _INTERNAL_ERROR_CODE_RE.fullmatch(message):
         return PUBLIC_REQUEST_FAILURE_MESSAGE
     public_message = runtime_public_tool_result(message)

@@ -21,6 +21,7 @@ from packages.core.models.user import Entity
 from packages.core.models.webhook import WebhookDelivery, WebhookEndpoint
 from packages.core.models.workspace import Workspace
 from packages.core.services import channel_credentials, event_emitter
+from tests.async_waits import LIVENESS_TIMEOUT_S, wait_for_signal
 
 
 def install_runtime(monkeypatch, factory):
@@ -273,8 +274,13 @@ async def test_waiting_delivery_is_not_claimed_before_a_slot_is_available(db_ses
 
     monkeypatch.setattr(event_emitter, "deliver_webhook_event", provider)
     monkeypatch.setattr(event_emitter, "deliver_task_external_event", AsyncMock())
+    # The queued sweep gives up after its admission wait and leaves the row for
+    # the next sweep. This test holds the slot through observer queries whose
+    # duration depends on the runner, so its sweeps wait out the hold instead.
+    monkeypatch.setattr(event_emitter, "_EXTERNAL_EVENT_ADMISSION_WAIT_SECONDS", LIVENESS_TIMEOUT_S)
+    monkeypatch.setattr(event_emitter, "_EXTERNAL_EVENT_SWEEP_BUDGET_SECONDS", LIVENESS_TIMEOUT_S)
     first = asyncio.create_task(event_emitter.dispatch_due_external_events(event_ids=(entries[0].id,)))
-    await asyncio.wait_for(started.wait(), 2)
+    await wait_for_signal(started, first)
     second = asyncio.create_task(event_emitter.dispatch_due_external_events(event_ids=(entries[1].id,)))
     try:
         # Longer than admission's 100 ms timeout: the queued claim must not
@@ -288,7 +294,7 @@ async def test_waiting_delivery_is_not_claimed_before_a_slot_is_available(db_ses
         assert not second.done()
     finally:
         release.set()
-    results = await asyncio.wait_for(asyncio.gather(first, second), 3)
+    results = await asyncio.wait_for(asyncio.gather(first, second), LIVENESS_TIMEOUT_S)
     assert [result["delivered"] for result in results] == [1, 1]
 
 

@@ -30,7 +30,7 @@ State these once, briefly, when entering the mode so the user is not surprised:
 
 ## Pipeline
 
-Steps 1–4 are unchanged from `SKILL.md` (Request Intake → Project Init →
+Steps 1–4 are unchanged from `workflows/free-design.md` (Request Intake → Project Init →
 Template Option → Strategist). The Strategist still runs the Eight Confirmations
 and produces `design_spec.md` + `spec_lock.md`, but frame each page entry as a
 **full-slide image brief** (overall composition, the exact text to render,

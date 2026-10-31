@@ -4,13 +4,17 @@ import { api, translateApiError } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import Button from "../ui/Button";
 import Modal from "../ui/Modal";
+import { WORKFLOW_REVIEW_FRAMES_DIALOG_WIDTH, workflowReviewHasFrames } from "./WorkflowApprovalReview";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
 import type { WorkflowHistoryRun } from "./workflowRunDisplay";
 
 /** Review the current frozen wait before sending a decision to normal resume. */
-export default function WorkflowRunResumeControl({ runId, disabled, onResumed }: {
+export default function WorkflowRunResumeControl({ runId, disabled, onResumed, label, variant = "outline" }: {
   runId: string;
   disabled?: boolean;
+  /** The button's words where the wait is known ("Review"); defaults to the generic request. */
+  label?: string;
+  variant?: "outline" | "primary";
   onResumed?: (run: WorkflowHistoryRun) => void;
 }) {
   const queryClient = useQueryClient();
@@ -55,7 +59,7 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed }:
         const approvalRunId = typeof action.workflow_run_id === "string" && action.workflow_run_id.trim()
           ? action.workflow_run_id.trim()
           : detail.id;
-        resumed = await api.workflows.resolveRuntimeApproval(approvalRunId, action.runtime_approval_id, choice);
+        resumed = await api.workflows.resolveRuntimeApproval(approvalRunId, action.runtime_approval_id, choice, payload?.review);
         if (approvalRunId !== detail.id) resumed = await api.workflows.getRun(detail.id);
       } else if (typeof action.message_id === "string" && action.message_id) {
         if (typeof action.message_workspace_id === "string" && action.message_workspace_id) {
@@ -74,7 +78,7 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed }:
           : undefined;
         resumed = await api.workflows.resumeRun(detail.id, variables, action.step_id);
       }
-      for (const key of ["workflow-run", "workflow-runs", "workspace-workflow-runs", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-review", "workspace-chat-workflow-run-family", "workspace-chat", "workspace-chat-messages", "chat-messages"]) {
+      for (const key of ["workflow-run", "workflow-runs", "workspace-workflow-runs", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-history-control", "workflow-run-review", "workspace-chat-workflow-run-family", "workspace-chat", "workspace-chat-messages", "chat-messages", "workspace-app-data", "workspace-app-data-contexts", "workspace-app-section", "workspace-app-recent-run"]) {
         void queryClient.invalidateQueries({ queryKey: [key] });
       }
       onResumed?.(resumed);
@@ -86,12 +90,12 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed }:
   };
 
   return <>
-    <Button size="sm" variant="outline" disabled={disabled || busy} onClick={() => void openReview()}>{t("component.workflow_review.open_request")}</Button>
+    <Button size="sm" variant={variant} disabled={disabled || busy} onClick={() => void openReview()}>{label || t("component.workflow_review.open_request")}</Button>
     <Modal
       open={open}
       onClose={() => { if (!busy) setOpen(false); }}
       title={detail?.resume_action?.kind === "workflow_approval" ? t("component.workflow_review.dialog_title") : t("component.workflow_review.response_title")}
-      maxWidth="760px"
+      maxWidth={workflowReviewHasFrames(detail?.resume_action?.review) ? WORKFLOW_REVIEW_FRAMES_DIALOG_WIDTH : "760px"}
       className="workflow-response-dialog"
     >
       {error && <p role="alert">{error}</p>}

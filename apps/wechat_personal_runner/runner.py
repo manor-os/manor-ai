@@ -84,7 +84,7 @@ _DATA_ROOT = Path(os.getenv("WECHAT_RUNNER_DATA", "/data"))
 _SESSIONS_DIR = _DATA_ROOT / "sessions"
 RUNNER_BEARER_TOKEN = os.getenv("RUNNER_BEARER_TOKEN", "")
 # Empty by default keeps the standalone runner useful for local pairing. The
-# compose and Kubernetes manifests set the in-cluster API service explicitly.
+# deployment manifests set the internal API service explicitly.
 MANOR_API_URL = os.getenv("MANOR_API_URL", "").rstrip("/")
 PUBLIC_QR_BASE = (os.getenv("PUBLIC_QR_BASE") or "").rstrip("/")
 

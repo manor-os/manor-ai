@@ -16,13 +16,11 @@ from packages.core.ai.runtime.control import (
     RuntimeToolSuspension,
     is_human_input_suspension_control,
 )
-from packages.core.ai.runtime.human_input import REQUEST_INPUT_JUSTIFICATION_SCHEMA, REQUEST_INPUT_PROMPT_SUFFIX
+from packages.core.ai.runtime.human_input import REQUEST_INPUT_JUSTIFICATION_SCHEMA
 from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
 from packages.core.ai.tools import request_input_tool
 from packages.core.ai.tools.request_input_tool import (
-    REQUEST_INPUT_RESULT_KEY,
     human_input_answer_result,
-    input_request_from_tool_result,
     normalize_input_request,
 )
 
@@ -69,27 +67,34 @@ def test_normalize_trims_dedupes_and_bounds_the_question() -> None:
     assert payload["context"] == "We found two matching units."
 
 
+def test_a_file_field_asks_for_a_document_instead_of_a_wait_option() -> None:
+    """An agent once offered "I'm uploading a document now - wait for it", which the card
+    cannot carry out; a file field lets the person upload or pick the document."""
+    from packages.core.ai.tools.request_input_tool import REQUEST_INPUT_SCHEMA
+
+    payload = normalize_input_request(
+        question="Which article should the carousel summarise?",
+        fields=[{"name": "source", "label": "Source article", "type": "file"}],
+    )
+    assert payload["fields"][0]["type"] == "file"
+    field_schema = REQUEST_INPUT_SCHEMA["function"]["parameters"]["properties"]["fields"]["items"]
+    assert "file" in field_schema["properties"]["type"]["enum"]
+    assert "`file` field" in REQUEST_INPUT_SCHEMA["function"]["description"]
+
+
 def test_normalize_rejects_an_empty_question() -> None:
     with pytest.raises(ValueError):
         normalize_input_request(question="   ")
 
 
-def test_missing_tool_guidance_discover_first_then_request_reviewed_setup() -> None:
-    prompt = REQUEST_INPUT_PROMPT_SUFFIX
-    schema_description = request_input_tool.REQUEST_INPUT_SCHEMA["function"]["description"]
-    assert "search_tools" in prompt and "existing permissions" in prompt
-    assert "exact tool and purpose" in prompt
-    assert "this Agent's configuration" in prompt
-    assert "this Agent's deployment binding" in prompt
-    assert "Connect any required account separately" in prompt
-    assert "bare 'yes' to this input question does not create a tool binding" in prompt
-    assert "typed, user-confirmed configuration review" in prompt
-    assert "search_tools" in schema_description
-    assert "user-reviewed update to this Agent's configuration" in schema_description
-    assert "deployment binding in the current Workspace" in schema_description
-    assert "Connect any required account separately" in schema_description
-    assert "bare yes to this input question cannot create a binding" in schema_description
-    assert "typed configuration review and confirmation flow" in schema_description
+def test_missing_tool_guidance_acquires_or_blocks_never_asks_for_configuration() -> None:
+    text = request_input_tool.REQUEST_INPUT_SCHEMA["function"]["description"]
+    assert text.index("search_tools") < text.index("acquire_capabilities") < text.index("blocked")
+    assert "complete_task(outcome=blocked)" in text
+    assert "tool access or" in text and "configuration" in text
+    # The old flow asked the operator for a reviewed configuration update.
+    assert "deployment binding" not in text and "configuration review" not in text
+    assert "cannot create a binding" in text
 
 
 def test_new_call_schema_requires_human_only_justification_without_defaulting_it() -> None:
@@ -98,9 +103,6 @@ def test_new_call_schema_requires_human_only_justification_without_defaulting_it
     assert parameters["properties"]["justification"] is REQUEST_INPUT_JUSTIFICATION_SCHEMA
     assert "default" not in REQUEST_INPUT_JUSTIFICATION_SCHEMA
     assert "justification" not in normalize_input_request(question="Historical question?")
-    assert "internal" in REQUEST_INPUT_PROMPT_SUFFIX
-    assert "execution records" in REQUEST_INPUT_PROMPT_SUFFIX
-    assert "file versions" in REQUEST_INPUT_PROMPT_SUFFIX
 
 
 @pytest.mark.asyncio
@@ -124,7 +126,6 @@ async def test_invalid_escalation_returns_same_loop_error_before_any_pause(justi
     assert error["details"]["path"] == path
     assert error["details"]["schema_rule"] == rule
     assert "expected" in error["details"]
-    assert input_request_from_tool_result(result) is None
     assert "authorization" not in error
 
 
@@ -193,41 +194,49 @@ async def test_handler_suspends_when_the_runtime_can_park_the_turn() -> None:
     assert datetime.fromisoformat(control["deadline_at"]) > datetime.now(timezone.utc)
 
 
-@pytest.mark.asyncio
-async def test_missing_tool_question_pauses_without_granting_access() -> None:
-    justification = _justification(
-        "authorization_setup",
-        why_human_required="The current Agent deployment requires an operator-reviewed configuration change.",
-        attempted_resolution=[{"source": "tool_result", "finding": "Capability acquisition reported that configuration requires operator review."}],
+def _setup(why: str) -> dict:
+    return _justification(
+        "authorization_setup", why_human_required=why,
+        attempted_resolution=[{"source": "tool_result", "finding": "Capability acquisition is not offered in this loop."}],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,question,why", [
+    (True, "Please configure generate_file for this Agent.",
+     "The current Agent deployment requires an operator-reviewed configuration change."),
+    # Prod Task 01M5DVK8G26J4P6GW5RB4RX87M, 2026-10-21.
+    (True, "请确认部署配置回执,以便我继续交付。", "需要用户确认部署配置。"),
+    (None, "Can you enable tool access to send_email for me?", "Only the user can grant the tool."),
+])
+async def test_tool_grant_question_is_refused_in_every_mode_before_any_pause(mode, question, why) -> None:
     result = await request_input_tool._request_input(
-        question="Please configure generate_file for this Agent.",
-        context="Needed to save the finished script as a Knowledge document.",
-        justification=justification,
+        question=question, justification=_setup(why), _runtime_human_input_from_context=mode,
+    )
+    assert isinstance(result, RuntimePreflightValidationError)
+    error = json.loads(result)
+    assert error["contract"] == "tool_error"
+    assert error["error"] == "tool_grant_not_requestable"
+    assert "acquire_capabilities" in error["details"]["instruction"]
+    assert "complete_task(outcome=blocked)" in error["details"]["instruction"]
+
+
+@pytest.mark.asyncio
+async def test_account_connection_still_pauses_and_other_kinds_are_not_scanned() -> None:
+    connect = _setup("Sending needs the user's own Gmail account; only they can sign in.")
+    result = await request_input_tool._request_input(
+        question="Please connect your Gmail account in Integrations so I can send the reply.",
+        justification=connect, _runtime_human_input_from_context=True,
+    )
+    assert isinstance(result, RuntimeToolSuspension)
+    assert result.payload["justification"] == connect
+    # The guard is scoped to authorization_setup: a preference about a
+    # configuration is still an ordinary human decision.
+    result = await request_input_tool._request_input(
+        question="Which report configuration do you prefer?", justification=_justification(),
         _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimeToolSuspension)
-    assert result.payload == {
-        "question": "Please configure generate_file for this Agent.",
-        "context": "Needed to save the finished script as a Knowledge document.",
-        "justification": justification,
-    }
-    assert "authorization" not in result.to_dict()
-
-
-@pytest.mark.asyncio
-async def test_handler_ends_the_turn_with_a_marker_in_the_task_loop() -> None:
-    result = await request_input_tool._request_input(
-        question="Which unit?", justification=_justification(), _runtime_human_input_from_context="end_turn",
-    )
-    assert isinstance(result, str)
-    parsed = json.loads(result)
-    assert parsed["ok"] is True
-    assert parsed[REQUEST_INPUT_RESULT_KEY] == {"question": "Which unit?", "justification": _justification()}
-    assert input_request_from_tool_result(result) == {"question": "Which unit?", "justification": _justification()}
-    # The marker never leaks from an ordinary tool result.
-    assert input_request_from_tool_result(json.dumps({"ok": True})) is None
-    assert input_request_from_tool_result("plain text") is None
 
 
 @pytest.mark.asyncio
@@ -281,9 +290,9 @@ def test_yes_answer_to_tool_request_is_not_a_tool_grant() -> None:
     parsed = json.loads(human_input_answer_result(answer="yes"))
     assert parsed["answer"] == "yes"
     assert "grant" not in parsed and "authorized" not in parsed
-    assert "does not itself create a tool binding" in parsed["instruction"]
-    assert "separate typed configuration review" in parsed["instruction"]
-    assert "verify the current runtime tool scope" in parsed["instruction"]
+    assert "does not create a tool binding" in parsed["instruction"]
+    assert "configuration review" not in parsed["instruction"]
+    assert "stop as blocked" in parsed["instruction"]
 
 
 # ── checkpoint schema ─────────────────────────────────────────────────────
@@ -769,6 +778,143 @@ async def test_resume_appends_the_stored_answer_instead_of_rerunning_the_tool(mo
 
 
 @pytest.mark.asyncio
+async def test_answered_question_is_not_parked_again_and_its_answer_returns(monkeypatch) -> None:
+    """Prod Task 01M5DVK8G26J4P6GW5RB4RX87M: the user answered 可以 and was asked again."""
+    seen: list[list[dict]] = []
+
+    async def fake_round(messages, *_args, **_kwargs):
+        seen.append([dict(m) for m in messages])
+        if len(seen) == 1:
+            return "", [{"id": "call-again", "name": "request_input", "arguments": {
+                "question": "Can I proceed with the platform admin's fix?", "justification": _justification(),
+            }}], {}
+        return "Proceeding.", [], {}
+
+    executed: list[str] = []
+
+    async def tool_executor(name: str, _args: dict):
+        executed.append(name)
+        return "should not run"
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_round)
+    asked = {"id": "call-ask", "name": "request_input", "arguments": {"question": "Can I proceed with the platform admin's fix"}}
+    checkpoint = RuntimeAgentCheckpoint(
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "deliver"},
+            {"role": "assistant", "content": "", "tool_calls": [asked]},
+        ],
+        usage={}, rounds=1, tool_calls_made=[],
+        pending_tool_call=asked,
+        pending_tool_result={"id": "call-ask", "content": human_input_answer_result(answer="可以")},
+    )
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="deliver", tools=[_tool("request_input")],
+        tool_executor=tool_executor, resume_checkpoint=checkpoint.to_dict(),
+        human_input_suspension=True, max_rounds=5,
+    )
+    assert result.stop_reason == "completed"
+    assert executed == [], "a re-asked question never reaches a handler"
+    refusal = json.loads(next(m for m in result.messages if m.get("tool_call_id") == "call-again")["content"])
+    assert refusal["error"] == "human_input_already_answered"
+    assert refusal["details"]["previous_answer"] == "可以"
+
+
+@pytest.mark.asyncio
+async def test_platform_fault_refuses_every_question_until_the_operation_recovers(monkeypatch) -> None:
+    from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+    from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
+
+    calls = iter([
+        [{"id": "c1", "name": "replan_task", "arguments": {}}],
+        [{"id": "c2", "name": "request_input", "arguments": {
+            "question": "Please apply the platform fix.", "justification": _justification("human_material"),
+        }}],
+        [{"id": "c3", "name": "replan_task", "arguments": {}}],
+        [{"id": "c4", "name": "request_input", "arguments": {
+            "question": "Which unit?", "justification": _justification(),
+        }}],
+    ])
+
+    async def fake_round(*_args, **_kwargs):
+        return "", next(calls), {}
+
+    replans = iter([
+        RuntimePreflightValidationError(json.dumps(tool_error_payload(
+            tool_name="replan_task", code="invalid_partial_continuation",
+            message="Existing Step inputs changed or have no pinned execution snapshot",
+            internal_error=True,
+        ))),
+        json.dumps({"status": "repaired"}),
+    ])
+    executed: list[str] = []
+
+    async def tool_executor(name: str, args: dict):
+        executed.append(name)
+        return next(replans) if name == "replan_task" else await request_input_tool._request_input(**args)
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_round)
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="deliver",
+        tools=[_tool("replan_task"), _tool("request_input")], tool_executor=tool_executor,
+        tool_evidence=RuntimeToolEvidence(), human_input_suspension=True, max_rounds=6,
+    )
+    refusal = json.loads(next(m for m in result.messages if m.get("tool_call_id") == "c2")["content"])
+    assert refusal["error"] == "human_input_platform_fault"
+    assert refusal["details"]["platform_error"] == "invalid_partial_continuation"
+    assert "complete_task(outcome=blocked)" in refusal["details"]["instruction"]
+    # The successful replan resolved the fault: the next real question parks.
+    assert executed == ["replan_task", "replan_task", "request_input"]
+    assert is_human_input_suspension_control(result.control)
+
+
+def test_every_human_park_producer_is_a_request_input_handler_behind_the_gate() -> None:
+    """Guard the class: a new way to park on a person must pass the shared gate.
+
+    The agentic loop gates every handler reached as ``request_input``. A new
+    producer of a human-input park, or a loop that dispatches request_input
+    itself (the retired end-turn mode), fails here until it is routed through
+    the gate.
+    """
+    import ast
+    from pathlib import Path
+
+    producers: set[str] = set()
+    gated: set[str] = set()
+    end_turn_hosts: set[str] = set()
+    for path in sorted(Path("packages").rglob("*.py")):
+        if "tests" in path.parts:
+            continue
+        rel = path.as_posix()
+        nodes = list(ast.walk(ast.parse(path.read_text())))
+        for node in nodes:
+            # A loop that dispatches request_input itself in end-turn mode.
+            if isinstance(node, ast.Dict) and any(
+                getattr(key, "value", None) == "_runtime_human_input_from_context"
+                and getattr(value, "id", None) == "HUMAN_INPUT_MODE_END_TURN"
+                for key, value in zip(node.keys, node.values)
+            ):
+                end_turn_hosts.add(rel)
+            # RuntimeToolSuspension(kind=HUMAN_INPUT_SUSPENSION_KIND, ...) parks;
+            # a {REQUEST_INPUT_RESULT_KEY: ...} result is the end-turn park.
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "RuntimeToolSuspension" and any(
+                keyword.arg == "kind" and getattr(keyword.value, "id", None) == "HUMAN_INPUT_SUSPENSION_KIND"
+                for keyword in node.keywords
+            ) or isinstance(node, ast.Dict) and any(
+                getattr(key, "id", None) == "REQUEST_INPUT_RESULT_KEY" for key in node.keys
+            ):
+                producers.add(rel)
+            # A tool registered with the same gate (runtime_human_park_arguments).
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "register_human_park_tool":
+                gated.add(rel)
+    # Reached only as the ``request_input`` tool of an agentic loop, or as a
+    # tool the loop gates the same way.
+    assert "packages/core/ai/tools/request_input_tool.py" in producers
+    assert producers - gated == {"packages/core/ai/tools/request_input_tool.py"}
+    assert end_turn_hosts == set()
+
+
+@pytest.mark.asyncio
 async def test_resume_reruns_the_tool_when_the_stored_result_is_for_another_call(monkeypatch) -> None:
     async def fake_round(*_args, **_kwargs):
         return "done", [], {}
@@ -817,15 +963,6 @@ async def test_handler_is_honest_where_the_runtime_cannot_pause() -> None:
     assert parsed["status"] == "error"
     assert parsed["error"] == "human_input_unavailable"
     assert parsed["details"]["question"] == "Which unit?"
-    assert input_request_from_tool_result(result) is None
-
-
-@pytest.mark.asyncio
-async def test_handler_end_turn_mode_returns_the_task_marker() -> None:
-    result = await request_input_tool._request_input(
-        question="Which unit?", justification=_justification(), _runtime_human_input_from_context="end_turn",
-    )
-    assert input_request_from_tool_result(result) == {"question": "Which unit?", "justification": _justification()}
 
 
 def test_services_import_the_runtime_bridge_not_the_tool() -> None:
@@ -834,8 +971,5 @@ def test_services_import_the_runtime_bridge_not_the_tool() -> None:
     for rel in (
         "packages/core/services/runtime_human_input.py",
         "packages/core/services/task_input_resume.py",
-        "packages/core/workers/internal.py",
-        "packages/core/ai/runtime/task_agent.py",
-        "packages/core/ai/task_runner.py",
     ):
         assert "packages.core.ai.tools.request_input_tool" not in Path(rel).read_text(), rel

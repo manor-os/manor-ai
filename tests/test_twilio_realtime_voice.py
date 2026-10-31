@@ -216,7 +216,7 @@ async def test_resolve_realtime_route_uses_admin_vercel_before_managed_openai(
     from packages.core.services.voice import realtime
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    async def no_byok(_entity_id):
+    async def no_byok(_entity_id, *_args, **_kwargs):
         return None
 
     async def managed_route(model_id, **kwargs):
@@ -257,7 +257,7 @@ async def test_resolve_realtime_route_accepts_managed_openai_fallback(monkeypatc
     from packages.core.services.voice import realtime
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    async def no_byok(_entity_id):
+    async def no_byok(_entity_id, *_args, **_kwargs):
         return None
 
     async def managed_route(_model_id, **kwargs):
@@ -292,7 +292,7 @@ async def test_resolve_realtime_route_rejects_untrusted_vercel_gateway(monkeypat
     from packages.core.services.voice import realtime
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    async def no_byok(_entity_id):
+    async def no_byok(_entity_id, *_args, **_kwargs):
         return None
 
     async def untrusted_route(*_args, **_kwargs):
@@ -317,7 +317,7 @@ async def test_resolve_realtime_route_rejects_untrusted_vercel_gateway(monkeypat
 async def test_resolve_realtime_route_prefers_native_openai_byok(monkeypatch):
     from packages.core.services.voice import realtime
 
-    async def native_byok(_entity_id):
+    async def native_byok(_entity_id, *_args, **_kwargs):
         return {
             "llm_api_key": "sk-user-openai",
             "llm_base_url": "https://api.openai.com/v1/",
@@ -349,7 +349,7 @@ async def test_resolve_realtime_route_prefers_native_openai_byok(monkeypatch):
 async def test_resolve_realtime_route_uses_actor_for_primary_byok(monkeypatch):
     from packages.core.services.voice import realtime
 
-    async def actor_byok(entity_id, user_id):
+    async def actor_byok(entity_id, user_id, **_kwargs):
         assert (entity_id, user_id) == ("entity-realtime", "owner-user")
         return {
             "llm_api_key": "sk-owner-openai",
@@ -451,7 +451,7 @@ async def test_resolve_realtime_route_rejects_unsupported_routes(
     from packages.core.services.voice import realtime
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    async def byok(_entity_id):
+    async def byok(_entity_id, *_args, **_kwargs):
         return metadata
 
     async def missing_managed_route(*_args, **_kwargs):
@@ -1263,7 +1263,7 @@ async def test_shared_realtime_engine_gates_each_managed_response(monkeypatch):
     assert_credit = AsyncMock()
     monkeypatch.setattr(
         "packages.core.ai.runtime.runtime_current_billing_context",
-        lambda: SimpleNamespace(entity_id="entity", source="voice_test", suppress=False),
+        lambda: SimpleNamespace(entity_id="entity", source="voice_test", suppress=False, workspace_id=None),
     )
     monkeypatch.setattr(
         "packages.core.ai.runtime.runtime_assert_credit_available",
@@ -1287,7 +1287,7 @@ async def test_shared_realtime_engine_gates_each_managed_response(monkeypatch):
     await engine.create_response({"type": "response.create"})
 
     check_access.assert_awaited_once()
-    assert_credit.assert_awaited_once_with("entity", source="voice_test")
+    assert_credit.assert_awaited_once_with("entity", source="voice_test", workspace_id=None)
     connection.send.assert_awaited_once_with({"type": "response.create"})
 
 
@@ -3484,7 +3484,7 @@ async def test_voice_session_checks_credit_before_each_platform_response(monkeyp
 
     events: list[tuple[str, str]] = []
 
-    async def allow_credit(entity_id, *, source):
+    async def allow_credit(entity_id, *, source, workspace_id=None):
         assert entity_id == "entity-1"
         assert source == "twilio_voice"
         events.append(("credit", source))
@@ -3540,7 +3540,7 @@ async def test_voice_session_checks_credit_before_server_vad_response(monkeypatc
 
     events: list[tuple[str, str]] = []
 
-    async def allow_credit(entity_id, *, source):
+    async def allow_credit(entity_id, *, source, workspace_id=None):
         assert entity_id == "entity-1"
         assert source == "twilio_voice"
         events.append(("credit", source))

@@ -15,7 +15,6 @@ from packages.core.ai.runtime.artifacts import (
 )
 from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
 from packages.core.ai.runtime import skills as runtime_skills
-from packages.core.ai.runtime.task_agent import runtime_execute_task_agent_turn
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_injected_tool_context_args,
@@ -135,12 +134,13 @@ def test_runtime_invoke_skill_action_passes_runtime_artifacts_to_skill(monkeypat
             return False
 
     async def fake_runtime_invoke_skill(db, skill_id, entity_id, input_text, **kwargs):
-        del db, kwargs
+        del db
         captured.update(
             {
                 "skill": skill_id,
                 "entity_id": entity_id,
                 "input_text": input_text,
+                "kwargs": kwargs,
             }
         )
         return {"content": "ok", "stop_reason": "completed"}
@@ -175,6 +175,10 @@ def test_runtime_invoke_skill_action_passes_runtime_artifacts_to_skill(monkeypat
     assert captured["skill"] == "pptx"
     assert "## Runtime Artifacts Available For This Run" in captured["input_text"]
     assert "`/workspace/Workspaces/Story/images/page_01.png`" in captured["input_text"]
+    assert captured["kwargs"]["context_artifact_urls"] == (
+        "/api/v1/fs/ent_1/Workspaces/Story/images/page_01.png",
+    )
+    assert "reference_artifact_urls" not in captured["kwargs"]
 
 
 def test_chrome_skill_receives_exact_parent_document_and_dependency_artifact(monkeypatch) -> None:
@@ -758,61 +762,6 @@ def test_runtime_agentic_loop_carries_runtime_artifacts_between_tool_calls() -> 
             "https://manor.test/api/v1/fs/ent_1/generated/style.png",
         }
     )
-
-
-def test_runtime_task_agent_turn_recovers_runtime_artifacts_from_prior_tool_messages() -> None:
-    from packages.core.ai.engine import ChatMessage
-
-    captured_contexts: list[object] = []
-
-    class FakeEngine:
-        async def chat(self, messages, **kwargs):
-            del messages, kwargs
-            return ChatMessage(
-                role="assistant",
-                content="",
-                tool_calls=[
-                    {
-                        "id": "tc_1",
-                        "name": "generate_video",
-                        "arguments": {"first_frame_url": "/api/v1/fs/ent_1/generated/start.png"},
-                    }
-                ],
-                usage={"prompt_tokens": 1, "completion_tokens": 1},
-            )
-
-    async def fake_execute_tool(name: str, args: dict, **kwargs):
-        del name, args, kwargs
-        captured_contexts.append(runtime_tool_call_context_from_kwargs(runtime_injected_tool_context_args()))
-        return json.dumps({"status": "pending", "job_id": "job_1"})
-
-    messages = [
-        ChatMessage(role="user", content="继续做下一段"),
-        ChatMessage(
-            role="tool",
-            content=json.dumps({"result_url": "/api/v1/fs/ent_1/generated/start.png"}),
-            tool_call_id="tc_prev",
-        ),
-    ]
-    schema = {"type": "function", "function": {"name": "generate_video"}}
-
-    with patch("packages.core.ai.runtime.task_agent.runtime_execute_tool", new=fake_execute_tool):
-        result = asyncio.run(
-            runtime_execute_task_agent_turn(
-                engine=FakeEngine(),
-                messages=messages,
-                tools=[schema],
-                loaded_tool_names={"generate_video"},
-                system_prompt="Task system",
-                runtime_envelope=None,
-                entity_id="ent_1",
-                agent_id="agent_1",
-                active_user_message="继续做下一段",
-            )
-        )
-
-    assert result.had_tool_calls is True
-    assert captured_contexts[0].runtime_artifact_urls == frozenset({"/api/v1/fs/ent_1/generated/start.png"})
 
 
 def test_text_references_end_at_cjk_punctuation_and_unbalanced_parentheses():

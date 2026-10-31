@@ -81,20 +81,17 @@ def test_guard_scans_the_known_sandbox_call_sites() -> None:
                 for node in ast.walk(tree)
             ):
                 seen.add(path.name)
-    expected = {
-        "sandbox_session_service.py", "sandbox_tools.py", "video_edit_tools.py",
-        "workflow_runner.py", "bash_tool.py", "runtime_tasks.py",
-    }
+    # Since every consumer admits containers through the session service,
+    # only it and the scheduler construct clients
+    # (tests/test_sandbox_single_entry_guard.py holds that).
+    expected = {"sandbox_session_service.py", "runtime_tasks.py"}
     assert expected <= seen, f"guard did not see {sorted(expected - seen)}; scan roots wrong?"
 
 
-def test_video_edit_sandbox_client_carries_the_api_token(monkeypatch) -> None:
-    """The video-edit helper forwards SANDBOX_API_TOKEN to every client."""
-    from types import SimpleNamespace
-
-    from packages.core import config as core_config
-    from packages.core.ai.tools import video_edit_tools
-    from packages.core.services import sandbox_sdk
+def test_session_service_clients_carry_the_api_token(monkeypatch) -> None:
+    """Every client the entry point hands out forwards SANDBOX_API_TOKEN."""
+    from packages.core.config import get_settings
+    from packages.core.services import sandbox_sdk, sandbox_session_service
 
     captured: dict[str, object] = {}
 
@@ -103,20 +100,7 @@ def test_video_edit_sandbox_client_carries_the_api_token(monkeypatch) -> None:
             captured.update(kwargs)
 
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", FakeSandboxClient)
-    monkeypatch.setattr(
-        core_config,
-        "get_settings",
-        lambda: SimpleNamespace(SANDBOX_SERVICE_URL="http://sandbox", SANDBOX_API_TOKEN=" tok-123 "),
-    )
-    video_edit_tools._video_sandbox_client(base_url="http://sandbox", timeout=5.0)
+    monkeypatch.setattr(get_settings(), "SANDBOX_API_TOKEN", " tok-123 ")
+    sandbox_session_service.sandbox_runner_client("http://sandbox", timeout=5.0)
     assert captured["api_token"] == "tok-123"
     assert captured["base_url"] == "http://sandbox"
-
-    # Settings without the attribute (older fakes) fall back to the process env.
-    captured.clear()
-    monkeypatch.setattr(
-        core_config, "get_settings", lambda: SimpleNamespace(SANDBOX_SERVICE_URL="http://sandbox")
-    )
-    monkeypatch.setenv("SANDBOX_API_TOKEN", "env-tok")
-    video_edit_tools._video_sandbox_client(base_url="http://sandbox", timeout=5.0)
-    assert captured["api_token"] == "env-tok"

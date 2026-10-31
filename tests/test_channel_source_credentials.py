@@ -475,6 +475,21 @@ async def test_facebook_adapter_uses_source_credentials_for_signature_verificati
     )
 
 
+@pytest.mark.asyncio
+async def test_facebook_adapter_rejects_inbound_without_an_app_secret(monkeypatch):
+    from packages.core.services.channels.facebook_adapter import FacebookChannelAdapter
+
+    _lease_only_from_source(monkeypatch, {})
+    monkeypatch.delenv("FACEBOOK_APP_SECRET", raising=False)
+
+    assert not await FacebookChannelAdapter().verify_inbound(
+        _source_linked_config("facebook"),
+        headers={},
+        query={},
+        body=b"{}",
+    )
+
+
 async def _integration_channel_config(
     db_session,
     *,
@@ -1021,7 +1036,7 @@ async def test_legacy_slack_config_id_callback_is_disabled(
     rejected = await client.post(path, content=body)
     assert rejected.status_code == 410
     assert rejected.json()["detail"] == (
-        "Slack events must use /api/v1/channels/slack/events"
+        "slack events must use /api/v1/channels/slack/events"
     )
 
 
@@ -1052,3 +1067,166 @@ async def test_slack_callback_rejects_a_channel_with_an_unavailable_oauth_source
         content=body,
     )
     assert response.status_code == 410
+
+
+async def _connect_email_channel(client, db_session, username: str):
+    headers = await _auth(client, username)
+    create = await client.post(
+        "/api/v1/integrations",
+        headers=headers,
+        json={
+            "provider": "email",
+            "credentials": {
+                "smtp_host": "smtp.example.test",
+                "username": "bot@example.test",
+                "password": "email-source-secret",
+            },
+        },
+    )
+    assert create.status_code == 201, create.text
+    integration = create.json()
+    config = await _integration_channel_config(
+        db_session,
+        entity_id=integration["entity_id"],
+        integration_id=integration["id"],
+        channel_type="email",
+    )
+    return headers, integration, config
+
+
+def _signed_email_headers(secret: str, body: bytes, *, age_seconds: int = 0) -> dict:
+    import time
+
+    from packages.core.services.channels.email_adapter import sign_inbound_body
+
+    timestamp = str(int(time.time()) - age_seconds)
+    return {
+        "X-Manor-Timestamp": timestamp,
+        "X-Manor-Signature": sign_inbound_body(secret, timestamp, body),
+    }
+
+
+@pytest.mark.asyncio
+async def test_email_inbound_secret_is_created_on_connect_and_readable_only_by_its_owner(
+    client,
+    db_session,
+):
+    from tests.test_document_permissions import _create_entity_user
+
+    headers, integration, config = await _connect_email_channel(
+        client, db_session, "email_inbound_secret_owner",
+    )
+    # Saving the connection creates the secret; the routing row holds only
+    # its encrypted reference.
+    assert config.config.get("inbound_secret_ref")
+    url = f"/api/v1/integrations/{integration['id']}/email-inbound"
+
+    first = await client.get(url, headers=headers)
+    second = await client.get(url, headers=headers)
+    assert first.status_code == 200, first.text
+    assert first.headers["cache-control"] == "no-store"
+    assert first.json()["channel_config_id"] == config.id
+    assert first.json()["callback_path"] == (
+        f"/api/v1/channels/email/callback?config_id={config.id}"
+    )
+    assert second.json()["signing_secret"] == first.json()["signing_secret"]
+    assert first.json()["signing_secret"] not in json.dumps(config.config)
+
+    admin = await _create_entity_user(
+        integration["entity_id"], "email_inbound_secret_admin", role="admin",
+    )
+    assert (await client.get(url, headers=admin["headers"])).status_code == 404
+    assert (await client.post(f"{url}/rotate", headers=admin["headers"])).status_code == 404
+
+    rotated = await client.post(f"{url}/rotate", headers=headers)
+    assert rotated.status_code == 200, rotated.text
+    assert rotated.json()["signing_secret"] != first.json()["signing_secret"]
+    assert (await client.get(url, headers=headers)).json()["signing_secret"] == (
+        rotated.json()["signing_secret"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_email_callback_accepts_only_fresh_requests_signed_with_the_current_secret(
+    client,
+    db_session,
+    monkeypatch,
+):
+    import packages.core.database as db_module
+    from apps.api.routers.channels import generic
+    from packages.core.models.channel import MessageLog
+
+    monkeypatch.setattr(generic, "async_session", db_module.async_session)
+    dispatched: list[dict] = []
+    monkeypatch.setattr(
+        generic.dispatch_inbound_task, "delay", lambda **kwargs: dispatched.append(kwargs),
+    )
+    headers, integration, config = await _connect_email_channel(
+        client, db_session, "email_inbound_callback_owner",
+    )
+    reveal_url = f"/api/v1/integrations/{integration['id']}/email-inbound"
+    old_secret = (await client.get(reveal_url, headers=headers)).json()["signing_secret"]
+    secret = (await client.post(f"{reveal_url}/rotate", headers=headers)).json()["signing_secret"]
+    callback = f"/api/v1/channels/email/callback?config_id={config.id}"
+    body = json.dumps({
+        "from": "alice@example.com",
+        "text": "Please call me back",
+        "message_id": "<inbound-1@example.com>",
+    }).encode()
+
+    async def inbound_logs() -> int:
+        async with db_module.async_session() as db:
+            return len((await db.execute(
+                select(MessageLog.id).where(
+                    MessageLog.channel_config_id == config.id,
+                    MessageLog.direction == "inbound",
+                )
+            )).all())
+
+    rejected = {
+        "unsigned": {},
+        "forged": _signed_email_headers("attacker-guess", body),
+        "rotated_out": _signed_email_headers(old_secret, body),
+        "replayed": _signed_email_headers(secret, body, age_seconds=10 * 60),
+        "tampered": _signed_email_headers(secret, body.replace(b"call", b"wire")),
+    }
+    for case, request_headers in rejected.items():
+        response = await client.post(callback, content=body, headers=request_headers)
+        assert response.status_code == 403, case
+    assert await inbound_logs() == 0
+    assert dispatched == []
+
+    accepted_headers = _signed_email_headers(secret, body)
+    response = await client.post(callback, content=body, headers=accepted_headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+
+    # A request replayed inside the timestamp window, and a forwarder retry
+    # signed afresh, carry the same Message-ID: neither starts a second turn.
+    for request_headers in (accepted_headers, _signed_email_headers(secret, body)):
+        duplicate = await client.post(callback, content=body, headers=request_headers)
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json() == {
+            "ok": True, "noop": True, "reason": "duplicate_event",
+        }
+    assert await inbound_logs() == 1
+    assert [item["sender_id"] for item in dispatched] == ["alice@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_email_config_without_a_secret_rejects_every_inbound_post():
+    from packages.core.services.channels.email_adapter import EmailChannelAdapter
+
+    adapter = EmailChannelAdapter()
+    legacy = SimpleNamespace(id=generate_ulid(), entity_id=generate_ulid(), config={})
+    body = b'{"from": "alice@example.com", "text": "hi"}'
+
+    assert not await adapter.verify_inbound(
+        legacy, headers=_signed_email_headers("any-secret", body), query={}, body=body,
+    )
+    # Webhook registration is retried by a worker; only the first call
+    # creates the secret, so a configured forwarder keeps working.
+    assert (await adapter.register_webhook(legacy))["registered"] is True
+    ref = legacy.config["inbound_secret_ref"]
+    assert (await adapter.register_webhook(legacy))["registered"] is False
+    assert legacy.config["inbound_secret_ref"] == ref

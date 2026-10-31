@@ -13,7 +13,7 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from packages.core.blueprints.freshness import (
     BLUEPRINT_ID_KEY, BLUEPRINT_SETTINGS_KEY, BLUEPRINT_VERSION_KEY,
@@ -26,7 +26,10 @@ from packages.core.blueprints.freshness import (
 from packages.core.blueprints.upgrade import (
     BlueprintUpgradePlanChangedError, LIVE_SETUP_STATE_KEYS,
 )
+from packages.core.blueprints.registry import PACKAGE_RECORD_KEY, sync_installed_package
 from packages.core.blueprints.upgrade_activity import active_runs
+from packages.core.models.base import generate_ulid
+from packages.core.models.blueprint_registry import WorkspaceBlueprintUpgrade
 from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
 
 PROTOCOL_VERSION = 3
@@ -38,7 +41,7 @@ RECORD_KEYS = (
     LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY, LAST_PARTIAL_UPGRADE_VERSION_KEY,
     "variable_declarations", "channel_requirements", "session_requirements",
     "synchronization_status", "upgrade_runtime_contract", "upgrade_protocol_version",
-    "restore_point", *LIVE_SETUP_STATE_KEYS,
+    "restore_point", PACKAGE_RECORD_KEY, *LIVE_SETUP_STATE_KEYS,
 )
 
 
@@ -82,6 +85,18 @@ async def _state(db, workspace, *, lock=False):
     if lock:
         statement = statement.with_for_update()
     return (await db.execute(statement)).scalar_one_or_none()
+
+
+async def installed_runtime_contract(db, *, workspace) -> dict | None:
+    """Return the current applied runtime contract without consulting source."""
+    record = (workspace.settings or {}).get(BLUEPRINT_SETTINGS_KEY) or {}
+    current = record.get("upgrade_runtime_contract")
+    if isinstance(current, dict):
+        return deepcopy(current)
+    state = await _state(db, workspace)
+    baseline = (state.baseline or {}).get("runtime") if state else None
+    installed = (baseline or {}).get("installed")
+    return deepcopy(installed) if isinstance(installed, dict) else None
 
 
 async def capture_install_baseline(db, *, workspace, payload):
@@ -202,7 +217,9 @@ def _choices(items, resolutions):
         if key not in known or key in result or choice not in ("keep_yours", "use_blueprint"):
             raise BlueprintUpgradePlanChangedError("Invalid or duplicate configuration choice. Refresh the preview.")
         result[key] = choice
-    if any(item["action"] != "unchanged" and item["key"] not in result for item in items):
+    # Kept local edits to components the author did not change default to
+    # keep_yours; every other difference needs an explicit choice.
+    if any(item["action"] not in {"unchanged", "customized"} and item["key"] not in result for item in items):
         raise BlueprintUpgradePlanChangedError("Review every configuration difference before applying.")
     return result
 
@@ -297,8 +314,12 @@ async def apply(db, *, workspace, payload, source_payload, by_user_id, actor,
             channels = list(combined.values())
             await sync_workspace_live_setup_requirements(db, workspace=workspace, payload=payload)
         kept = list(components["kept"]) + list(configuration["kept"])
-        if not use_runtime and runtime["current_content"] != runtime["new_content"]:
-            kept.append(RUNTIME_KEY)
+        runtime_updated = []
+        if runtime["current_content"] != runtime["new_content"]:
+            if use_runtime:
+                runtime_updated.append({"kind": runtime["kind"], "name": runtime["name"], "key": RUNTIME_KEY})
+            else:
+                kept.append(RUNTIME_KEY)
         # The component/configuration writers verify the persisted projections.
         # Acknowledged customizations are represented explicitly, not as a claim
         # that every local byte matches upstream.
@@ -321,6 +342,7 @@ async def apply(db, *, workspace, payload, source_payload, by_user_id, actor,
         })
         for key in (LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY, LAST_PARTIAL_UPGRADE_VERSION_KEY, "restore_point"):
             record.pop(key, None)
+        await sync_installed_package(db, record)
         if use_runtime:
             record["upgrade_runtime_contract"] = runtime_contract(payload)
             record["channel_requirements"] = deepcopy((payload.get("contract") or {}).get("channels", []))
@@ -341,17 +363,31 @@ async def apply(db, *, workspace, payload, source_payload, by_user_id, actor,
         else:
             state.baseline = baseline
             state.revision += 1
-        state.restore_point = {
-            "protocol_version": PROTOCOL_VERSION, "applied_at": datetime.now(timezone.utc).isoformat(),
+        applied_at = datetime.now(timezone.utc)
+        restore = {
+            "protocol_version": PROTOCOL_VERSION, "applied_at": applied_at.isoformat(),
             "from_version": intended["installed_version"], "to_version": current_version,
             "components": components["restore"], "configuration": configuration["restore"],
-            "channels": channels, "baseline_before": baseline_before,
+            "channels": channels,
             "metadata_before": metadata_before, "metadata_after": _metadata(workspace),
         }
+        # The history row is the durable receipt; the state keeps the one
+        # undo-able restore point, which names it.
+        history = WorkspaceBlueprintUpgrade(
+            id=generate_ulid(), workspace_id=workspace.id, entity_id=workspace.entity_id,
+            package_ref=record.get(BLUEPRINT_ID_KEY),
+            from_version=intended["installed_version"], to_version=current_version,
+            from_integrity=(metadata_before["record"].get(PACKAGE_RECORD_KEY) or {}).get("integrity"),
+            to_integrity=(record.get(PACKAGE_RECORD_KEY) or {}).get("integrity"),
+            choices=choices, restore=restore, baseline_before=baseline_before,
+            applied_by=by_user_id, applied_at=applied_at,
+        )
+        db.add(history)
+        state.restore_point = {**restore, "baseline_before": baseline_before, "upgrade_id": history.id}
         await db.flush()
         return {
             "upgrade_protocol_version": PROTOCOL_VERSION,
-            "updated": components["updated"] + configuration["updated"] + [
+            "updated": components["updated"] + configuration["updated"] + runtime_updated + [
                 {"kind": "channel", "name": item.get("name")} for item in channels
             ],
             "kept_yours": kept, "can_revert": True,
@@ -517,6 +553,11 @@ async def revert(db, *, workspace, by_user_id, actor):
         state.restore_point = None
         state.baseline = point["baseline_before"] or {}
         state.revision += 1
+        if point.get("upgrade_id"):
+            await db.execute(update(WorkspaceBlueprintUpgrade).where(
+                WorkspaceBlueprintUpgrade.id == point["upgrade_id"],
+                WorkspaceBlueprintUpgrade.workspace_id == workspace.id,
+            ).values(reverted_at=datetime.now(timezone.utc)))
         await db.flush()
         return {"upgrade_protocol_version": PROTOCOL_VERSION, "can_revert": False,
                 "reverted": (configuration or {}).get("reverted", []) + (components or {}).get("reverted", [])}
@@ -525,12 +566,17 @@ async def revert(db, *, workspace, by_user_id, actor):
 async def invalidate_after_legacy_upgrade(db, *, workspace):
     """An old client must not leave a v3 receipt claiming a different state."""
     state = await _state(db, workspace, lock=True)
+    settings = deepcopy(workspace.settings or {})
+    record = settings.setdefault(BLUEPRINT_SETTINGS_KEY, {})
+    # Legacy callers invalidate the v3 baseline after their update. Preserve
+    # the installed runtime receipt first, or optional setup policy is lost.
+    installed = ((state.baseline or {}).get("runtime") or {}).get("installed") if state else None
+    if not isinstance(record.get("upgrade_runtime_contract"), dict) and isinstance(installed, dict):
+        record["upgrade_runtime_contract"] = deepcopy(installed)
     if state is not None:
         state.restore_point = None
         state.baseline = {}
         state.revision += 1
-    settings = deepcopy(workspace.settings or {})
-    record = settings.setdefault(BLUEPRINT_SETTINGS_KEY, {})
     record.pop("synchronization_status", None)
     record.pop("upgrade_protocol_version", None)
     workspace.settings = settings

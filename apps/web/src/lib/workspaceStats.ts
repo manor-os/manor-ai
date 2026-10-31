@@ -32,7 +32,7 @@ export function workspaceStatAttentionPresentation(
 }
 
 export function formatWorkspaceStatValue(
-  stat: WorkspaceStatDefinition,
+  stat: Pick<WorkspaceStatDefinition, "freshness_status" | "current_value" | "value_type" | "unit">,
   value?: number | null,
 ): string {
   if (value === undefined) {

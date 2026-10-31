@@ -92,7 +92,15 @@ Each node in "steps" is an object:
 
 CANONICAL TYPES (pick the closest fit; do not use any other value). The config
 keys below are EXACTLY what the runner reads — use these names, not synonyms:
-  trigger    - entry point (manual / schedule / event). Every workflow starts with one. config: {}
+  trigger    - entry point (manual / schedule / event). Every workflow starts with one.
+               config: {run_inputs?: [{key, label, type, required?, default?, schema?}]}
+               (run_inputs = the Run form; type: string|number|boolean|json; schema is JSON
+                Schema. To pick Workspace Ledger records (contacts, leads, tracked creators), use
+                "x-ui": {control: "record_select", record_source: {ledger: "relationship_ledger",
+                filter?: <query_ledger filter>, value_field?: "identity_key", label_field?:
+                "display_name", secondary_field?}} on a string schema (one record) or a type json
+                input with schema {type: "array", items: {type: "string"}} (several); the value is
+                the records' keys)
   webhook    - entry point fired by an inbound HTTP call. config: {}
   llm        - call a language model. config: {model?, system_prompt?, prompt, temperature?, max_rounds?}
                (temperature 0–2; max_rounds = tool-call rounds, default 1)
@@ -104,9 +112,14 @@ keys below are EXACTLY what the runner reads — use these names, not synonyms:
                config: {receipt, payload?, require_verified?, output_var?}
                receipt must map platform, verification_status, external_id or published_url,
                published_at, payload_hash or payload, fallback_used?, evidence?, and attempts?.
+  workflow_effect_deadline - freeze a time limit for a declared set of external action keys.
+               config: {deadline_at, action_keys, output_var?}. Use only an ISO timestamp
+               resolved from approved Workflow state; action_keys are trusted Runtime action keys.
   code       - run Python / JavaScript / Bash in an ephemeral restricted sandbox.
                `inputs` contains workflow variables; print the result to stdout.
-               config: {language, code, requirements?, code_timeout?, output_format?, allow_network?}
+               config: {language, code, requirements?, code_timeout?, output_format?, allow_network?,
+               memory? (e.g. "1g", max 4g), pids_limit? (64-1024, threads count), cpus? (0.25-4)}.
+               Defaults suit plain scripts; a headless browser needs about 1g and 512 pids.
   http       - make an HTTP request. config: {method, url, headers?, body?, timeout?, output_var?}
   condition  - if/else branch. Put the test in config.expression and wire the
                branches with true_next / false_next. config: {expression}

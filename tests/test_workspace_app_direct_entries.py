@@ -56,6 +56,82 @@ def test_same_agent_has_independent_commands_and_missing_runner_is_unavailable()
         assert entry["available"] is False
 
 
+def test_owned_project_automation_is_a_component_row_but_remains_an_explicit_entry_target():
+    config = {
+        "entries": {"action:run-review": {"title": "Run review"}},
+        "targets": {"action:run-review": "automation:project-review"},
+        "data_sources": {
+            "campaigns": {
+                "type": "workflow_projects", "project_type": "campaign", "schema_versions": [1],
+                "producer_workflows": ["workflow_definition:campaign"], "launch_workflows": [], "fields": [],
+            },
+            "project_jobs": {"type": "owned_automations", "parent": "campaigns", "producer_workflows": [], "fields": []},
+        },
+        "components": [{
+            "type": "data_view", "schema_version": 1, "key": "campaign_status",
+            "context": {"kind": "project", "source": "campaigns"},
+            "blocks": [{"key": "jobs", "type": "progress", "source": "project_jobs"}],
+        }],
+    }
+    project_job = SimpleNamespace(
+        job_id="project-review", name="project-review", owner_project_id="campaign-1",
+        enabled=True, last_status="succeeded", execution_target={},
+    )
+    workspace_job = SimpleNamespace(
+        job_id="workspace-review", name="Workspace review", owner_project_id=None,
+        enabled=True, last_status="succeeded", execution_target={},
+    )
+
+    view = project_workspace_app_view(workspace(config), [], [workspace_job, project_job])
+
+    assert {item["key"] for item in view["actions"]} == {"automation:workspace-review", "action:run-review"}
+    explicit = next(item for item in view["actions"] if item["key"] == "action:run-review")
+    assert explicit["kind"] == "automation"
+    assert explicit["job_id"] == "project-review"
+    assert explicit["available"] is True
+    assert {item["job_id"] for item in view["automation_options"]} == {"workspace-review", "project-review"}
+
+
+@pytest.mark.parametrize("display", [
+    {"hidden": True},
+    {"hidden_blocks": ["jobs"]},
+])
+def test_hidden_owned_automation_component_uses_project_job_through_its_entry(display):
+    config = {
+        "entries": {"action:run-review": {"title": "Run review"}},
+        "targets": {"action:run-review": "automation:project-review"},
+        "data_sources": {
+            "campaigns": {"type": "workflow_projects", "project_type": "campaign", "schema_versions": [1],
+                          "producer_workflows": ["workflow_definition:campaign"], "launch_workflows": [], "fields": []},
+            "project_jobs": {"type": "owned_automations", "parent": "campaigns", "producer_workflows": [], "fields": []},
+        },
+        "components": [{
+            "type": "data_view", "schema_version": 1, "key": "campaign_status",
+            "context": {"kind": "project", "source": "campaigns"},
+            "blocks": [{"key": "jobs", "type": "progress", "source": "project_jobs"}],
+            "display": display,
+        }],
+    }
+    project_job = SimpleNamespace(
+        job_id="project-review", name="project-review", owner_project_id="campaign-1",
+        enabled=True, last_status="succeeded", execution_target={},
+    )
+    view = project_workspace_app_view(workspace(config), [], [project_job])
+    assert {item["key"] for item in view["actions"]} == {"action:run-review"}
+    assert view["actions"][0]["job_id"] == "project-review"
+
+
+def test_legacy_app_keeps_owned_project_automation_as_a_default_action():
+    job = SimpleNamespace(
+        job_id="project-review", name="Project review", owner_project_id="campaign-1",
+        enabled=True, last_status="succeeded", execution_target={},
+    )
+
+    view = project_workspace_app_view(workspace({}), [], [job])
+
+    assert any(item["key"] == "automation:project-review" for item in view["actions"])
+
+
 def test_remove_custom_entry_cleans_only_its_display_settings():
     key = "action:create"
     config = {"entries": {key: {"title": "Create"}, "action:keep": {"title": "Keep"}},

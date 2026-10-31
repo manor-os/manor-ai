@@ -15,7 +15,7 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.user import Entity, User
 from packages.core.ai.runtime import approval_store
-from packages.core.services.task_runtime_approvals import TASK_RUNTIME_CHECKPOINT_CONTEXT_KEY
+from packages.core.services.task_agent_loop_hitl import TASK_AGENT_LOOP_HITL_CONTEXT_KEY
 
 # The existing policy tests register the PostgreSQL JSONB -> SQLite JSON test
 # compiler; neither suite starts a database or touches deployment state.
@@ -34,7 +34,10 @@ async def command_db(monkeypatch):
     monkeypatch.setattr(policies, '_capabilities', AsyncMock(return_value=caps))
     monkeypatch.setattr(commands, 'authorize_hitl_resolution', AsyncMock(return_value=SimpleNamespace(allowed=True)))
     monkeypatch.setattr(commands, 'lock_task_runtime_approval_boundary', AsyncMock())
-    monkeypatch.setattr(commands, 'ensure_task_runtime_approval_resolvable', AsyncMock(return_value=True))
+    # The signed park tag and the live park are the agent loop's own contract
+    # (tests/test_task_agent_loop_hitl.py); here a tag's presence stands in.
+    monkeypatch.setattr(commands, 'verified_request_tag', lambda request: (request.context or {}).get(TASK_AGENT_LOOP_HITL_CONTEXT_KEY))
+    monkeypatch.setattr(commands, 'task_agent_loop_approval_is_current', AsyncMock(return_value=True))
     monkeypatch.setattr(approval_store, 'mark_runtime_hitl_request_resolved', AsyncMock())
     async def grant(db, request, **kwargs):
         assert kwargs['standing'] is False
@@ -45,7 +48,7 @@ async def command_db(monkeypatch):
     async def stage(db, *, request, **kwargs):
         db.add(RuntimeOutboxEvent(event_type='runtime.resume_task', aggregate_id='t', dedupe_key='approval:h', payload={'request_id': request.id}))
         return {'approval_kind': 'task_runtime', 'task_runtime_resume': {'task_id': 't', 'hitl_id': request.id}}
-    monkeypatch.setattr(commands, 'stage_task_runtime_approval_resolution', stage)
+    monkeypatch.setattr(commands, 'stage_task_agent_loop_approval_resolution', stage)
     async with AsyncSession(engine, expire_on_commit=False) as db:
         db.add(Entity(id='e', name='Account', settings={'approval_defaults': policies.account_defaults()}))
         db.add(User(id='u', entity_id='e', email='u@example.test', password_hash='none', preferences={'approval_policy': {'e': policies.local_defaults('e')}}))
@@ -53,7 +56,7 @@ async def command_db(monkeypatch):
         db.add(HitlRequest(id='h', entity_id='e', action_key='workspace.file.modify', resource_kind='file', resource_id='report.md',
             risk_level='medium', origin_kind='tool_call', origin_task_id='t', origin_conversation_id='c', status='pending',
             hitl_type='authorize', dedup_key='operation:runtime:r:call:x', payload={}, context={
-                'operation_id': 'runtime:r:call:x', 'approval_requirements': [], TASK_RUNTIME_CHECKPOINT_CONTEXT_KEY: {'fixture': True},
+                'operation_id': 'runtime:r:call:x', 'approval_requirements': [], TASK_AGENT_LOOP_HITL_CONTEXT_KEY: {'fixture': True},
                 'policy_evaluation': {'target_decisions': [{'target': {'account_id': None, 'resource_kind': 'file', 'resource_id': 'report.md'}}]},
                 'tool': 'edit_file', 'args_hash': 'digest', 'continuation': {'version': 1, 'tool': 'edit_file', 'arguments': {'path': 'report.md', 'content': 'new'}}}))
         await db.commit()
@@ -79,7 +82,9 @@ async def test_combo_is_one_rule_one_grant_one_outbox_and_retry_is_idempotent(co
     assert result['policy']['policy']['rules'][0]['selector']['resource_ids'] == ['report.md']
     repeated = await commands.approve_and_save_rule(db, command=command, actor=actor)
     assert repeated['idempotent'] is True
-    assert len((await db.execute(select(RuntimeOutboxEvent))).scalars().all()) == 1
+    events = (await db.execute(select(RuntimeOutboxEvent))).scalars().all()
+    # One resume, plus the one re-decision of other pending asks the rule write stages.
+    assert sorted(event.event_type for event in events) == ['approval.reevaluate_pending', 'runtime.resume_task']
     assert len((await db.execute(select(AuditLog))).scalars().all()) == 2
 
 
@@ -105,7 +110,7 @@ async def test_failure_after_rule_save_rolls_back_rule_grant_and_outbox(command_
         db.add(RuntimeOutboxEvent(event_type='runtime.resume_task', aggregate_id='t', dedupe_key='approval:h', payload={}))
         await db.flush()
         raise failure
-    monkeypatch.setattr(commands, 'stage_task_runtime_approval_resolution', fail)
+    monkeypatch.setattr(commands, 'stage_task_agent_loop_approval_resolution', fail)
     with pytest.raises(type(failure)):
         await commands.approve_and_save_rule(db, command=command, actor=actor)
     await db.commit()
@@ -154,7 +159,7 @@ async def test_exact_rule_covers_all_proven_targets_or_is_not_offered(command_db
 async def test_lost_resumable_origin_does_not_save_rule(command_db, monkeypatch):
     db, actor = command_db
     command = await command_for(db, actor)
-    monkeypatch.setattr(commands, 'ensure_task_runtime_approval_resolvable', AsyncMock(return_value=False))
+    monkeypatch.setattr(commands, 'task_agent_loop_approval_is_current', AsyncMock(return_value=False))
     with pytest.raises(commands.ApprovalCommandError, match='durable'):
         await commands.approve_and_save_rule(db, command=command, actor=actor)
     assert (await db.execute(select(HitlRequest.status))).scalar_one() == 'pending'

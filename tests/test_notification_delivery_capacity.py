@@ -18,6 +18,7 @@ from packages.core.models.event import EventLog
 from packages.core.models.notification import Notification, NotificationOutboxEvent
 from packages.core.models.workspace import Workspace
 from packages.core.services import event_emitter, notification_scheduler as scheduler, notify
+from tests.async_waits import LIVENESS_TIMEOUT_S, wait_for_signal
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("client")]
 
@@ -70,6 +71,32 @@ async def immediate(factory, notification_id):
         return await scheduler.dispatch_notification_outbox(db, notification_id=notification_id)
 
 
+def control_attempt_deadline(monkeypatch, **asyncio_overrides):
+    """Keep the real per-attempt deadline, but expire it on demand.
+
+    A short wall-clock deadline can fire during NullPool reconnects,
+    authorization or checkpointing on a slow runner instead of at the stage a
+    test targets. Tests expire it after observing that stage.
+    """
+    scopes = []
+
+    def observed_timeout(delay):
+        scope = asyncio.timeout(delay)
+        if delay == scheduler._OUTBOX_ATTEMPT_TIMEOUT_SECONDS:
+            scopes.append(scope)
+        return scope
+
+    monkeypatch.setattr(scheduler, "asyncio", SimpleNamespace(
+        **{**vars(asyncio), "timeout": observed_timeout, **asyncio_overrides},
+    ))
+
+    def expire():
+        assert scopes, "the delivery attempt deadline was never entered"
+        scopes[-1].reschedule(asyncio.get_running_loop().time())
+
+    return expire
+
+
 async def assert_pending(observer, ids):
     async with observer() as db:
         for event_id in ids:
@@ -92,7 +119,7 @@ async def test_sweep_claims_only_the_notification_being_sent(db_session, limited
     async with factory() as db:
         delivery = asyncio.create_task(scheduler.dispatch_due_notifications(db))
         try:
-            await asyncio.wait_for(started.wait(), 2)
+            await wait_for_signal(started, delivery)
             observer = async_sessionmaker(db_session.bind, expire_on_commit=False)
             await assert_pending(observer, [event.id for event in events[1:]])
         finally:
@@ -131,7 +158,7 @@ async def test_event_and_notification_queues_share_capacity(db_session, limited_
     monkeypatch.setattr(scheduler, "_OUTBOX_ADMISSION_WAIT_SECONDS", 0.03)
     delivery = asyncio.create_task(event_emitter.dispatch_due_external_events(event_ids=(domain_event.id,)))
     try:
-        await asyncio.wait_for(started.wait(), 2)
+        await wait_for_signal(started, delivery)
         assert (await immediate(factory, notifications[0].id))["due"] == 0
         observer = async_sessionmaker(db_session.bind, expire_on_commit=False)
         await assert_pending(observer, [events[0].id])
@@ -164,7 +191,7 @@ async def test_delivery_limit_reserves_a_foreground_transaction(db_session, limi
     try:
         # NullPool reconnects across claim/authorization transactions. Observe
         # occupied delivery slots, not machine-dependent startup performance.
-        await asyncio.wait_for(started.wait(), 10)
+        await asyncio.wait_for(started.wait(), LIVENESS_TIMEOUT_S)
         assert runtime.checked_out == count
         async with factory() as foreground:
             assert await foreground.scalar(select(literal(1))) == 1
@@ -187,14 +214,22 @@ async def test_attempt_deadline_releases_locks_and_records_bounded_retry(db_sess
     events[0].attempt_count = attempts
     await db_session.commit()
 
+    stalled = asyncio.Event()
+
     async def stuck(**kwargs):
         assert await kwargs["before_external_target"]()
         assert runtime.checked_out == 1
+        stalled.set()
         await asyncio.Event().wait()
 
     monkeypatch.setattr(notify, "dispatch_persisted_notification", stuck)
-    monkeypatch.setattr(scheduler, "_OUTBOX_ATTEMPT_TIMEOUT_SECONDS", 0.15)
-    assert (await asyncio.wait_for(immediate(factory, notifications[0].id), 2))[outcome] == 1
+    # The deadline must expire while the authorized provider call holds the
+    # session, not earlier in claim/authorization on a slow runner.
+    expire_attempt = control_attempt_deadline(monkeypatch)
+    delivery = asyncio.create_task(immediate(factory, notifications[0].id))
+    await wait_for_signal(stalled, delivery)
+    expire_attempt()
+    assert (await asyncio.wait_for(delivery, LIVENESS_TIMEOUT_S))[outcome] == 1
     assert runtime.checked_out == 0
     async with factory() as db:
         saved = await db.scalar(select(NotificationOutboxEvent).where(NotificationOutboxEvent.id == events[0].id).with_for_update())
@@ -209,20 +244,23 @@ async def test_attempt_deadline_releases_locks_and_records_bounded_retry(db_sess
 async def test_timeout_retains_completed_target_for_retry(db_session, limited_db, monkeypatch):
     _, factory = limited_db
     notifications, events = await seed(db_session)
-    checkpointed = asyncio.Event()
+    stalled = asyncio.Event()
 
     async def partial(**kwargs):
         assert await kwargs["before_external_target"]()
         await kwargs["on_target_delivered"]("first-target")
-        checkpointed.set()
         assert await kwargs["before_external_target"]()
+        stalled.set()
         await asyncio.Event().wait()
 
     monkeypatch.setattr(notify, "dispatch_persisted_notification", partial)
-    # Allow DB authorization and checkpointing to finish before the provider stalls.
-    monkeypatch.setattr(scheduler, "_OUTBOX_ATTEMPT_TIMEOUT_SECONDS", 1)
-    assert (await immediate(factory, notifications[0].id))["retried"] == 1
-    assert checkpointed.is_set()
+    # Expire the deadline only once the first target is checkpointed and the
+    # provider stalls on the second, however long the database work took.
+    expire_attempt = control_attempt_deadline(monkeypatch)
+    delivery = asyncio.create_task(immediate(factory, notifications[0].id))
+    await wait_for_signal(stalled, delivery)
+    expire_attempt()
+    assert (await asyncio.wait_for(delivery, LIVENESS_TIMEOUT_S))["retried"] == 1
 
     async def finish(**kwargs):
         assert kwargs["delivered_target_keys"] == {"first-target"}
@@ -261,15 +299,7 @@ async def test_cancellation_drains_receipt_before_releasing_session(db_session, 
     monkeypatch.setattr(notify, "dispatch_persisted_notification", sent)
     if stalled:
         monkeypatch.setattr(scheduler, "_OUTBOX_CHECKPOINT_DRAIN_SECONDS", 0.03)
-    attempt_timeout = None
     draining = asyncio.Event()
-
-    def observed_timeout(delay):
-        nonlocal attempt_timeout
-        scope = asyncio.timeout(delay)
-        if delay == scheduler._OUTBOX_ATTEMPT_TIMEOUT_SECONDS:
-            attempt_timeout = scope
-        return scope
 
     async def observed_wait_for(awaitable, timeout):
         draining.set()
@@ -277,25 +307,22 @@ async def test_cancellation_drains_receipt_before_releasing_session(db_session, 
 
     # Expire the real timeout only after the receipt starts, so database/CI
     # latency cannot cancel setup. Observe drain entry instead of racing sleeps.
-    monkeypatch.setattr(scheduler, "asyncio", SimpleNamespace(
-        **{**vars(asyncio), "timeout": observed_timeout, "wait_for": observed_wait_for},
-    ))
+    expire_attempt = control_attempt_deadline(monkeypatch, wait_for=observed_wait_for)
     delivery = asyncio.create_task(immediate(factory, notifications[0].id))
-    await asyncio.wait_for(started.wait(), 10)
+    await wait_for_signal(started, delivery)
     if trigger == "cancel":
         delivery.cancel()
     else:
-        assert attempt_timeout is not None
-        attempt_timeout.reschedule(asyncio.get_running_loop().time())
-    await asyncio.wait_for(draining.wait(), 2)
+        expire_attempt()
+    await wait_for_signal(draining, delivery)
     if not stalled:
         assert not delivery.done()
         release.set()
     if trigger == "cancel":
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(delivery, 2)
+            await asyncio.wait_for(delivery, LIVENESS_TIMEOUT_S)
     else:
-        assert (await asyncio.wait_for(delivery, 2))["retried"] == 1
+        assert (await asyncio.wait_for(delivery, LIVENESS_TIMEOUT_S))["retried"] == 1
     assert stopped.is_set() and runtime.checked_out == 0
     async with factory() as db:
         saved = await db.get(NotificationOutboxEvent, events[0].id)
@@ -347,7 +374,7 @@ async def test_canceled_waiter_does_not_claim_or_leak_capacity(db_session, limit
 
     monkeypatch.setattr(notify, "dispatch_persisted_notification", slow)
     first = asyncio.create_task(immediate(factory, notifications[0].id))
-    await asyncio.wait_for(started.wait(), 2)
+    await wait_for_signal(started, first)
     second = asyncio.create_task(immediate(factory, notifications[1].id))
     try:
         await asyncio.sleep(0.03)

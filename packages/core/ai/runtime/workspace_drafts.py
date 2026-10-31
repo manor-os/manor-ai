@@ -174,6 +174,7 @@ async def runtime_run_workspace_architect_turn(
     on_tool_start: Any | None = None,
     on_tool_end: Any | None = None,
     repair_service_keys: tuple[str, ...] | None = None,
+    turn: Any | None = None,
 ) -> str:
     """Run one workspace architect turn through the Runtime draft boundary."""
 
@@ -190,6 +191,7 @@ async def runtime_run_workspace_architect_turn(
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
         **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
+        **({"turn": turn} if turn is not None else {}),
     )
 
 
@@ -208,8 +210,14 @@ def runtime_workspace_architect_tool_executor(
     entity_id: str,
     user_id: str | None,
     repair_service_keys: tuple[str, ...] | None = None,
+    turn: Any | None = None,
 ) -> Callable[[str, dict[str, Any]], Awaitable[str]]:
-    """Build the Runtime-owned executor for workspace architect draft tools."""
+    """Build the Runtime-owned executor for workspace architect draft tools.
+
+    With a ``DraftTurn``, each tool call re-locks the draft, and its writes
+    commit when it returns, so no transaction (row lock, connection or
+    admission permit) stays open while the model works between tool calls.
+    """
 
     from packages.core.ai.tools.workspace_arch_tools import (
         HANDLERS,
@@ -342,7 +350,37 @@ def runtime_workspace_architect_tool_executor(
                 logger.exception("architect tool %s crashed", name)
                 return json.dumps({"ok": False, "error": f"tool crashed: {exc}"})
 
-    return executor
+    if turn is None:
+        return executor
+
+    turn_lock = asyncio.Lock()
+
+    async def rollback_quietly() -> None:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001 - the original failure wins
+            logger.warning("architect tool rollback failed", exc_info=True)
+
+    async def executor_in_turn(name: str, args: dict[str, Any]) -> str:
+        # agentic_loop runs tools in child tasks, possibly in parallel; they
+        # share the turn's Session, so one tool transaction at a time.
+        async with turn_lock:
+            try:
+                await turn.lock()
+                result = await executor(name, args)
+            except BaseException:
+                await rollback_quietly()
+                raise
+            try:
+                await turn.release()
+            except Exception as exc:
+                await rollback_quietly()
+                raise RuntimeTurnAborted(
+                    "Draft changes could not be saved; send the message again",
+                ) from exc
+            return result
+
+    return executor_in_turn
 
 
 def runtime_reconcile_workspace_draft_fields(

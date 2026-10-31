@@ -26,6 +26,13 @@ _GOOGLE_VOICES: dict[VoiceProfile, str] = {
     "bright": "Zephyr",
     "deep": "Charon",
 }
+# ElevenLabs premade voices that OpenRouter accepts by name.
+_ELEVENLABS_VOICES: dict[VoiceProfile, str] = {
+    "warm": "sarah",
+    "clear": "alice",
+    "bright": "jessica",
+    "deep": "brian",
+}
 
 
 def normalize_voice_profile(value: object) -> VoiceProfile:
@@ -52,6 +59,8 @@ def speech_voice(profile: VoiceProfile, model: str) -> str | None:
         if native_model in {"tts-1", "tts-1-hd"}:
             return _OPENAI_LEGACY_TTS_VOICES[normalized]
         return _OPENAI_VOICES[normalized]
+    if provider == "elevenlabs":
+        return _ELEVENLABS_VOICES[normalized]
     # Other OpenRouter speech providers expose different, incompatible voice
     # identifiers. Let their adapter use its documented default.
     return None

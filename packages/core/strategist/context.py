@@ -66,6 +66,10 @@ class StrategistContext:
     recent_plans: list[ExecutionPlan] = field(default_factory=list)
     execution_snapshot: dict[str, Any] = field(default_factory=dict)
     """Read-only, Task-owned execution evidence; never an execution or tool grant."""
+    open_tasks: list[dict[str, Any]] = field(default_factory=list)
+    """Every open (in_progress / waiting / blocked / on hold) Task in the
+    Workspace, not only the recent window, so a proposal that restates or
+    repairs one of them can be recognised wherever that Task sits."""
     recent_activity: list[WorkspaceActivity] = field(default_factory=list)
     """Recent workspace activity/events that may not be represented as tasks."""
 
@@ -217,6 +221,7 @@ async def gather_context(
         db, workspace=workspace, tasks=recent_tasks, plans=recent_plans,
         outcomes=recent_outcomes, service_capabilities=service_capabilities,
     )
+    open_tasks = await _open_tasks(db, workspace)
 
     relevant_memory = await _gather_memory(
         db,
@@ -284,6 +289,7 @@ async def gather_context(
         recent_tasks=recent_tasks,
         recent_plans=recent_plans,
         execution_snapshot=execution_snapshot,
+        open_tasks=open_tasks,
         recent_activity=recent_activity,
         declined_human_requests=declined_human_requests,
         relevant_memory=relevant_memory,
@@ -564,6 +570,39 @@ async def _recent_tasks(
             Task.created_at >= cutoff,
         ).order_by(desc(Task.created_at)).limit(limit)
     )).scalars().all())
+
+
+_OPEN_TASK_STATUSES = (
+    TaskStatus.IN_PROGRESS.value,
+    TaskStatus.WAITING_ON_CUSTOMER.value,
+    TaskStatus.BLOCKED.value,
+    TaskStatus.ON_HOLD.value,
+)
+_MAX_OPEN_TASKS = 200
+
+
+async def _open_tasks(db: AsyncSession, workspace: Workspace) -> list[dict[str, Any]]:
+    """Id, title and wait state of every open Task, newest activity first."""
+    from packages.core.services.workspace_work_reconciliation import (
+        is_waiting_on_human,
+        task_ids_with_open_human_requests,
+    )
+
+    rows = (await db.execute(
+        select(Task.id, Task.title, Task.status).where(
+            Task.entity_id == workspace.entity_id,
+            Task.workspace_id == workspace.id,
+            Task.status.in_(_OPEN_TASK_STATUSES),
+        ).order_by(desc(Task.updated_at), desc(Task.id)).limit(_MAX_OPEN_TASKS)
+    )).all()
+    asking = await task_ids_with_open_human_requests(
+        db, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        task_ids=[row.id for row in rows],
+    )
+    return [{
+        "task_id": row.id, "title": row.title or "", "status": row.status,
+        "waiting_on_human": is_waiting_on_human(row.status, has_open_human_request=row.id in asking),
+    } for row in rows]
 
 
 async def _recent_plans(

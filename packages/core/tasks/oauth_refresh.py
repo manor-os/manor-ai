@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.credentials import CredentialDecryptError
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
+from packages.core.services.account_incidents import open_incident
 from packages.core.services.oauth_account_credentials import (
     clear_oauth_account_tokens,
     lease_oauth_account_tokens,
@@ -323,7 +324,7 @@ def _mark_oauth_account_reauth_required(
         "latency_ms": 0.0,
         "checked_at": refresh_state["checked_at"],
     }
-    row.profile = profile
+    row.profile = open_incident(profile, reason="reauth_required", now=datetime.now(timezone.utc))
     from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
 
     # Retain only encrypted grant material for an explicit remote Disconnect.
@@ -347,7 +348,7 @@ def _mark_integration_reauth_required(
         "latency_ms": 0.0,
         "checked_at": refresh_state["checked_at"],
     }
-    row.config = config
+    row.config = open_incident(config, reason="reauth_required", now=datetime.now(timezone.utc))
     credentials = dict(row.credentials or {})
     for key in ("access_token", "refresh_token", "expires_at"):
         credentials.pop(key, None)

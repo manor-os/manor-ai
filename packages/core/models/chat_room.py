@@ -20,6 +20,8 @@ class ChatRoom(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_chat_rooms_owner_entity", "owner_entity_id"),
         Index("uq_chat_rooms_dm_key", "dm_key", unique=True),
+        Index("uq_chat_rooms_public_invite_token", "public_invite_token", unique=True),
+        CheckConstraint("kind = 'group' OR public_invite_token IS NULL", name="ck_chat_rooms_public_invite_group"),
         CheckConstraint("kind IN ('dm', 'group')", name="ck_chat_rooms_kind"),
         CheckConstraint("status IN ('active', 'closed')", name="ck_chat_rooms_status"),
         CheckConstraint("ai_tool_execution_revision >= 0", name="ck_chat_rooms_ai_tool_execution_revision"),
@@ -45,6 +47,8 @@ class ChatRoom(Base, TimestampMixin):
     owner_user_id: Mapped[Optional[str]] = mapped_column(String(26), ForeignKey("users.id", ondelete="CASCADE"))
     created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26), ForeignKey("users.id", ondelete="SET NULL"))
     dm_key: Mapped[Optional[str]] = mapped_column(String(320))
+    # Reusable bearer link, exposed only through the owner/admin management API.
+    public_invite_token: Mapped[Optional[str]] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
     # A room-wide capability ceiling. Each tool call still needs its own actor
     # and authorization; historical On rooms retain their approval flow.
@@ -144,15 +148,20 @@ class ChatRoomMessageReaction(Base):
 
 
 class ChatRoomFile(Base):
-    """A room-only attachment: inline bytes or a pinned Knowledge artifact."""
+    """A room-only attachment: inline/chunked bytes or a pinned Knowledge artifact."""
     __tablename__ = "chat_room_files"
     __table_args__ = (
         Index("ix_chat_room_files_message", "message_id"),
         UniqueConstraint("source_run_id", "document_id", name="uq_chat_room_files_run_document"),
         CheckConstraint(
-            "size > 0 AND ((content IS NOT NULL AND size <= 104857600 AND document_id IS NULL "
-            "AND document_entity_id IS NULL AND content_sha256 IS NULL AND source_run_id IS NULL "
-            "AND source_media_job_id IS NULL) OR (content IS NULL AND document_id IS NOT NULL "
+            "size > 0 AND ((content IS NOT NULL AND size <= 104857600 AND chunk_count IS NULL "
+            "AND document_id IS NULL AND document_entity_id IS NULL AND content_sha256 IS NULL "
+            "AND source_run_id IS NULL AND source_media_job_id IS NULL) "
+            "OR (content IS NULL AND chunk_count IS NOT NULL AND chunk_count > 0 AND size <= 1073741824 "
+            "AND (chunk_count - 1) * 4194304 < size AND size <= chunk_count * 4194304 "
+            "AND document_id IS NULL AND document_entity_id IS NULL AND content_sha256 IS NOT NULL "
+            "AND length(content_sha256) = 64 AND source_run_id IS NULL AND source_media_job_id IS NULL) "
+            "OR (content IS NULL AND chunk_count IS NULL AND document_id IS NOT NULL "
             "AND document_entity_id IS NOT NULL AND content_sha256 IS NOT NULL "
             "AND length(content_sha256) = 64 AND source_run_id IS NOT NULL))",
             name="ck_chat_room_files_storage",
@@ -165,6 +174,7 @@ class ChatRoomFile(Base):
     mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    chunk_count: Mapped[Optional[int]] = mapped_column(Integer)
     document_id: Mapped[Optional[str]] = mapped_column(
         String(26), ForeignKey("documents.id", ondelete="CASCADE")
     )
@@ -176,6 +186,24 @@ class ChatRoomFile(Base):
     source_media_job_id: Mapped[Optional[str]] = mapped_column(String(26))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class ChatRoomFileChunk(Base):
+    """Bounded room-file bytes, retained and deleted with their parent attachment."""
+    __tablename__ = "chat_room_file_chunks"
+    __table_args__ = (
+        CheckConstraint("chunk_index >= 0", name="ck_chat_room_file_chunks_index"),
+        CheckConstraint(
+            "length(content) > 0 AND length(content) <= 4194304",
+            name="ck_chat_room_file_chunks_size",
+        ),
+    )
+
+    file_id: Mapped[str] = mapped_column(
+        String(26), ForeignKey("chat_room_files.id", ondelete="CASCADE"), primary_key=True,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
 
 class ChatRoomAgentBinding(Base, TimestampMixin):

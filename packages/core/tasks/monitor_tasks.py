@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from packages.core.constants.goals import GoalStatus
-from packages.core.constants.task import TaskLogType, TaskStatus
+from packages.core.constants.task import TaskStatus
 from packages.core.constants.execution import (
     ExecutionPlanStatus,
     ExecutionStepStatus,
@@ -34,118 +34,11 @@ HEARTBEAT_OK_MARKER = "HEARTBEAT_OK"
 # Skip proactive messages if the conversation already has a recent assistant
 # message within this many minutes.
 HEARTBEAT_COOLDOWN_MINUTES = 30
-HITL_REMINDER_AFTER_MINUTES = int(os.getenv("HITL_REMINDER_AFTER_MINUTES", "60"))
-HITL_REMINDER_COOLDOWN_MINUTES = int(os.getenv("HITL_REMINDER_COOLDOWN_MINUTES", "240"))
-HITL_REMINDER_LIMIT = int(os.getenv("HITL_REMINDER_LIMIT", "50"))
 
 
 def _run_async(coro):
     """Run an async coroutine from synchronous Celery worker context."""
     return asyncio.run(coro)
-
-
-def _aware_utc(dt: datetime | None) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _parse_iso_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return _aware_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
-    except ValueError:
-        return None
-
-
-def _hitl_wait_started_at(step) -> datetime:
-    """Best-effort timestamp for when a step entered waiting_human."""
-    return (
-        _aware_utc(getattr(step, "updated_at", None))
-        or _aware_utc(getattr(step, "started_at", None))
-        or _aware_utc(getattr(step, "created_at", None))
-        or datetime.now(timezone.utc)
-    )
-
-
-def _hitl_last_reminded_at(plan, step_id: str) -> datetime | None:
-    state = getattr(plan, "dispatcher_state", None) or {}
-    reminders = state.get("hitl_reminders") if isinstance(state, dict) else None
-    if not isinstance(reminders, dict):
-        return None
-    item = reminders.get(step_id)
-    if isinstance(item, dict):
-        return _parse_iso_datetime(item.get("last_reminded_at"))
-    return _parse_iso_datetime(item)
-
-
-#: How the gap between reminders grows with the length of the wait, and where
-#: reminding stops. A flat 4-hour cooldown with no ceiling sent ~60 notices
-#: about one governance approval that had been waiting ten days — every one of
-#: them into an inbox with a 100% unread rate. Past the last threshold the
-#: request is not forgotten (it stays waiting, and the task still shows it);
-#: we simply stop saying the same thing into the same void.
-HITL_REMINDER_BACKOFF_STEPS: tuple[tuple[int, int], ...] = (
-    # (waited at least N minutes, remind at most every M minutes)
-    (0, 60),          # first hour of waiting → hourly
-    (60 * 4, 240),    # after 4h → every 4h
-    (60 * 24, 1440),  # after a day → daily
-)
-#: Waiting longer than this stops the reminders entirely.
-HITL_REMINDER_GIVE_UP_MINUTES = int(
-    os.getenv("HITL_REMINDER_GIVE_UP_MINUTES", str(60 * 24 * 3))
-)
-
-
-def hitl_reminder_interval_minutes(waited_minutes: float) -> int | None:
-    """Minutes to wait before the next reminder, or None to stop reminding."""
-    if waited_minutes >= HITL_REMINDER_GIVE_UP_MINUTES:
-        return None
-    interval = HITL_REMINDER_BACKOFF_STEPS[0][1]
-    for threshold, step_interval in HITL_REMINDER_BACKOFF_STEPS:
-        if waited_minutes >= threshold:
-            interval = step_interval
-    return interval
-
-
-def _hitl_reminder_due(
-    *,
-    wait_started_at: datetime,
-    last_reminded_at: datetime | None,
-    now: datetime,
-    after_minutes: int = HITL_REMINDER_AFTER_MINUTES,
-    cooldown_minutes: int | None = None,
-) -> bool:
-    wait_started_at = _aware_utc(wait_started_at) or now
-    last_reminded_at = _aware_utc(last_reminded_at)
-    if wait_started_at > now - timedelta(minutes=after_minutes):
-        return False
-
-    waited_minutes = (now - wait_started_at).total_seconds() / 60
-    interval = (
-        cooldown_minutes
-        if cooldown_minutes is not None
-        else hitl_reminder_interval_minutes(waited_minutes)
-    )
-    if interval is None:
-        return False
-    if last_reminded_at and last_reminded_at > now - timedelta(minutes=interval):
-        return False
-    return True
-
-
-def _record_hitl_reminder(plan, step_id: str, *, now: datetime, wait_minutes: int) -> None:
-    state = dict(getattr(plan, "dispatcher_state", None) or {})
-    reminders = dict(state.get("hitl_reminders") or {})
-    reminders[step_id] = {
-        "last_reminded_at": now.isoformat(),
-        "wait_minutes": wait_minutes,
-    }
-    state["hitl_reminders"] = reminders
-    plan.dispatcher_state = state
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +207,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     from sqlalchemy import select, func
     from packages.core.models.task import Task
     from packages.core.services.task_deadlines import task_deadline_overdue_expr
+    from packages.core.services.workspace_health_metrics import stalled_task_clause
 
     # Total open tasks
     r = await db.execute(
@@ -354,13 +248,12 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     )
     completed_today = r.scalar_one()
 
-    # Stalled: in_progress for more than 48h with no update
-    stale_cutoff = now - timedelta(hours=48)
+    # Stalled: in progress with no status change for STALLED_AFTER — the
+    # same definition the launch review and Workspace health use.
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status == TaskStatus.IN_PROGRESS,
-            Task.updated_at < stale_cutoff,
+            stalled_task_clause(now),
         )
     )
     stalled_count = r.scalar_one()
@@ -378,6 +271,10 @@ async def _query_execution_stats(db, entity_id: str, now: datetime) -> dict:
     """Query agent execution metrics for the last 24 hours."""
     from sqlalchemy import select, func
     from packages.core.models.scheduler import AgentExecution
+    from packages.core.services.workspace_health_metrics import success_rate
+
+    AGENT_EXECUTION_SUCCEEDED = "completed"
+    AGENT_EXECUTION_FAILED = ("failed", "error")
 
     since = now - timedelta(hours=24)
 
@@ -391,17 +288,22 @@ async def _query_execution_stats(db, entity_id: str, now: datetime) -> dict:
     total = r.scalar_one()
 
     if total == 0:
-        return {"total": 0, "success_rate": 0.0, "avg_turns": 0.0, "total_tokens": 0}
+        return {"total": 0, "success_rate": None, "avg_turns": 0.0, "total_tokens": 0}
 
-    # Successful executions
-    r = await db.execute(
-        select(func.count()).select_from(AgentExecution).where(
+    # Only finished executions are judged: running and cancelled ones are not.
+    status_counts = dict((await db.execute(
+        select(AgentExecution.status, func.count()).where(
             AgentExecution.entity_id == entity_id,
             AgentExecution.created_at >= since,
-            AgentExecution.status == "completed",
-        )
+            AgentExecution.status.in_(
+                (AGENT_EXECUTION_SUCCEEDED,) + AGENT_EXECUTION_FAILED
+            ),
+        ).group_by(AgentExecution.status)
+    )).all())
+    rate = success_rate(
+        status_counts.get(AGENT_EXECUTION_SUCCEEDED, 0),
+        sum(status_counts.get(status, 0) for status in AGENT_EXECUTION_FAILED),
     )
-    success_count = r.scalar_one()
 
     # Average turns
     r = await db.execute(
@@ -414,7 +316,8 @@ async def _query_execution_stats(db, entity_id: str, now: datetime) -> dict:
 
     return {
         "total": total,
-        "success_rate": round(success_count / total * 100, 1) if total else 0.0,
+        # Percent of judged executions; None when none finished.
+        "success_rate": None if rate is None else round(rate * 100, 1),
         "avg_turns": round(float(avg_turns), 1),
         "total_tokens": 0,  # token_usage is JSONB, skip deep aggregation for now
     }
@@ -513,12 +416,15 @@ def _format_briefing(
     if task_stats["blocked"] > 0:
         alerts.append(f"{task_stats['blocked']} blocked task(s)")
     if task_stats["stalled"] > 0:
-        alerts.append(f"{task_stats['stalled']} stalled task(s) (no update in 48h)")
+        alerts.append(f"{task_stats['stalled']} stalled task(s) (no status change in 48h)")
     if job_stats["broken"] > 0:
         alerts.append(f"{job_stats['broken']} scheduled job(s) with repeated failures")
     if goal_stats["stuck_hitl"] > 0:
         alerts.append(f"{goal_stats['stuck_hitl']} goal(s) waiting for human input")
     alert_text = "; ".join(alerts) if alerts else "All clear"
+    exec_success = (
+        "n/a" if exec_stats.get("success_rate") is None else f"{exec_stats['success_rate']}%"
+    )
 
     # ── Action items ──
     action_items = []
@@ -545,7 +451,7 @@ def _format_briefing(
         f"  Tasks: {task_stats['open']} open | {task_stats['overdue']} overdue | "
         f"{task_stats['completed_today']} completed today\n"
         f"  Agent Executions (24h): {exec_stats['total']} total | "
-        f"{exec_stats['success_rate']}% success | avg {exec_stats['avg_turns']} turns\n"
+        f"{exec_success} success | avg {exec_stats['avg_turns']} turns\n"
         f"  Scheduled Jobs: {job_stats['enabled']} enabled | "
         f"{job_stats['errored']} errored | {job_stats['broken']} broken\n"
         f"  Goals: {goal_stats['active']} active | {goal_stats['stuck_hitl']} awaiting human input\n"
@@ -553,7 +459,7 @@ def _format_briefing(
         f"\n"
         f"--- Business Overview ---\n"
         f"  Open workload: {task_stats['open']} tasks across all workspaces\n"
-        f"  Stalled work: {task_stats['stalled']} task(s) with no progress in 48h\n"
+        f"  Stalled work: {task_stats['stalled']} task(s) with no status change in 48h\n"
         f"  Blocked: {task_stats['blocked']} task(s) needing intervention\n"
         f"\n"
         f"--- Action Items ---\n"
@@ -653,6 +559,7 @@ async def _check_conversation_attention(
     from packages.core.models.task import Message, Task
     from packages.core.models.execution import ExecutionStep
     from packages.core.services.task_deadlines import task_deadline_overdue_expr
+    from packages.core.services.workspace_health_metrics import stalled_task_clause
 
     # Check if there are recent messages (last 2 hours)
     r = await db.execute(
@@ -694,19 +601,17 @@ async def _check_conversation_attention(
     if overdue_tasks > 0:
         attention_items.append(f"{overdue_tasks} overdue task(s) assigned to me")
 
-    # 2. Stalled tasks (in_progress for > 48h with no update)
-    stale_cutoff = now - timedelta(hours=48)
+    # 2. Stalled tasks — the shared stall definition (no status change in 48h)
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == conv.entity_id,
             Task.agent_id == conv.agent_id,
-            Task.status == TaskStatus.IN_PROGRESS,
-            Task.updated_at < stale_cutoff,
+            stalled_task_clause(now),
         )
     )
     stalled_tasks = r.scalar_one()
     if stalled_tasks > 0:
-        attention_items.append(f"{stalled_tasks} stalled task(s) with no progress in 48h")
+        attention_items.append(f"{stalled_tasks} stalled task(s) with no status change in 48h")
 
     # 3. Plans with steps waiting on human input.
     # The old query joined by conversation_id; the new ExecutionPlan
@@ -744,13 +649,15 @@ async def _check_conversation_attention(
 
 @celery_app.task(bind=True, name="monitor.hitl_waiting_reminder", max_retries=1)
 def hitl_waiting_reminder(self):
-    """Remind task owners when plan steps wait too long for human input."""
+    """Remind people about cards waiting on them (24h, then +72h)."""
     if not MONITOR_ENABLED:
         logger.info("hitl_waiting_reminder: disabled via MONITOR_ENABLED=false")
         return
 
     try:
-        delivered = _run_async(_async_hitl_waiting_reminder())
+        from packages.core.services.hitl_reminders import run_hitl_reminder_sweep
+
+        delivered = _run_async(run_hitl_reminder_sweep())
         if delivered:
             logger.info("hitl_waiting_reminder: delivered %d reminder(s)", delivered)
     except Exception as exc:
@@ -758,121 +665,18 @@ def hitl_waiting_reminder(self):
         raise self.retry(exc=exc, countdown=300)
 
 
-async def _async_hitl_waiting_reminder(
-    *,
-    now: datetime | None = None,
-    after_minutes: int = HITL_REMINDER_AFTER_MINUTES,
-    cooldown_minutes: int | None = None,
-    limit: int = HITL_REMINDER_LIMIT,
-) -> int:
-    from sqlalchemy import func, select
+@celery_app.task(name="workspace.digest_sweep")
+def workspace_digest_sweep() -> int:
+    """Send each person's daily Workspace digest at 09:00 their time (every 15 min)."""
+    if not MONITOR_ENABLED:
+        logger.info("workspace_digest_sweep: disabled via MONITOR_ENABLED=false")
+        return 0
+    from packages.core.services.workspace_digest import run_workspace_digest_sweep
 
-    from packages.core.database import create_worker_session
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.task import Task
-
-    current = now or datetime.now(timezone.utc)
-    stale_cutoff = current - timedelta(minutes=after_minutes)
-
-    async with create_worker_session()() as db:
-        from packages.core.services.task_execution_reconcile import (
-            recover_misclassified_tool_error_human_waits,
-        )
-
-        recovered = await recover_misclassified_tool_error_human_waits(db)
-        if recovered:
-            await db.commit()
-
-        rows = list((await db.execute(
-            select(ExecutionStep, ExecutionPlan, Task)
-            .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
-            .join(Task, Task.id == ExecutionPlan.task_id)
-            .where(
-                ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
-                ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PAUSED, ExecutionPlanStatus.NEEDS_ATTENTION,)),
-                func.coalesce(
-                    ExecutionStep.updated_at,
-                    ExecutionStep.started_at,
-                    ExecutionStep.created_at,
-                ) <= stale_cutoff,
-            )
-            .order_by(ExecutionStep.updated_at.asc().nullslast(), ExecutionStep.created_at.asc())
-            .limit(limit)
-        )).all())
-
-        delivered = 0
-        for step, plan, task in rows:
-            wait_started_at = _hitl_wait_started_at(step)
-            last_reminded_at = _hitl_last_reminded_at(plan, step.id)
-            if not _hitl_reminder_due(
-                wait_started_at=wait_started_at,
-                last_reminded_at=last_reminded_at,
-                now=current,
-                after_minutes=after_minutes,
-                cooldown_minutes=cooldown_minutes,
-            ):
-                continue
-
-            wait_minutes = max(0, int((current - wait_started_at).total_seconds() // 60))
-            count, _event_payload = await _deliver_hitl_reminder(
-                db,
-                task=task,
-                plan=plan,
-                step=step,
-                now=current,
-                wait_minutes=wait_minutes,
-            )
-            if count:
-                _record_hitl_reminder(plan, step.id, now=current, wait_minutes=wait_minutes)
-                delivered += count
-
-        if delivered:
-            await db.commit()
-        return delivered
-
-
-async def _deliver_hitl_reminder(
-    db,
-    *,
-    task,
-    plan,
-    step,
-    now: datetime,
-    wait_minutes: int,
-) -> tuple[int, dict[str, Any]]:
-    from packages.core.services.event_emitter import emit_in_session
-    from packages.core.constants.task_actors import TaskActor
-    from packages.core.services.task_service import add_task_log
-
-    prompt = (step.human_input_prompt or "This task is waiting for your input.").strip()
-    meta = {
-        "task_id": task.id,
-        "plan_id": plan.id,
-        "step_id": step.id,
-        "step_key": step.step_key,
-        "wait_minutes": wait_minutes,
-        "prompt": prompt,
-        "reminded_at": now.isoformat(),
-    }
-    await add_task_log(
-        db,
-        task.id,
-        TaskLogType.AI_HITL_REMINDER,
-        f"Reminder sent: step '{step.step_key}' has waited {wait_minutes} minute(s) for human input.",
-        actor=TaskActor.SYSTEM,
-        created_by="system",
-        metadata=meta,
-    )
-    delivered = await emit_in_session(
-        db,
-        task.entity_id,
-        "task.hitl_reminder",
-        source="hitl_waiting_reminder",
-        payload=meta,
-        workspace_id=task.workspace_id,
-        deliver_after_commit=True,
-    )
-    return delivered, meta
+    sent = _run_async(run_workspace_digest_sweep())
+    if sent:
+        logger.info("workspace_digest_sweep: sent %d digest(s)", sent)
+    return sent
 
 
 # ---------------------------------------------------------------------------

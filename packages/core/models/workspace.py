@@ -113,6 +113,9 @@ class WorkspaceStaff(Base, TimestampMixin):
     added_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
+    # Set when the seat is derived from a WorkspaceCollaboration grant; such a
+    # seat is rewritten only by external_collaboration_access.sync_external_access.
+    collaboration_id: Mapped[Optional[str]] = mapped_column(String(26))
 
 
 class Agent(Base, TimestampMixin, SoftDeleteMixin):
@@ -268,6 +271,9 @@ class WorkspaceOperationDraft(Base, TimestampMixin):
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     source_event_id: Mapped[Optional[str]] = mapped_column(String(100))
+    # The chat conversation that drafted it, written by the host (never from
+    # patches). Tasks the draft materializes carry it as Task.conversation_id.
+    origin_conversation_id: Mapped[Optional[str]] = mapped_column(String(26))
     base_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     status: Mapped[str] = mapped_column(
         String(20), nullable=False,

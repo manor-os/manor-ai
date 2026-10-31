@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from packages.core.constants.chrome import CHROME_READ_ACTIONS as _CHROME_READ_ACTIONS
+
 CHROME_MCP_TOOLS = frozenset({
     "mcp__chrome__documentation",
     "mcp__chrome__capabilities",
@@ -95,12 +97,8 @@ CHROME_COMPUTER_ACTIONS = {
     "scroll": "scroll", "scroll_to": "scroll", "hover": "hover", "drag": "drag",
     "wait": "wait", "screenshot": "screenshot",
 }
-CHROME_READ_ACTIONS = frozenset({
-    "documentation", "capabilities", "status", "selected_tab", "tab_info",
-    "list_tabs", "get_windows_and_tabs", "get_group_state", "ping_tab",
-    "read_page", "target_state", "resolve_target", "wait", "get_interactive_elements",
-    "inspect_selector", "get_web_content", "screenshot", "viewport", "page_assets", "console_logs", "js_dialog",
-})
+# Declared in a leaf module so governance.action_effects can use it too.
+CHROME_READ_ACTIONS = _CHROME_READ_ACTIONS
 CHROME_TARGET_ACTIONS = frozenset({
     "mcp__chrome__click_element", "mcp__chrome__fill_or_select", "mcp__chrome__click_point",
     "mcp__chrome__type_text", "mcp__chrome__press_key", "mcp__chrome__keyboard",

@@ -84,7 +84,7 @@ from packages.core.ai.runtime.goal_actions import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
 )
-from packages.core.ai.runtime.stat_actions import STAT_ASSESSMENT_GUIDANCE, runtime_stat_action
+from packages.core.ai.runtime.stat_actions import ADD_ASSESSED_METRICS_GUIDANCE, STAT_ASSESSMENT_GUIDANCE, runtime_stat_action
 from packages.core.ai.runtime.notification_actions import (
     runtime_notify_members_action,
 )
@@ -144,9 +144,9 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("delete_document", "Delete a document (params: document_id)"),
         (
             "search_documents",
-            "Search user-visible document names and metadata with plural filters and "
-            "inclusive time/size ranges in one params object; this does not "
-            "retrieve document-body evidence",
+            "Search user-visible documents by name and text (params: query plus "
+            "plural filters and inclusive time/size ranges); returns name matches "
+            "and content_matches with snippets",
         ),
         ("list_workspace_artifacts", "List AI-generated or saved files associated with a workspace"),
         ("list_document_folders", "List user-visible Knowledge folders"),
@@ -232,6 +232,7 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("get_goal_status", "Get active workspace goal status, current values, and measurement metadata"),
         ("get_stat_status", "Read workspace metric definitions, latest assessment receipts and source document versions. " + STAT_ASSESSMENT_GUIDANCE),
         ("record_stat_assessment", "Persist an evidence-backed metric assessment and project linked Goals. " + STAT_ASSESSMENT_GUIDANCE),
+        ("add_assessed_metrics", "Track audience metrics (video views, comments, likes, followers, active users) that an agent assesses from evidence on a schedule. " + ADD_ASSESSED_METRICS_GUIDANCE),
         ("update_goal_value", "Record a verified manual goal measurement; params must include goal_id (ULID or goal_key) AND numeric value in the same call; appends goal_measurements and updates current_value"),
         ("update_workspace_goals", "Update workspace goals"),
         ("update_workspace_rules", "Update workspace rules"),
@@ -331,6 +332,46 @@ def _unsupported_action_response(action: str) -> str:
         details={"field": "action", "action": action,
                  "capability_availability": "not_established",
                  "discovery_tool": "search_tools", "action_executed": False},
+    ), ensure_ascii=False)
+
+
+async def _collaborator_refused(
+    action: str, params: dict, *, entity_id: str, user_id: str | None, workspace_id: str | None,
+) -> str | None:
+    """Backstop for the company-wide Manor gateway.
+
+    The runtime authorization gate is the primary boundary. Here an external
+    collaborator reaches only the actions whose subject that gate admits for
+    them (Workspace work, Tasks, goals, automations), judged the same way.
+
+    A collaborator acts only inside a Workspace: the gate refuses every
+    collaborator call without one before the handler runs. A call with no
+    Workspace is therefore not a collaborator's and needs no role lookup.
+    """
+    if not user_id or not workspace_id:
+        return None
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.services.runtime_authorization.collaborator import collaborator_subject_allowed
+    from packages.core.services.runtime_authorization.domain import AuthorizationSubject
+
+    try:
+        authorization = classify_runtime_tool("manor", {"action": action, "params": params}).authorization
+    except Exception:
+        authorization = None
+    if authorization is not None and collaborator_subject_allowed(
+        AuthorizationSubject.create(authorization.action_key, authorization.capability_id), tool_name="manor",
+    ):
+        return None
+    from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+    from packages.core.services.runtime_authorization.collaborator import is_runtime_collaborator
+
+    # The gate cached this call's answer; a direct call reads it once.
+    if not await is_runtime_collaborator(user_id, entity_id):
+        return None
+    return json.dumps(tool_error_payload(
+        tool_name="manor", code="collaborator_action_unavailable",
+        message="This Manor action reaches the whole company and is not available to external collaborators.",
+        details={"field": "action", "action": action, "action_executed": False},
     ), ensure_ascii=False)
 
 
@@ -459,6 +500,7 @@ async def _dispatch_action(
                     entity_id=entity_id,
                     params=params,
                     actor_agent_id=getattr(runtime_envelope, "agent_id", None),
+                    user_id=user_id,
                 )
 
             # Documents
@@ -490,6 +532,7 @@ async def _dispatch_action(
                     user_id=user_id,
                     workspace_id=authorization_workspace_id,
                     params=params,
+                    user_wording=active_user_message,
                 )
 
             if action == "list_workspace_artifacts":
@@ -760,7 +803,7 @@ async def _dispatch_action(
                     params=params,
                 )
 
-            if action in {"get_stat_status", "record_stat_assessment"}:
+            if action in {"get_stat_status", "record_stat_assessment", "add_assessed_metrics"}:
                 return await runtime_stat_action(
                     action=action, entity_id=entity_id, user_id=user_id,
                     workspace_id=workspace_id or params.get("workspace_id"), params=params,
@@ -1134,6 +1177,14 @@ def _implemented_action_names() -> frozenset[str]:
 
 _IMPLEMENTED_ACTIONS: frozenset[str] = _implemented_action_names()
 
+# Accepted before the catalog check: the catalog search and a legacy alias.
+_GATEWAY_ACTIONS = frozenset({"search", "create_workspace"})
+
+
+def manor_action_is_callable(action: str) -> bool:
+    """Whether ``manor`` has a handler for ``action``; anything else runs nothing."""
+    return action in _GATEWAY_ACTIONS or (action in _ALL_ACTIONS and action in _IMPLEMENTED_ACTIONS)
+
 
 # ── Tool schema ──────────────────────────────────────────────────────────────
 
@@ -1171,7 +1222,7 @@ MANOR_SCHEMA = {
             "App targets/Workflow attachments use configuration drafts; author/run Workflows via dedicated actions. "
             "CRM uses company-scoped client/contact/activity/deal/followup actions. Followups/email activities are records; Ledger links stay in the current Workspace. "
             "Use dedicated actions for ScheduledJobs/Agent Initiatives, never action='workspace'. "
-            "list_documents/search_documents read metadata; generate_file creates artifacts. "
+            "search_documents finds documents by name and text; generate_file creates artifacts. "
             "create_agent_initiative is only for private Agent/Manor Chat. "
             "Workspace recurrence uses create_scheduled_job; ScheduledJobs lack conversational delivery, mute, quiet-hours and Initiative history. "
             "Use exact active params.agent_id from action='list_agents'; omit for the calling Agent."
@@ -1194,16 +1245,17 @@ MANOR_SCHEMA = {
                         "params={action:'create_task',params:{title,description,"
                         "runtime_instructions,rules,start}}. description holds objective, "
                         "filename and deliverables; runtime_instructions holds task "
-                        "rules and output language; start=true runs now. "
+                        "rules and output language; start=true runs now. A drafted "
+                        "Task: params={action:'start_task',params:{task_id}}. "
                         "Workspace input: action='workspace', params={action:'resolve_hitl',"
                         "params:{message_id,action:'respond',response:'the user reply'}}. "
-                        "Use hitl_id when message_id is unavailable; payload.fields/answers "
-                        "and payload.attachments hold structured input or file references. "
-                        "Use approve/reject only for approval decisions, with optional note. "
+                        "hitl_id if no message_id; payload.fields/answers "
+                        "and payload.attachments hold structured input/file refs. "
+                        "approve/reject only decide approvals (optional note). "
                         "Workspace config: action='workspace', params={action:'operation',"
                         "params:{action:'create_draft',patches:[{op,payload}]}}. "
                         + WORKSPACE_OPERATION_EAGER_CONFIGURATION_GUIDANCE
-                        + "Rules use rule.add for new rules or rule.update for existing rules. "
+                        + "Rules: rule.add for new ones, rule.update for existing ones. "
                     ),
                     "additionalProperties": True,
                 },
@@ -1241,6 +1293,11 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
         # Runtime tool calls always carry an injected context key, even when
         # anonymous, so model-supplied top-level values cannot reach this path.
         acting_user_id = str(kwargs.get("user_id") or "").strip() or None
+    if refused := await _collaborator_refused(
+        action, _merge_action_params(kwargs), entity_id=entity_id, user_id=acting_user_id,
+        workspace_id=runtime_context.workspace_id,
+    ):
+        return refused
 
     # The Manor platform's own catalog: Manor actions, Workspace actions and
     # operations (inside a Workspace) and Manor's MCP servers. search_tools
@@ -1266,7 +1323,7 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
             ),
         )
 
-    if action not in _ALL_ACTIONS or action not in _IMPLEMENTED_ACTIONS:
+    if not manor_action_is_callable(action):
         return _unsupported_action_response(action)
 
     params = _merge_action_params(kwargs)

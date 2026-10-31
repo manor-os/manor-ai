@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from PIL import Image
 import pytest
 
+from packages.core.blueprints.app_view import PLATFORM_ASSET_DIRS, is_platform_asset_path
 from packages.core.blueprints.catalogue import get_platform_blueprints
 
 
@@ -29,7 +31,9 @@ EVIDENCE = {
         "/blueprints/creative/presentation-slide-03.jpg",
     ],
     "creative-podcast-v1": ["/blueprints/creative/podcast-playback.jpg"],
-    "creative-carousel-v1": [f"/blueprints/creative/carousel-page-{index:02}.jpg" for index in range(1, 4)],
+    "creative-video-v1": ["/blueprints/creative/video-series-app.jpg", "/blueprints/creative/oak-street-bakery-episode.mp4",
+                          "/blueprints/creative/series-showcase.mp4"],
+    "creative-carousel-agent-v1": [f"/blueprints/creative/carousel-page-{index:02}.jpg" for index in range(1, 4)],
     "creative-dubbing-v1": [
         "/blueprints/creative/dubbing-english-playback.jpg",
         "/blueprints/creative/cedar-cup-english.mp4",
@@ -155,3 +159,56 @@ def test_public_showcase_provenance_keeps_verification_limits_self_contained():
     assert "no-reference STT was unavailable" in provenance
     assert "the no-SRT transcription route was not browser-verified" in provenance
     assert "Subtitle timing is proportional, not word-aligned" in provenance
+
+
+def _example_image_schemas(value):
+    if isinstance(value, dict):
+        if "x-example-images" in value or "x-enum-images" in value:
+            yield value
+        for child in value.values():
+            yield from _example_image_schemas(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _example_image_schemas(child)
+
+
+def test_field_example_pictures_ship_with_the_app_and_match_their_examples():
+    """A suggested value's or option's picture is a site path the web app serves, one per value."""
+    found = 0
+    for payload in get_platform_blueprints():
+        for schema in _example_image_schemas(payload):
+            pictured = "x-enum-images" in schema
+            images = schema["x-enum-images"] if pictured else schema["x-example-images"]
+            values = schema.get("enum" if pictured else "examples") or []
+            assert len(images) == len(values), payload["manifest"]["slug"]
+            cases = (schema.get("x-enum-cases") or {}).get("cases") or {}
+            for case in cases.values():
+                # What suits one kind of work is among the options, and so is each picture made for it.
+                assert set(case.get("recommended") or []) <= set(values), payload["manifest"]["slug"]
+                assert set(case.get("images") or {}) <= set(values), payload["manifest"]["slug"]
+            for url in [*images, *(url for case in cases.values() for url in (case.get("images") or {}).values())]:
+                found += 1
+                assert url.startswith("/") and not url.startswith("//"), url
+                with Image.open(PUBLIC / url.lstrip("/")) as image:
+                    assert image.width >= 320 and image.height >= 180, url
+    assert found, "no Blueprint declares example pictures; this guard would pass vacuously"
+
+
+ROOT = PUBLIC.parents[2]
+
+
+def _blueprint_asset_references() -> set[str]:
+    sources = [*(ROOT / "packages/core/blueprints/configs").rglob("*.json"), *(ROOT / "docs/blueprints").glob("*.json")]
+    return {match for path in sources for match in re.findall(r"/blueprints/[A-Za-z0-9_./-]+", path.read_text())}
+
+
+def test_blueprint_asset_paths_are_shipped_and_portable():
+    """A Blueprint's /blueprints/ path is a file the web app serves, so it exports as is."""
+    references = _blueprint_asset_references()
+    assert references
+    for url in references:
+        assert (PUBLIC / url.lstrip("/")).is_file(), url
+        assert is_platform_asset_path(url), url
+    assert set(PLATFORM_ASSET_DIRS) == {path.name for path in (PUBLIC / "blueprints").iterdir() if path.is_dir()}
+
+

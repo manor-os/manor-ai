@@ -188,27 +188,6 @@ def test_projection_is_attached_as_the_canonical_result_handle():
     assert result["knowledge_artifacts"] == projection.knowledge_artifacts
 
 
-def test_executor_prefers_canonical_knowledge_refs_for_multi_file_results():
-    from packages.core.plans.executor import _artifact_refs_from_result
-
-    refs = _artifact_refs_from_result({
-        "created": True,
-        "files": [
-            {"name": "one.md", "fs_path": "Workspaces/W/one.md"},
-            {"name": "two.md", "fs_path": "Workspaces/W/two.md"},
-        ],
-        "knowledge_artifacts": [
-            {"type": "file", "name": "one.md", "fs_path": "Workspaces/W/one.md", "document_id": "doc_one"},
-            {"type": "file", "name": "two.md", "fs_path": "Workspaces/W/two.md", "document_id": "doc_two"},
-        ],
-    })
-
-    assert [(ref["fs_path"], ref["document_id"]) for ref in refs] == [
-        ("Workspaces/W/one.md", "doc_one"),
-        ("Workspaces/W/two.md", "doc_two"),
-    ]
-
-
 @pytest.mark.asyncio
 async def test_generate_document_cannot_disable_knowledge_sync(tmp_path, monkeypatch):
     import json
@@ -254,24 +233,3 @@ async def test_generate_document_cannot_disable_knowledge_sync(tmp_path, monkeyp
     assert result["document"]["document_id"] == "doc_write"
     assert result["document"]["viewer_url"] == "/viewer/doc_write"
 
-
-def test_completed_task_output_detects_legacy_files_without_document_ids():
-    from packages.core.services.task_execution_reconcile import (
-        _has_unprojected_local_artifacts,
-    )
-
-    assert _has_unprojected_local_artifacts({
-        "files": [{"fs_path": "Workspaces/Demo/report.md"}],
-    })
-    assert _has_unprojected_local_artifacts({
-        "files": [{"url": "/api/v1/fs/ent_1/Workspaces/Demo/report.md"}],
-    })
-    assert _has_unprojected_local_artifacts({
-        "steps": [{"files": [{"fs_path": "Workspaces/Demo/legacy.md"}]}],
-    })
-    assert not _has_unprojected_local_artifacts({
-        "files": [{
-            "fs_path": "Workspaces/Demo/report.md",
-            "document_id": "doc_1",
-        }],
-    })

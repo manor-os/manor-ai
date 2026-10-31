@@ -1,6 +1,6 @@
 """Admission and strict decision settlement for proactive Agent runs.
 
-The scheduler and TaskRunner remain the execution engine.  This module owns
+The scheduler and the Task agent loop are the execution engine.  This module owns
 the Initiative-specific authority checks and turns one strictly validated
 model decision into idempotent delivery intents.  It deliberately performs no
 Chat or Notification I/O; delivery retries must never re-run the Agent.

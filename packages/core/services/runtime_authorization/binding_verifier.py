@@ -45,38 +45,16 @@ class CurrentRuntimeToolBindingVerifier(RuntimeToolBindingVerifier):
         if request.tool_name in runtime_tool_auto_pass_names(is_master=False):
             return RuntimeToolBindingDecision(RuntimeToolBindingSource.CONTEXTUAL)
 
-        if request.tool_name == "execute_planned_action":
-            # This tool is never a catalog grant. Its only binding is a live,
-            # claimed action lease for this Agent and Task. The handler also
-            # checks its exact lease/claim immediately before provider I/O.
-            from sqlalchemy import select
-            from packages.core.constants.execution import WorkLeaseStatus
-            from packages.core.models.execution import ExecutionPlan, ExecutionStep
-            from packages.core.models.worker import WorkLease
+        # Server-owned grants every internal Agent holds (the Sandbox). No
+        # durable row exists to revoke; external surfaces never hold them.
+        from packages.core.ai.runtime.profiles import runtime_surface_is_internal
+        from packages.core.ai.runtime.tool_visibility import (
+            runtime_tool_is_internal_default_grant,
+        )
 
-            lease_id = (await db.execute(
-                select(WorkLease.id)
-                .join(ExecutionStep, ExecutionStep.id == WorkLease.step_id)
-                .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
-                .where(
-                    ExecutionStep.kind == "action",
-                    ExecutionStep.entity_id == request.entity_id,
-                    ExecutionStep.workspace_id == request.workspace_id,
-                    ExecutionStep.resolved_agent_id == request.principal_agent_id,
-                    ExecutionStep.current_lease_id == WorkLease.id,
-                    ExecutionPlan.task_id == request.task_id,
-                    WorkLease.status == WorkLeaseStatus.ACTIVE,
-                    WorkLease.execution_claim_id.is_not(None),
-                ).limit(1)
-            )).scalar_one_or_none()
-            return RuntimeToolBindingDecision(
-                RuntimeToolBindingSource.CONTEXTUAL if lease_id else RuntimeToolBindingSource.REVOKED
-            )
-
-        if request.tool_name == "sandbox" and await self._has_active_sandbox_skill_binding(
-            db,
-            request,
-        ):
+        if runtime_tool_is_internal_default_grant(
+            request.tool_name or ""
+        ) and runtime_surface_is_internal(request.runtime_surface):
             return RuntimeToolBindingDecision(RuntimeToolBindingSource.CONTEXTUAL)
 
         if request.tool_name and request.tool_name.startswith("mcp__"):
@@ -97,58 +75,6 @@ class CurrentRuntimeToolBindingVerifier(RuntimeToolBindingVerifier):
 
         return RuntimeToolBindingDecision(RuntimeToolBindingSource.REVOKED)
 
-
-    @staticmethod
-    async def _has_active_sandbox_skill_binding(
-        db: "AsyncSession",
-        request: "RuntimeAuthorizationRequest",
-    ) -> bool:
-        """Recheck the Skill-backed Sandbox handoff for this exact actor.
-
-        A successful ``invoke_skill`` call grants ``sandbox`` only on the
-        active Runtime envelope.  This storage check prevents that ephemeral
-        grant from surviving a Skill revocation, agent switch, or conversation
-        switch.  The Sandbox handler separately binds the supplied sandbox_id
-        to the same owner before every operation.
-        """
-
-        if (
-            not request.conversation_id
-            or not request.user_id
-            or not request.principal_agent_id
-        ):
-            return False
-
-        from packages.core.ai.runtime.sandbox import (
-            runtime_load_sandbox_context,
-            runtime_sandbox_context_owner_matches,
-        )
-
-        context = await runtime_load_sandbox_context(request.conversation_id)
-        if not runtime_sandbox_context_owner_matches(
-            context,
-            entity_id=request.entity_id,
-            user_id=request.user_id,
-        ):
-            return False
-        if str((context or {}).get("agent_id") or "") != request.principal_agent_id:
-            return False
-        skill_ref = str((context or {}).get("skill_id") or "").strip()
-        if not skill_ref:
-            return False
-
-        from packages.core.services.skill_service import list_skills_for_agent
-
-        skills = await list_skills_for_agent(
-            db,
-            request.entity_id,
-            request.principal_agent_id,
-            workspace_id=request.workspace_id,
-        )
-        return any(
-            skill_ref == str(getattr(skill, "id", "") or "")
-            for skill in skills
-        )
 
     @staticmethod
     async def _has_direct_binding(
@@ -317,7 +243,9 @@ class CurrentRuntimeToolBindingVerifier(RuntimeToolBindingVerifier):
             surface = ChatSurface(request.runtime_surface) if request.runtime_surface else None
         except ValueError:
             return False
-        if surface in {ChatSurface.PUBLIC_CUSTOMER_CHAT, ChatSurface.EXTERNAL_CHANNEL_CHAT}:
+        from packages.core.ai.runtime.profiles import EXTERNAL_CHAT_SURFACES
+
+        if surface in EXTERNAL_CHAT_SURFACES:
             return False
         return request.tool_name in runtime_tool_auto_pass_names(
             is_master=False,

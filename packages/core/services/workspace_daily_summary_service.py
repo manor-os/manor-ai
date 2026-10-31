@@ -22,6 +22,7 @@ from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace
 from packages.core.services.task_deadlines import task_deadline_overdue_expr
+from packages.core.services.workspace_health_metrics import stalled_task_clause
 
 
 VISIBLE_TASK_STATUSES = [
@@ -109,17 +110,12 @@ async def get_workspace_daily_summary(
         limit=limit,
         order_by=Task.deadline.asc(),
     )
-    stale_cutoff = now - timedelta(hours=48)
-    stalled_conditions = (
-        Task.status == TaskStatus.IN_PROGRESS,
-        func.coalesce(Task.updated_at, Task.created_at) < stale_cutoff,
-    )
-    stalled_count = await _task_count(db, entity_id, workspace_id, *stalled_conditions)
+    stalled_count = await _task_count(db, entity_id, workspace_id, stalled_task_clause(now))
     stalled_tasks = await _tasks(
         db, entity_id, workspace_id,
-        *stalled_conditions,
+        stalled_task_clause(now),
         limit=limit,
-        order_by=func.coalesce(Task.updated_at, Task.created_at).asc(),
+        order_by=func.coalesce(Task.status_changed_at, Task.updated_at, Task.created_at).asc(),
     )
 
     completed_conditions = (
@@ -466,7 +462,7 @@ def _action_items(
     if status_counts.get("blocked", 0):
         items.append(f"Unblock {status_counts['blocked']} blocked task(s).")
     if stalled_count:
-        items.append(f"Check {stalled_count} in-progress task(s) with no update in 48 hours.")
+        items.append(f"Check {stalled_count} in-progress task(s) with no status change in 48 hours.")
     if automation_health.get("broken_count", 0):
         items.append(f"Investigate {automation_health['broken_count']} broken scheduled job(s).")
     if execution_health.get("waiting_human_plans", 0):

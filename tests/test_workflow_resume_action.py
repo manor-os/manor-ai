@@ -88,3 +88,50 @@ def test_input_wait_projects_its_frozen_schema_and_response_variable():
         "prompt": "Exact saved scheme",
         "input_schema": config["input_schema"],
     }
+
+
+def test_collection_input_wait_projects_only_the_current_round():
+    run = paused_run("input")
+    run.execution_snapshot = build_execution_snapshot(SimpleNamespace(
+        id="flow", version=1, variables={}, steps=[{
+            "id": "confirm", "type": "wait", "name": "Collect settings",
+            "config": {"wait_type": "input", "response_variable": "answers"},
+        }],
+    ))
+    run.step_results["confirm"] = {
+        "status": "paused",
+        "output": "Add a timezone.",
+        "collection_fields": [{"key": "timezone", "required": True}],
+        "collection_values": {"campaign": "Release"},
+        "collection_round": 2,
+    }
+
+    assert run_resume_action(run) == {
+        "kind": "workflow_input",
+        "workflow_run_id": "run",
+        "step_id": "confirm",
+        "title": "Collect settings",
+        "options": ["submit"],
+        "response_variable": "answers",
+        "prompt": "Add a timezone.",
+        "inputs": [{"key": "timezone", "required": True}],
+        "values": {"campaign": "Release"},
+        "collection_round": 2,
+    }
+
+
+def test_paused_step_and_its_form_read_in_the_viewers_language_with_the_runs_values():
+    run = paused_run("input")
+    run.execution_snapshot = build_execution_snapshot(SimpleNamespace(id="flow", version=1, variables={}, steps=[{
+        "id": "confirm", "type": "wait", "name": "Add the cover",
+        "config": {"wait_type": "input", "input_schema": {"type": "object", "properties": {
+            "cover": {"type": "string", "title": "Cover"}}}},
+        "i18n": {"zh": {"name": "补充封面", "config": {"input_schema": {"properties": {"cover": {"title": "封面"}}}}}},
+    }]))
+    run.step_results = {"confirm": {"status": "paused", "input_schema": {"type": "object", "properties": {
+        "cover": {"type": "string", "title": "Cover", "default": "bound.png"}}}}}
+
+    action = run_resume_action(run, locale="zh")
+    assert action["title"] == "补充封面"
+    assert action["input_schema"]["properties"]["cover"] == {"type": "string", "title": "封面", "default": "bound.png"}
+    assert run_resume_action(run)["title"] == "Add the cover"

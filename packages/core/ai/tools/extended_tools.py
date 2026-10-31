@@ -15,7 +15,7 @@ import re
 import secrets
 from html import unescape
 from collections.abc import Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import unquote, urlsplit
 
 if TYPE_CHECKING:
@@ -30,8 +30,11 @@ from packages.core.contracts.audio_generation import (
     AudioGenerationPurpose,
     AudioGenerationRole,
     AudioGenerationStatus,
+    DEFAULT_NARRATION_VOICE_ROLE,
     GenerateFileKind,
+    NARRATION_VOICE_MODE_FIXED_PER_PROJECT,
     NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE,
+    NARRATION_VOICE_MODES,
     NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION,
     NARRATION_VOICE_MODE_RANDOM_PER_TASK,
     normalize_audio_generation_purpose,
@@ -46,9 +49,14 @@ from packages.core.services.model_gateway import (
 )
 from packages.core.services.model_provider_handlers import vercel_catalog_model_type
 from packages.core.services.file_refs import file_ref, parse_file_reference
+from packages.core.services.document_service import StorageLimitExceeded
 from packages.core.services.generated_file_refs import entity_fs_open_url, parse_entity_fs_url
 from packages.core.services.audio_conversion import (
     SUPPORTED_AUDIO_ARTIFACT_FORMATS,
+    AudioConversionError,
+    probe_audio_duration_seconds,
+    repair_streamed_wav_header,
+    sniff_audio_format,
     transcode_audio_bytes,
     validate_generated_audio_bytes,
 )
@@ -299,6 +307,19 @@ async def _extract_data_handler(entity_id: str = "", **kwargs: Any) -> str:
 # ── Shared BYOK helper for media tools ────────────────────────────────────────
 
 
+def _pin_byok_job_payer(job, entity_id: str, workspace_id: str | None) -> None:
+    """Pin whose keys a BYOK media job runs on when another company pays.
+
+    During a client delivery trial the run's keys are the provider's. The
+    worker resolves the job's key again later and must find the same owner.
+    """
+    from packages.core.ai.runtime.billing import runtime_bound_billing_payer
+
+    payer = runtime_bound_billing_payer(entity_id, workspace_id)
+    if payer and payer != entity_id:
+        job.params = {**(job.params or {}), "payer_entity_id": payer}
+
+
 async def _resolve_user_api_key(user_id: str, entity_id: str, role: str | None = None) -> tuple[str, bool]:
     """Resolve the API key for media tools.
 
@@ -402,7 +423,6 @@ def _platform_native_media_key(provider: str) -> str:
         ),
         "kwaivgi": ("KLING_API_KEY", "KLINGAI_API_KEY"),
         "zyphra": ("ZYPHRA_API_KEY",),
-        "suno": ("SUNO_API_KEY",),
     }
     for env_name in envs_by_provider.get((provider or "").lower(), ()):
         value = (os.getenv(env_name) or "").strip()
@@ -512,8 +532,26 @@ async def _resolve_user_media_credentials(
     user_id: str,
     entity_id: str,
     role: str,
+    *,
+    require_saved_base: bool = False,
 ) -> tuple[str, str, bool]:
     """Resolve a role-specific media key plus optional native provider base URL."""
+    if require_saved_base:
+        # The xAI caller must resolve key and base from the same authorized
+        # metadata snapshot. Empty means the official endpoint, not an env
+        # fallback; an unavailable snapshot must never select a platform key.
+        if not entity_id:
+            return "", "", False
+        try:
+            from packages.core.services.model_resolver import resolve_llm_metadata_for_user
+            from packages.core.services.xai_video_transport import normalize_xai_url
+
+            metadata = await resolve_llm_metadata_for_user(role, user_id=user_id or None, entity_id=entity_id)
+            if not metadata or not metadata.get("llm_api_key"):
+                return "", "", False
+            return metadata["llm_api_key"], normalize_xai_url(metadata.get("llm_base_url")), True
+        except Exception:
+            return "", "", False
     api_key, is_byok = await _resolve_user_api_key(user_id, entity_id, role=role)
     base_url = ""
     if is_byok and entity_id:
@@ -591,6 +629,87 @@ def _is_openrouter_base_url(base_url: str) -> bool:
     return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
 
 
+def _is_openrouter_credential(api_key: str, base_url: str = "") -> bool:
+    """Whether a resolved media credential is an OpenRouter key/endpoint."""
+    key = (api_key or "").strip()
+    return bool(key) and (key.startswith("sk-or-") or _is_openrouter_base_url(base_url))
+
+
+def _platform_openrouter_media_key(api_key: str) -> str:
+    """The managed OpenRouter key a non-BYOK media call may fall back to.
+
+    Mirrors the generic OpenRouter fallthrough in ``_generate_live_audio``:
+    the platform key resolved for the role, else Cloud's ``OPENROUTER_API_KEY``.
+    """
+    key = (api_key or "").strip()
+    if key.startswith("sk-or-"):
+        return key
+    return ""
+
+
+def _is_lyria_music_model(model: str, role: str) -> bool:
+    lowered = (model or "").lower()
+    return role == "audio" and _catalog_provider(lowered) == "google" and "lyria-3-" in lowered
+
+
+async def _resolve_lyria_music_route(
+    api_key: str,
+    base_url: str,
+    is_byok: bool,
+) -> tuple[str, str, str]:
+    """Pick the Lyria transport for the resolved credentials.
+
+    Returns ``(route, api_key, base_url)`` where route is ``google`` (native
+    Gemini Interactions API), ``openrouter`` (chat-completions audio output) or
+    ``""`` when nothing can run it. A BYOK key stays authoritative and is never
+    replaced by a platform key; for managed calls a native Google key is
+    preferred over OpenRouter.
+    """
+    if is_byok:
+        if _is_openrouter_credential(api_key, base_url):
+            return "openrouter", api_key, base_url
+        if _is_native_key_for_provider(api_key, "google"):
+            return "google", api_key, base_url
+        return "", api_key, base_url
+    native_key, native_base_url = await _platform_native_media_credential_async("google")
+    if native_key:
+        return "google", native_key, native_base_url or base_url
+    platform_key = _platform_openrouter_media_key(api_key)
+    if platform_key:
+        return "openrouter", platform_key, ""
+    return "", api_key, base_url
+
+
+def _is_vercel_music_model(model: str, role: str) -> bool:
+    """Whether a music model runs only on Vercel AI Gateway's Speech protocol."""
+    return role == "audio" and vercel_catalog_model_type(role, model) == "speech"
+
+
+async def _resolve_vercel_music_route(model: str, is_byok: bool) -> tuple[str, str, str, str]:
+    """Return ``(route, api_key, base_url, auth_method)`` for Vercel-only music.
+
+    No BYOK key can run these models (OpenRouter does not serve them), so a
+    BYOK Music key leaves them unrunnable instead of spending platform credit.
+    """
+    if is_byok:
+        return "", "", "", "api-key"
+    try:
+        route = await _resolve_official_model_route(
+            model,
+            vercel_reason="media.music.vercel_gateway_key",
+            gateway_provider="vercel",
+        )
+    except Exception:
+        logger.debug("Managed Vercel music route lookup failed", exc_info=True)
+        route = None
+    if not route or not route.api_key:
+        return "", "", "", "api-key"
+    auth_method = (
+        "oidc" if str(getattr(route, "source_detail", "")).strip() == "VERCEL_OIDC_TOKEN" else "api-key"
+    )
+    return "vercel", route.api_key, route.base_url or "", auth_method
+
+
 def _native_media_model(model: str, *, kind: str, provider: str) -> str:
     """Map Manor/OpenRouter catalog IDs to native provider model IDs."""
     raw = (model or "").split("/", 1)[1] if "/" in (model or "") else (model or "")
@@ -625,7 +744,7 @@ def _media_key_provider_mismatch(api_key: str, provider: str) -> str:
     key = (api_key or "").strip()
     selected = (provider or "").lower()
     if key.startswith("ark-") and selected and selected != "bytedance":
-        target = {"kwaivgi": "Kling", "atlascloud": "Atlas Cloud"}.get(selected, selected)
+        target = {"kwaivgi": "Kling", "atlascloud": "Atlas Cloud", "xai": "xAI Grok"}.get(selected, selected)
         return (
             "The saved video API key looks like a Volcengine/Seedance key, "
             f"but the selected video model is {target}. Select a Seedance model, "
@@ -686,6 +805,64 @@ def _requested_audio_artifact_format(requested_format: str, output_name: str = "
     if requested == "pcm":
         return "wav"
     return requested if requested in SUPPORTED_AUDIO_ARTIFACT_FORMATS else ""
+
+
+class _ConformedAudio(NamedTuple):
+    audio_bytes: bytes
+    audio_format: str
+    # The container the provider's bytes really were, whatever was requested.
+    source_format: str
+    duration_seconds: float | None
+
+
+async def _conform_generated_audio(
+    audio_bytes: bytes,
+    *,
+    declared_format: str,
+    requested_format: str = "",
+    measure_duration: bool = True,
+) -> _ConformedAudio:
+    """Deliver generated audio in the requested format, labelled by its bytes.
+
+    Every audio route funnels through here before anything is saved. Some
+    providers ignore the requested format (OpenRouter's Lyria always returns
+    MP3), so the container is read from the bytes rather than trusted from the
+    request. When the caller asked for a format, the audio is converted to it;
+    otherwise it keeps its real container. MP3 bytes are never stored under a
+    WAV label.
+    """
+    declared = _normalize_audio_format(declared_format) or "mp3"
+    actual = declared
+    if declared != "pcm":
+        sniffed = sniff_audio_format(audio_bytes)
+        if sniffed and sniffed != declared:
+            logger.info(
+                "Generated audio was declared %s but contains %s; using its real container",
+                declared,
+                sniffed,
+            )
+            actual = sniffed
+    if actual == "wav":
+        audio_bytes = repair_streamed_wav_header(audio_bytes)
+    if requested_format in SUPPORTED_AUDIO_ARTIFACT_FORMATS:
+        target = requested_format
+    else:
+        target = actual if actual in SUPPORTED_AUDIO_ARTIFACT_FORMATS else "mp3"
+    if target != actual:
+        audio_bytes = await transcode_audio_bytes(
+            audio_bytes,
+            source_format=actual,
+            target_format=target,
+        )
+    duration = await probe_audio_duration_seconds(audio_bytes, target) if measure_duration else None
+    return _ConformedAudio(audio_bytes, target, actual, duration)
+
+
+def _audio_format_label(audio_format: str) -> AudioGenerationFormat | str:
+    try:
+        return AudioGenerationFormat(audio_format)
+    except ValueError:
+        return audio_format
 
 
 def _openrouter_audio_formats(model: str, role: str, requested_format: str = "") -> tuple[str, str]:
@@ -957,6 +1134,144 @@ async def _remember_workspace_reusable_image(
     return record
 
 
+_PROJECT_IMAGE_REFERENCES = "images"
+
+
+async def _project_image_holder(
+    *, entity_id: str, workspace_id: str, project_id: str, asset_key: str,
+) -> dict[str, Any] | None:
+    """The project that keeps this named image, when the project chain holds images.
+
+    A series that declares ``references.images`` keeps every named image its
+    episodes make (a character, a key visual); otherwise names stay with the
+    Workspace, as before. Returns the holder's id and folder.
+    """
+    if not (entity_id and workspace_id and project_id and asset_key):
+        return None
+    from packages.core.database import async_session
+    from packages.core.services.project_references import (
+        ProjectReferenceError, declares_reference, locate_reference, project_chain,
+    )
+
+    async with async_session() as db:
+        try:
+            chain = await project_chain(db, entity_id=entity_id, workspace_id=workspace_id, project_id=project_id)
+        except ProjectReferenceError:
+            return None
+    if not declares_reference(chain, _PROJECT_IMAGE_REFERENCES, asset_key):
+        return None
+    holder, _value = locate_reference(chain, _PROJECT_IMAGE_REFERENCES, asset_key)
+    return {"project_id": holder.id, "requested_project_id": chain[0].id,
+            "project_root": str((holder.state or {}).get("project_root") or "").strip().strip("/")}
+
+
+def _existing_image_records(
+    found: dict[str, tuple[dict[str, Any], dict[str, Any]]], entity_id: str,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    from packages.core.services.entity_fs import get_entity_root
+
+    root = get_entity_root(entity_id)
+    return {
+        key: (record, receipt) for key, (record, receipt) in found.items()
+        if str(record.get("result_url") or "").strip() and str(record.get("fs_path") or "").strip()
+        and os.path.isfile(os.path.join(root, str(record["fs_path"]).lstrip("/")))
+    }
+
+
+async def _project_named_images(
+    *, entity_id: str, workspace_id: str, project_id: str | None,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    """The named images the project chain keeps, nearest first, as ``key -> (record, receipt)``."""
+    if not (entity_id and workspace_id and project_id):
+        return {}
+    from packages.core.database import async_session
+    from packages.core.services.project_references import ProjectReferenceError, held_references, project_chain
+
+    async with async_session() as db:
+        try:
+            chain = await project_chain(db, entity_id=entity_id, workspace_id=workspace_id, project_id=project_id)
+        except ProjectReferenceError:
+            return {}
+    return _existing_image_records({
+        key: (record, {"scope": "project", "project_id": holder.id, "inherited": holder.id != chain[0].id})
+        for key, (holder, record) in held_references(chain, _PROJECT_IMAGE_REFERENCES).items()
+    }, entity_id)
+
+
+async def _named_image_assets(
+    *, entity_id: str, workspace_id: str, project_id: str | None,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    """Every named image visible here, nearest first: the project chain's, then the Workspace's.
+
+    Each is ``key -> (record, receipt)``; only images whose file still exists.
+    """
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.workspace import Workspace
+
+    found = await _project_named_images(entity_id=entity_id, workspace_id=workspace_id, project_id=project_id)
+    async with async_session() as db:
+        workspace = (await db.execute(select(Workspace).where(
+            Workspace.id == workspace_id, Workspace.entity_id == entity_id, Workspace.deleted_at.is_(None),
+        ))).scalar_one_or_none()
+    workspace_assets = {
+        key: (record, {"scope": "workspace", "id": workspace_id})
+        for key, record in dict(((workspace.settings or {}) if workspace else {}).get(
+            _WORKSPACE_REUSABLE_MEDIA_ASSETS_KEY) or {}).items()
+        if key not in found and isinstance(record, dict) and record.get("kind") == "image"
+    }
+    return {**found, **_existing_image_records(workspace_assets, entity_id)}
+
+
+class _UnknownReferenceAssets(ValueError):
+    """A call named reference assets that do not exist here."""
+
+
+async def _reference_asset_urls(
+    *, entity_id: str, workspace_id: str | None, project_id: str | None, keys: Any,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """The exact files behind ``reference_assets`` names, and a receipt for each.
+
+    A name is resolved in the project chain, then the Workspace. An unknown
+    name is an error that lists the names that exist, never a guessed file.
+    """
+    names = [_workspace_asset_key(key) for key in (keys if isinstance(keys, list) else [keys] if keys else [])]
+    names = list(dict.fromkeys(name for name in names if name))
+    if not names:
+        return [], []
+    if not entity_id or not workspace_id:
+        raise _UnknownReferenceAssets("reference_assets requires a Workspace.")
+    assets = await _named_image_assets(entity_id=entity_id, workspace_id=workspace_id, project_id=project_id)
+    missing = [name for name in names if name not in assets]
+    if missing:
+        raise _UnknownReferenceAssets(
+            f"No reference asset named {', '.join(missing)}. Make it first with workspace_asset_key, "
+            f"or use one of: {', '.join(sorted(assets)) or '(none yet)'}."
+        )
+    return ([str(assets[name][0]["result_url"]) for name in names],
+            [{"key": name, **assets[name][1]} for name in names])
+
+
+async def _remember_project_image(
+    *, entity_id: str, workspace_id: str, holder: dict[str, Any], asset_key: str,
+    image_url: str, prompt: str, model: str, size: str,
+) -> dict[str, Any]:
+    """Keep a named image on the project that holds the series' images, replacing an older one."""
+    from packages.core.database import async_session
+    from packages.core.services.project_references import replace_project_reference
+
+    record = {"version": 1, "kind": "image", "result_url": image_url,
+              "fs_path": _fs_path_from_result_url(image_url, entity_id),
+              "prompt": prompt, "model": model, "size": size}
+    async with async_session() as db:
+        await replace_project_reference(
+            db, entity_id=entity_id, workspace_id=workspace_id, project_id=holder["requested_project_id"],
+            kind=_PROJECT_IMAGE_REFERENCES, role=asset_key, value=record,
+        )
+    return record
+
+
 async def _generated_image_result_payload(
     *,
     image_url: str,
@@ -968,6 +1283,8 @@ async def _generated_image_result_payload(
     workspace_asset_key: str,
     saved_to_knowledge: bool,
     include_fs_path: bool,
+    image_holder: dict[str, Any] | None = None,
+    asset_receipts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if image_url.startswith("group-document:"):
         return {
@@ -975,7 +1292,12 @@ async def _generated_image_result_payload(
             "prompt": prompt, "size": size, "model": model,
             "saved_to_knowledge": True, "pending_group_share": True,
         }
-    if workspace_asset_key and workspace_id:
+    if workspace_asset_key and workspace_id and image_holder:
+        await _remember_project_image(
+            entity_id=entity_id, workspace_id=workspace_id, holder=image_holder, asset_key=workspace_asset_key,
+            image_url=image_url, prompt=prompt, model=model, size=size,
+        )
+    elif workspace_asset_key and workspace_id:
         await _remember_workspace_reusable_image(
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -998,7 +1320,21 @@ async def _generated_image_result_payload(
         payload.update(
             workspace_asset_key=workspace_asset_key,
             reused_workspace_asset=False,
+            asset_reference=(
+                {"scope": "project", "project_id": image_holder["project_id"]} if image_holder
+                else {"scope": "workspace", "id": workspace_id}
+            ),
         )
+    if asset_receipts:
+        # Which named assets the image was made from, and who keeps each.
+        payload["reference_assets"] = list(asset_receipts)
+    sandbox_delivery = getattr(image_url, "sandbox_delivery", None)
+    if sandbox_delivery:
+        payload["sandbox_delivery"] = dict(sandbox_delivery)
+    document_id = getattr(image_url, "document_id", None)
+    if document_id:
+        # The Knowledge Document this image was saved as; workflow receipts cite it.
+        payload["document_id"] = document_id
     return payload
 
 
@@ -1017,59 +1353,119 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
+class _SavedImageUrl(str):
+    """A saved image's URL that also carries what the tool result reports about it.
+
+    ``_save_generated_image_bytes`` returns the URL every caller already
+    renders; the sandbox delivery outcome and the Knowledge Document ID ride
+    along so ``_generated_image_result_payload`` can report them to the model
+    without each provider branch threading them.
+    """
+
+    sandbox_delivery: dict[str, Any] | None = None
+    document_id: str | None = None
+
+
+def _carry_saved_image_details(
+    image_url: str,
+    *,
+    sandbox_delivery: dict[str, Any] | None = None,
+    document_id: str | None = None,
+) -> str:
+    if sandbox_delivery is None and document_id is None:
+        return image_url
+    carried = _SavedImageUrl(image_url)
+    carried.sandbox_delivery = sandbox_delivery
+    carried.document_id = document_id
+    return carried
+
+
 async def _deliver_image_to_sandbox(
     *,
-    conversation_id: str | None,
-    sandbox_binding_key: str | None = None,
+    entity_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    sandbox_binding_key: str | None,
     sandbox_path: str,
     image_bytes: bytes,
-) -> bool:
-    """Best-effort: push generated image bytes straight into the active sandbox.
+) -> dict[str, Any]:
+    """Push generated image bytes into the calling agent's own sandbox.
 
     Lets a skill (e.g. pptx image mode) consume the image from inside the
     sandbox immediately, instead of waiting for the read-only entity-FS mount
-    to propagate. Any failure is logged and swallowed so it never breaks image
-    generation; the entity-FS copy still exists as a fallback.
+    to propagate. The target is the conversation sandbox this agent operates
+    -- where it drives a Skill first, else the one it created -- never a
+    sandbox of another conversation or user, and the bytes go to that
+    sandbox's own runner (on external runners ``SANDBOX_SERVICE_URL`` is not
+    where the container lives).
 
-    The sandbox is registered under its binding key, which for a task-worker
-    run (no conversation) is the synthetic key rather than an empty
-    conversation. The key is used for this lookup only.
+    Generation never fails because of delivery, but a failed delivery is
+    reported back (``delivered: false`` plus the reason) so the model does not
+    assume the file is in the sandbox. The entity-FS copy always exists.
     """
-    binding_key = sandbox_binding_key or conversation_id
-    if not binding_key or not sandbox_path or not image_bytes:
-        return False
+
+    outcome: dict[str, Any] = {"path": sandbox_path, "delivered": False}
+    fallback = (
+        " The image itself was generated and saved; do not regenerate it. Copy it into "
+        "the sandbox with sandbox action='write_file' (path=<this sandbox path>, "
+        "workspace_path=<this result's workspace_path>)."
+    )
+    if not sandbox_path or not image_bytes:
+        outcome["error"] = "Nothing to deliver." + fallback
+        return outcome
+    from packages.core.ai.runtime import (
+        RuntimeSandboxKind,
+        runtime_agent_sandbox,
+        runtime_agent_skill_in,
+        runtime_sandbox_scope,
+    )
+
+    # The user owns the sandboxes; the target is the one THIS agent operates
+    # in this conversation: where it drives a Skill (written through that
+    # Skill's /skill view), else the sandbox it created.
+    scope = runtime_sandbox_scope(
+        entity_id=entity_id,
+        user_id=user_id,
+        binding_key=sandbox_binding_key,
+    )
+    sandbox_id = ""
+    if scope is not None:
+        for kind in (RuntimeSandboxKind.SKILL, RuntimeSandboxKind.GENERIC):
+            found = await runtime_agent_sandbox(scope, agent_id, kind)
+            if found is not None:
+                sandbox_id = found[0]
+                break
+    if not sandbox_id:
+        outcome["error"] = (
+            "No sandbox is bound to this agent in this conversation, so sandbox_path was not "
+            "written. Open the sandbox first (invoke_skill or sandbox action='create')." + fallback
+        )
+        return outcome
+    outcome["sandbox_id"] = sandbox_id
+    held = await runtime_agent_skill_in(scope, agent_id, sandbox_id) if scope is not None else None
+    skill_view = str((held or {}).get("skill_key") or "")
     try:
         import base64 as _b64
 
-        from packages.core.ai.runtime import runtime_load_sandbox_context
-        from packages.core.config import get_settings
-        from packages.core.services.sandbox_sdk import SandboxClient
+        from packages.core.ai.runtime.sandbox import runtime_sandbox_client
 
-        ctx = await runtime_load_sandbox_context(binding_key)
-        sandbox_id = (ctx or {}).get("sandbox_id") if isinstance(ctx, dict) else None
-        if not sandbox_id:
-            return False
-        sandbox_url = (get_settings().SANDBOX_SERVICE_URL or "").strip()
-        if not sandbox_url:
-            return False
-        client = SandboxClient(
-            base_url=sandbox_url,
-            timeout=120.0,
-            api_token=get_settings().SANDBOX_API_TOKEN,
-        )
+        client = await runtime_sandbox_client(sandbox_id)
         try:
             await client.write_file_base64(
                 sandbox_id=sandbox_id,
                 path=sandbox_path,
                 content_base64=_b64.b64encode(image_bytes).decode("ascii"),
+                **({"skill": skill_view} if skill_view else {}),
             )
         finally:
             await client.close()
-        logger.info("Delivered generated image into sandbox %s at %s", sandbox_id, sandbox_path)
-        return True
     except Exception as exc:  # never let delivery break generation
-        logger.warning("Sandbox image delivery failed (%s): %s", sandbox_path, exc)
-        return False
+        logger.warning("Sandbox image delivery failed (sandbox=%s path=%s): %s", sandbox_id, sandbox_path, exc)
+        outcome["error"] = f"Writing into sandbox {sandbox_id} failed: {exc}." + fallback
+        return outcome
+    logger.info("Delivered generated image into sandbox %s at %s", sandbox_id, sandbox_path)
+    outcome["delivered"] = True
+    return outcome
 
 
 async def _save_generated_image_bytes(
@@ -1104,6 +1500,7 @@ async def _save_generated_image_bytes(
         return f"data:{mime or 'image/png'};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
     ext = _image_mime_to_ext(mime)
+    sandbox_delivery: dict[str, Any] | None = None
 
     from packages.core.services.room_generation_scope import current_room_generation_scope
 
@@ -1151,9 +1548,11 @@ async def _save_generated_image_bytes(
         logger.info("Generated image saved: %s (%d bytes)", filepath, len(image_bytes))
 
         if sandbox_path:
-            await _deliver_image_to_sandbox(
-                conversation_id=conversation_id,
-                sandbox_binding_key=sandbox_binding_key,
+            sandbox_delivery = await _deliver_image_to_sandbox(
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                sandbox_binding_key=sandbox_binding_key or conversation_id,
                 sandbox_path=sandbox_path,
                 image_bytes=image_bytes,
             )
@@ -1189,8 +1588,9 @@ async def _save_generated_image_bytes(
 
     if not save_to_knowledge:
         logger.info("Generated image kept out of Knowledge: %s", image_url)
-        return image_url
+        return _carry_saved_image_details(image_url, sandbox_delivery=sandbox_delivery)
 
+    document_id: str | None = None
     try:
         from packages.core.database import create_worker_session
         from packages.core.services.document_service import upsert_document_by_fs_path
@@ -1209,7 +1609,8 @@ async def _save_generated_image_bytes(
                 user_id=user_id,
                 workspace_id=target_workspace_id,
                 rel_path=target.rel_path,
-                rel_dir=target.rel_dir,
+                conversation_id=conversation_id,
+                task_id=task_id,
             )
             doc = await upsert_document_by_fs_path(
                 db,
@@ -1225,6 +1626,7 @@ async def _save_generated_image_bytes(
                 visibility="workspace" if target_workspace_id else "private",
                 folder_id=folder_id,
             )
+            document_id = str(doc.id)
             doc.source = "ai_generated"
             if user_id:
                 doc.created_by = user_id
@@ -1255,10 +1657,15 @@ async def _save_generated_image_bytes(
                     user_id=user_id,
                     tool_name="generate_image",
                 )
+    except StorageLimitExceeded:
+        # The file is not usable without its Document: a full store is reported, never skipped.
+        raise
     except Exception:
         logger.warning("Failed to register generated image as document", exc_info=True)
 
-    return image_url
+    return _carry_saved_image_details(
+        image_url, sandbox_delivery=sandbox_delivery, document_id=document_id,
+    )
 
 
 async def _ensure_generated_media_document_folder(
@@ -1267,22 +1674,23 @@ async def _ensure_generated_media_document_folder(
     user_id: str,
     workspace_id: str | None,
     rel_path: str,
-    rel_dir: str,
+    conversation_id: str | None,
+    task_id: str | None,
 ) -> str | None:
-    if workspace_id:
-        from packages.core.services.workspace_artifacts import (
-            ensure_workspace_document_folder,
-        )
+    # Same filing as every generated artifact, including an ordinary Chat's
+    # ``Chat sessions/<title>`` folder.
+    from packages.core.services.generated_artifact_service import (
+        generated_artifact_document_folder_id,
+    )
 
-        return await ensure_workspace_document_folder(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            rel_path=rel_path,
-        )
-
-    from packages.core.services.knowledge_sync import ensure_folder_path
-
-    return await ensure_folder_path(entity_id, rel_dir, owner_id=user_id or None)
+    return await generated_artifact_document_folder_id(
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        rel_path=rel_path,
+        conversation_id=conversation_id,
+        task_id=task_id,
+    )
 
 
 async def _resolve_user_audio_model(
@@ -1325,6 +1733,125 @@ async def _resolve_user_audio_model(
         return fallback, role
 
 
+async def _audio_model_route(
+    model: str,
+    role: str,
+    *,
+    api_key: str,
+    base_url: str,
+    is_byok: bool,
+) -> str:
+    """Name the transport ``_generate_live_audio`` would use, or ``""``.
+
+    Mirrors the generation routing for the resolved role credentials so a
+    model inspection never presents a model the caller cannot run.
+    """
+    provider = _catalog_provider(model)
+    role_value = str(role)
+    if not model:
+        return ""
+    if _is_lyria_music_model(model, role_value):
+        route, _key, _base = await _resolve_lyria_music_route(api_key, base_url, is_byok)
+        return route
+    if _is_vercel_music_model(model, role_value):
+        route, _key, _base, _auth = await _resolve_vercel_music_route(model, is_byok)
+        return route
+    if role_value == AudioGenerationRole.VOICE.value and provider in {"google", "zyphra"}:
+        if is_byok:
+            return provider if _is_native_key_for_provider(api_key, provider) else ""
+        native_key, _native_base = await _platform_native_media_credential_async(provider)
+        if native_key:
+            return provider
+    if provider == "openai" and api_key and not _is_openrouter_credential(api_key, base_url):
+        return "openai"
+    if (
+        not is_byok
+        and role_value == AudioGenerationRole.VOICE.value
+        and provider in {"openai", "google"}
+        and os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
+    ):
+        # The managed speech route generation resolves for these providers.
+        try:
+            official_route = await _resolve_official_model_route(
+                model,
+                vercel_reason="media.voice.vercel_gateway_key",
+                openrouter_reason="media.voice.openrouter_fallback_key",
+                gateway_provider=(
+                    None if _vercel_speech_model_supported(model) else "openrouter"
+                ),
+            )
+        except Exception:
+            logger.debug("Managed speech route lookup failed", exc_info=True)
+            official_route = None
+        if official_route and official_route.api_key:
+            return str(official_route.provider or "managed")
+    if _is_openrouter_credential(api_key, base_url) or _platform_openrouter_media_key(api_key):
+        return "openrouter"
+    return ""
+
+
+async def _runnable_audio_model(
+    user_id: str,
+    entity_id: str,
+    model: str,
+    role: AudioGenerationRole,
+) -> tuple[str, str]:
+    """Return ``(model, route)`` for an Account-selected audio model.
+
+    Keeps the selection when its route works with the caller's credentials;
+    otherwise picks the first enabled Catalog model of the same role that
+    does. Both model inspection and generation use this, so the inspected
+    ``expected_model`` matches what generation runs. Route ``""`` means no
+    configured credential can run any model of this role.
+    """
+    if not model:
+        return model, ""
+    role_value = str(role)
+    try:
+        api_key, base_url, is_byok = await _resolve_user_media_credentials(
+            user_id,
+            entity_id,
+            role=role_value,
+        )
+        route = await _audio_model_route(
+            model, role_value, api_key=api_key, base_url=base_url, is_byok=is_byok,
+        )
+        if route:
+            return model, route
+        try:
+            from packages.core.services.model_settings import (
+                effective_catalog,
+                get_model_settings_cached,
+            )
+
+            entries = effective_catalog(await get_model_settings_cached()).get(role_value) or []
+        except Exception:
+            from packages.core.constants.models import CATALOG
+
+            entries = CATALOG.get(role_value) or []
+        for entry in entries:
+            candidate = str(entry.get("id") or "").strip()
+            if not candidate or candidate == model:
+                continue
+            candidate_route = await _audio_model_route(
+                candidate, role_value, api_key=api_key, base_url=base_url, is_byok=is_byok,
+            )
+            if candidate_route:
+                logger.info(
+                    "Selected %s model %s is not runnable with the configured credentials; using %s via %s",
+                    role_value,
+                    model,
+                    candidate,
+                    candidate_route,
+                )
+                return candidate, candidate_route
+    except Exception:
+        # Availability is advisory: keep the selection and let generation
+        # report the concrete credential error.
+        logger.debug("Audio route availability lookup failed", exc_info=True)
+    return model, ""
+
+
 def _default_openrouter_voice(model: str) -> str:
     lowered = (model or "").lower()
     if lowered.startswith("google/"):
@@ -1341,7 +1868,58 @@ def _default_openrouter_voice(model: str) -> str:
         return "alloy"
     if lowered.startswith("zyphra/"):
         return "american_female"
+    if lowered.startswith("elevenlabs/"):
+        # OpenRouter rejects ElevenLabs speech without an explicit voice.
+        return _ELEVENLABS_DEFAULT_VOICE
     return ""
+
+
+# Premade voices OpenRouter accepts by name for every ElevenLabs TTS model
+# (``supported_voices`` in https://openrouter.ai/api/v1/models, 2026-10-20).
+# Names are case-insensitive on OpenRouter; send them lowercase.
+_ELEVENLABS_PREMADE_VOICES: tuple[str, ...] = (
+    "george", "sarah", "adam", "alice", "bella", "bill", "brian", "callum",
+    "charlie", "chris", "daniel", "eric", "harry", "jessica", "laura", "liam",
+    "lily", "matilda", "river", "roger", "will",
+)
+_ELEVENLABS_DEFAULT_VOICE = "george"
+# Custom/cloned ElevenLabs voices are passed by their 20-character voice ID.
+_ELEVENLABS_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")
+# Per-request character limits from OpenRouter's ElevenLabs launch notes.
+_ELEVENLABS_MAX_INPUT_CHARACTERS: dict[str, int] = {
+    "elevenlabs/eleven-v4": 10_000,
+    "elevenlabs/eleven-v4-turbo": 10_000,
+    "elevenlabs/eleven-v3": 5_000,
+    "elevenlabs/eleven-multilingual-v2": 10_000,
+    "elevenlabs/eleven-flash-v2.5": 40_000,
+}
+
+
+def _elevenlabs_voice(voice: str) -> str:
+    """Map a requested voice onto one OpenRouter accepts for ElevenLabs.
+
+    Premade names and ElevenLabs voice IDs pass through; another provider's
+    voice name (``alloy``, ``Zephyr``) would be rejected upstream, so it
+    becomes the default premade narrator instead.
+    """
+    requested = str(voice or "").strip()
+    if requested.lower() in _ELEVENLABS_PREMADE_VOICES:
+        return requested.lower()
+    if _ELEVENLABS_VOICE_ID_RE.fullmatch(requested):
+        return requested
+    return _ELEVENLABS_DEFAULT_VOICE
+
+
+def _elevenlabs_language_code(model: str, language: str) -> str:
+    """ISO 639-1 code for ElevenLabs language enforcement, or ``""``.
+
+    ElevenLabs ignores codes a model cannot enforce, but documents that
+    Multilingual v2 does not accept the parameter at all.
+    """
+    if (model or "").lower() == "elevenlabs/eleven-multilingual-v2":
+        return ""
+    primary = str(language or "").strip().replace("_", "-").split("-", 1)[0].lower()
+    return primary if len(primary) == 2 and primary.isalpha() else ""
 
 
 _TASK_NARRATOR_PROFILE_KEY = "stickman_narrator_profile"
@@ -1369,10 +1947,12 @@ _TASK_NARRATOR_CONCRETE_VOICE_CHOICES: dict[str, tuple[str, ...]] = {
         "shimmer",
         "verse",
     ),
+    "elevenlabs": _ELEVENLABS_PREMADE_VOICES,
 }
 _WORKSPACE_NARRATOR_DEFAULT_VOICE: dict[str, str] = {
     "google": "Puck",
     "openai": "alloy",
+    "elevenlabs": _ELEVENLABS_DEFAULT_VOICE,
 }
 
 
@@ -1385,6 +1965,8 @@ def _task_narrator_model_provider(model: str) -> str:
     if provider == "openai" and (
         model_id.startswith("openai/tts-") or model_id.endswith("-tts")
     ):
+        return provider
+    if provider == "elevenlabs" and model_id.startswith("elevenlabs/eleven-"):
         return provider
     return ""
 
@@ -1417,7 +1999,7 @@ def _validated_task_narrator_profile(value: object) -> dict[str, str | int]:
     if not supported_provider:
         raise _NarrationProfileError(
             code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
-            detail="The task narrator profile must use a supported Google or OpenAI TTS model.",
+            detail="The task narrator profile must use a supported Google, OpenAI, or ElevenLabs TTS model.",
         )
     if supported_provider != provider:
         raise _NarrationProfileError(
@@ -1493,7 +2075,7 @@ async def _resolve_task_narrator_profile(
                 code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
                 detail=(
                     f"{model or 'The selected model'} cannot select a concrete task-scoped narrator. "
-                    "Choose a supported Google or OpenAI TTS model."
+                    "Choose a supported Google, OpenAI, or ElevenLabs TTS model."
                 ),
             )
 
@@ -1562,7 +2144,7 @@ async def _resolve_conversation_narrator_profile(
                 code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
                 detail=(
                     f"{model or 'The selected model'} cannot select a concrete "
-                    "conversation-scoped narrator. Choose a supported Google or OpenAI TTS model."
+                    "conversation-scoped narrator. Choose a supported Google, OpenAI, or ElevenLabs TTS model."
                 ),
             )
 
@@ -1639,11 +2221,13 @@ async def _resolve_workspace_narrator_profile(
                 code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
                 detail=(
                     f"{model or 'The selected model'} cannot create a concrete "
-                    "workspace-scoped narrator. Choose a supported Google or OpenAI TTS model."
+                    "workspace-scoped narrator. Choose a supported Google, OpenAI, or ElevenLabs TTS model."
                 ),
             )
 
         requested_voice = str(preferred_voice or "").strip()
+        if provider == "elevenlabs":
+            requested_voice = requested_voice.lower()  # OpenRouter names are case-insensitive.
         voice = requested_voice or _WORKSPACE_NARRATOR_DEFAULT_VOICE.get(provider, "")
         if voice not in voices:
             raise _NarrationProfileError(
@@ -1662,6 +2246,93 @@ async def _resolve_workspace_narrator_profile(
         workspace.settings = settings
         await db.commit()
         return profile
+
+
+async def _project_holds_voice(*, entity_id: str, workspace_id: str, project_id: str, role: str) -> bool:
+    """Whether the project or an ancestor holds, or declares, this voice."""
+    from packages.core.database import async_session
+    from packages.core.services.project_references import (
+        ProjectReferenceError, declares_reference, project_chain,
+    )
+
+    async with async_session() as db:
+        try:
+            chain = await project_chain(db, entity_id=entity_id, workspace_id=workspace_id, project_id=project_id)
+        except ProjectReferenceError:
+            return False
+    return declares_reference(chain, "voices", role)
+
+
+async def _resolve_project_narrator_profile(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    project_id: str,
+    role: str,
+    candidate_model: str,
+    voice_instructions: str,
+    preferred_voice: str = "",
+) -> tuple[dict[str, str | int], dict[str, Any]]:
+    """Create or reuse the voice ``role`` speaks in across a project.
+
+    The voice lives on the project that declares it (a series for all its
+    episodes), else on the outermost one. A new role takes a voice the
+    project's other roles do not use. Returns the profile and its receipt.
+    """
+    from packages.core.database import async_session
+    from packages.core.services.project_references import (
+        ProjectReferenceError, resolve_project_reference,
+    )
+
+    if not str(entity_id or "").strip() or not str(workspace_id or "").strip() or not str(project_id or "").strip():
+        raise _NarrationProfileError(
+            code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_PROJECT_REQUIRED,
+            detail="Project-scoped narration requires a Workspace project.",
+        )
+
+    def create(siblings: dict[str, Any]) -> dict[str, Any]:
+        model = str(candidate_model or "").strip()
+        provider = _task_narrator_model_provider(model)
+        voices = _TASK_NARRATOR_CONCRETE_VOICE_CHOICES.get(provider, ())
+        if not model or not voices:
+            raise _NarrationProfileError(
+                code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
+                detail=(
+                    f"{model or 'The selected model'} cannot create a concrete "
+                    "project-scoped narrator. Choose a supported Google, OpenAI, or ElevenLabs TTS model."
+                ),
+            )
+        requested_voice = str(preferred_voice or "").strip()
+        if provider == "elevenlabs":
+            requested_voice = requested_voice.lower()  # OpenRouter names are case-insensitive.
+        taken = {str(item.get("voice") or "") for item in siblings.values() if isinstance(item, dict)}
+        default = _WORKSPACE_NARRATOR_DEFAULT_VOICE.get(provider, "")
+        voice = requested_voice or next((name for name in (default, *voices) if name not in taken), default)
+        if voice not in voices:
+            raise _NarrationProfileError(
+                code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_INVALID,
+                detail=f"Voice {voice or '(empty)'} is not supported by {model}.",
+            )
+        return {
+            "version": 1,
+            "provider": provider,
+            "model": model,
+            "voice": voice,
+            "voice_instructions": str(voice_instructions or "").strip(),
+        }
+
+    async with async_session() as db:
+        try:
+            reference = await resolve_project_reference(
+                db, entity_id=entity_id, workspace_id=workspace_id, project_id=project_id,
+                kind="voices", role=role, create=create,
+            )
+        except ProjectReferenceError as exc:
+            raise _NarrationProfileError(
+                code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_PROJECT_REQUIRED,
+                detail=str(exc),
+            ) from exc
+    return _validated_task_narrator_profile(reference.value), reference.receipt()
 
 
 def _is_speech_response_audio_model(model: str) -> bool:
@@ -1743,6 +2414,7 @@ async def _save_generated_audio_bytes(
     voice: str = "",
     voice_instructions: str = "",
     narration_profile: dict[str, str | int] | None = None,
+    voice_reference: dict[str, Any] | None = None,
     language: str = DEFAULT_WORKSPACE_AUDIO_LANGUAGE,
     output_name: str = "",
     workspace_id: str | None = None,
@@ -1750,10 +2422,27 @@ async def _save_generated_audio_bytes(
     agent_id: str | None = None,
     conversation_id: str | None = None,
     bill_media: bool = True,
+    provider_cost_usd: float | None = None,
 ) -> str:
-    """Persist generated audio and register it as a Knowledge document."""
+    """Persist generated audio and register it as a Knowledge document.
+
+    ``provider_cost_usd`` is the gateway-reported cost of this generation; it
+    replaces the catalog estimate when present (BYOK calls are never charged).
+    """
     import base64
 
+    # Name and MIME follow the bytes: a caller that skipped conversion must not
+    # store one container under another's label (MP3 bytes as ``.wav``).
+    declared_format = _normalize_audio_format(audio_format)
+    actual_format = sniff_audio_format(audio_bytes) if declared_format != "pcm" else ""
+    if actual_format and actual_format != declared_format and actual_format in SUPPORTED_AUDIO_ARTIFACT_FORMATS:
+        logger.warning(
+            "Generated audio labelled %s contains %s; saving it as %s",
+            declared_format,
+            actual_format,
+            actual_format,
+        )
+        audio_format = actual_format
     validate_generated_audio_bytes(audio_bytes, audio_format)
     mime = _audio_format_to_mime(audio_format)
     if not entity_id:
@@ -1817,7 +2506,12 @@ async def _save_generated_audio_bytes(
             user_id=user_id,
             kind="audio",
             model=model,
-            cost_usd=_estimate_audio_cost(model, purpose=purpose),
+            cost_usd=_generated_audio_cost_usd(
+                model,
+                purpose=purpose,
+                prompt=prompt,
+                provider_cost_usd=provider_cost_usd,
+            ),
             units=1,
             workspace_id=workspace_id,
             agent_id=agent_id,
@@ -1846,7 +2540,8 @@ async def _save_generated_audio_bytes(
                 user_id=user_id,
                 workspace_id=target_workspace_id,
                 rel_path=target.rel_path,
-                rel_dir=target.rel_dir,
+                conversation_id=conversation_id,
+                task_id=task_id,
             )
             doc = await upsert_document_by_fs_path(
                 db,
@@ -1885,6 +2580,8 @@ async def _save_generated_audio_bytes(
                     "voice_instructions": voice_instructions or None,
                     "language": normalize_workspace_audio_language(language),
                     "narration_profile": narration_profile,
+                    # Where the voice is pinned; later steps (normalizing) follow it.
+                    "voice_reference": voice_reference,
                 },
             )
             await db.commit()
@@ -1901,6 +2598,9 @@ async def _save_generated_audio_bytes(
                     user_id=user_id,
                     tool_name="generate_audio",
                 )
+    except StorageLimitExceeded:
+        # The file is not usable without its Document: a full store is reported, never skipped.
+        raise
     except Exception:
         logger.warning("Failed to register generated audio as document", exc_info=True)
 
@@ -1963,7 +2663,11 @@ def _vercel_speech_model_supported(model: str) -> bool:
 def _speech_model_supports_instructions(model: str) -> bool:
     """Return whether the speech model accepts delivery instructions."""
 
-    native_model = str(model or "").strip().lower().split("/", 1)[-1]
+    model_id = str(model or "").strip().lower()
+    if model_id.startswith("elevenlabs/"):
+        # No instructions parameter; delivery is steered by inline audio tags.
+        return False
+    native_model = model_id.split("/", 1)[-1]
     return native_model not in {"tts-1", "tts-1-hd"}
 
 
@@ -1980,11 +2684,84 @@ async def _vercel_speech_bytes(
 ) -> bytes:
     """Generate speech through Vercel AI Gateway's beta Speech protocol."""
 
+    output_format = _normalize_audio_format(audio_format) or "mp3"
+    payload: dict[str, Any] = {
+        "text": prompt,
+        "voice": voice,
+        "outputFormat": output_format,
+    }
+    if voice_instructions and _speech_model_supports_instructions(model):
+        payload["instructions"] = voice_instructions
+    audio_bytes, _body = await _vercel_speech_request(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        payload=payload,
+        auth_method=auth_method,
+        kind="speech",
+    )
+    return audio_bytes
+
+
+_VERCEL_MUSIC_MIN_MS = 3_000
+_VERCEL_MUSIC_MAX_MS = 600_000
+
+
+async def _vercel_music_bytes(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    duration_seconds: float | None,
+    auth_method: str = "api-key",
+) -> tuple[bytes, float | None]:
+    """Generate music through Vercel's Speech protocol (ElevenLabs Music).
+
+    The length is an exact provider parameter (3 s to 10 min), not prompt
+    guidance. Returns the MP3 bytes and the gateway-reported cost.
+    """
+    payload: dict[str, Any] = {"text": prompt, "outputFormat": "mp3"}
+    if duration_seconds:
+        length_ms = int(round(float(duration_seconds) * 1000))
+        payload["providerOptions"] = {
+            "elevenlabs": {
+                "musicLengthMs": max(_VERCEL_MUSIC_MIN_MS, min(length_ms, _VERCEL_MUSIC_MAX_MS)),
+            }
+        }
+    audio_bytes, body = await _vercel_speech_request(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        payload=payload,
+        auth_method=auth_method,
+        kind="music",
+        timeout=600.0,
+    )
+    gateway = ((body.get("providerMetadata") or {}).get("gateway") or {}) if isinstance(body, dict) else {}
+    try:
+        cost = float(gateway.get("cost")) if gateway.get("cost") is not None else None
+    except (TypeError, ValueError):
+        cost = None
+    return audio_bytes, cost
+
+
+async def _vercel_speech_request(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    payload: dict[str, Any],
+    auth_method: str,
+    kind: str,
+    timeout: float = 180.0,
+) -> tuple[bytes, dict[str, Any]]:
+    """POST one Vercel Speech-protocol request; return audio bytes and body."""
+
     import base64
     import binascii
     import httpx
 
-    output_format = _normalize_audio_format(audio_format) or "mp3"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -1994,16 +2771,10 @@ async def _vercel_speech_bytes(
         # Keep the catalog id intact, matching the chat gateway route.
         "ai-model-id": str(model or "").strip(),
     }
-    payload: dict[str, Any] = {
-        "text": prompt,
-        "voice": voice,
-        "outputFormat": output_format,
-    }
-    if voice_instructions and _speech_model_supports_instructions(model):
-        payload["instructions"] = voice_instructions
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        begin_speech_provider_request()
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if kind == "speech":
+            begin_speech_provider_request()
         response = await client.post(
             _vercel_speech_endpoint(base_url),
             headers=headers,
@@ -2011,23 +2782,23 @@ async def _vercel_speech_bytes(
         )
     if response.status_code >= 300:
         raise RuntimeError(
-            f"Vercel AI Gateway speech generation failed ({response.status_code}): "
+            f"Vercel AI Gateway {kind} generation failed ({response.status_code}): "
             f"{str(response.text or '')[:500]}"
         )
     try:
         body = response.json()
     except Exception as exc:
-        raise RuntimeError("Vercel AI Gateway speech response was not valid JSON.") from exc
+        raise RuntimeError(f"Vercel AI Gateway {kind} response was not valid JSON.") from exc
     encoded = body.get("audio") if isinstance(body, dict) else None
     if not isinstance(encoded, str) or not encoded.strip():
-        raise RuntimeError("Vercel AI Gateway speech response did not include audio data.")
+        raise RuntimeError(f"Vercel AI Gateway {kind} response did not include audio data.")
     try:
         audio_bytes = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("Vercel AI Gateway speech response included invalid base64 audio data.") from exc
+        raise RuntimeError(f"Vercel AI Gateway {kind} response included invalid base64 audio data.") from exc
     if not audio_bytes:
-        raise RuntimeError("Vercel AI Gateway speech response decoded to empty audio data.")
-    return audio_bytes
+        raise RuntimeError(f"Vercel AI Gateway {kind} response decoded to empty audio data.")
+    return audio_bytes, body
 
 
 class _AudioProviderUnavailable(RuntimeError):
@@ -2074,6 +2845,7 @@ async def _openrouter_speech_bytes(
     voice: str,
     audio_format: str,
     voice_instructions: str = "",
+    language: str = "",
 ) -> bytes:
     import httpx
 
@@ -2084,7 +2856,14 @@ async def _openrouter_speech_bytes(
     }
     if voice:
         payload["voice"] = voice
-    if voice_instructions and model.lower().startswith("google/"):
+    if model.lower().startswith("elevenlabs/"):
+        # ElevenLabs speaks ``input`` verbatim (delivery is steered with inline
+        # audio tags), so directions are never prepended; the language goes
+        # through OpenRouter's ElevenLabs passthrough options instead.
+        language_code = _elevenlabs_language_code(model, language)
+        if language_code:
+            payload["provider"] = {"options": {"elevenlabs": {"language_code": language_code}}}
+    elif voice_instructions and model.lower().startswith("google/"):
         payload["input"] = _directed_speech_prompt(prompt, voice_instructions)
     elif (
         voice_instructions
@@ -2851,7 +3630,6 @@ async def _openrouter_audio_output_bytes(
     audio_format: str,
 ) -> bytes:
     import base64
-    import httpx
 
     audio_config: dict[str, Any] = {"format": audio_format}
     if voice:
@@ -2863,8 +3641,34 @@ async def _openrouter_audio_output_bytes(
         "audio": audio_config,
         "stream": True,
     }
+    encoded, _cost = await _openrouter_stream_audio_chunks(
+        api_key=api_key,
+        payload=payload,
+        timeout=360.0,
+    )
+    if not encoded:
+        raise RuntimeError("OpenRouter returned no audio chunks")
+    return base64.b64decode(encoded)
+
+
+async def _openrouter_stream_audio_chunks(
+    *,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> tuple[str, float | None]:
+    """Stream an OpenRouter chat-completions audio response.
+
+    OpenRouter delivers audio output only over SSE: base64 pieces arrive in
+    ``choices[].delta.audio.data`` and the final chunk carries ``usage.cost``.
+    Errors after the ``200`` arrive as an SSE event with a top-level ``error``.
+    Returns the concatenated base64 audio and the reported cost (if any).
+    """
+    import httpx
+
     chunks: list[str] = []
-    async with httpx.AsyncClient(timeout=360.0) as client:
+    cost_usd: float | None = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
         begin_speech_provider_request()
         async with client.stream(
             "POST",
@@ -2890,14 +3694,63 @@ async def _openrouter_audio_output_bytes(
                     data = json.loads(data_text)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(data, dict):
+                    continue
+                error = data.get("error")
+                if isinstance(error, dict):
+                    raise RuntimeError(
+                        f"OpenRouter audio generation failed ({error.get('code') or 'stream error'}): "
+                        f"{str(error.get('message') or '')[:500]}"
+                    )
+                usage = data.get("usage")
+                if isinstance(usage, dict) and isinstance(usage.get("cost"), (int, float)):
+                    cost_usd = float(usage["cost"])
                 for choice in data.get("choices") or []:
                     delta = choice.get("delta") or {}
                     audio = delta.get("audio") or {}
                     if isinstance(audio, dict) and audio.get("data"):
                         chunks.append(str(audio["data"]))
-    if not chunks:
-        raise RuntimeError("OpenRouter returned no audio chunks")
-    return base64.b64decode("".join(chunks))
+    return "".join(chunks), cost_usd
+
+
+async def _openrouter_music_bytes(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+) -> tuple[bytes, str, float | None]:
+    """Generate Lyria music through OpenRouter's chat-completions audio output.
+
+    OpenRouter serves ``google/lyria-3-*`` as a text+image -> text+audio chat
+    model; audio output requires ``stream: true``. Lyria answers with text only
+    when ``text`` is listed first in ``modalities``, so audio goes first. The
+    requested ``audio.format`` is advisory: Lyria returns MP3 regardless, so the
+    container is sniffed from the bytes. Returns (bytes, format, reported cost).
+    """
+    import base64
+    import binascii
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["audio", "text"],
+        "audio": {"format": "mp3"},
+        "stream": True,
+    }
+    encoded, cost_usd = await _openrouter_stream_audio_chunks(
+        api_key=api_key,
+        payload=payload,
+        timeout=420.0,
+    )
+    if not encoded:
+        raise RuntimeError("OpenRouter Lyria response did not include audio data.")
+    try:
+        audio_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("OpenRouter Lyria returned invalid base64 audio data.") from exc
+    if not audio_bytes:
+        raise RuntimeError("OpenRouter Lyria returned an empty audio file.")
+    return audio_bytes, sniff_audio_format(audio_bytes) or "mp3", cost_usd
 
 
 def _audio_duration_seconds(value: Any) -> float | None:
@@ -2956,159 +3809,33 @@ def _audio_prompt_for_purpose(prompt: str, purpose: str, duration_seconds: float
     return clean_prompt
 
 
+def _video_job_origin(kwargs: dict[str, Any]) -> dict[str, str]:
+    """Where a video job sits: its workflow run and scene, and the job it redoes.
+
+    All of it comes from trusted context (a model cannot pass these keys), so
+    viewers can group a run's clips and chain a clip's versions.
+    """
+    origin: dict[str, str] = {}
+    for key, source in (
+        ("run_id", "_workflow_run_id_from_context"),
+        ("unit_id", "_workflow_scene_id_from_context"),
+    ):
+        value = str(kwargs.get(source) or "").strip()
+        if value:
+            origin[key] = value
+    lineage = kwargs.get("_media_lineage_from_context")
+    if isinstance(lineage, dict):
+        for key in ("regenerated_from", "lineage_root"):
+            value = str(lineage.get(key) or "").strip()
+            if value:
+                origin[key] = value
+    return origin
+
+
 def _media_job_lineage(task_id: str | None, kwargs: dict[str, Any]) -> dict[str, str]:
     from packages.core.ai.runtime.media_job_scope import runtime_media_job_lineage
 
     return runtime_media_job_lineage(task_id, kwargs)
-
-
-async def _start_suno_audio_job(
-    *,
-    entity_id: str,
-    user_id: str,
-    prompt: str,
-    model: str,
-    output_name: str,
-    instrumental: bool,
-    lyrics: str,
-    style: str,
-    title: str,
-    is_byok: bool,
-    workspace_id: str | None,
-    task_id: str | None,
-    agent_id: str | None,
-    conversation_id: str | None,
-    lineage: dict[str, str] | None = None,
-) -> str:
-    """Persist and reserve one Suno job before any provider I/O."""
-    if not entity_id:
-        return json.dumps(
-            _audio_error_payload(
-                code=AudioGenerationErrorCode.INVALID_REQUEST,
-                error="Suno Catalog generation requires an Entity workspace.",
-                purpose=AudioGenerationPurpose.MUSIC,
-                provider=AudioGenerationProvider.SUNO,
-                model=model,
-                role=AudioGenerationRole.AUDIO,
-            ),
-            ensure_ascii=False,
-        )
-
-    from packages.core.database import async_session
-    from packages.core.models.base import generate_ulid
-    from packages.core.models.media_job import MediaJob
-    from packages.core.services.room_generation_scope import current_room_generation_scope
-
-    group_scope = current_room_generation_scope()
-
-    cost_usd = _estimate_audio_cost(model, purpose="music")
-    credits_estimate = 0
-    if not is_byok:
-        from packages.core.services.billing_service import cost_to_credits
-
-        credits_estimate = max(1, int(cost_to_credits(cost_usd)))
-
-    job_id = generate_ulid()
-    params = {
-        "provider": "suno",
-        "billing_mode": "byok" if is_byok else "platform",
-        "credential_source": "byok" if is_byok else "platform",
-        "instrumental": instrumental,
-        "lyrics": lyrics or None,
-        "style": style or None,
-        "title": title or None,
-        "output_name": output_name or None,
-        "workspace_id": workspace_id or None,
-        "task_id": task_id or None,
-        "provider_submit_state": "not_started",
-        **(lineage or {}),
-    }
-    try:
-        async with async_session() as db:
-            db.add(
-                MediaJob(
-                    id=job_id,
-                    entity_id=entity_id,
-                    user_id=user_id or None,
-                    agent_id=agent_id,
-                    conversation_id=conversation_id,
-                    room_agent_run_id=group_scope.run_id if group_scope else None,
-                    kind="audio",
-                    status="pending",
-                    prompt=prompt,
-                    model=model,
-                    params=params,
-                    cost_usd=0 if is_byok else cost_usd,
-                    credits=0 if is_byok else credits_estimate,
-                    byok=is_byok,
-                )
-            )
-            await db.flush()
-            if not is_byok:
-                from packages.core.services.credit_reservations import reserve_credits
-
-                await reserve_credits(
-                    db,
-                    entity_id=entity_id,
-                    amount_credits=credits_estimate,
-                    source_kind="media_job",
-                    source_id=job_id,
-                    reason="Suno music generation estimate",
-                    workspace_id=workspace_id,
-                    agent_id=agent_id,
-                    conversation_id=conversation_id,
-                    user_id=user_id or None,
-                    metadata={
-                        "model": model,
-                        "provider": "suno",
-                        "tool_name": "generate_audio",
-                        "billing_mode": "platform",
-                        "cost_usd": cost_usd,
-                    },
-                )
-            await db.commit()
-    except Exception as exc:
-        from packages.core.services.credit_reservations import CreditReservationError
-
-        if isinstance(exc, CreditReservationError):
-            message = str(exc)
-        else:
-            logger.exception("Could not create Suno audio job")
-            message = "Could not create the Suno generation job."
-        return json.dumps(
-            _audio_error_payload(
-                code=AudioGenerationErrorCode.AUDIO_GENERATION_FAILED,
-                error=message,
-                purpose=AudioGenerationPurpose.MUSIC,
-                provider=AudioGenerationProvider.SUNO,
-                model=model,
-                role=AudioGenerationRole.AUDIO,
-            ),
-            ensure_ascii=False,
-        )
-
-    from packages.core.tasks.media_tasks import schedule_suno_audio_job
-
-    # A group job is dispatched only after its exact room approval receipt
-    # commits. Recovery can safely requeue a committed pending job later.
-    if group_scope is None:
-        schedule_suno_audio_job(job_id)
-    return json.dumps(
-        {
-            "kind": GenerateFileKind.AUDIO,
-            "status": AudioGenerationStatus.PENDING,
-            "provider": AudioGenerationProvider.SUNO,
-            "job_id": job_id,
-            "prompt": prompt,
-            "purpose": AudioGenerationPurpose.MUSIC,
-            "model": model,
-            "name": output_name,
-            "credits_estimate": credits_estimate,
-            "billing_mode": "byok" if is_byok else "platform",
-            "message": "Suno music generation started; Manor will wait for the durable audio artifact.",
-        },
-        ensure_ascii=False,
-    )
 
 
 async def _generate_audio_handler(
@@ -3172,8 +3899,25 @@ async def _music_from_library(entity_id: str, user_id: str, live_failure: dict, 
         entity_id,
         kwargs.get("task_id") or runtime_context.task_id,
     )
-    audio_bytes = track.path.read_bytes()
-    audio_format = track.path.suffix.lstrip(".").lower() or "mp3"
+    output_name = str(kwargs.get("name") or kwargs.get("output_name") or kwargs.get("filename") or "").strip()
+    # A library track stands in for the music the caller asked for, so it is
+    # delivered in the format that caller requested; if it cannot be
+    # converted, it keeps its own (correctly labelled) format.
+    track_bytes = track.path.read_bytes()
+    track_format = track.path.suffix.lstrip(".").lower() or "mp3"
+    try:
+        conformed = await _conform_generated_audio(
+            track_bytes,
+            declared_format=track_format,
+            requested_format=_requested_audio_artifact_format(
+                str(kwargs.get("response_format") or kwargs.get("format") or ""),
+                output_name,
+            ),
+        )
+    except AudioConversionError:
+        logger.warning("Library music could not be converted; keeping %s", track_format, exc_info=True)
+        conformed = await _conform_generated_audio(track_bytes, declared_format=track_format)
+    audio_bytes, audio_format = conformed.audio_bytes, conformed.audio_format
     audio_url = await _save_generated_audio_bytes(
         entity_id=entity_id,
         user_id=user_id,
@@ -3183,7 +3927,7 @@ async def _music_from_library(entity_id: str, user_id: str, live_failure: dict, 
         audio_bytes=audio_bytes,
         audio_format=audio_format,
         is_byok=False,
-        output_name=str(kwargs.get("name") or ""),
+        output_name=output_name,
         workspace_id=str(kwargs.get("workspace_id") or runtime_context.workspace_id or "") or None,
         task_id=str(kwargs.get("task_id") or runtime_context.task_id or "") or None,
         conversation_id=str(kwargs.get("conversation_id") or runtime_context.conversation_id or "") or None,
@@ -3202,7 +3946,7 @@ async def _music_from_library(entity_id: str, user_id: str, live_failure: dict, 
         "purpose": AudioGenerationPurpose.MUSIC,
         "model": LIBRARY_MODEL,
         "format": audio_format,
-        "duration_seconds": track.duration_seconds,
+        "duration_seconds": conformed.duration_seconds or track.duration_seconds,
         "requested_duration_seconds": kwargs.get("duration_seconds"),
         "file_size": len(audio_bytes),
         "library_track_id": track.id,
@@ -3253,6 +3997,9 @@ async def _generate_live_audio(
     model, role = await _resolve_user_audio_model(user_id, entity_id, purpose=purpose)
     if kwargs.get("model"):
         model = str(kwargs["model"]).strip()
+    elif model:
+        # Same runnable-model choice as kind=search inspection reports.
+        model, _route = await _runnable_audio_model(user_id, entity_id, model, role)
     expected_model = str(kwargs.get("expected_model") or "").strip()
     if not model:
         return json.dumps(
@@ -3279,10 +4026,25 @@ async def _generate_live_audio(
             == NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE
         ):
             narration_voice_mode = NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE
+    voice_role = str(kwargs.get("voice_role") or "").strip() or DEFAULT_NARRATION_VOICE_ROLE
+    project_id = str(runtime_context.workflow_project_id or "").strip()
+    # A project that holds this voice (or declares where it lives) decides it
+    # for everything made inside it, whatever scope the call asked for.
+    if (
+        purpose == AudioGenerationPurpose.NARRATION
+        and workspace_id
+        and project_id
+        and narration_voice_mode != NARRATION_VOICE_MODE_FIXED_PER_PROJECT
+        and await _project_holds_voice(
+            entity_id=entity_id, workspace_id=workspace_id, project_id=project_id, role=voice_role,
+        )
+    ):
+        narration_voice_mode = NARRATION_VOICE_MODE_FIXED_PER_PROJECT
     # A voice scope with nothing to pin it to (a standalone Flow has no
     # Workspace, Task, or Conversation) means the account's narration voice,
     # not a failed request.
     scope_ids = {
+        NARRATION_VOICE_MODE_FIXED_PER_PROJECT: project_id if workspace_id else "",
         NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE: workspace_id,
         NARRATION_VOICE_MODE_RANDOM_PER_TASK: runtime_context.task_id or kwargs.get("task_id"),
         NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION: (
@@ -3292,12 +4054,9 @@ async def _generate_live_audio(
     if narration_voice_mode in scope_ids and not str(scope_ids[narration_voice_mode] or "").strip():
         narration_voice_mode = ""
     narration_profile: dict[str, str | int] | None = None
+    narration_reference: dict[str, Any] | None = None
     if narration_voice_mode:
-        if narration_voice_mode not in {
-            NARRATION_VOICE_MODE_RANDOM_PER_TASK,
-            NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION,
-            NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE,
-        }:
+        if narration_voice_mode not in NARRATION_VOICE_MODES:
             return json.dumps(
                 _audio_error_payload(
                     code=AudioGenerationErrorCode.INVALID_REQUEST,
@@ -3320,7 +4079,17 @@ async def _generate_live_audio(
                 ensure_ascii=False,
             )
         try:
-            if narration_voice_mode == NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE:
+            if narration_voice_mode == NARRATION_VOICE_MODE_FIXED_PER_PROJECT:
+                narration_profile, narration_reference = await _resolve_project_narrator_profile(
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    project_id=project_id,
+                    role=voice_role,
+                    candidate_model=model,
+                    voice_instructions=voice_instructions,
+                    preferred_voice=str(kwargs.get("voice") or ""),
+                )
+            elif narration_voice_mode == NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE:
                 narration_profile = await _resolve_workspace_narrator_profile(
                     entity_id=entity_id,
                     workspace_id=workspace_id,
@@ -3357,7 +4126,15 @@ async def _generate_live_audio(
                 ensure_ascii=False,
             )
         model = str(narration_profile["model"])
-        voice_instructions = str(narration_profile["voice_instructions"])
+        # A project pins who speaks; how this piece is read (its own numbers,
+        # names, pace) is the call's, so one episode's direction never carries
+        # into the next. Other scopes keep their pinned direction.
+        if not (narration_voice_mode == NARRATION_VOICE_MODE_FIXED_PER_PROJECT and voice_instructions):
+            voice_instructions = str(narration_profile["voice_instructions"])
+        narration_reference = narration_reference or {
+            "scope": narration_voice_mode.split("_per_", 1)[1],
+            "id": str(scope_ids[narration_voice_mode] or ""),
+        }
     if expected_model and model != expected_model and not _selectable_media_model(expected_model, role.value):
         # Another audio role's model (a narration voice passed to music), or a
         # guess: not a selection that changed.
@@ -3404,118 +4181,38 @@ async def _generate_live_audio(
         if narration_profile is not None
         else kwargs.get("voice") or call_voice or _default_openrouter_voice(model)
     ).strip()
-    native_google_music = bool(
-        role == AudioGenerationRole.AUDIO
-        and provider == "google"
-        and "lyria-3-" in model.lower()
-    )
-    if native_google_music:
+    if provider == "elevenlabs" and role == AudioGenerationRole.VOICE:
+        voice = _elevenlabs_voice(voice)
+        max_characters = _ELEVENLABS_MAX_INPUT_CHARACTERS.get(model.lower())
+        if max_characters and len(prompt) > max_characters:
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.INVALID_REQUEST,
+                    error=(
+                        f"{model} accepts at most {max_characters} characters per request "
+                        f"(got {len(prompt)}). Split the script into shorter segments."
+                    ),
+                    purpose=purpose,
+                    provider=AudioGenerationProvider.OPENROUTER,
+                    model=model,
+                    role=role,
+                ),
+                ensure_ascii=False,
+            )
+    lyria_music = _is_lyria_music_model(model, str(role))
+    if lyria_music:
         requested_native_format = _normalize_audio_format(requested_audio_format)
         request_format = "wav" if "pro" in model.lower() and requested_native_format == "wav" else "mp3"
         storage_format = request_format
+    vercel_music = _is_vercel_music_model(model, str(role))
+    if vercel_music:
+        request_format = storage_format = "mp3"
 
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
         user_id,
         entity_id,
         role=role,
     )
-    if provider == "suno":
-        if callable(_deliver_audio):
-            return json.dumps({"error": "The selected async audio model cannot use this delivery target."})
-        if purpose != AudioGenerationPurpose.MUSIC or role != AudioGenerationRole.AUDIO:
-            return json.dumps(
-                _audio_error_payload(
-                    code=AudioGenerationErrorCode.INVALID_REQUEST,
-                    error="Suno Catalog is available for purpose=music only.",
-                    purpose=purpose,
-                    provider=AudioGenerationProvider.SUNO,
-                    model=model,
-                    role=role,
-                ),
-                ensure_ascii=False,
-            )
-        instrumental = kwargs.get("instrumental", False)
-        if not isinstance(instrumental, bool):
-            return json.dumps(
-                _audio_error_payload(
-                    code=AudioGenerationErrorCode.INVALID_REQUEST,
-                    error="instrumental must be a boolean",
-                    purpose=purpose,
-                    provider=AudioGenerationProvider.SUNO,
-                    model=model,
-                    role=role,
-                ),
-                ensure_ascii=False,
-            )
-        if is_byok:
-            if not _is_native_key_for_provider(api_key, "suno"):
-                return json.dumps(
-                    _audio_error_payload(
-                        code=AudioGenerationErrorCode.PROVIDER_KEY_REQUIRED,
-                        error="The selected Suno model requires a native Suno API key.",
-                        purpose=purpose,
-                        provider=AudioGenerationProvider.SUNO,
-                        model=model,
-                        role=role,
-                    ),
-                    ensure_ascii=False,
-                )
-        else:
-            api_key, base_url_override = await _platform_native_media_credential_async("suno")
-        if not api_key:
-            missing_suno_key_error = (
-                "No Suno API key is configured. Add a native Suno key for Music & Score."
-            )
-            return json.dumps(
-                _audio_error_payload(
-                    code=AudioGenerationErrorCode.PROVIDER_KEY_REQUIRED,
-                    error=missing_suno_key_error,
-                    purpose=purpose,
-                    provider=AudioGenerationProvider.SUNO,
-                    model=model,
-                    role=role,
-                ),
-                ensure_ascii=False,
-            )
-        if entity_id and not is_byok:
-            await runtime_assert_credit_available(
-                entity_id,
-                source=RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
-            )
-        lyrics = str(kwargs.get("lyrics") or "").strip()
-        style = str(kwargs.get("style") or "").strip()
-        title = str(kwargs.get("title") or "").strip()
-        if lyrics or style:
-            style = style or prompt
-            if not instrumental and not lyrics:
-                return json.dumps(
-                    _audio_error_payload(
-                        code=AudioGenerationErrorCode.INVALID_REQUEST,
-                        error="Suno custom mode requires lyrics unless instrumental is true.",
-                        purpose=purpose,
-                        provider=AudioGenerationProvider.SUNO,
-                        model=model,
-                        role=role,
-                    ),
-                    ensure_ascii=False,
-                )
-        return await _start_suno_audio_job(
-            entity_id=entity_id,
-            user_id=user_id,
-            prompt=prompt,
-            model=model,
-            output_name=output_name,
-            instrumental=instrumental,
-            lyrics=lyrics,
-            style=style,
-            title=title,
-            is_byok=is_byok,
-            workspace_id=workspace_id or None,
-            task_id=runtime_context.task_id,
-            agent_id=runtime_context.agent_id,
-            conversation_id=runtime_context.conversation_id,
-            lineage=_media_job_lineage(runtime_context.task_id, kwargs),
-        )
     # A Primary chat key must not silently override an Official media
     # selection. Media BYOK is role-scoped: only an explicitly configured
     # Voice/Music key may bypass Manor's managed Vercel route. This keeps the
@@ -3600,40 +4297,61 @@ async def _generate_live_audio(
                 base_url_override = native_base_url or base_url_override
                 native_voice_provider = provider
 
-    if native_google_music:
-        if is_byok:
-            if not _is_native_key_for_provider(api_key, "google"):
-                return json.dumps(
-                    _audio_error_payload(
-                        code=AudioGenerationErrorCode.NATIVE_MUSIC_KEY_REQUIRED,
-                        error=(
-                            "The selected Google Lyria music model requires a native Google/Gemini API key. "
-                            "Save a matching key for Music & Score or Primary, or choose another music model."
-                        ),
-                        purpose=purpose,
-                        provider=AudioGenerationProvider.GOOGLE,
-                        model=model,
-                    )
-                )
+    # Lyria runs natively on a Google key, otherwise through OpenRouter's
+    # chat-completions audio output on the same key class (BYOK OpenRouter key
+    # with 0 credits, or Manor's managed OpenRouter key with credits).
+    openrouter_music = False
+    if lyria_music:
+        lyria_route, api_key, base_url_override = await _resolve_lyria_music_route(
+            api_key,
+            base_url_override,
+            is_byok,
+        )
+        if lyria_route == "google":
             native_music_provider = "google"
+        elif lyria_route == "openrouter":
+            openrouter_music = True
         else:
-            native_key, native_base_url = await _platform_native_media_credential_async("google")
-            if native_key:
-                api_key = native_key
-                base_url_override = native_base_url or base_url_override
-                native_music_provider = "google"
-        if not native_music_provider:
             return json.dumps(
                 _audio_error_payload(
                     code=AudioGenerationErrorCode.NATIVE_MUSIC_KEY_REQUIRED,
                     error=(
-                        "Google Lyria music generation requires a native Google/Gemini API key. "
-                        "Configure one for Music & Score or Primary."
+                        "The selected Google Lyria music model requires a native Google/Gemini API key "
+                        "or an OpenRouter key. Save a matching key for Music & Score, or choose another "
+                        "music model."
+                        if is_byok
+                        else "Google Lyria music generation requires a native Google/Gemini API key or an "
+                        "OpenRouter key. Configure one for Music & Score."
                     ),
                     purpose=purpose,
                     provider=AudioGenerationProvider.GOOGLE,
                     model=model,
                 )
+            )
+
+    vercel_music_auth = "api-key"
+    if vercel_music:
+        vercel_route, api_key, base_url_override, vercel_music_auth = await _resolve_vercel_music_route(
+            model,
+            is_byok,
+        )
+        if not vercel_route:
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.AUDIO_PROVIDER_UNAVAILABLE,
+                    error=(
+                        f"{model} runs only on Manor's managed Vercel AI Gateway route, which a "
+                        "Music & Score API key cannot use. Clear that key, or choose another music model."
+                        if is_byok
+                        else f"{model} needs Manor's Vercel AI Gateway key, which is not configured. "
+                        "Choose another music model."
+                    ),
+                    purpose=purpose,
+                    provider=AudioGenerationProvider.ELEVENLABS,
+                    model=model,
+                    role=role,
+                ),
+                ensure_ascii=False,
             )
 
     if (
@@ -3642,6 +4360,8 @@ async def _generate_live_audio(
         and not native_openai_output_audio
         and not managed_vercel_voice
         and not native_music_provider
+        and not openrouter_music
+        and not vercel_music
     ):
         if not api_key or not api_key.startswith("sk-or-"):
             return json.dumps(
@@ -3662,7 +4382,7 @@ async def _generate_live_audio(
         generation_provider = AudioGenerationProvider.OPENAI
     elif native_openai_output_audio:
         generation_provider = AudioGenerationProvider.OPENAI
-    elif managed_vercel_voice:
+    elif managed_vercel_voice or vercel_music:
         # Vercel is the transport gateway; retain the selected speech model's
         # provider in the artifact metadata for compatibility with native routes.
         generation_provider = AudioGenerationProvider.coerce(provider)
@@ -3670,9 +4390,17 @@ async def _generate_live_audio(
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
+            workspace_id=workspace_id or None,
         )
 
+    # Gateway-reported cost for this generation when the provider returns one.
+    provider_cost_usd: float | None = None
     try:
+        lyria_prompt = _audio_prompt_for_purpose(
+            prompt,
+            purpose,
+            duration_seconds if "pro" in model.lower() else None,
+        ) if lyria_music else ""
         if native_openai_output_audio:
             request_format = "wav"
             storage_format = "wav"
@@ -3686,12 +4414,24 @@ async def _generate_live_audio(
                 voice_instructions=voice_instructions,
                 render_as_speech=False,
             )
-        elif native_music_provider == "google":
-            lyria_prompt = _audio_prompt_for_purpose(
-                prompt,
-                purpose,
-                duration_seconds if "pro" in model.lower() else None,
+        elif vercel_music:
+            # Lyrics keep their line breaks; the length is a real parameter.
+            audio_bytes, provider_cost_usd = await _vercel_music_bytes(
+                api_key=api_key,
+                base_url=base_url_override,
+                model=model,
+                prompt=prompt,
+                duration_seconds=duration_seconds,
+                auth_method=vercel_music_auth,
             )
+        elif openrouter_music:
+            audio_bytes, storage_format, provider_cost_usd = await _openrouter_music_bytes(
+                api_key=api_key,
+                model=model,
+                prompt=lyria_prompt,
+            )
+            request_format = storage_format
+        elif native_music_provider == "google":
             audio_bytes, storage_format = await _google_music_bytes(
                 api_key=api_key,
                 model=model,
@@ -3795,6 +4535,7 @@ async def _generate_live_audio(
                 voice=voice,
                 voice_instructions=voice_instructions,
                 audio_format=request_format,
+                language=audio_language,
             )
             if request_format == "pcm" and storage_format == "wav":
                 audio_bytes = _wav_from_pcm16(audio_bytes)
@@ -3812,17 +4553,18 @@ async def _generate_live_audio(
             if request_format in {"pcm", "pcm16"} and storage_format == "wav":
                 audio_bytes = _wav_from_pcm16(audio_bytes)
         provider_response_format = request_format
-        requested_artifact_format = _requested_audio_artifact_format(
-            requested_audio_format,
-            output_name,
+        conformed = await _conform_generated_audio(
+            audio_bytes,
+            declared_format=storage_format,
+            requested_format=_requested_audio_artifact_format(
+                requested_audio_format,
+                output_name,
+            ),
+            measure_duration=not callable(_deliver_audio),
         )
-        if requested_artifact_format and requested_artifact_format != storage_format:
-            audio_bytes = await transcode_audio_bytes(
-                audio_bytes,
-                source_format=storage_format,
-                target_format=requested_artifact_format,
-            )
-            storage_format = requested_artifact_format
+        if conformed.source_format != _normalize_audio_format(storage_format):
+            provider_response_format = conformed.source_format
+        audio_bytes, storage_format = conformed.audio_bytes, conformed.audio_format
         if narration_profile is not None:
             from packages.core.services.generated_media_naming import (
                 workspace_execution_artifact_dir, workspace_artifact_default_dir,
@@ -3833,7 +4575,13 @@ async def _generate_live_audio(
                 workflow_run_id=runtime_context.workflow_run_id,
                 workflow_lineage_root_run_id=runtime_context.workflow_lineage_root_run_id,
             )
-            if "/" in output_name or workspace_artifact_default_dir(narration_base, "audio") != narration_base:
+            from packages.core.services.generated_media_naming import voice_folder_applies
+
+            # One pinned voice needs no folder of its own; a random one is
+            # grouped by voice so takes in different voices stay apart.
+            if voice_folder_applies(narration_reference) and (
+                "/" in output_name or workspace_artifact_default_dir(narration_base, "audio") != narration_base
+            ):
                 output_name = _task_narrator_audio_output_name(output_name, voice)
         # Chat playback uses the same provider/credit path without creating a
         # Knowledge artifact. Only an internal Python callable can select it.
@@ -3850,12 +4598,23 @@ async def _generate_live_audio(
             voice=voice,
             voice_instructions=voice_instructions,
             narration_profile=narration_profile,
+            voice_reference=(
+                {**(narration_reference or {}), "role": voice_role} if narration_profile is not None else None
+            ),
             language=audio_language,
             output_name=output_name,
             workspace_id=workspace_id or None,
             task_id=runtime_context.task_id,
             agent_id=runtime_context.agent_id,
             conversation_id=runtime_context.conversation_id,
+            **({"provider_cost_usd": provider_cost_usd} if provider_cost_usd is not None else {}),
+        )
+        saved_fs_path = _fs_path_from_result_url(audio_url, entity_id)
+        # The Document the file was registered as, so later steps and App views
+        # can reference the file by id rather than by path.
+        saved_document_id = (
+            await _document_id_for_fs_path(entity_id, saved_fs_path)
+            if saved_fs_path and not callable(_deliver_audio) else None
         )
         payload: AudioGenerationCompletedResult = {
             "kind": GenerateFileKind.AUDIO,
@@ -3863,7 +4622,8 @@ async def _generate_live_audio(
             "provider": generation_provider,
             "result_url": audio_url,
             "audio_url": audio_url,
-            "fs_path": _fs_path_from_result_url(audio_url, entity_id),
+            "fs_path": saved_fs_path,
+            **({"document_id": saved_document_id} if saved_document_id else {}),
             **_audio_file_ref(audio_url, entity_id),
             "prompt": prompt,
             "purpose": purpose,
@@ -3871,9 +4631,13 @@ async def _generate_live_audio(
             "voice": voice or None,
             "voice_instructions": voice_instructions or None,
             "language": audio_language,
-            "format": AudioGenerationFormat(storage_format),
-            "provider_response_format": AudioGenerationFormat(provider_response_format),
-            "duration_seconds": 30.0 if native_google_music and "clip" in model.lower() else duration_seconds,
+            "format": _audio_format_label(storage_format),
+            "provider_response_format": _audio_format_label(provider_response_format),
+            # The measured length of the saved file; the provider's nominal
+            # length only when it could not be measured.
+            "duration_seconds": conformed.duration_seconds or (
+                30.0 if lyria_music and "clip" in model.lower() else duration_seconds
+            ),
             "requested_duration_seconds": duration_seconds,
             "file_size": len(audio_bytes),
         }
@@ -3885,6 +4649,7 @@ async def _generate_live_audio(
             payload["pending_group_share"] = True
         if narration_profile is not None:
             payload["narration_profile"] = narration_profile
+            payload["voice_reference"] = {**(narration_reference or {}), "role": voice_role}
         return json.dumps(payload, ensure_ascii=False)
     except _AudioProviderUnavailable as exc:
         logger.warning(
@@ -3957,6 +4722,23 @@ def _srt_from_segments(segments: list[dict]) -> str:
         blocks.append(f"{index}\n{start} --> {end}\n{text}")
         index += 1
     return ("\n\n".join(blocks) + "\n") if blocks else ""
+
+
+async def _document_id_for_fs_path(entity_id: str, fs_path: str) -> str | None:
+    """Best-effort: the live Knowledge document registered for a saved file."""
+    try:
+        from sqlalchemy import select
+
+        from packages.core.database import async_session
+        from packages.core.models.document import Document
+
+        async with async_session() as db:
+            return (await db.execute(select(Document.id).where(
+                Document.entity_id == entity_id, Document.fs_path == fs_path, Document.is_trashed.is_(False),
+            ).limit(1))).scalar_one_or_none()
+    except Exception:
+        logger.debug("audio document lookup failed", exc_info=True)
+    return None
 
 
 async def _rel_path_from_document_id(document_id: str, entity_id: str) -> str | None:
@@ -4562,6 +5344,69 @@ def _image_response_json(resp, *, provider: str) -> tuple[dict, str]:
         )
 
 
+# Grok Imagine images (docs.x.ai /v1/images): only 2.0 edits from source images, at most 5.
+_XAI_IMAGE_EDIT_MODELS = frozenset({"grok-imagine-image-2.0"})
+_XAI_IMAGE_MAX_REFERENCES = 5
+_XAI_IMAGE_RATIOS = {"1024x1024": "1:1", "1536x1024": "3:2", "1024x1536": "2:3"}
+
+
+async def _xai_image_bytes(
+    *, api_key: str, base_url: str, model: str, prompt: str, aspect_ratio: str, size: str,
+    quality: Any, reference_urls: list[str], entity_id: str,
+) -> tuple[bytes, str, str]:
+    """One Grok image through xAI or the Account's xAI-compatible relay: (bytes, mime, error)."""
+    import base64
+
+    from packages.core.services.xai_video_transport import XaiTransportError, normalize_xai_url, xai_request
+
+    native = model.split("/", 1)[1] if "/" in model else model
+    body: dict[str, Any] = {
+        "model": native, "prompt": prompt, "n": 1,
+        "aspect_ratio": aspect_ratio or _XAI_IMAGE_RATIOS.get(size or "", "1:1"),
+        "resolution": "2k" if str(quality or "").lower() == "high" else "1k",
+        "response_format": "b64_json",
+    }
+    endpoint = "/images/generations"
+    references = [url for url in reference_urls if url][:_XAI_IMAGE_MAX_REFERENCES]
+    if references:
+        if native not in _XAI_IMAGE_EDIT_MODELS:
+            return b"", "", f"{model} does not edit from reference images; choose Grok Imagine Image 2.0."
+        loaded = await _load_image_references_for_upload(references, entity_id, limit=_XAI_IMAGE_MAX_REFERENCES)
+        items = [{"url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}", "type": "image_url"}
+                 for _name, data, mime in loaded]
+        if len(items) == 1:
+            body["image"] = items[0]
+        else:
+            body["images"] = items
+        endpoint = "/images/edits"
+    try:
+        base = normalize_xai_url(base_url)
+        response = await xai_request(
+            "POST", f"{base}{endpoint}", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json_body=body, timeout=180, max_bytes=25 * 1024 * 1024,
+        )
+    except XaiTransportError as exc:
+        return b"", "", str(exc)
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if response.status_code != 200:
+        # The relay's own words stay out of the result; only a plain error kind is kept.
+        kind = ((data.get("error") or {}).get("type") if isinstance(data, dict) and isinstance(data.get("error"), dict) else "") or ""
+        kind = kind if re.fullmatch(r"[a-z0-9_]{1,64}", str(kind)) else ""
+        return b"", "", (f"Grok image generation failed ({response.status_code}{', ' + kind if kind else ''}). "
+                         "Check the relay and API key.")
+    first = ((data.get("data") or [{}])[0] if isinstance(data, dict) else {}) or {}
+    encoded = first.get("b64_json")
+    if not isinstance(encoded, str) or not encoded:
+        return b"", "", "Grok image response did not include image data."
+    try:
+        return base64.b64decode(encoded, validate=True), str(first.get("mime_type") or "image/png"), ""
+    except Exception:
+        return b"", "", "Grok returned invalid base64 image data."
+
+
 async def _generate_image_handler(
     entity_id: str = "",
     user_id: str = "",
@@ -4594,10 +5439,11 @@ async def _generate_image_handler(
         prompt = f"{prompt}{_aspect_ratio_prompt_hint(aspect_ratio)}"
     quality = kwargs.get("quality", "medium")
     save_to_knowledge = _coerce_bool(kwargs.get("save_to_knowledge"), True)
-    # Optional: deliver the generated image straight into the active sandbox
-    # (used by the pptx image mode so page images bypass the laggy entity-FS
-    # mount). When set, the image bytes are also written into the sandbox at
-    # this path. Best-effort; never blocks generation.
+    # Optional: deliver the generated image straight into this agent's own
+    # sandbox (used by the pptx image mode so page images bypass the laggy
+    # entity-FS mount). When set, the image bytes are also written into the
+    # sandbox at this path; the result's ``sandbox_delivery`` reports whether
+    # that worked. Never blocks generation.
     sandbox_path = str(kwargs.get("sandbox_path") or "").strip() or None
     reference_urls = _coerce_image_reference_urls(
         kwargs.get("reference_urls"),
@@ -4638,18 +5484,31 @@ async def _generate_image_handler(
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
+    project_id = str(runtime_context.workflow_project_id or "").strip()
+    image_holder: dict[str, Any] | None = None
     if workspace_asset_key:
         if not entity_id or not runtime_context.workspace_id:
             return json.dumps(
                 {"error": "workspace_asset_key requires a valid Workspace context."}
             )
+        image_holder = await _project_image_holder(
+            entity_id=entity_id, workspace_id=str(runtime_context.workspace_id),
+            project_id=project_id, asset_key=workspace_asset_key,
+        )
         if reuse_if_exists:
-            existing_asset = await _load_workspace_reusable_image(
-                entity_id=entity_id,
-                workspace_id=runtime_context.workspace_id,
-                asset_key=workspace_asset_key,
-            )
-            if existing_asset is not None:
+            existing = (await _project_named_images(
+                entity_id=entity_id, workspace_id=str(runtime_context.workspace_id), project_id=project_id,
+            )).get(workspace_asset_key)
+            if existing is None:
+                workspace_asset = await _load_workspace_reusable_image(
+                    entity_id=entity_id,
+                    workspace_id=runtime_context.workspace_id,
+                    asset_key=workspace_asset_key,
+                )
+                if workspace_asset is not None:
+                    existing = (workspace_asset, {"scope": "workspace", "id": runtime_context.workspace_id})
+            if existing is not None:
+                existing_asset, existing_reference = existing
                 payload = _image_result_payload(
                     image_url=str(existing_asset["result_url"]),
                     prompt=str(existing_asset.get("prompt") or prompt),
@@ -4662,8 +5521,18 @@ async def _generate_image_handler(
                 payload.update(
                     workspace_asset_key=workspace_asset_key,
                     reused_workspace_asset=True,
+                    asset_reference=existing_reference,
                 )
                 return json.dumps(payload)
+    # Named reference assets are the exact files a project or Workspace keeps.
+    try:
+        asset_urls, asset_receipts = await _reference_asset_urls(
+            entity_id=entity_id, workspace_id=runtime_context.workspace_id, project_id=project_id,
+            keys=kwargs.get("reference_assets"),
+        )
+    except _UnknownReferenceAssets as exc:
+        return json.dumps({"error": str(exc), "error_code": "reference_asset_not_found"})
+    reference_urls = list(dict.fromkeys([*asset_urls, *reference_urls]))
 
     model = await _resolve_user_image_model(user_id, entity_id, False)
     expected_model = str(kwargs.get("expected_model") or "").strip()
@@ -4687,6 +5556,40 @@ async def _generate_image_handler(
     if expected_model and model != expected_model:
         return json.dumps({"error": "model override conflicts with expected_model", "error_code": "image_model_changed_reinspect_required", "expected_model": expected_model, "model": model})
     provider = _catalog_provider(model)
+    if provider == "xai":
+        if reference_urls and model.split("/", 1)[1] not in _XAI_IMAGE_EDIT_MODELS:
+            return json.dumps({"error": f"{model} does not edit from reference images; choose Grok Imagine Image 2.0."})
+        reference_urls = [url for url in reference_urls if url][:_XAI_IMAGE_MAX_REFERENCES]
+        # Grok images, like Grok video, use the Account's own key through its saved relay when there is
+        # one, and otherwise the managed Vercel AI Gateway below.
+        api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
+            user_id, entity_id, role="image", require_saved_base=True,
+        )
+    if provider == "xai" and is_byok and api_key:
+        image_bytes, mime, error = await _xai_image_bytes(
+            api_key=api_key, base_url=base_url_override, model=model, prompt=prompt, aspect_ratio=aspect_ratio,
+            size=size, quality=quality, reference_urls=reference_urls, entity_id=entity_id,
+        )
+        if error:
+            return json.dumps({"error": error})
+        image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(image_bytes, mime, aspect_ratio)
+        if actual_size:
+            size = actual_size
+        image_url = await _save_generated_image_bytes(
+            entity_id=entity_id, user_id=user_id, prompt=prompt, output_name=output_name, model=model, size=size,
+            image_bytes=image_bytes, mime=mime, is_byok=True, usage={},
+            workspace_id=runtime_context.workspace_id, task_id=runtime_context.task_id,
+            agent_id=runtime_context.agent_id, conversation_id=runtime_context.conversation_id,
+            sandbox_binding_key=runtime_context.sandbox_binding_key, save_to_knowledge=save_to_knowledge,
+            sandbox_path=sandbox_path,
+            workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
+        )
+        return json.dumps(await _generated_image_result_payload(
+            image_url=image_url, prompt=prompt, size=size, model=model, entity_id=entity_id,
+            workspace_id=runtime_context.workspace_id, workspace_asset_key=workspace_asset_key,
+            include_fs_path=bool(kwargs.get("workspace_id")), image_holder=image_holder,
+            asset_receipts=asset_receipts, saved_to_knowledge=save_to_knowledge,
+        ))
     managed_vercel_image = False
     vercel_auth_method = "api-key"
     if (
@@ -4697,7 +5600,8 @@ async def _generate_image_handler(
             official_route = await _resolve_official_model_route(
                 model,
                 vercel_reason="media.image.vercel_gateway_key",
-                provider_chain=("vercel", provider, "openrouter"),
+                # Grok has no managed route but Vercel's.
+                provider_chain=("vercel",) if provider == "xai" else ("vercel", provider, "openrouter"),
             )
         except Exception:
             logger.debug("Managed Vercel image route lookup failed", exc_info=True)
@@ -4718,6 +5622,11 @@ async def _generate_image_handler(
             api_key = native_key
             base_url_override = native_base_url or base_url_override
             is_byok = False
+    if provider == "xai" and not managed_vercel_image:
+        return json.dumps({"error": (
+            "Grok Imagine is unavailable right now: the managed gateway has no credentials and no Grok key "
+            "is saved in Settings → AI Models."
+        )})
     if not api_key and not managed_vercel_image:
         api_key, native_base_url = await _platform_native_media_credential_async(provider)
         base_url_override = native_base_url or base_url_override
@@ -4728,6 +5637,7 @@ async def _generate_image_handler(
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_IMAGE_TOOL_SOURCE,
+            workspace_id=runtime_context.workspace_id or None,
         )
 
     is_openrouter = api_key.startswith("sk-or-")
@@ -4785,7 +5695,8 @@ async def _generate_image_handler(
                 return json.dumps(
                     {"error": "Vercel AI Gateway returned invalid base64 image data."}
                 )
-            mime = "image/png"
+            # Most gateway models return PNG; Grok returns JPEG.
+            mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
             image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(
                 image_bytes,
                 mime,
@@ -4823,6 +5734,8 @@ async def _generate_image_handler(
                     workspace_id=runtime_context.workspace_id,
                     workspace_asset_key=workspace_asset_key,
                     include_fs_path=bool(kwargs.get("workspace_id")),
+                    image_holder=image_holder,
+                    asset_receipts=asset_receipts,
                     saved_to_knowledge=save_to_knowledge,
                 )
             )
@@ -4924,6 +5837,8 @@ async def _generate_image_handler(
                     workspace_id=runtime_context.workspace_id,
                     workspace_asset_key=workspace_asset_key,
                     include_fs_path=bool(kwargs.get("workspace_id")),
+                    image_holder=image_holder,
+                    asset_receipts=asset_receipts,
                     saved_to_knowledge=save_to_knowledge,
                 )
             )
@@ -5031,6 +5946,8 @@ async def _generate_image_handler(
                     workspace_id=runtime_context.workspace_id,
                     workspace_asset_key=workspace_asset_key,
                     include_fs_path=bool(kwargs.get("workspace_id")),
+                    image_holder=image_holder,
+                    asset_receipts=asset_receipts,
                     saved_to_knowledge=save_to_knowledge,
                 )
             )
@@ -5119,6 +6036,8 @@ async def _generate_image_handler(
                         workspace_id=runtime_context.workspace_id,
                         workspace_asset_key=workspace_asset_key,
                         include_fs_path=bool(kwargs.get("workspace_id")),
+                        image_holder=image_holder,
+                        asset_receipts=asset_receipts,
                         saved_to_knowledge=save_to_knowledge,
                     )
                 )
@@ -5467,7 +6386,7 @@ GENERATE_VIDEO_SCHEMA = {
                 "reference_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Reference image URLs for style/character consistency. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL. Seedance 2.0 supports up to 9; 2.5 up to 30.",
+                    "description": "Reference image URLs for style/character consistency. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL. Seedance 2.0 supports up to 9; 2.5 up to 30; Grok Imagine Video 1.5 up to 14 and Grok Imagine Video up to 7 (the same people in new scenes, with or without a first frame); Grok 1.5 Lite takes none.",
                 },
                 "reference_url": {
                     "type": "string",
@@ -5748,7 +6667,9 @@ def _reference_selected_by_user(source_text: Any, ref_url: Any) -> bool:
             parse_entity_fs_url(needle) is not None or needle.startswith(("http://", "https://"))
         ) and needle.lower() in lowered:
             return True
-        if re.search(rf"#\s*{re.escape(needle)}(?=$|[\s,，。；;])", text, re.IGNORECASE):
+        # The mention ends where the file name ends: CJK text and punctuation
+        # (（、：) often follow directly, but more name characters do not.
+        if re.search(rf"#\s*{re.escape(needle)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])", text, re.IGNORECASE):
             return True
     return False
 
@@ -5973,8 +6894,34 @@ def _seedance_openrouter_downgrade_warning(unsupported_inputs: list[str]) -> str
     )
 
 
-def _prompt_requests_video_post_asset(prompt: str) -> str:
-    """Detect requests that should be handled after silent video generation."""
+def _video_native_audio_assets(model: str, generate_audio: Any) -> frozenset[str]:
+    """Audio assets the provider clip itself produces when native audio is on.
+
+    A model with native dialogue (Grok Imagine) speaks the prompt's lines in
+    lip sync; telling it to leave the dialogue for post-production makes it
+    mouth gibberish over a picture nobody can re-voice.
+    """
+    from packages.core.constants.models import video_model_capabilities
+
+    if not _truthy_video_option(generate_audio):
+        return frozenset()
+    caps = video_model_capabilities(model)
+    native = set()
+    if caps.get("native_dialogue"):
+        native.add("dialogue")
+    if caps.get("native_narration"):
+        native.add("narration")
+    if caps.get("native_audio"):
+        native.add("sfx")
+    return frozenset(native)
+
+
+def _prompt_requests_video_post_asset(prompt: str, *, native: frozenset[str] = frozenset()) -> str:
+    """Detect requests that should be handled after silent video generation.
+
+    ``native`` names assets the provider generates in the clip itself; they
+    are not post-production work.
+    """
     text = " ".join(str(prompt or "").lower().split())
     if not text:
         return ""
@@ -6022,6 +6969,8 @@ def _prompt_requests_video_post_asset(prompt: str) -> str:
         "烧录",
     )
     for asset, terms in checks:
+        if asset in native:
+            continue
         for term in terms:
             idx = text.find(term)
             if idx == -1:
@@ -6461,6 +7410,18 @@ async def _generate_video_handler(
         kwargs.get("reference_audio_urls"),
     )
     audio_reference_url = audio_reference_urls[0] if audio_reference_urls else ""
+    # Named reference assets (a series' characters, its key visual) are the
+    # exact files the project or Workspace keeps, so the call may use them.
+    try:
+        asset_urls, asset_receipts = await _reference_asset_urls(
+            entity_id=entity_id,
+            workspace_id=str(kwargs.get("workspace_id") or runtime_context.workspace_id or "") or None,
+            project_id=str(runtime_context.workflow_project_id or "") or None,
+            keys=kwargs.get("reference_assets"),
+        )
+    except _UnknownReferenceAssets as exc:
+        return _video_error_result(str(exc), prompt=raw_prompt, error_code="reference_asset_not_found")
+    reference_urls = list(dict.fromkeys([*asset_urls, *reference_urls]))
     (
         first_frame_url,
         last_frame_url,
@@ -6475,7 +7436,7 @@ async def _generate_video_handler(
     )
     runtime_allowed_reference_urls = set(runtime_context.runtime_artifact_urls) | set(
         runtime_context.dependency_artifact_urls
-    )
+    ) | set(asset_urls)
     source_text_for_reference_policy = str(active_user_message or "")
     unmentioned_visual_refs: list[str] = []
     unrequested_media_refs: list[str] = []
@@ -6501,6 +7462,18 @@ async def _generate_video_handler(
             reference_video_urls=reference_video_urls,
             audio_reference_urls=audio_reference_urls,
             allowed_reference_urls=runtime_allowed_reference_urls,
+        )
+    dropped_references = sorted(set(unmentioned_visual_refs) | set(unrequested_media_refs))
+    if dropped_references:
+        # Never downgrade silently: without its first frame an image-to-video
+        # request becomes text-to-video, and without its audio reference a
+        # lip-sync request loses its voice — a different, still-billed video.
+        return _video_error_result(
+            "Reference media was not selected by the user, so it cannot be used: "
+            f"{', '.join(dropped_references)}. Ask the user to attach or #mention the file "
+            "(or paste its full file URL), or call again without these arguments.",
+            prompt=raw_prompt,
+            error_code="reference_media_not_selected",
         )
     audio_reference_url = audio_reference_urls[0] if audio_reference_urls else ""
     raw_resolution = kwargs.get("resolution", "720p")
@@ -6620,7 +7593,36 @@ async def _generate_video_handler(
     # Validate API key before reference preflight so OpenRouter fallback can
     # omit native-only Seedance reference inputs instead of failing on URLs the
     # selected route cannot use.
-    api_key, _base_url_override, is_byok = await _resolve_user_media_credentials(user_id, entity_id, role="video")
+    api_key, _base_url_override, is_byok = await _resolve_user_media_credentials(
+        user_id, entity_id, role="video", **({"require_saved_base": True} if provider == "xai" else {}),
+    )
+    if is_byok and _catalog_provider(selected_model) != provider:
+        # The saved video key is bound to the Account's selected model. A
+        # per-call model pin from another provider must never receive it.
+        api_key, _base_url_override, is_byok = "", "", False
+    # Grok runs on the Account's own key (through its saved relay) when there
+    # is one, and otherwise on the managed Vercel AI Gateway below.
+    if provider == "xai" and route_preference == "vercel":
+        api_key, _base_url_override, is_byok = "", "", False
+    xai_binding = None
+    if provider == "xai" and is_byok:
+        from packages.core.services.xai_video_transport import XaiTransportError, xai_credential_binding
+
+        try:
+            xai_binding = xai_credential_binding(
+                entity_id=entity_id, model=model, base_url=_base_url_override, api_key=api_key,
+            )
+        except XaiTransportError as exc:
+            return _video_error_result(str(exc), prompt=raw_prompt, model=model)
+    if not is_byok and not _selectable_media_model(model, "video"):
+        # A model outside the catalog has no managed route or price: it runs
+        # only on the key the Account tested and saved for it.
+        return _video_error_result(
+            f"Video model {model} runs only on your own API key. Test and save it "
+            "with its key in Settings → AI Models, or pick a catalog video model.",
+            prompt=raw_prompt,
+            model=model,
+        )
     route_provider = provider
     vercel_auth_method = "api-key"
     if route_preference == "vercel" or (
@@ -6656,6 +7658,13 @@ async def _generate_video_handler(
                 prompt=raw_prompt,
                 model=model,
             )
+    if provider == "xai" and route_provider != "vercel" and not is_byok:
+        return _video_error_result(
+            "Grok Imagine Video is unavailable right now: the managed gateway has no "
+            "credentials and no Grok key is saved in Settings → AI Models.",
+            prompt=raw_prompt,
+            model=model,
+        )
     if route_provider != "vercel":
         if not is_byok and provider in {"bytedance", "kwaivgi"}:
             native_key = await _platform_native_media_key_async(provider)
@@ -6673,6 +7682,7 @@ async def _generate_video_handler(
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_VIDEO_TOOL_SOURCE,
+            workspace_id=runtime_context.workspace_id or None,
         )
     # Atlas Cloud models are BYOK-only: Manor holds no platform key and does
     # not proxy or bill these calls. Without a user-supplied Atlas key the
@@ -6690,8 +7700,6 @@ async def _generate_video_handler(
         return _video_error_result(mismatch, prompt=raw_prompt, model=model)
 
     route_warnings: list[str] = []
-    if unmentioned_visual_refs or unrequested_media_refs:
-        route_warnings.append("Ignored reference media that was not mentioned or explicitly requested by the user.")
     omitted_seedance_inputs = _seedance_openrouter_native_only_inputs(
         provider=provider,
         api_key=api_key,
@@ -6706,9 +7714,11 @@ async def _generate_video_handler(
         audio_reference_urls = []
         audio_reference_url = ""
         generate_audio = False
-    if route_provider == "vercel" and audio_reference_urls:
+    if route_provider == "vercel" and audio_reference_urls and provider != "bytedance":
+        # Seedance takes audio references through providerOptions on the
+        # gateway (see VercelGatewayVideoAdapter); other models have no slot.
         route_warnings.append(
-            "Vercel's v4 video protocol does not accept audio reference files; "
+            "This model has no audio-reference input on the Vercel AI Gateway; "
             "the references were omitted while native generate_audio remains enabled."
         )
         audio_reference_urls = []
@@ -6781,7 +7791,10 @@ async def _generate_video_handler(
         return _video_error_result(capability_error, prompt=raw_prompt, model=model)
 
     workflow_notes: list[str] = []
-    post_asset = _prompt_requests_video_post_asset(raw_prompt)
+    post_asset = _prompt_requests_video_post_asset(
+        raw_prompt,
+        native=_video_native_audio_assets(model, generate_audio),
+    )
     post_warning = _video_post_production_warning(post_asset)
     if post_warning:
         route_warnings.append(post_warning)
@@ -6917,6 +7930,10 @@ async def _generate_video_handler(
             "audio_reference_url": audio_reference_url or None,
             "seed": seed,
         }
+        if xai_binding is not None:
+            from packages.core.services.xai_video_transport import XAI_BINDING_KEY
+
+            video_params[XAI_BINDING_KEY] = xai_binding
         if output_contract is not None:
             video_params[MEDIA_JOB_OUTPUT_CONTRACT_KEY] = output_contract
         if route_provider == "vercel":
@@ -6929,12 +7946,16 @@ async def _generate_video_handler(
             video_params["output_name"] = output_name
         if runtime_context.workspace_id:
             video_params["workspace_id"] = runtime_context.workspace_id
+        if runtime_context.workflow_run_id:
+            # The Workflow run reports its own outcome, so a successful job stays quiet.
+            video_params["workflow_run_id"] = runtime_context.workflow_run_id
         if runtime_context.task_id:
             video_params["task_id"] = runtime_context.task_id
             # A parked Task agent loop is woken by this job's completion.
             video_params.update(_media_job_lineage(runtime_context.task_id, kwargs))
         if inferred_inline_references:
             video_params["inferred_inline_references"] = inferred_inline_references
+        video_params.update(_video_job_origin(kwargs))
         if prompt != raw_prompt:
             video_params["source_prompt"] = raw_prompt
             video_params["audio_policy"] = (
@@ -6984,14 +8005,16 @@ async def _generate_video_handler(
         await db.flush()
         if entity_id and not is_byok:
             try:
+                from packages.core.ai.runtime.billing import runtime_bound_billing_payer
                 from packages.core.services.credit_reservations import (
                     CreditReservationError,
                     reserve_credits,
                 )
 
-                await reserve_credits(
+                reservation = await reserve_credits(
                     db,
                     entity_id=entity_id,
+                    payer_entity_id=runtime_bound_billing_payer(entity_id, runtime_context.workspace_id),
                     amount_credits=int(credits_estimate or 0),
                     source_kind="media_job",
                     source_id=job_id,
@@ -7009,9 +8032,14 @@ async def _generate_video_handler(
                         "credential_source": "platform",
                     },
                 )
+                # This job's own pin, for settlement after the reservation
+                # is gone. Never copied into another job.
+                job.params = {**video_params, "payer_entity_id": reservation.entity_id}
             except CreditReservationError as exc:
                 await db.rollback()
                 return _video_error_result(str(exc), prompt=raw_prompt, model=model)
+        elif is_byok:
+            _pin_byok_job_payer(job, entity_id, runtime_context.workspace_id)
         await db.commit()
 
     # Schedule background processing
@@ -7052,6 +8080,8 @@ async def _generate_video_handler(
         result["last_frame_url"] = last_frame_url
     if reference_urls:
         result["reference_urls"] = reference_urls
+    if asset_receipts:
+        result["reference_assets"] = asset_receipts
     if reference_video_urls:
         result["reference_video_urls"] = reference_video_urls
     if audio_reference_urls:
@@ -7096,11 +8126,32 @@ def _estimate_image_cost(model: str, size: str = "1024x1024") -> float:
     return estimate_image_cost_usd(model, size=size)
 
 
-def _estimate_audio_cost(model: str, *, purpose: str = "") -> float:
-    """Best-effort USD cost for one generated audio asset."""
+def _estimate_audio_cost(model: str, *, purpose: str = "", characters: int | None = None) -> float:
+    """Best-effort USD cost for one generated audio asset.
+
+    ``characters`` is the synthesized text length for per-character speech
+    models; flat-priced models ignore it.
+    """
     from packages.core.services.model_pricing_gateway import estimate_audio_cost_usd
 
-    return estimate_audio_cost_usd(model, purpose=purpose)
+    return estimate_audio_cost_usd(model, purpose=purpose, characters=characters)
+
+
+def _generated_audio_cost_usd(
+    model: str,
+    *,
+    purpose: str,
+    prompt: str,
+    provider_cost_usd: float | None = None,
+) -> float:
+    """USD charged for one generated audio file on a managed route.
+
+    The gateway-reported cost wins; otherwise the catalog estimate, counting
+    the synthesized text for per-character speech models.
+    """
+    if provider_cost_usd is not None and provider_cost_usd > 0:
+        return float(provider_cost_usd)
+    return _estimate_audio_cost(model, purpose=purpose, characters=len(prompt or ""))
 
 
 async def _bill_media(

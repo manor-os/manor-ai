@@ -6,8 +6,9 @@ entity Integration with provider="elevenlabs" and credentials
 not Authorization Bearer — we adapt internally.
 
 Output: audio responses come back as bytes. To keep the MCP wire
-format text-friendly, we save the audio to Manor's filesystem under
-``/manor-fs/audio/elevenlabs/<id>.mp3`` and return a short JSON blob
+format text-friendly, we save the audio to Manor's filesystem (the
+Workspace/Task/Workflow archive, or ``audio/<id>.mp3`` without a
+Workspace) and return a short JSON blob
 with the path + duration. Callers that need the actual bytes should
 read the file via the existing filesystem MCP.
 """
@@ -525,11 +526,26 @@ async def _save_audio_bytes(audio_bytes: bytes, filename_hint: str) -> tuple[Pat
         for c in (filename_hint or "audio")
     )[:32]
     fname = f"{int(time.time())}_{safe_hint}_{uuid.uuid4().hex[:8]}.mp3"
-    entity_id = _call_context_var.get().get("entity_id")
+    call_context = _call_context_var.get()
+    entity_id = call_context.get("entity_id")
     if entity_id:
         from packages.core.services.entity_fs import write_entity_file_atomic
+        from packages.core.services.generated_media_naming import (
+            resolve_workspace_artifact_base_dir, workspace_artifact_default_dir,
+        )
 
-        rel_path = f"audio/elevenlabs/{fname}"
+        # Workspace runs write into their Workspace/Task/Workflow archive like
+        # every other generated audio; Workspace-less calls use the
+        # entity-level ``audio/`` storage folder (Chat-filed in Knowledge).
+        base_dir = await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=call_context.get("workspace_id"),
+            task_id=call_context.get("task_id"),
+            workflow_run_id=call_context.get("workflow_run_id"),
+            workflow_lineage_root_run_id=call_context.get("workflow_lineage_root_run_id"),
+        )
+        rel_dir = workspace_artifact_default_dir(base_dir, "audio") if base_dir else "audio"
+        rel_path = f"{rel_dir}/{fname}"
         fpath = Path(
             write_entity_file_atomic(
                 entity_id,
@@ -558,7 +574,10 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
         from packages.core.database import async_session
         from packages.core.services.document_metadata import merge_document_metadata
         from packages.core.services.document_service import upsert_document_by_fs_path
-        from packages.core.services.knowledge_sync import bind_document_to_workspace, ensure_folder_path
+        from packages.core.services.generated_artifact_service import (
+            generated_artifact_document_folder_id,
+        )
+        from packages.core.services.knowledge_sync import bind_document_to_workspace
 
         from packages.core.services.entity_fs import get_entity_root
 
@@ -569,16 +588,26 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
         except ValueError:
             rel_path = fs_path
 
-        rel_dir = str(Path(rel_path).parent).replace("\\", "/")
-        rel_dir = "" if rel_dir == "." else rel_dir
         call_context = _call_context_var.get()
         workspace_id = call_context.get("workspace_id")
         task_id = call_context.get("task_id")
         agent_id = call_context.get("agent_id")
         conversation_id = call_context.get("conversation_id")
         user_id = call_context.get("user_id")
-        folder_id = await ensure_folder_path(
-            entity_id, rel_dir, owner_id=user_id or None,
+        from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+
+        # Audio in Workspace storage is shared with that Workspace, like every
+        # other generated artifact filed there.
+        storage_workspace_id = await infer_workspace_id_from_storage_path(
+            entity_id=entity_id, rel_path=rel_path,
+        )
+        folder_id = await generated_artifact_document_folder_id(
+            entity_id=entity_id,
+            user_id=user_id or "",
+            workspace_id=storage_workspace_id,
+            rel_path=rel_path,
+            conversation_id=conversation_id,
+            task_id=task_id,
         )
         document_id = None
         async with async_session() as db:
@@ -593,7 +622,7 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
                 source="elevenlabs",
                 created_by=user_id,
                 owner_id=user_id,
-                visibility="private",
+                visibility="workspace" if storage_workspace_id else "private",
                 folder_id=folder_id,
             )
             doc.source = "elevenlabs"

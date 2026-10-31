@@ -149,11 +149,6 @@ class TeamsChannelAdapter(ChannelAdapter):
             "raw": data,
         }
 
-    async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
-        # Graph authenticates the notification through the subscription's
-        # clientState; the router performs the constant-time comparison.
-        return True
-
     def parse_notification(
         self, cc: ChannelConfig, notification: dict,
     ) -> Optional[NormalizedInbound]:

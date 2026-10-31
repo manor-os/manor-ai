@@ -7,6 +7,7 @@ import { api, type ProvenanceStep } from "../lib/api";
 import type { Task, Agent, UserSummary } from "../lib/types";
 import { relativeTime, formatDateFull, formatDateLong, isDeadlineOverdue } from "../lib/format";
 import { useAuthStore } from "../stores/auth";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 import { useToastStore } from "../stores/toast";
 import { MANOR_AGENT_ID, MANOR_AGENT_TYPE, MANOR_AGENT_NAME, isMasterAgent, isLegacyAgentAuthorPlaceholder } from "../lib/constants";
 import { getAgentDescription } from "../lib/localizedContent";
@@ -30,20 +31,13 @@ import { STATUS_CONFIG } from "../components/ui/StatusPill";
 import { PRIORITY_CONFIG } from "../components/ui/PriorityPill";
 import { CATEGORIES } from "../lib/taskCategories";
 import { TaskType, isApprovalTaskType, isInteractiveTaskType } from "../lib/taskTypes";
-import {
-  canResumeLegacyAgentInput,
-  hasPendingPlanDecision,
-  needsEffectReconciliation,
-  pendingTaskInputRequests,
-  resumablePlanInputStep,
-} from "../lib/taskHitl";
+import { canResumeLegacyAgentInput } from "../lib/taskHitl";
 import CategoryChip from "../components/ui/CategoryChip";
 import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
-import { useTaskInputResolution } from "../components/task/useTaskInputResolution";
 import { currentTaskBlocker, taskBlockerFromLog } from "../lib/taskBlocker";
-import TaskExecutionTimeline from "../components/task/TaskExecutionTimeline";
+import { taskLogVisibleInComments, taskLogVisibleInExecution } from "../lib/taskCommentDisplay";
 import ChatInputFooter, { type AttachedItem, type MentionOption } from "../components/ChatInputFooter";
 import { t } from "../lib/i18n";
 import { inferRuntimeRuleFromText, runtimeRuleSelectorLabels } from "../lib/runtimeRules";
@@ -90,8 +84,6 @@ const LOG_ICONS: Record<string, { color: string; icon: string }> = {
 
 const TASK_DETAIL_POLL_INTERVAL_MS = 60_000;
 const LIVE_TASK_STATUSES = new Set(["pending", "in_progress"]);
-const LIVE_PLAN_STATUSES = new Set(["pending_approval", "running", "paused", "needs_attention"]);
-const LIVE_STEP_STATUSES = new Set(["pending", "running", "waiting_human"]);
 const RECOVERY_EVENT_TYPES = new Set([
   "ai_hitl_requested",
   "step_needs_human",
@@ -114,16 +106,6 @@ type TaskCommentPayload = {
 
 function hasLiveTaskStatus(task: unknown): boolean {
   return LIVE_TASK_STATUSES.has(String((task as any)?.status || ""));
-}
-
-function hasLivePlanStatus(value: unknown): boolean {
-  const plans = Array.isArray(value) ? value : [];
-  return plans.some((plan: any) => LIVE_PLAN_STATUSES.has(String(plan?.status || "")));
-}
-
-function hasLiveStepStatus(value: unknown): boolean {
-  const steps = Array.isArray(value) ? value : [];
-  return steps.some((step: any) => LIVE_STEP_STATUSES.has(String(step?.step_status || step?.status || "")));
 }
 
 function outputFileIdentity(file: any): string {
@@ -468,10 +450,6 @@ function TaskDependencyPanel({ task, onOpenTask }: { task: Task; onOpenTask: (ta
   );
 }
 
-function taskShortId(task?: Pick<Task, "id"> | null) {
-  return task?.id ? `#${task.id.slice(-6)}` : "";
-}
-
 function taskStatusLabel(status?: string | null) {
   const normalized = String(status || "").trim();
   if (!normalized) return t("page.agent_dashboard.status");
@@ -606,10 +584,6 @@ function TaskActionPanel({
   onApproveTask,
   onRequestTaskChanges,
   approvalPending,
-  plan,
-  planStepCount,
-  onApprovePlan,
-  planPending,
 }: {
   task: Task;
   pendingInputPrompt: string;
@@ -626,17 +600,12 @@ function TaskActionPanel({
   onApproveTask: () => void;
   onRequestTaskChanges: () => void;
   approvalPending: boolean;
-  plan: any | null;
-  planStepCount: number;
-  onApprovePlan: () => void;
-  planPending: boolean;
 }) {
-  const needsPlanApproval = plan?.status === "pending_approval";
   const showTaskApproval = isApprovalTask;
-  const showPanel = hasPendingInput || showTaskApproval || needsPlanApproval;
+  const showPanel = hasPendingInput || showTaskApproval;
   if (!showPanel) return null;
   const taskIsClosed = ["completed", "cancelled", "failed"].includes(task.status);
-  const hasAction = hasPendingInput || (showTaskApproval && !taskIsClosed) || needsPlanApproval;
+  const hasAction = hasPendingInput || (showTaskApproval && !taskIsClosed);
 
   return (
     <div
@@ -754,39 +723,6 @@ function TaskActionPanel({
                   : t("page.task_detail.save_reply_as_comment")}
               </Button>
             </div>
-          </section>
-        )}
-
-        {needsPlanApproval && (
-          <section style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-            padding: "11px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(79,113,105,0.16)",
-            background: "rgba(242,248,246,0.7)",
-          }}>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 850, color: "#1c1917" }}>
-                {t("page.task_detail.plan_approval_title")}
-              </div>
-              <div style={{ marginTop: 2, fontSize: 11, color: "#3f665e", lineHeight: 1.45 }}>
-                {t("page.task_detail.plan_approval_desc")
-                  .replace("{id}", taskShortId(plan))
-                  .replace("{count}", String(planStepCount))}
-              </div>
-            </div>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={onApprovePlan}
-              loading={planPending}
-              disabled={planPending}
-            >
-              {t("page.task_detail.approve_plan_and_run")}
-            </Button>
           </section>
         )}
 
@@ -1038,25 +974,7 @@ export default function TaskDetail() {
     enabled: !!taskId,
     refetchInterval: (query) => hasLiveTaskStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
   });
-  const inputResolution = useTaskInputResolution(task);
   const { data: taskConstants } = useQuery({ queryKey: ["task-constants"], queryFn: () => api.tasks.constants() });
-  const {
-    data: taskPlans = [],
-    isLoading: plansLoading,
-    isSuccess: plansResolved,
-  } = useQuery({
-    queryKey: ["task-plans", taskId],
-    queryFn: () => api.plans.list({ task_id: taskId!, limit: 5 }),
-    enabled: !!taskId,
-    refetchInterval: (query) => hasLiveTaskStatus(task) || hasLivePlanStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
-  });
-  const latestPlan = taskPlans[0] || null;
-  const { data: planSteps = [], isSuccess: planStepsResolved } = useQuery({
-    queryKey: ["plan-steps", latestPlan?.id],
-    queryFn: () => api.plans.steps(latestPlan!.id),
-    enabled: !!latestPlan?.id,
-    refetchInterval: (query) => hasLivePlanStatus([latestPlan]) || hasLiveStepStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
-  });
   // M14 execution provenance — lazy, workspace-scoped, and silent on 404
   // (entity-level tasks have no workspace ledger to trace).
   const { data: taskProvenance } = useQuery({
@@ -1076,16 +994,19 @@ export default function TaskDetail() {
     queryKey: ["task-logs", taskId],
     queryFn: () => api.tasks.logs(taskId!),
     enabled: !!taskId,
-    refetchInterval: () => hasLiveTaskStatus(task) || hasLivePlanStatus([latestPlan]) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
+    refetchInterval: () => hasLiveTaskStatus(task) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
   });
   // Lookups so the sidebar can render names instead of opaque ULIDs and
   // link out to the parent task / source chat.
   const { data: workspaces = [] } = useQuery({ queryKey: ["workspaces"], queryFn: () => api.workspaces.list() });
+  // The company directory is refused to an external collaborator.
+  const collaborator = useIsCollaborator();
   const { data: users = [] } = useQuery({
     queryKey: ["users", "directory"],
     queryFn: () => api.users.directory(),
+    enabled: !collaborator,
   });
-  const { data: staffList = [] } = useQuery({ queryKey: ["entity-staff-for-assignee"], queryFn: () => api.staff.list() });
+  const { data: staffList = [] } = useQuery({ queryKey: ["entity-staff-for-assignee"], queryFn: () => api.staff.list(), enabled: !collaborator });
 
   const workspaceAgentIds = task?.workspace_id
     ? workspaceAssignableAgents?.agent_ids || []
@@ -1239,10 +1160,6 @@ export default function TaskDetail() {
       queryClient.setQueryData(["task", taskId], result.task);
       queryClient.invalidateQueries({ queryKey: ["task", taskId] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      if (result.plan_id) {
-        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
-      }
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       toast.success(
@@ -1256,15 +1173,11 @@ export default function TaskDetail() {
   });
 
   const hitlMutation = useMutation({
-    mutationFn: ({ stepId, response, fields }: { stepId?: string; response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(taskId!, { step_id: stepId, response, fields }),
+    mutationFn: ({ response, fields }: { response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(taskId!, { response, fields }),
     onSuccess: (result) => {
       queryClient.setQueryData(["task", taskId], result.task);
       queryClient.invalidateQueries({ queryKey: ["task", taskId] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      if (result.plan_id) {
-        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
-      }
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       window.dispatchEvent(new CustomEvent("manor:workspace-actions-refresh", { detail: { workspaceId: result.task.workspace_id } }));
@@ -1315,79 +1228,6 @@ export default function TaskDetail() {
     },
     onError: (err: any) => {
       toast.error(t("page.task_detail.approval_decision_failed"), err?.message || t("page.task_detail.try_again"));
-    },
-  });
-
-  const approvePlanMutation = useMutation({
-    mutationFn: ({ planId }: { planId: string }) => api.plans.approve(planId),
-    onSuccess: (updatedPlan) => {
-      queryClient.setQueryData(["task-plans", taskId], (prev: any[] | undefined) => {
-        const rows = prev || [];
-        if (rows.some((plan) => plan.id === updatedPlan.id)) {
-          return rows.map((plan) => plan.id === updatedPlan.id ? updatedPlan : plan);
-        }
-        return [updatedPlan, ...rows];
-      });
-      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["plan-steps", updatedPlan.id] });
-      queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      toast.success(t("page.task_detail.approval_decision_saved"));
-    },
-    onError: (err: any) => {
-      toast.error(t("page.task_detail.approval_decision_failed"), err?.message || t("page.task_detail.try_again"));
-    },
-  });
-
-  const retryPlanMutation = useMutation({
-    mutationFn: ({ planId, note }: { planId: string; note?: string }) => api.plans.retryFailedSteps(planId, note),
-    onSuccess: (result) => {
-      queryClient.setQueryData(["task-plans", taskId], (prev: any[] | undefined) => {
-        const rows = prev || [];
-        return rows.map((plan) => plan.id === result.plan.id ? result.plan : plan);
-      });
-      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan.id] });
-      queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      toast.success(
-        result.dispatched ? t("page.task_detail.failed_steps_retry_started") : t("page.task_detail.failed_steps_reset"),
-        `${result.reset_steps} ${t("page.task_detail.steps_reset")}`,
-      );
-    },
-    onError: (err: any) => {
-      toast.error(t("page.task_detail.retry_failed"), err?.message || t("page.task_detail.could_not_retry_failed_steps"));
-    },
-  });
-
-  const retryStepMutation = useMutation({
-    mutationFn: ({ stepId, note }: { stepId: string; note?: string }) => api.plans.retryStep(stepId, note),
-    onSuccess: (result) => {
-      queryClient.setQueryData(["task-plans", taskId], (prev: any[] | undefined) => {
-        const rows = prev || [];
-        return rows.map((plan) => plan.id === result.plan.id ? result.plan : plan);
-      });
-      queryClient.setQueryData(["plan-steps", result.plan.id], (prev: any[] | undefined) => {
-        const rows = prev || [];
-        return rows.map((step) => step.id === result.step.id ? result.step : step);
-      });
-      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan.id] });
-      queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      toast.success(
-        result.dispatched ? t("page.task_detail.step_retry_started") : t("page.task_detail.step_reset"),
-        `${t("component.task_execution_timeline.step")}: ${formatUserFacingLabel(result.step.step_key)}`,
-      );
-    },
-    onError: (err: any) => {
-      toast.error(t("page.task_detail.retry_failed"), err?.message || t("page.task_detail.could_not_retry_this_step"));
     },
   });
 
@@ -1473,40 +1313,8 @@ export default function TaskDetail() {
     for (const file of taskOutputFiles) {
       addPreview(buildTaskOutputPreview(file, outputFileLabel(file)), file);
     }
-    for (const step of planSteps as any[]) {
-      const result = step?.result;
-      if (!result || typeof result !== "object") continue;
-      const stepLabel = String(step?.title || formatUserFacingLabel(step?.step_key || step?.key) || "Generated output");
-      const stepKey = step?.step_key || step?.key;
-      const resultSource = stepKey ? { ...result, step: stepKey } : result;
-      const resultPreview = buildTaskOutputPreview(resultSource, outputFileLabel(resultSource, stepLabel));
-      addPreview(resultPreview, resultSource);
-      const resultContent = outputFileInlineContent(result);
-      const resultPath = outputFileLookupPath(result);
-      const resultDocId = outputFileDocumentId(result);
-      for (const key of ["files", "artifacts", "documents", "images"]) {
-        const values = result[key];
-        if (!Array.isArray(values)) continue;
-        for (const item of values) {
-          if (!item || typeof item !== "object") continue;
-          const source = {
-            ...(resultContent && !outputFileInlineContent(item) ? { ...item, markdown_document: resultContent } : item),
-            ...(stepKey ? { step: stepKey } : {}),
-          };
-          addPreview(
-            buildTaskOutputPreview(
-              source,
-              outputFileLabel(item, stepLabel),
-              outputFileLookupPath(item) || resultPath,
-              outputFileDocumentId(item) || resultDocId,
-            ),
-            item,
-          );
-        }
-      }
-    }
     return { byKey, list };
-  }, [planSteps, taskOutputFiles]);
+  }, [taskOutputFiles]);
   const taskOutputLookupPaths = useMemo(
     () => Array.from(new Set(
       taskOutputFiles
@@ -1622,6 +1430,12 @@ export default function TaskDetail() {
   const isLongDescription = formattedDescription.length > 720;
   const taskOutputSteps = Array.isArray(taskOutput?.steps) ? taskOutput.steps : [];
   const taskOutputSummary = formatTaskOutputSummary(taskOutput) || taskOutputErrorMessage;
+  // A delivered Task whose acceptance report left criteria unmet or unverified.
+  const taskOutputExceptions = (Array.isArray(taskOutput?.acceptance_exceptions) ? taskOutput.acceptance_exceptions : [])
+    .filter((item: any) => item && typeof item.criterion === "string" && item.criterion.trim()) as { criterion: string; evidence?: string }[];
+  // Tool calls of that delivery whose effect the host could not confirm.
+  const taskOutputUnconfirmedEffects = (Array.isArray(taskOutput?.unconfirmed_effects) ? taskOutput.unconfirmed_effects : [])
+    .filter((item: any) => item && typeof item.tool === "string" && item.tool.trim()) as { tool: string; operation?: string; targets?: string[] }[];
   const shouldShowAgentResponseInOutput = Boolean(
     taskOutputAgentResponse
     && taskOutputAgentResponse !== taskOutputSummary
@@ -1691,16 +1505,7 @@ export default function TaskDetail() {
     commitRuntimeContext(patch);
     setRuntimeRulePrompt("");
   };
-  const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps as any[]);
-  const pendingInputCards = pendingTaskInputRequests(task, latestPlan, planSteps);
-  const canResumePendingInput = Boolean(pendingPlanInputStep)
-    || canResumeLegacyAgentInput(task, latestPlan, plansResolved);
-  const hasPendingTypedDecision = hasPendingPlanDecision(
-    planSteps,
-    pendingPlanInputStep?.id,
-  );
-  const planDecisionStateResolved = plansResolved
-    && (!latestPlan || planStepsResolved);
+  const canResumePendingInput = canResumeLegacyAgentInput(task);
   const submitHumanInputReply = (response: string, fields?: Record<string, string>) => {
     const cleanResponse = response.trim();
     const cleanFields = Object.fromEntries(
@@ -1710,7 +1515,6 @@ export default function TaskDetail() {
     );
     if (canResumePendingInput) {
       hitlMutation.mutate({
-        stepId: pendingPlanInputStep?.id,
         response: cleanResponse,
         fields: cleanFields,
       });
@@ -1722,20 +1526,12 @@ export default function TaskDetail() {
   };
   const pendingInputRequest = latestActionableInputRequest(logs as any[], taskOutput, task.status);
   const actionableInputRequest = canResumePendingInput ? pendingInputRequest : null;
-  const pendingInputPrompt = String(pendingPlanInputStep?.human_input_prompt || "")
-    || inputRequestPrompt(actionableInputRequest);
-  const hasTaskRecoveryOrigin = Boolean(latestPlan)
-    || Boolean(currentTaskBlocker(task))
+  const pendingInputPrompt = inputRequestPrompt(actionableInputRequest);
+  const hasTaskRecoveryOrigin = Boolean(currentTaskBlocker(task))
     || canResumePendingInput
     || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
-  const showTaskRecoveryPanel = planDecisionStateResolved
-    && hasTaskRecoveryOrigin
-    && (pendingInputCards.length > 0 || (
-      !actionableInputRequest && (!hasPendingTypedDecision || canResumePendingInput)
-    ));
-  const reviewEffectsHref = needsEffectReconciliation(task, latestPlan)
-    ? `/chat?workspace=${encodeURIComponent(task.workspace_id!)}`
-    : undefined;
+  const showTaskRecoveryPanel = hasTaskRecoveryOrigin
+    && !actionableInputRequest;
   const submitActionReply = () => {
     submitHumanInputReply(hitlReply);
   };
@@ -1999,13 +1795,7 @@ export default function TaskDetail() {
               logs={logs}
               comment={newComment}
               detailReason={formatUserFacingStructuredText(taskOutputErrorMessage)}
-              inputStepId={pendingPlanInputStep?.id}
-              inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
-              inputRequests={pendingInputCards}
-              inputResetToken={inputResolution.resetToken}
-              onResolveInput={inputResolution.resolve}
-              reviewEffectsHref={reviewEffectsHref}
-              isPending={retryMutation.isPending || hitlMutation.isPending || actionReplyCommentMutation.isPending || inputResolution.isPending}
+              isPending={retryMutation.isPending || hitlMutation.isPending || actionReplyCommentMutation.isPending}
               onRetry={(note) => retryMutation.mutate(note)}
               onRespond={canResumePendingInput ? submitHumanInputReply : undefined}
             />
@@ -2014,7 +1804,7 @@ export default function TaskDetail() {
           <TaskActionPanel
             task={task}
             pendingInputPrompt={pendingInputPrompt}
-            hasPendingInput={pendingInputCards.length === 0 && !!actionableInputRequest}
+            hasPendingInput={!!actionableInputRequest}
             canResumePendingInput={canResumePendingInput}
             hitlReply={hitlReply}
             onHitlReplyChange={setHitlReply}
@@ -2027,10 +1817,6 @@ export default function TaskDetail() {
             onApproveTask={() => approvalMutation.mutate({ choice: "approve", note: approvalNote })}
             onRequestTaskChanges={() => approvalMutation.mutate({ choice: "request_changes", note: approvalNote })}
             approvalPending={approvalMutation.isPending}
-            plan={latestPlan}
-            planStepCount={(planSteps as any[]).length}
-            onApprovePlan={() => latestPlan?.id && approvePlanMutation.mutate({ planId: latestPlan.id })}
-            planPending={approvePlanMutation.isPending}
           />
 
           {taskResolutionNotice && (
@@ -2314,6 +2100,41 @@ export default function TaskDetail() {
                 )}
               </div>
               <div className="task-detail-section-body" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 14 }}>
+                {taskOutputExceptions.length > 0 && (
+                  <div role="note" style={{ border: "1px solid rgba(180,83,9,0.28)", background: "rgba(254,243,199,0.5)", borderRadius: 12, padding: "10px 14px" }}>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: "#92400e", marginBottom: 6 }}>
+                      {t("page.task_detail.acceptance_exceptions_title", { count: taskOutputExceptions.length })}
+                    </div>
+                    <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: "#44403c", lineHeight: 1.6 }}>
+                      {taskOutputExceptions.map((item, index) => (
+                        <li key={index}>
+                          <span style={{ fontWeight: 650 }}>{item.criterion}</span>
+                          {item.evidence ? <span style={{ color: "#78716c" }}> — {item.evidence}</span> : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {taskOutputUnconfirmedEffects.length > 0 && (
+                  <div role="note" style={{ border: "1px solid rgba(180,83,9,0.28)", background: "rgba(254,243,199,0.5)", borderRadius: 12, padding: "10px 14px" }}>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: "#92400e", marginBottom: 6 }}>
+                      {t("page.task_detail.unconfirmed_effects_title", { count: taskOutputUnconfirmedEffects.length })}
+                    </div>
+                    <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: "#44403c", lineHeight: 1.6 }}>
+                      {taskOutputUnconfirmedEffects.map((item, index) => (
+                        <li key={index}>
+                          <span style={{ fontWeight: 650 }}>{item.operation ? `${item.tool}/${item.operation}` : item.tool}</span>
+                          <span style={{ color: "#78716c" }}>
+                            {" — "}
+                            {Array.isArray(item.targets) && item.targets.length > 0
+                              ? t("page.task_detail.unconfirmed_effect_targets", { targets: item.targets.join(", ") })
+                              : t("page.task_detail.unconfirmed_effect_unknown")}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 {taskOutputSummary ? (
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 800, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
@@ -2423,17 +2244,6 @@ export default function TaskDetail() {
           )}
 
           <TaskProvenanceBreadcrumb provenance={taskProvenance} />
-
-          <TaskExecutionTimeline
-            plan={latestPlan}
-            taskStatus={task?.status}
-            steps={planSteps}
-            isLoading={plansLoading}
-            isPending={approvePlanMutation.isPending || retryPlanMutation.isPending || retryStepMutation.isPending}
-            note={newComment}
-            onRetryFailedSteps={(planId, note) => retryPlanMutation.mutate({ planId, note })}
-            onRetryStep={(stepId, note) => retryStepMutation.mutate({ stepId, note })}
-          />
 
           {/* Subtasks card — direct children of this task. Hidden when
               there are no children, so leaf tasks stay clean. */}
@@ -2649,34 +2459,11 @@ export default function TaskDetail() {
             </details>
           ))}
 
-          {/* ── Comments (human + status changes + AI agent voice) ──
-              Comments now includes the agent-side moments users care
-              about: HITL requests, HITL resumes, replan signals, and
-              the final execution completion / failure summary. The
-              per-turn supervisor noise stays in the Execution Log
-              section so the Comments stream reads like a conversation. */}
+          {/* Comments include bounded coordinator progress. Internal turn
+              traces stay in Execution Log. */}
           {(() => {
-            // Low-signal exec events (turn-by-turn loop) — stay in Execution Log only
-            const EXEC_ONLY_TYPES = new Set([
-              "ai_execution_started",
-              "ai_agent_turn",
-              "ai_supervisor_verdict",
-            ]);
-            // Conversation-grade exec events — surface in Comments AND in Execution Log
-            const COMMENT_EXEC_TYPES = new Set([
-              "ai_hitl_requested",
-              "ai_hitl_resumed",
-              "ai_needs_replan",
-              "ai_execution_completed",
-              "ai_execution_failed",
-            ]);
-            const comments = (logs as any[]).filter((l: any) =>
-              !EXEC_ONLY_TYPES.has(l.log_type) || COMMENT_EXEC_TYPES.has(l.log_type)
-            );
-            // Execution Log keeps the full stream for traceability
-            const execLogs = (logs as any[]).filter((l: any) =>
-              EXEC_ONLY_TYPES.has(l.log_type) || COMMENT_EXEC_TYPES.has(l.log_type)
-            );
+            const comments = (logs as any[]).filter(taskLogVisibleInComments);
+            const execLogs = (logs as any[]).filter(taskLogVisibleInExecution);
             return (<>
           <div className="glass-card task-detail-section-card task-detail-comments-card" style={{ padding: 0, overflow: "hidden" }}>
             <div className="task-detail-section-header" style={{ padding: "12px 20px", background: "rgba(245,245,244,0.5)", borderBottom: "1px solid rgba(28,25,23,0.06)", display: "flex", alignItems: "center", gap: 8 }}>

@@ -1,0 +1,2366 @@
+{
+ "hyperframes_version": "0.7.105",
+ "generated_by": "scripts/hyperframes_check_rules.py",
+ "strict_failing_severities": [
+  "error",
+  "warning"
+ ],
+ "rules": [
+  {
+   "code": "audio_file_without_element",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "Found audio file(s) in project (${audioFiles.join(\", \")}) but no <audio> element in any composition. The rendered video will be silent."
+   ]
+  },
+  {
+   "code": "audio_reactive_single_tween_per_group",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Sample audio data at 100-200ms intervals throughout each group's lifetime (for loop from group.start to group.end) and create a tween at each sample point for visible pulsing."
+   ],
+   "messages": [
+    "Audio-reactive captions use a single tween per group based on peak values. This sets one static value at group.start — not perceptible as audio reactivity."
+   ]
+  },
+  {
+   "code": "audio_src_not_found",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add the file \"${unique[0]}\" to the project directory, or update the src attribute to point to an existing file.",
+    "Add the missing files to the project directory, or update the src attributes to point to existing files."
+   ],
+   "messages": [
+    "<audio> element references file(s) not found in the project: ${unique.join(\", \")}. The rendered video will be silent."
+   ]
+  },
+  {
+   "code": "base64_media_prohibited",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use a relative path (assets/music.mp3) or HTTPS URL for the audio/video src. Never embed media as base64."
+   ],
+   "messages": [
+    "Inline base64 audio/video detected (${(dataSize / 1024).toFixed(0)} KB)${isSuspicious ? \" — likely fabricated data\" : \"\"}. Base64 media is prohibited — it bloats file size and breaks rendering."
+   ]
+  },
+  {
+   "code": "canvas_overflow",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Move the text inward, reduce its size, or mark intentional off-canvas animation with data-layout-allow-overflow."
+   ],
+   "messages": [
+    "Text extends outside the composition canvas."
+   ]
+  },
+  {
+   "code": "caption_container_relative_position",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use position: absolute for all caption elements."
+   ],
+   "messages": [
+    "Caption selector \"${(selector ?? \"\").trim()}\" uses position: relative which causes overflow and breaks caption stacking."
+   ]
+  },
+  {
+   "code": "caption_exit_missing_hard_kill",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `tl.set(groupEl, { opacity: 0, visibility: \"hidden\" }, group.end)` after every exit tl.to animation as a deterministic kill."
+   ],
+   "messages": [
+    "Caption exit animations (tl.to with opacity: 0) detected without a hard tl.set kill. Exit tweens can fail when karaoke word-level tweens conflict, leaving captions stuck on screen."
+   ]
+  },
+  {
+   "code": "caption_fittext_scale_mismatch",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Reduce maxWidth to ${Math.floor(1700 / maxScale)}px to leave headroom for scaled emphasis words."
+   ],
+   "messages": [
+    "fitTextFontSize uses maxWidth: ${maxWidth}px but emphasis words scale up to ${maxScale}x. Effective width ${Math.round(effectiveWidth)}px may overflow the composition (1920px minus margins)."
+   ]
+  },
+  {
+   "code": "caption_overflow_clips_scaled_words",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use overflow: visible on caption containers. Rely on fitTextFontSize with reduced maxWidth to prevent overflow instead."
+   ],
+   "messages": [
+    "\"${(selector ?? \"\").trim()}\" has overflow: hidden but GSAP scales caption words above 1.0x. Scaled emphasis words and their glow effects will be clipped."
+   ]
+  },
+  {
+   "code": "caption_text_overflow_risk",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add max-width: 1600px (landscape) or max-width: 900px (portrait) and overflow: hidden."
+   ],
+   "messages": [
+    "Caption selector \"${(selector ?? \"\").trim()}\" has white-space: nowrap but no max-width. Long phrases will clip off-screen."
+   ]
+  },
+  {
+   "code": "caption_textshadow_on_group_container",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Apply textShadow to individual active word elements instead of the group container. Use scale on the group for bass-reactive pulsing."
+   ],
+   "messages": [
+    "textShadow is tweened on a caption group container. When children have semi-transparent color (e.g., inactive karaoke words at rgba opacity), the glow renders as a visible rectangle behind the entire group."
+   ]
+  },
+  {
+   "code": "caption_transcript_not_inline",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Embed the transcript as `var TRANSCRIPT = [{ \"text\": \"...\", \"start\": 0, \"end\": 1 }, ...]` with JSON-quoted property keys. See the captions skill for details."
+   ],
+   "messages": [
+    "Captions composition loads transcript via fetch(). The studio caption editor requires an inline `var TRANSCRIPT = [...]` array to detect and edit captions."
+   ]
+  },
+  {
+   "code": "caption_transcript_parse_error",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use JSON-quoted keys: { \"text\": \"don't\", \"start\": 0, \"end\": 1 } instead of { text: \"don't\", start: 0, end: 1 }."
+   ],
+   "messages": [
+    "Inline TRANSCRIPT array is not valid JSON. The studio caption editor may fail to parse it. Common cause: unquoted property keys with apostrophes in text."
+   ]
+  },
+  {
+   "code": "caption_zone_collision",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Keep main content outside the configured caption band, or mark intentional lower-third copy with data-layout-allow-caption-zone."
+   ],
+   "messages": [
+    "<${candidate.tag}> \"${text2}\" is centred in the reserved caption band (~${pctFromBottom}% up from the bottom)."
+   ]
+  },
+  {
+   "code": "check_lint_failure",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "check_runtime_failure",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "clip_media_fit",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "clipped_text",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "error",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [],
+   "messages": [
+    "Text content is clipped by its own box."
+   ]
+  },
+  {
+   "code": "color_grading_invalid_json",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use valid JSON, for example {\"preset\":\"skin-soft\",\"intensity\":0.6,\"adjust\":{\"highlights\":-0.08}}."
+   ],
+   "messages": [
+    "data-color-grading contains malformed JSON and will not render."
+   ]
+  },
+  {
+   "code": "color_grading_invalid_structure",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "data-color-grading ${issue.path} ${issue.message}."
+   ]
+  },
+  {
+   "code": "color_grading_non_media",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Move the grading attribute to the real <video> or <img> media element. Do not attach it to a wrapper or CSS background."
+   ],
+   "messages": [
+    "data-color-grading on <${tag.name}> has no effect. The shader runtime only grades real <video> and <img> elements."
+   ]
+  },
+  {
+   "code": "composition_file_too_large",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "${splitTarget}, then mount them from the parent with data-composition-src so each file stays small enough to inspect, revise, and validate independently."
+   ],
+   "messages": [
+    "This HTML composition file has ${lineCount} lines. Smaller sub-compositions are easier to read, iterate on, and diff."
+   ]
+  },
+  {
+   "code": "composition_heavy_overlay_count_high",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "${splitTarget} and concat the pieces (FFmpeg or the runtime's slideshow) so each capture only sees a small subset of heavy overlays at once. Even hidden overlays (opacity:0 / visibility:hidden) contribute — either remove truly unused ones from the source or scope them into their own per-transition sub-composition. If an overlay is genuinely inert for the whole clip, use display:none so it never enters the render tree. Field ref ts=1784040753 (#hyperframes-cli-feedback)."
+   ],
+   "messages": [
+    "This composition has ${heavyCount} elements carrying \"heavy overlay\" CSS (filter:blur, radial-gradient, or clip-path). Field signal: a composition with ~40 such elements — including opacity:0 / visibility:hidden ones — captures solid-black for the first ~half of the render, recovering near the end. Reproduces identically via drawElement, forced screenshot capture, and snapshot, so the capture layer itself is the offender (not encoder/mux). Independent of duration. Presence alone matters; only display:none elements are excluded here."
+   ]
+  },
+  {
+   "code": "composition_self_attribute_selector",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use #${rootId} for clearer authoring intent and instance-isolated styling.",
+    "Add a stable id to the composition root and use that id selector for clearer authoring intent and instance-isolated styling."
+   ],
+   "messages": [
+    "Selector matches the block's own id; will leak to sibling instances when the block is embedded twice."
+   ]
+  },
+  {
+   "code": "connector_detached",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Convert measured screen coordinates into the SVG's user space (subtract the SVG rect / invert getScreenCTM) before writing path `d`, and keep the SVG a direct child of the stage."
+   ],
+   "messages": [
+    "Connector path endpoints render ${gap}px from the nearest anchorable element, but the path's user-space coordinates would attach if read as screen pixels — screen/viewport numbers were likely written into SVG `d` without inverting the CTM."
+   ]
+  },
+  {
+   "code": "console_error",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "console_warning",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "container_overflow",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Resize/reposition the child or container, or mark intentional overflow with data-layout-allow-overflow."
+   ],
+   "messages": [
+    "Element extends outside a clipping layout container."
+   ]
+  },
+  {
+   "code": "content_overlap",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "error",
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Give each block its own zone, or mark intentional layering with data-layout-allow-overlap."
+   ],
+   "messages": [
+    "Two text blocks overlap and may render unreadable."
+   ]
+  },
+  {
+   "code": "contrast_aa_failure",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "Contrast is ${entry.ratio}:1; WCAG AA requires ${requiredRatio}:1."
+   ]
+  },
+  {
+   "code": "deprecated_data_end",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Replace data-end with data-duration. The compiler generates data-end from data-duration automatically."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> has data-end that disagrees with data-duration. Remove the stale data-end; the compiler regenerates it from data-duration.",
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> uses data-end without data-duration. Use data-duration in source HTML."
+   ]
+  },
+  {
+   "code": "deprecated_data_layer",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Replace data-layer with data-track-index. The runtime reads data-track-index."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> uses data-layer instead of data-track-index."
+   ]
+  },
+  {
+   "code": "duplicate_audio_track",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use non-overlapping time windows or different track indices."
+   ],
+   "messages": [
+    "Multiple <audio> elements on track ${a.trackIndex} overlap (${a.src} at ${a.start}-${Number.isFinite(a.end) ? a.end.toFixed(1) : \"end\"}s, ${b2.src} at ${b2.start}-${Number.isFinite(b2.end) ? b2.end.toFixed(1) : \"end\"}s). This causes layered audio playback."
+   ]
+  },
+  {
+   "code": "duplicate_composition_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Keep data-composition-id on exactly one element, the composition root. Remove it from metadata or duplicate hosts, especially a <meta> tag carrying the same data-composition-id as the root <div>, which causes a silent duplicate-id collision."
+   ],
+   "messages": [
+    "Composition id \"${compositionId}\" is used by ${matchingTags.length} elements. Each data-composition-id value must be unique within a composition file."
+   ]
+  },
+  {
+   "code": "duplicate_media_discovery_risk",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Avoid duplicated media nodes that can be discovered twice during compilation."
+   ],
+   "messages": [
+    "Detected ${count} matching ${tagName19} entries with the same source/start/duration."
+   ]
+  },
+  {
+   "code": "duplicate_media_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Give each media element a unique id so preview and producer discover the same media graph."
+   ],
+   "messages": [
+    "Media id \"${elementId}\" is defined multiple times."
+   ]
+  },
+  {
+   "code": "escaped_container",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Compute left/top in the offset parent's frame (subtract its rect), or mark intentional placement with data-layout-allow-overflow."
+   ],
+   "messages": [
+    "Positioned element renders far outside its offset parent — its coordinates were likely computed in a different frame (canvas/viewport pixels)."
+   ]
+  },
+  {
+   "code": "font_family_without_font_face",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add @font-face { font-family: '...'; src: url('capture/assets/fonts/...woff2'); } for each font family, pointing to the captured .woff2 files. For an OS-bundled system font (e.g. Hiragino Sans, Microsoft YaHei) that has no downloadable file, use src: local('Exact Font Name') instead — the declaration alone satisfies this check without needing a font file."
+   ],
+   "messages": [
+    "Font ${undeclared.length === 1 ? \"family\" : \"families\"} used without @font-face declaration: ${undeclared.join(\", \")}. These are not in the auto-resolved font list, so the renderer cannot supply them automatically. Text will fall back to a generic font, producing incorrect typography in the video."
+   ]
+  },
+  {
+   "code": "frame_out_of_frame",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Keep media within the composition frame's safe area."
+   ],
+   "messages": []
+  },
+  {
+   "code": "google_fonts_import",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "For bundled fonts, remove the Google Fonts <link> or @import and keep the font-family declaration. For custom fonts, use @font-face { font-family: '...'; src: url('...woff2'); }."
+   ],
+   "messages": [
+    "Composition loads fonts from fonts.googleapis.com. The producer resolves Google Fonts during compile/render, but raw external font requests add latency and can fail before canonicalization. Prefer mapped family names or local @font-face declarations when possible."
+   ]
+  },
+  {
+   "code": "gsap_animates_clip_element",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the visibility/display tween, or move the content into a child <div> and target that instead."
+   ],
+   "messages": [
+    "GSAP animation sets ${conflictingProps.join(\", \")} on a clip element. Selector \"${sel}\" resolves to element ${elDesc}. The framework manages clip visibility via ${conflictingProps.join(\"/\")} — do not animate these properties on clip elements."
+   ]
+  },
+  {
+   "code": "gsap_callback_dom_measurement",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Do all measurement and DOM setup synchronously at build time, before registering the timeline — or derive geometry from fixed composition coordinates instead of measuring."
+   ],
+   "messages": [
+    "Timeline callback reaches DOM measurement (getBoundingClientRect/getTotalLength/getComputedStyle/...). The renderer seeks with suppressEvents=false, so callbacks re-fire on every seek — and a cold render worker runs them against whatever DOM state its own non-linear seek order produced. Measured geometry is seek-order-dependent, and values measured at build time (before the callback ran) are stale or zero."
+   ]
+  },
+  {
+   "code": "gsap_cold_seek_hidden_fromto_missing_reveal",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `opacity: 1` (or `autoAlpha: 1`) to the destination vars for \"${sel}\" so every seek path establishes the visible end state explicitly."
+   ],
+   "messages": [
+    "\"${sel}\" starts hidden, but its gsap.fromTo() makes it visible only in the from-vars and omits opacity/autoAlpha from the destination. Cold render workers restore the hidden authored state, so the encoded element can stay invisible even when sequential snapshots look correct."
+   ]
+  },
+  {
+   "code": "gsap_css_transform_conflict",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove `transform: ${cssTransform}` from CSS and replace with GSAP properties: ${gsapEquivalent}. Example: tl.fromTo('${sel}', { ${gsapEquivalent} }, { ${gsapEquivalent}, ...yourAnimation }). tl.fromTo is exempt from this rule.",
+    "Remove the transform from CSS and use tl.fromTo('${sel}', { xPercent: -50, x: -1000 }, { xPercent: -50, x: 0 }) so GSAP owns the full transform state. tl.fromTo is exempt from this rule."
+   ],
+   "messages": [
+    "\"${sel}\" has CSS `transform: ${cssTransform}` and a GSAP tween animates ${propList}. GSAP will overwrite the full CSS transform, discarding any translateX(-50%) centering or CSS scale value."
+   ]
+  },
+  {
+   "code": "gsap_exit_missing_hard_kill",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "\"${win.targetSelector}\" is a clip element — the framework already manages its visibility. Wrap the scene's content in an inner non-clip <div>, move the exit tween and the hard kill (`tl.set(\"<inner-selector>\", ${hiddenStateLiteral(win.propertyValues)}, ${boundary.toFixed(2)})`) onto that wrapper instead.",
+    "Add `tl.set(\"${win.targetSelector}\", ${hiddenStateLiteral(win.propertyValues)}, ${boundary.toFixed(2)})` after the exit tween."
+   ],
+   "messages": [
+    "GSAP exit on \"${win.targetSelector}\" ends at the ${boundary.toFixed(2)}s clip start boundary without a matching tl.set hard kill. Non-linear seeking can land after the fade and leave stale visibility state."
+   ]
+  },
+  {
+   "code": "gsap_from_opacity_noop",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove `opacity: 0` from the CSS/inline style on \"${sel}\". Let gsap.from({opacity: 0}) handle the initial hidden state — it will animate FROM 0 TO the CSS value (1 by default)."
+   ],
+   "messages": [
+    "\"${sel}\" has CSS `opacity: 0` and a gsap.${win.method}() that also sets opacity to 0. gsap.from() animates FROM the specified value TO the current CSS value — since CSS is already 0, the element animates from 0→0 and never becomes visible."
+   ]
+  },
+  {
+   "code": "gsap_fullscreen_overlay_starts_visible",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `opacity: 0` to \"${selector}\" in CSS/inline styles, or add an immediate `gsap.set(\"${selector}\", { opacity: 0 })` (outside the timeline) before the reveal tween."
+   ],
+   "messages": [
+    "Full-frame overlay \"${selector}\" starts visible before its first GSAP opacity tween at ${firstVisible.position.toFixed(2)}s. It will cover earlier render frames, often as a blank/white video."
+   ]
+  },
+  {
+   "code": "gsap_function_value_hazard",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use the SECOND parameter for the element: (index, target) => ... — or index arithmetic like (i) => i * 20.",
+    "Compute the value once at build time (before the timeline is registered) and pass a constant, or derive it from fixed composition coordinates."
+   ],
+   "messages": [
+    "Function-valued tween var for ${prop2} on \"${anim.targetSelector}\" ${reason}. Each render worker initializes tweens independently."
+   ]
+  },
+  {
+   "code": "gsap_group_selector_keyframes",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Replace the group selector with individual tl.to() calls per element, each with their own keyframes object."
+   ],
+   "messages": [
+    "GSAP tween targets ${count} elements with shared keyframes (\"${truncateSnippet(selector, 60)}\"). Editing one element's keyframes in Studio will affect all ${count} elements. Split into individual tweens for per-element keyframe control."
+   ]
+  },
+  {
+   "code": "gsap_infinite_repeat",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Keep the explicit finite composition `data-duration`. Use a finite repeat count only when the loop itself must end before the composition does.",
+    "Add a finite composition `data-duration`, or replace `repeat: -1` with `repeat: Math.max(0, Math.floor(totalDuration / singleCycleDuration) - 1)`."
+   ],
+   "messages": [
+    "GSAP tween uses `repeat: -1` (infinite), but the composition declares a finite ${declaredDuration}s window. HyperFrames clips deterministic seeking and export to that explicit duration.",
+    "GSAP tween uses `repeat: -1` (infinite) without a finite composition `data-duration`. The timeline can report an unbounded duration and make render planning fail."
+   ]
+  },
+  {
+   "code": "gsap_non_transform_motion",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "${fixes.join(\"; \")}. Transforms interpolate sub-pixel and stay smooth at any speed."
+   ],
+   "messages": [
+    "GSAP tween on \"${call.selector}\" uses motion that snaps to integer device pixels: ${flagged.join(\", \")}. Layout and text-reflow properties snap during browser layout; roundProps rounds the tween value. Slow motion or an ease-out tail then stutters under the seek-by-frame capture engine — animate transforms (x/y/scale/opacity) instead."
+   ]
+  },
+  {
+   "code": "gsap_relative_value_second_writer",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use absolute values for ${sharedProps.join(\", \")}, or a fromTo() with explicit endpoints, so every seek path resolves the same state. Single-writer relative values are safe; the conflict is the second writer."
+   ],
+   "messages": [
+    "Relative value(s) ${values} on \"${win.targetSelector}\" start while another writer for the same propert${sharedProps.length > 1 ? \"ies\" : \"y\"} is active between ${formatTime(win.position)} and ${formatTime(overlapEnd)}. Relative tweens capture their base at tween init: the sequential path inits mid-flight of the other writer, a cold render worker landing later inits with its end state — the same frame renders at two different positions (snap at chunk boundaries)."
+   ]
+  },
+  {
+   "code": "gsap_repeat_ceil_overshoot",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use `Math.floor` instead of `Math.ceil` to ensure the animation fits within the duration: `repeat: Math.max(0, Math.floor(totalDuration / cycleDuration) - 1)`. Math.floor(10.5 / 2) - 1 = 4 repeats → 5 cycles × 2s = 10s ✓"
+   ],
+   "messages": [
+    "GSAP repeat calculation uses `Math.ceil` which can overshoot the composition duration. For example, Math.ceil(10.5 / 2) - 1 = 5 repeats → 6 cycles × 2s = 12s, exceeding 10.5s."
+   ]
+  },
+  {
+   "code": "gsap_repeat_floor_unclamped",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Clamp the finite repeat count at zero: `repeat: Math.max(0, Math.floor(totalDuration / cycleDuration) - 1)`."
+   ],
+   "messages": [
+    "GSAP repeat calculation can evaluate to -1 when the composition is shorter than one cycle, which GSAP interprets as an infinite repeat."
+   ]
+  },
+  {
+   "code": "gsap_repeat_refresh_relative_value",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove `repeatRefresh: true`, or replace the relative value with absolute endpoints (e.g. a fromTo()) so each iteration resolves to the same state on every seek path."
+   ],
+   "messages": [
+    "`repeatRefresh: true` combined with a relative value (\"+=\"/\"-=\") accumulates per repeat iteration. A cold render worker seeking non-linearly into iteration N never performed the earlier iterations' accumulation, so its rendered position diverges from the sequential path."
+   ]
+  },
+  {
+   "code": "gsap_timeline_not_registered",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `window.__timelines = window.__timelines || {};` and `window.__timelines[\"root\"] = tl;` after creating the timeline (use the composition's data-composition-id as the key)."
+   ],
+   "messages": [
+    "GSAP timeline is created but never registered in window.__timelines. The runtime discovers timelines from this registry — without registration, animations will not play during preview or render."
+   ]
+  },
+  {
+   "code": "gsap_timeline_registered_before_async_build",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Move the `window.__timelines[id] = tl;` assignment to the END of the document.fonts.ready callback, after the tweens are added. Optionally call window.__hfForceTimelineRebind() right after, to re-nest the populated timeline."
+   ],
+   "messages": [
+    "window.__timelines is assigned BEFORE the timeline is built inside document.fonts.ready. An empty timeline registered early gets nested empty when this composition is used as a sub-composition (the readiness gate treats \"key present\" as \"ready\" and never re-nests), so the animation renders blank."
+   ]
+  },
+  {
+   "code": "gsap_timeline_set_initial_hide",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use gsap.set(...) (immediate, outside the timeline) for initial states, or author the hidden state directly in CSS/attributes."
+   ],
+   "messages": [
+    "Initial hidden state for \"${win.targetSelector}\" is set via tl.set(...) at position 0 inside the paused timeline. A zero-duration set at 0 does not render while the playhead sits exactly at 0, so frame 0 shows the un-hidden state."
+   ]
+  },
+  {
+   "code": "head_leaked_text",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Move CSS into a single `<style>...</style>` block and remove stray close tags, markdown fences, or code text from `<head>`, the `</head>`/`<body>` boundary, or the pre-root body prefix."
+   ],
+   "messages": [
+    "Detected leaked code or CSS text around the document `<head>` or before the composition root. Browsers render this as visible text in the video."
+   ]
+  },
+  {
+   "code": "hevc_preview_codec",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [
+    "If \"${unique[0]}\" fails to play in preview, run hyperframes doctor and confirm media.autoProxy is not false.",
+    "If these files fail to play in preview, run hyperframes doctor and confirm media.autoProxy is not false."
+   ],
+   "messages": [
+    "Video file(s) use the HEVC/H.265 codec: ${unique.join(\", \")}. The render pipeline pre-decodes video with FFmpeg and never uses the browser's video decoder, so these render correctly. Live preview/player playback automatically uses a cached H.264 proxy when the browser cannot decode HEVC. If playback still fails, verify ffmpeg/ffprobe are installed and auto-proxying is enabled."
+   ]
+  },
+  {
+   "code": "host_missing_composition_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Set `data-composition-id` on every `data-composition-src` host element."
+   ],
+   "messages": [
+    "Composition host for \"${src}\" is missing `data-composition-id`."
+   ]
+  },
+  {
+   "code": "html_dir_attribute_breaks_render",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove dir=\"${dir}\" from <html>. Keep lang, and scope ${scopedDirection} to individual text-containing elements instead — text still shapes correctly via the browser's own bidi algorithm."
+   ],
+   "messages": [
+    "<html dir=\"${dir}\"> renders correctly in preview/snapshot but produces a fully blank/black video from render — a confirmed, silent failure."
+   ]
+  },
+  {
+   "code": "http_error",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "${response.status()} loading ${urlPath(url)}"
+   ]
+  },
+  {
+   "code": "id_requires_css_escape",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Rename the id to start with a letter (recommended), or build selectors with `#${CSS.escape(id)}` at runtime."
+   ],
+   "messages": [
+    "id=\"${id}\" starts with a digit, so the common selector `#${id}` throws a SyntaxError in querySelector()."
+   ]
+  },
+  {
+   "code": "imperative_media_control",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove imperative media play/pause/currentTime/muted control. Express timing with data-start/data-duration and media offsets like data-media-start or data-playback-start instead."
+   ],
+   "messages": [
+    "Inline <script> imperatively controls managed media via ${kind}. HyperFrames must own media play/pause/seek to keep preview, timeline, and renders deterministic."
+   ]
+  },
+  {
+   "code": "inaccessible_media_url",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "This URL is not accessible. Replace with a valid, reachable media URL."
+   ],
+   "messages": [
+    "<${tagName19}${elementId ? ` id=\"${elementId}\"` : \"\"}> references a URL that returned HTTP ${resp.status}: ${url.slice(0, 100)}",
+    "<${tagName19}${elementId ? ` id=\"${elementId}\"` : \"\"}> references an unreachable URL (${reason}): ${url.slice(0, 100)}"
+   ]
+  },
+  {
+   "code": "invalid_composition_variables_declaration",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Provide a JSON array of variable declarations: data-composition-variables='[{\"id\":\"title\",\"type\":\"string\",\"label\":\"Title\",\"default\":\"Hello\"}]'.",
+    "Wrap declarations in [] and give each an id, type, label, and default: '[{\"id\":\"title\",\"type\":\"string\",\"label\":\"Title\",\"default\":\"Hello\"}]'."
+   ],
+   "messages": [
+    "data-composition-variables is not valid JSON (${reason}).",
+    "data-composition-variables must be a JSON array of variable declarations.",
+    "data-composition-variables entry [${i2}] must be an object with id, type, label, and default.",
+    "data-composition-variables entry [${i2}] is missing or has invalid: ${missing.join(\", \")}. Type must be one of string, number, color, boolean, enum, font, image."
+   ]
+  },
+  {
+   "code": "invalid_inline_script_syntax",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Close inline scripts with a valid `</script>` tag.",
+    "Fix the inline script syntax before render verification."
+   ],
+   "messages": [
+    "Detected malformed inline `<script>` closing syntax.",
+    "Inline script has invalid syntax: ${syntaxError}"
+   ]
+  },
+  {
+   "code": "invalid_parent_traversal_in_asset_path",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use plain root-relative paths (e.g. \"assets/...\", \"capture/...\", \"fonts/...\") — compositions are served with the project root as their base URL, so paths must be root-relative, not relative to the compositions/ directory."
+   ],
+   "messages": [
+    "Found ${offenders.length} asset path(s) traversing above the project root with \"../\" (${prefixSummary}). Renders rewrite this against each sub-composition's source path, but Studio preview and other live consumers resolve against the project root and 404."
+   ]
+  },
+  {
+   "code": "invalid_variable_values_json",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Wrap the attribute value in single quotes and the JSON keys/values in double quotes, e.g. data-variable-values='{\"title\":\"Hello\"}'.",
+    "Replace the value with a JSON object whose keys are variable ids declared in the sub-composition's data-composition-variables."
+   ],
+   "messages": [
+    "data-variable-values is not valid JSON (${reason}).",
+    "data-variable-values must be a JSON object keyed by variable id (e.g. {\"title\":\"Hello\"})."
+   ]
+  },
+  {
+   "code": "media_crossorigin_breaks_preview",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the crossorigin attribute unless you read the media back via canvas/WebGL/WebAudio AND the host is known to send CORS headers. Plain displayed media never needs it."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> has crossorigin, which forces a CORS-checked fetch. If the media host omits Access-Control-Allow-Origin, the load silently fails in Studio preview (media shows BLANK/black) while server-side renders still work — hiding the bug."
+   ]
+  },
+  {
+   "code": "media_missing_data_start",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add data-start=\"0\" (or the intended start time) and data-duration if the clip should stop before the source ends."
+   ],
+   "messages": [
+    "<${tag.name}${hasId ? ` id=\"${hasId}\"` : \"\"}> has src but no data-start. HyperFrames cannot own playback for untimed media, so preview and render behavior can diverge."
+   ]
+  },
+  {
+   "code": "media_missing_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a unique id attribute: <${tag.name} id=\"my-${tag.name}\" ...>"
+   ],
+   "messages": [
+    "<${tag.name}> has data-start but no id attribute. The renderer requires id to discover media elements — this ${tag.name === \"audio\" ? \"audio will be SILENT\" : \"video will be FROZEN\"} in renders."
+   ]
+  },
+  {
+   "code": "media_missing_src",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a src attribute to the <${tag.name}> element directly. If using <source> children, the renderer still requires src on the parent element."
+   ],
+   "messages": [
+    "<${tag.name} id=\"${hasId}\"> has data-start but no src attribute. The renderer cannot load this media."
+   ]
+  },
+  {
+   "code": "media_preload_none",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove preload=\"none\" or change to preload=\"auto\". The framework manages media loading."
+   ],
+   "messages": [
+    "<${tag.name}${hasId ? ` id=\"${hasId}\"` : \"\"}> has preload=\"none\" which prevents the renderer from loading this media. The compiler strips it for renders, but preview may also have issues."
+   ]
+  },
+  {
+   "code": "media_proxy_fallback",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "media_proxy_unavailable",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "media_variable_src_no_fallback",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a fallback src the composition can render with when the variable is not provided."
+   ],
+   "messages": [
+    "<${tag.name} id=\"${hasId}\"> relies on data-var-src=\"${varSrc}\" with no fallback src. Renders without a \"${varSrc}\" value cannot load this media, and audio extraction reads the authored src."
+   ]
+  },
+  {
+   "code": "missing_data_no_timeline",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `data-no-timeline` to the root element to skip the poll: `<div data-composition-id=\"...\" data-no-timeline ...>`."
+   ],
+   "messages": [
+    "This composition has no `window.__timelines` registration but is missing `data-no-timeline`. The producer polls for timeline registration for up to 45 seconds before timing out, adding 45 s to every render."
+   ]
+  },
+  {
+   "code": "missing_gsap_plugin",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Load MotionPathPlugin before the animation script and register it with gsap.registerPlugin(MotionPathPlugin), or replace motionPath with core GSAP x/y tweens."
+   ],
+   "messages": [
+    "A GSAP tween uses motionPath, but MotionPathPlugin is not loaded. Core GSAP ignores this plugin-specific property, so the intended motion will not render."
+   ]
+  },
+  {
+   "code": "missing_gsap_script",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add <script src=\"https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js\"></script> before your animation script."
+   ],
+   "messages": [
+    "Composition uses GSAP but no GSAP script is loaded. The animation will not run."
+   ]
+  },
+  {
+   "code": "missing_local_asset",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add \"${unique[0]}\" to the project directory, or update the src attribute to point to an existing file. Common cause: captured asset filenames are unreliable (heygen-logo.svg often contains Google, nvidia-logo.svg may contain Autodesk, etc.). Open the contact sheets and verify the file actually exists at this path before referencing it.",
+    "Add the missing files to the project directory, or update the src attributes to point to existing files. Captured asset filenames are unreliable — verify against capture/contact-sheets/ and capture/extracted/asset-descriptions.md."
+   ],
+   "messages": [
+    "<${tagName19}> element references local file(s) not found in the project: ${unique.join(\", \")}. The renderer will silently skip these and produce a video with missing visuals."
+   ]
+  },
+  {
+   "code": "missing_lottie_script",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add <script src=\"https://cdn.jsdelivr.net/npm/lottie-web@5/build/player/lottie.min.js\"></script> before your Lottie code."
+   ],
+   "messages": [
+    "Composition uses Lottie but no Lottie script is loaded. The animation will not render."
+   ]
+  },
+  {
+   "code": "missing_or_empty_sub_composition",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Fix this before rendering — the render pre-flight rejects unusable sub-compositions. Write valid HTML into \"${srcPath}\" — it needs a <template> or <body> containing an element with data-composition-id, data-width, and data-height. Preview/studio still tolerates and skips the scene while you author it. If a scene-authoring step is still running, wait for it to finish before referencing the file, or re-run the step that generates it."
+   ],
+   "messages": [
+    "data-composition-src references \"${srcPath}\", but ${problem}."
+   ]
+  },
+  {
+   "code": "missing_three_script",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add <script src=\"https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js\"></script> before your Three.js code."
+   ],
+   "messages": [
+    "Composition uses Three.js but no Three.js script is loaded. The 3D scene will not render."
+   ]
+  },
+  {
+   "code": "missing_timeline_registry",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Register each composition timeline on `window.__timelines[compositionId]`."
+   ],
+   "messages": [
+    "Missing `window.__timelines` registration."
+   ]
+  },
+  {
+   "code": "motion_appears_late",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "The renderer seeks a paused timeline; a forward-only reveal can be skipped. Ensure the entrance is applied at this time, not only played through."
+   ],
+   "messages": [
+    "appears at ${round(appear.time)}s but should be visible by ${round(bySec)}s (check its entrance reveal fires under seek)",
+    "never reaches visible opacity but should be visible by ${round(bySec)}s (check its entrance reveal fires under seek)"
+   ]
+  },
+  {
+   "code": "motion_frozen",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add or extend motion so no shot freezes for this long, or shorten the static hold."
+   ],
+   "messages": [
+    "nothing moves${within ? ` within ${within}` : \"\"} between ${round(runStart)}s and ${round(endTime)}s (${round(span)}s static) — should keep moving"
+   ]
+  },
+  {
+   "code": "motion_off_frame",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Clamp the element's motion so its box stays within the canvas for the whole shot."
+   ],
+   "messages": [
+    "${selector} drifts off the ${canvas.width}×${canvas.height} canvas at ${round(frame.time)}s (box ${r2.left},${r2.top}→${r2.right},${r2.bottom})"
+   ]
+  },
+  {
+   "code": "motion_out_of_order",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Make ${a}'s entrance land before ${b2}'s on the timeline."
+   ],
+   "messages": [
+    "${a} should appear before ${b2}, but ${a} appears at ${label2(timeA)} and ${b2} at ${label2(timeB)} — reorder the entrances"
+   ]
+  },
+  {
+   "code": "motion_selector_ambiguous",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use #id or :nth-child() instead of a class selector when multiple elements share the same class."
+   ],
+   "messages": [
+    "${selector} matches multiple elements — use a more specific selector so the assertion targets exactly one"
+   ]
+  },
+  {
+   "code": "motion_selector_missing",
+   "sources": [
+    "motion"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Verify the selector exists in the composition and is spelled correctly."
+   ],
+   "messages": [
+    "${selector} matched no element in any sampled frame — check the selector"
+   ]
+  },
+  {
+   "code": "motion_spec_invalid",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "multiple_root_compositions",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "A project should have exactly one root index.html with data-composition-id. Remove or rename extra files."
+   ],
+   "messages": [
+    "Multiple root-level HTML files with data-composition-id: ${rootCompositions.join(\", \")}. The runtime may discover both as entry points, causing duplicate audio playback."
+   ]
+  },
+  {
+   "code": "non_deterministic_code",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "Script contains `${label2}` which produces non-deterministic output. Renders may differ between frames or runs."
+   ]
+  },
+  {
+   "code": "off_pivot_rotation",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "The pointer's center-of-rotation must coincide with the dial hub. Rotate the group about the hub (e.g. transform-origin/svgOrigin set to the hub center, or translate the group so its rotation pivot lands on the hub) rather than about the element's own bbox center."
+   ],
+   "messages": [
+    "Gauge/dial pointer rotates about a point ${Math.round(drift)}px from the dial hub — its center-of-rotation is off the hub, so it points wrong or overshoots the track (check the rotating group's pivot: translate to the hub before rotate, or set svgOrigin/transform-origin to the hub)."
+   ]
+  },
+  {
+   "code": "overlapping_clips_same_track",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Adjust data-start or data-duration so clips on the same track do not overlap, or move one clip to a different data-track-index."
+   ],
+   "messages": [
+    "Track ${track}: clip ending at ${current2.end}s overlaps with clip starting at ${next.start}s. Overlapping clips on the same track cause rendering conflicts."
+   ]
+  },
+  {
+   "code": "overlapping_gsap_tweens",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Shorten the earlier tween, move the later tween, or add `overwrite: \"auto\"`."
+   ],
+   "messages": [
+    "GSAP tweens overlap on \"${left.targetSelector}\" for ${sharedProperties.join(\", \")} between ${overlapStart.toFixed(2)}s and ${overlapEnd.toFixed(2)}s."
+   ]
+  },
+  {
+   "code": "page_error",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "panel_out_of_canvas",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "warning",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Move the panel inward, or mark intentional off-canvas animation with data-layout-allow-overflow."
+   ],
+   "messages": [
+    "Painted panel extends outside the composition canvas."
+   ]
+  },
+  {
+   "code": "placeholder_media_url",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Replace with a real media URL. Placeholder domains will 404 at render time."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> uses a placeholder URL that will 404 at render time: ${src.slice(0, 80)}"
+   ]
+  },
+  {
+   "code": "pointer_events_none",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [
+    "If this element should be selectable in the Studio, remove `pointer-events: none` or move it to a wrapper that doesn't contain editable content.",
+    "If these elements should be selectable in the Studio, remove `pointer-events: none` or move it to a wrapper that doesn't contain editable content."
+   ],
+   "messages": [
+    "<${tag.name}${id ? ` id=\"${id}\"` : \"\"}> has `pointer-events: none` in its inline style. Elements with this property are harder to select in the Studio preview.",
+    "`${selector}` sets `pointer-events: none`. Elements matching this selector are harder to select in the Studio preview."
+   ]
+  },
+  {
+   "code": "repeated_id_descendant_selector",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the duplicate ancestor: change `#${repeatedId} #${repeatedId}` to `#${repeatedId}`."
+   ],
+   "messages": [
+    "Selector \"${selector}\" requires #${repeatedId} to be nested inside another #${repeatedId}. IDs must be unique, so this selector cannot match a valid composition."
+   ]
+  },
+  {
+   "code": "request_failed",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": [
+    "Failed to load ${urlPath(url)}: ${failure ?? \"net::ERR_FAILED\"}"
+   ]
+  },
+  {
+   "code": "requestanimationframe_in_composition",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use GSAP tweens or onUpdate callbacks instead of requestAnimationFrame for animation logic."
+   ],
+   "messages": [
+    "`requestAnimationFrame` runs on wall-clock time, not the GSAP timeline. It will not sync with frame capture and may cause flickering or missed frames during rendering."
+   ]
+  },
+  {
+   "code": "root_composition_missing_data_start",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add data-start=\"0\" to the root composition element."
+   ],
+   "messages": [
+    "Root composition \"${compId}\" is missing data-start. The runtime needs data-start=\"0\" on the root element to begin playback."
+   ]
+  },
+  {
+   "code": "root_composition_missing_duration_source",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add data-duration=\"<seconds>\" to the root element, or add a paused GSAP timeline registered on window.__timelines.",
+    "Add data-duration=\"<seconds>\" to the root element.",
+    "Add data-duration=\"<seconds>\" to the root element with the intended total length."
+   ],
+   "messages": [
+    "Root composition has no data-duration, no GSAP timeline, and no CSS/WAAPI/Lottie/Three.js animation for the runtime to infer a duration from. The render engine cannot determine how long to capture and will fail with \"Composition has zero duration\".",
+    "Root composition uses Three.js with no data-duration. The runtime cannot discover a Three.js scene's duration automatically (no AnimationClip/AnimationMixer inspection) — render will fail with \"Composition has zero duration\".",
+    "Root composition uses a CSS animation with animation-iteration-count: infinite and no data-duration, so the intended total length is ambiguous. If a finite animation is also present the runtime infers that length; with no finite source the render fails with \"Composition has zero duration\". Declare the intended length explicitly."
+   ]
+  },
+  {
+   "code": "root_composition_missing_html_wrapper",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Wrap the composition in <!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body>...</body></html>."
+   ],
+   "messages": [
+    "Composition starts with a bare element instead of a proper HTML document. An index.html that contains data-composition-id but no <!DOCTYPE html>, <html>, or <body> is a fragment — browsers quirks-mode it, the preview server cannot load it, and the bundler will fail to inject runtime scripts."
+   ]
+  },
+  {
+   "code": "root_missing_composition_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a stable `data-composition-id` to the entry composition wrapper."
+   ],
+   "messages": [
+    "Root composition is missing `data-composition-id`."
+   ]
+  },
+  {
+   "code": "root_missing_dimensions",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Set numeric `data-width` and `data-height` on the entry composition root."
+   ],
+   "messages": [
+    "Root composition is missing `data-width` or `data-height`."
+   ]
+  },
+  {
+   "code": "rotation_pivot_drift",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "The bounding-box center should stay fixed while the element spins; check its transformOrigin/svgOrigin so rotation pivots about the element's own center rather than a point in a coordinate space it was resized out of."
+   ],
+   "messages": [
+    "Rotating element's bounding-box center drifts ${Math.round(drift)}px across rotation — it is not spinning about its own center (check transformOrigin/svgOrigin)."
+   ]
+  },
+  {
+   "code": "scene_layer_missing_visibility_kill",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "\"#${id}\" is a clip element — the framework already manages its visibility. Wrap the scene's content in an inner non-clip <div>, move the exit tween and the hard kill (`tl.set(\"<inner-selector>\", { visibility: \"hidden\" }, <exit-end-time>)`) onto that wrapper instead.",
+    "Add `tl.set(\"#${id}\", { visibility: \"hidden\" }, <exit-end-time>)` after the scene's exit tweens."
+   ],
+   "messages": [
+    "Scene layer \"#${id}\" exits via opacity tween but has no visibility: hidden hard kill. When scrubbing or when tweens conflict, the scene may remain partially visible and overlap the next scene."
+   ]
+  },
+  {
+   "code": "scoped_css_missing_wrapper",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Preserve the matching composition wrapper or align the CSS scope to an existing wrapper."
+   ],
+   "messages": [
+    "Scoped CSS targets composition \"${compId}\" but no matching wrapper exists in this HTML."
+   ]
+  },
+  {
+   "code": "self_closing_media_tag",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Change <${tagName19} .../> to <${tagName19} ...></${tagName19}> — media elements MUST have explicit closing tags."
+   ],
+   "messages": [
+    "Self-closing <${tagName19}/> is invalid HTML. The browser will leave the tag open, swallowing all subsequent elements as invisible fallback content. This makes compositions INVISIBLE."
+   ]
+  },
+  {
+   "code": "slideshow_invalid",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Ensure the <script type=\"application/hyperframes-slideshow+json\"> block contains valid JSON matching the SlideshowManifest schema."
+   ],
+   "messages": [
+    "Slideshow island contains invalid JSON or structure: ${e3 instanceof Error ? e3.message : String(e3)}"
+   ]
+  },
+  {
+   "code": "slideshow_unresolved_ref",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Ensure every sceneId in the slideshow island matches the data-composition-id of a scene element in the composition, or provide explicit startTime/endTime."
+   ],
+   "messages": [
+    "Slideshow manifest error: ${error}"
+   ]
+  },
+  {
+   "code": "snapshot_write_failed",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "split_data_attribute_selector",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Use separate attribute selectors: [data-composition-id=\"${compId}\"][${attrName}=\"${attrValue}\"]."
+   ],
+   "messages": [
+    "Selector \"${match[0]}\" combines two attributes inside one CSS attribute selector. Browsers reject it, so GSAP timelines or querySelector calls will fail before registering."
+   ]
+  },
+  {
+   "code": "standalone_composition_wrapped_in_template",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the <template> wrapper. Use <!DOCTYPE html><html>...<div data-composition-id>...</div>...</html> instead."
+   ],
+   "messages": [
+    "Root index.html is wrapped in a <template> tag. Only sub-compositions loaded via data-composition-src should use <template> wrappers. The runtime cannot play a standalone composition inside a template."
+   ]
+  },
+  {
+   "code": "studio_missing_editable_id",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a stable, human-readable id such as id=\"hero-title\" or id=\"scene-1-card\" to every timeline-visible element you want agents or Studio to edit."
+   ],
+   "messages": [
+    "${descriptor} has no id, so Studio cannot use a stable edit target for its timeline and canvas controls."
+   ]
+  },
+  {
+   "code": "subcomposition_blanks_before_host",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "data-duration is the slot's visible window. Set this sub-composition's data-duration to ${round32(rootDuration - t2.start)} to fill the host window, or add another clip to cover the remaining ~${gap}s."
+   ],
+   "messages": [
+    "<${t2.tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> sub-composition ends at ${round32(t2.end)}s but the composition runs to ${round32(rootDuration)}s — its slot will be blank for ~${gap}s."
+   ]
+  },
+  {
+   "code": "subcomposition_root_styled_by_class",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Give the root id=\"root\" and style it with `#root { ... }` plus plain descendant selectors (`.kicker`, `#hero`) — the runtime already scopes each sub-composition by data-composition-id, so a class namespace on the root is redundant and breaks under scoping."
+   ],
+   "messages": [
+    "Root element has class=\"${rootClasses.join(\" \")}\" and is styled by ${offenders.length} rule(s) keyed off that class (e.g. ${example}). At render, every sub-composition rule is scoped to [data-composition-id=\"${rootCompositionId}\"] <selector>, so a selector whose leftmost part is the ROOT's own class becomes a descendant selector that cannot match the root — the scene renders unstyled (tiny text top-left, full-size images). lint/validate/inspect and Studio's per-frame iframe preview do not scope, so this passes every static check and looks correct in preview."
+   ]
+  },
+  {
+   "code": "svg_drawon_css_dasharray_conflict",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the CSS stroke-dasharray from \"${conflictToken}\" (decorative dashes belong on a separate element), or set the full two-component value in GSAP: strokeDasharray: \"${len} ${len}\"."
+   ],
+   "messages": [
+    "GSAP writes strokeDasharray on \"${targetLabel}\", but its CSS (\"${conflictToken}\") declares a multi-component stroke-dasharray. GSAP merges dash lists per component, so the CSS gap survives (e.g. \"641.4px, 10px\") — the draw-on hide only hides one gap's worth and the line stays visible the whole scene."
+   ]
+  },
+  {
+   "code": "svg_measure_before_path_d",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error",
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Assign the path's `d` synchronously at build time (top level, before measuring), or author a static d attribute in the HTML."
+   ],
+   "messages": [
+    "getTotalLength() is called on \"${tokenLabel}\", whose `d` is only assigned inside a function body — if the measure runs before that function (e.g. the function is a timeline callback), the length is 0 and the dash animation is dead.",
+    "getTotalLength() is called on \"${tokenLabel}\", but the path has no static `d` attribute and no d assignment exists anywhere — getTotalLength() returns 0 in Chrome, silently killing dash animations."
+   ]
+  },
+  {
+   "code": "sweep_static",
+   "sources": [
+    "check"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Confirm the composition seeks a paused GSAP/CSS timeline under `data-*` timing attributes rather than only autoplaying."
+   ],
+   "messages": [
+    "Timeline did not advance under seek; every green verdict on this run is unreliable."
+   ]
+  },
+  {
+   "code": "system_font_will_alias",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [],
+   "messages": []
+  },
+  {
+   "code": "template_literal_selector",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Replace the template literal variable with a hardcoded string. The bundler's CSS parser cannot handle interpolated variables in script content."
+   ],
+   "messages": [
+    "querySelector uses a template literal variable (e.g. `${compId}`). The HTML bundler's CSS parser crashes on these. Use a hardcoded string instead."
+   ]
+  },
+  {
+   "code": "text_box_overflow",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "error",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [],
+   "messages": [
+    "Text extends outside its nearest visual/container box."
+   ]
+  },
+  {
+   "code": "text_not_painted",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Set an explicit, opaque `color` on the text — and an explicit `-webkit-text-fill-color` if an ancestor makes the fill transparent. If the transparency is intentional gradient text, add `background-clip: text`."
+   ],
+   "messages": [
+    "Text paints with an effectively transparent fill (-webkit-text-fill-color / color), so its glyphs are invisible."
+   ]
+  },
+  {
+   "code": "text_occluded",
+   "sources": [
+    "layout"
+   ],
+   "severities": [
+    "error",
+    "info"
+   ],
+   "strict_fails": true,
+   "persistence_tiered": true,
+   "fix_hints": [
+    "Give the text its own zone, raise its stacking order above the covering element, or mark intentional layering with data-layout-allow-occlusion."
+   ],
+   "messages": [
+    "Text is hidden beneath an opaque element."
+   ]
+  },
+  {
+   "code": "texture_class_missing_base",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `${TEXTURE_BASE_CLASS}` alongside the material class, for example `class=\"${TEXTURE_BASE_CLASS} ${textureClasses[0]}\"`."
+   ],
+   "messages": [
+    "Texture material class `${textureClasses[0]}` is used without `${TEXTURE_BASE_CLASS}`."
+   ]
+  },
+  {
+   "code": "texture_class_unknown",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Paste the Texture Mask Text component `<style>...</style>` block into the composition, or fix the texture class typo."
+   ],
+   "messages": [
+    "Texture material class `${textureClass}` is not defined by local CSS."
+   ]
+  },
+  {
+   "code": "texture_drop_shadow_on_text",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Wrap the textured text and apply `filter: drop-shadow(...)` to the wrapper, not the `hf-texture-text` element."
+   ],
+   "messages": [
+    "Drop shadow is applied directly to textured text."
+   ]
+  },
+  {
+   "code": "texture_mask_asset_not_found",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add \"${urls[0]}\" to the project, or update the mask-image URL to point to an existing texture mask.",
+    "Add the missing texture mask files to the project, or update the mask-image URLs to point to existing files."
+   ],
+   "messages": [
+    "CSS mask-image references file(s) not found in the project: ${urls.join(\", \")}."
+   ]
+  },
+  {
+   "code": "texture_text_missing_mask",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add a material class such as `hf-texture-lava`, or set `mask-image` and `-webkit-mask-image` on the element."
+   ],
+   "messages": [
+    "`${TEXTURE_BASE_CLASS}` is used without a texture material class or custom mask image."
+   ]
+  },
+  {
+   "code": "timed_element_missing_clip_class",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add class=\"clip\" to the element. The HyperFrames runtime uses .clip to control visibility based on data-start/data-duration."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> has timing attributes but no class=\"clip\". The element will be visible for the entire composition instead of only during its scheduled time range."
+   ]
+  },
+  {
+   "code": "timed_element_missing_visibility_hidden",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "info"
+   ],
+   "strict_fails": false,
+   "fix_hints": [
+    "Add class=\"clip\" (with CSS: .clip { visibility: hidden; }) or style=\"opacity:0\" if the element should start hidden."
+   ],
+   "messages": [
+    "<${tag.name}${elementId ? ` id=\"${elementId}\"` : \"\"}> has data-start but no class=\"clip\", visibility:hidden, or opacity:0. Consider adding initial hidden state if the element should not be visible before its start time."
+   ]
+  },
+  {
+   "code": "timeline_id_mismatch",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Change window.__timelines[\"${key2}\"] to match the data-composition-id attribute, or vice versa."
+   ],
+   "messages": [
+    "Timeline registered as \"${key2}\" but no element has data-composition-id=\"${key2}\". The runtime cannot auto-nest this timeline."
+   ]
+  },
+  {
+   "code": "timeline_registry_missing_init",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add `window.__timelines = window.__timelines || {};` before any timeline assignment."
+   ],
+   "messages": [
+    "`window.__timelines[…] = …` is used without initializing `window.__timelines` first."
+   ]
+  },
+  {
+   "code": "timeline_track_too_dense",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "${splitTarget} and mount them from the parent with data-composition-src so the timeline stays easier to inspect, revise, and validate."
+   ],
+   "messages": [
+    "Track ${track} has ${count} timed elements in this HTML file. Smaller sub-compositions keep timelines easier to read, iterate on, and diff."
+   ]
+  },
+  {
+   "code": "unknown_variable_binding",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "warning"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Declare the variable on the composition root (<html>, or the [data-composition-id] root element for a template/fragment comp): data-composition-variables='[{\"id\":\"${id}\",\"type\":\"${attr2 === \"data-var-src\" ? \"image\" : \"string\"}\",\"label\":\"${id}\",\"default\":\"...\"}]', or fix the binding id."
+   ],
+   "messages": [
+    "<${tag.name}> binds ${attr2}=\"${id}\" but no variable \"${id}\" is declared in data-composition-variables — the binding will silently keep the authored fallback."
+   ]
+  },
+  {
+   "code": "unscoped_gsap_selector",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Scope the selector: `[data-composition-id=\"${localTimelineCompId}\"] ${win.targetSelector}` or use a unique id."
+   ],
+   "messages": [
+    "Timeline \"${localTimelineCompId}\" uses unscoped selector \"${win.targetSelector}\" that will target elements in ALL compositions when bundled, causing data loss (opacity, transforms, etc.)."
+   ]
+  },
+  {
+   "code": "video_audio_double_source",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Either mute the video (add `muted` attribute) and keep the separate <audio>, or remove the <audio> element and let the video provide its own audio track."
+   ],
+   "messages": [
+    "<audio${audioInfo.id ? ` id=\"${audioInfo.id}\"` : \"\"}> and <video${videoInfo.id ? ` id=\"${videoInfo.id}\"` : \"\"}> both point to the same source. The unmuted video already provides audio — the duplicate <audio> will cause double playback and echo."
+   ]
+  },
+  {
+   "code": "video_missing_muted",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Add the `muted` attribute for silent video, or add data-has-audio=\"true\" when the video track should contribute audio."
+   ],
+   "messages": [
+    "<video${elementId ? ` id=\"${elementId}\"` : \"\"}> has data-start but is not muted. Mark audible videos with data-has-audio=\"true\"; otherwise keep video muted and use a separate <audio> element for sound."
+   ]
+  },
+  {
+   "code": "video_muted_with_declared_audio",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the `muted` attribute if this video should be audible, or remove data-has-audio=\"true\" and use data-volume=\"0\" for silent visual video."
+   ],
+   "messages": [
+    "<video${elementId ? ` id=\"${elementId}\"` : \"\"}> declares data-has-audio=\"true\" but also has muted. Studio preview will silence the video audio."
+   ]
+  },
+  {
+   "code": "video_nested_in_timed_element",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Move the <video> to be a direct child of the stage, or remove data-start from the wrapper div (use it as a non-timed visual container)."
+   ],
+   "messages": [
+    "<video> with data-start is nested inside <${parent.name}${parent.id ? ` id=\"${parent.id}\"` : \"\"}> which also has data-start. The framework cannot manage playback of nested media — video will be FROZEN in renders."
+   ]
+  },
+  {
+   "code": "visible_markup_comment",
+   "sources": [
+    "lint"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [
+    "Remove the text or convert it to a real HTML comment (`<!-- ... -->`). Keep CSS comments inside `<style>` and JS comments inside `<script>`."
+   ],
+   "messages": [
+    "CSS/JS block comment syntax (`/* ... */`) appears in visible HTML markup. HTML only treats `<!-- ... -->` as comments, so this renders as on-screen text."
+   ]
+  },
+  {
+   "code": "webgpu_runtime_error",
+   "sources": [
+    "runtime"
+   ],
+   "severities": [
+    "error"
+   ],
+   "strict_fails": true,
+   "fix_hints": [],
+   "messages": []
+  }
+ ]
+}

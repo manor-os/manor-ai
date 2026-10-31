@@ -187,6 +187,7 @@ import {
 import { decodeAuthTokenClaims, getAuthToken } from "../lib/authToken";
 import type { Agent, UserSummary } from "../lib/types";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
+import { useRealtimeResync } from "../lib/realtimeResync";
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 
@@ -2543,7 +2544,7 @@ export default function FloatingChat() {
     })();
   }, [editorLiveSessionActive, messages]);
 
-  /* Listen for video completion — reload messages so VideoCard picks up result */
+  /* Listen for video completion — reload messages so MediaJobCard picks up result */
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
@@ -2588,6 +2589,22 @@ export default function FloatingChat() {
     window.addEventListener("manor:conversation-message", handler);
     return () => window.removeEventListener("manor:conversation-message", handler);
   }, [currentConvId, loadRecentMessages, setMessages]);
+
+  /* Catch up after a realtime gap — pushes sent while the socket was down are
+   * never replayed (see EmbeddedChat). Writes to the conversation's own session,
+   * and re-checks streaming at resolution like the snapshot terminal refetch. */
+  useRealtimeResync(() => {
+    const convId = currentConvId;
+    if (!convId || streamingRef.current || isConversationStreamingNow(convId)) return;
+    if (shouldIgnoreLocallyStoppedStreamUpdate(convId)) return;
+    loadRecentMessages(convId)
+      .then((msgs) => {
+        if (isConversationStreamingNow(convId)) return;
+        if (shouldIgnoreLocallyStoppedStreamUpdate(convId)) return;
+        setSessionMessages(convId, msgs);
+      })
+      .catch(() => {});
+  });
 
   /* Follow a turn this tab is not streaming — see EmbeddedChat for the full note. */
   useEffect(() => {
@@ -4613,6 +4630,7 @@ export default function FloatingChat() {
                         <ApprovalSummary
                           action={inferApprovalAction(content)}
                           paths={extractApprovalPaths(content)}
+                          pathsFromText
                           content={content}
                         />
                         <ChatActionCard

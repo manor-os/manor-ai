@@ -2,7 +2,7 @@
 
 Three failure classes these tests pin:
 
-* a cancelled plan/step left its lease ACTIVE, so the worker kept running and
+* a cancelled step left its lease ACTIVE, so the worker kept running and
   its late ``complete_lease`` overwrote the cancelled step (D1);
 * a step reset by a retry surface (or re-leased) was still writable through
   the OLD lease — last writer wins, the reset was silently undone (D2);
@@ -27,7 +27,6 @@ from packages.core.dispatcher.service import Dispatcher, LeaseNotActive
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import WorkLease, Worker, WorkerActivityLog
-from packages.core.workers import internal as worker_internal
 
 
 # ── helpers ───────────────────────────────────────────────────────────
@@ -120,61 +119,6 @@ def _reset_step_to_pending(step: ExecutionStep) -> None:
     step.human_input_prompt = None
 
 
-@pytest.mark.asyncio
-async def test_direct_action_intent_survives_provider_crash_and_blocks_expiry_retry(
-    db_session,
-):
-    """A provider write cannot disappear in the return-to-checkpoint window."""
-
-    seeded = await _seed(
-        db_session,
-        kind="action",
-        params={"message": "publish once"},
-        attempt_count=1,
-        max_attempts=3,
-    )
-    claim_id = generate_ulid()
-    lease = await db_session.get(WorkLease, seeded["lease_id"])
-    step = await db_session.get(ExecutionStep, seeded["step_id"])
-    lease.execution_claim_id = claim_id
-    step.provider = "test_provider"
-    step.action_key = "publish"
-    await db_session.commit()
-
-    snapshot = {
-        **seeded,
-        "execution_claim_id": claim_id,
-        "execution_mode": "live",
-        "provider": "test_provider",
-        "action_key": "publish",
-        "integration_id": None,
-        "params": {"message": "publish once"},
-    }
-    await worker_internal._persist_direct_action_effect_intent(snapshot)
-
-    # Model the process dying after the provider accepted the write but before
-    # any adapter return or AgenticLoop checkpoint could be persisted.
-    db_session.expire_all()
-    lease = await db_session.get(WorkLease, seeded["lease_id"])
-    lease.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-    await db_session.commit()
-    await Dispatcher().expire_leases(
-        db_session,
-        now=datetime.now(timezone.utc),
-    )
-    await db_session.commit()
-
-    db_session.expire_all()
-    step = await db_session.get(ExecutionStep, seeded["step_id"])
-    lease = await db_session.get(WorkLease, seeded["lease_id"])
-    assert step.step_status == "waiting_human"
-    assert lease.status == WorkLeaseStatus.EXPIRED.value
-    assert any(
-        ref.get("kind") == "tool_effect" and ref.get("effect") == "pending"
-        for ref in step.evidence_refs
-    )
-
-
 # ── D1: revoke_active_leases ──────────────────────────────────────────
 
 
@@ -235,22 +179,6 @@ async def test_revoke_without_scope_touches_nothing(db_session):
     seeded = await _seed(db_session)
     assert await Dispatcher().revoke_active_leases(db_session, reason="no scope") == []
     assert (await db_session.get(WorkLease, seeded["lease_id"])).status == "active"
-
-
-@pytest.mark.asyncio
-async def test_cancel_plan_revokes_its_active_leases(db_session):
-    from packages.core.plans.service import cancel_plan
-
-    seeded = await _seed(db_session)
-
-    plan = await cancel_plan(db_session, seeded["plan_id"], reason="user cancelled")
-
-    assert plan is not None and plan.status == "cancelled"
-    lease = await db_session.get(WorkLease, seeded["lease_id"])
-    assert lease.status == WorkLeaseStatus.CANCELLED.value
-    assert lease.error["type"] == LEASE_REVOKED_ERROR_TYPE
-    step = await db_session.get(ExecutionStep, seeded["step_id"])
-    assert step.step_status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -485,8 +413,10 @@ async def test_fail_lease_with_tool_effect_evidence_blocks_retry(db_session):
     assert lease.evidence_refs == [effect]
     assert step.evidence_refs == [effect]
     assert step.step_status == "failed", "a recorded external effect must not be repeated"
-    assert lease.status == WorkLeaseStatus.NEEDS_HUMAN.value
+    assert lease.status == WorkLeaseStatus.FAILED.value
     assert step.runtime_checkpoint == checkpoint
+    assert step.error["type"] == "OutputSchemaError"
+    assert "may or may not have happened" in step.error["failure"]["reason"]
     assert step.error["failure"]["requires_human"] is True
     assert step.error["failure"]["retryable"] is False
 
@@ -510,7 +440,7 @@ async def test_fail_lease_does_not_trust_unpersisted_effect_checkpoint(db_sessio
     )
 
     step = await db_session.get(ExecutionStep, seeded["step_id"])
-    assert lease.status == WorkLeaseStatus.NEEDS_HUMAN.value
+    assert lease.status == WorkLeaseStatus.FAILED.value
     assert step.step_status == "failed"
     assert step.evidence_refs == [effect]
     assert step.runtime_checkpoint is None, "worker report alone must not mint replay authority"

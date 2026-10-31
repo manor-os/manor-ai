@@ -100,6 +100,18 @@ def runtime_nested_skill_state(checkpoint: dict[str, Any]) -> dict[str, Any] | N
     return copy.deepcopy(state)
 
 
+def runtime_nested_skill_resume_active() -> bool:
+    """Whether the current nested Skill call is restoring an earlier loop."""
+
+    from packages.core.ai.runtime.tool_effect_intents import runtime_current_tool_checkpoint
+
+    parent = runtime_current_tool_checkpoint()
+    if _observer.get() is None or parent is None:
+        return False
+    state = runtime_nested_skill_state(parent) or {}
+    return state.get("kind") in {"pending", "transcript"}
+
+
 def runtime_pending_checkpoint_leaf(
     checkpoint: dict[str, Any], *, tool_call_id: str | None = None,
 ) -> dict[str, Any]:
@@ -278,6 +290,28 @@ async def runtime_execute_with_nested_approval_checkpoints(operation, *args, **k
     with runtime_nested_checkpoint_scope(observe, checkpoint_approvals=True):
         result = await operation(*args, **kwargs)
     control = result.get("control") if isinstance(result, dict) else getattr(result, "control", None)
+    stop_reason = result.get("stop_reason") if isinstance(result, dict) else getattr(result, "stop_reason", None)
+    if stop_reason not in {None, "completed", "hitl_required"}:
+        # The parent can fail after a child already finished external work.
+        # Retain the host-observed response as evidence, not as an instruction
+        # to replay it or as proof that the parent's business goal succeeded.
+        responses = []
+        for call_id, tree in observed.items():
+            state = runtime_nested_skill_state(tree) or {}
+            response = state.get("response")
+            if state.get("kind") == "completed" and isinstance(response, dict):
+                responses.append({"tool_call_id": call_id, "skill_id": state["skill_id"],
+                    "result": {key: response[key] for key in (
+                        "skill", "content", "chrome_outcome", "tool_observations", "stop_reason", "error",
+                    ) if key in response}})
+        if responses:
+            from packages.core.services.workflow_agent_recovery import recovery_prompt_evidence
+
+            control = {**(control or {}), "child_skill_results": recovery_prompt_evidence(responses)}
+            if isinstance(result, dict):
+                result["control"] = control
+            else:
+                result.control = control
     if not isinstance(control, dict) or control.get("kind") != "approval_required":
         return result
     checkpoint = control.get("checkpoint")

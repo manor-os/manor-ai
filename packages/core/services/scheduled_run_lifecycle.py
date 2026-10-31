@@ -710,7 +710,6 @@ async def cancel_scheduled_child_if_pristine(
         from packages.core.models.hitl_request import HitlRequest
         from packages.core.models.task import Task
         from packages.core.services.task_runtime_approvals import (
-            TASK_RUNTIME_HITL_DETAIL_KEY,
             lock_task_runtime_approval_boundary,
         )
         from packages.core.services.task_state_machine import apply_task_status_transition
@@ -738,12 +737,7 @@ async def cancel_scheduled_child_if_pristine(
         if task is None:
             return False
         details = task.details if isinstance(task.details, dict) else {}
-        runtime_hitl = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-        if live_hitl_id is not None or (
-            isinstance(runtime_hitl, dict)
-            and str(runtime_hitl.get("state") or "")
-            in {"waiting", "resume_queued", "resuming"}
-        ):
+        if live_hitl_id is not None:
             return False
         if (
             str(details.get("scheduled_run_id") or "") != run_id
@@ -779,6 +773,7 @@ async def cancel_scheduled_child_if_pristine(
         from packages.core.services.workflow_chat_projection import (
             project_workflow_run_status,
         )
+        from packages.core.constants.task import CancelSource
         from packages.core.services.workflow_run_control import cancel_run
 
         workflow_run = (await db.execute(
@@ -806,7 +801,11 @@ async def cancel_scheduled_child_if_pristine(
             or workflow_run.execution_trace
         ):
             return False
-        cancel_run(workflow_run, actor_id="scheduler_lifecycle_gate")
+        cancel_run(
+            workflow_run,
+            actor_id="scheduler_lifecycle_gate",
+            source=CancelSource.SYSTEM,
+        )
         mark_workflow_terminal_effects_pending(workflow_run)
         await project_workflow_run_status(db, run=workflow_run)
         from packages.core.ledger.adapters import record_workflow_run_status
@@ -849,7 +848,6 @@ async def cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
     from packages.core.models.hitl_request import HitlRequest
     from packages.core.models.task import Task
     from packages.core.services.task_runtime_approvals import (
-        TASK_RUNTIME_HITL_DETAIL_KEY,
         expire_task_runtime_approval_for_terminal,
         lock_task_runtime_approval_boundary,
     )
@@ -902,10 +900,6 @@ async def cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
             and task.id != legacy_task_id
         ):
             continue
-        marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-        marker_state = (
-            str(marker.get("state") or "") if isinstance(marker, dict) else ""
-        )
         exact_live_requests = [
             request
             for request in live_requests
@@ -919,21 +913,12 @@ async def cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
             continue
         if (
             task.status == TaskStatus.IN_PROGRESS
-            or marker_state == "resuming"
             or any(
                 isinstance(request.context, dict)
                 and isinstance(request.context.get("provider_action_claim"), dict)
                 for request in exact_live_requests
             )
         ):
-            blocked_task_ids.append(task.id)
-            continue
-        if isinstance(marker, dict) and marker_state not in {
-            "",
-            "waiting",
-            "resume_queued",
-            "finished",
-        }:
             blocked_task_ids.append(task.id)
             continue
         if task.status in {

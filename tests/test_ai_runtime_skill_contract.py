@@ -101,23 +101,28 @@ async def test_builtin_sandbox_skill_contract_embeds_complete_external_skill_md(
     monkeypatch.setattr(sandbox_session_service, "load_sandbox_session", empty_owner_registry)
 
     async def record_sandbox_context(
-        conversation_id,
+        scope,
         sandbox_id,
         skill_id,
         **kwargs,
     ):
         contexts.append(
             {
-                "conversation_id": conversation_id,
+                "conversation_id": scope.binding_key,
                 "sandbox_id": sandbox_id,
                 "skill_id": skill_id,
-                **kwargs,
+                "entity_id": scope.entity_id,
+                "user_id": scope.user_id,
+                "agent_id": kwargs.get("agent_id"),
+                "skill_key": kwargs.get("skill_key"),
+                "holds_credentials": kwargs.get("holds_credentials"),
+                "credentials_owner_user_id": kwargs.get("credentials_owner_user_id"),
             }
         )
 
     monkeypatch.setattr(
         sandbox_session_service,
-        "runtime_init_sandbox_context",
+        "runtime_init_sandbox_binding",
         record_sandbox_context,
     )
 
@@ -172,6 +177,9 @@ async def test_builtin_sandbox_skill_contract_embeds_complete_external_skill_md(
             "entity_id": "ent_1",
             "user_id": "user_1",
             "agent_id": None,
+            "skill_key": "external-style-skill",
+            "holds_credentials": False,
+            "credentials_owner_user_id": None,
         }
     ]
 
@@ -214,7 +222,7 @@ async def test_sandbox_skill_destroys_new_instance_when_context_admission_fails(
 
     from packages.core.services import sandbox_session_service
 
-    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_context", fail_context)
+    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_binding", fail_context)
 
     settings = get_settings()
     old_url = settings.SANDBOX_SERVICE_URL
@@ -288,7 +296,7 @@ async def test_consumed_sandbox_is_not_destroyed_when_context_refresh_fails(
     from packages.core.services import sandbox_session_service
 
     monkeypatch.setattr(sandbox_queue_service, "resolve_sandbox_runner", resolve_runner)
-    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_context", fail_context)
+    monkeypatch.setattr(sandbox_session_service, "runtime_init_sandbox_binding", fail_context)
     monkeypatch.setattr(sandbox_sdk, "SandboxClient", UnexpectedSandboxClient)
 
     settings = get_settings()
@@ -343,6 +351,13 @@ async def test_entity_sandbox_skill_contract_uses_minio_bundle_and_credentials(
     import packages.core.services.skill_file_storage as skill_file_storage
     import packages.core.services.skill_service as skill_service
     from packages.core.config import get_settings
+    from packages.core.services.runtime_authorization import collaborator
+
+    async def member(*_args, **_kwargs):
+        # A company member's run: credentials are not withheld (no database here).
+        return False
+
+    monkeypatch.setattr(collaborator, "is_runtime_collaborator", member)
 
     skill_md = "\n".join(
         [
@@ -425,6 +440,7 @@ async def test_entity_sandbox_skill_contract_uses_minio_bundle_and_credentials(
             entity_id="ent_owner",
             user_id="user_1",
             input_text="Use the entity skill.",
+            conversation_id="conversation_1",
         )
     finally:
         settings.SANDBOX_SERVICE_URL = old_url
@@ -498,13 +514,18 @@ async def test_sandbox_skill_binds_with_the_binding_key_when_no_conversation(
     async def record_binding(_owner, session, *, scope=None):
         bindings.append(scope)
 
-    async def record_sandbox_context(conversation_id, sandbox_id, skill_id, **kwargs):
+    async def record_sandbox_context(scope, sandbox_id, skill_id, **kwargs):
         contexts.append(
             {
-                "conversation_id": conversation_id,
+                "conversation_id": scope.binding_key,
                 "sandbox_id": sandbox_id,
                 "skill_id": skill_id,
-                **kwargs,
+                "entity_id": scope.entity_id,
+                "user_id": scope.user_id,
+                "agent_id": kwargs.get("agent_id"),
+                "skill_key": kwargs.get("skill_key"),
+                "holds_credentials": kwargs.get("holds_credentials"),
+                "credentials_owner_user_id": kwargs.get("credentials_owner_user_id"),
             }
         )
 
@@ -512,7 +533,7 @@ async def test_sandbox_skill_binds_with_the_binding_key_when_no_conversation(
     monkeypatch.setattr(sandbox_session_service, "register_sandbox_session", record_binding)
     monkeypatch.setattr(
         sandbox_session_service,
-        "runtime_init_sandbox_context",
+        "runtime_init_sandbox_binding",
         record_sandbox_context,
     )
 
@@ -549,8 +570,11 @@ async def test_sandbox_skill_binds_with_the_binding_key_when_no_conversation(
             "entity_id": "ent_1",
             "user_id": "user_1",
             "agent_id": "agent_1",
+            "skill_key": "worker-skill",
+            "holds_credentials": False,
+            "credentials_owner_user_id": None,
         }
     ]
-    # The reuse scope is keyed by the same binding, so the next call in this
-    # run finds the warm sandbox instead of minting a second one.
-    assert bindings and "U01ABC" in str(bindings[0])
+    # A task of a human user reuses the user's general sandbox, so the next
+    # call in this run finds the warm sandbox instead of minting a second one.
+    assert bindings == ["user"]

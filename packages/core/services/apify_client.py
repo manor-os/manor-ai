@@ -425,6 +425,15 @@ def _media_type(item: dict, permalink: str | None) -> str:
     return "unknown"
 
 
+def _public_count(value: Any) -> int | None:
+    """A displayed engagement counter; hidden (-1) or missing stays unknown, never zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value != int(value) or value > 10**12:
+        return None
+    return int(value)
+
+
 def normalize_items(spec: dict, items: list) -> dict:
     """Filter/dedupe evidence without ever claiming provider completeness."""
     spec = _validated_spec(spec)
@@ -516,6 +525,13 @@ def normalize_items(spec: dict, items: list) -> dict:
                 "published_at": _iso(timestamp) if timestamp else None,
                 "media_type": _media_type(item, permalink),
                 "caption": _bounded_text(item.get("caption"), 20_000),
+                # Counts as observed by the provider at collection time.
+                "metrics": {
+                    "likes": _public_count(item.get("likesCount")),
+                    "comments": _public_count(item.get("commentsCount")),
+                    "views": _public_count(item.get("videoViewCount")),
+                    "plays": _public_count(item.get("videoPlayCount")),
+                },
                 "thumbnail_url": _https_url(item.get("displayUrl")),
                 "video_url": _https_url(item.get("videoUrl")),
                 "transcript": _bounded_text(item.get("transcript"), 50_000),

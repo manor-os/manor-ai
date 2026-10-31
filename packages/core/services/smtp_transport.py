@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import imaplib
 import os
 import smtplib
 import socket
 import ssl
 from email.message import Message
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 class SMTPTransportConfigurationError(RuntimeError):
@@ -99,7 +100,9 @@ def open_smtp_client(
         client_type = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
     else:
         client_type = _SMTP_SSL if use_ssl else _SMTP
-    return client_type(host=host, port=port, timeout=timeout)
+    # SMTP_SSL's stdlib default context does not verify peer certificates.
+    tls_options = {"context": ssl.create_default_context()} if use_ssl else {}
+    return client_type(host=host, port=port, timeout=timeout, **tls_options)
 
 
 def open_imap_client(
@@ -114,7 +117,36 @@ def open_imap_client(
         client_type = imaplib.IMAP4_SSL if use_ssl else imaplib.IMAP4
     else:
         client_type = _IMAP4SSL if use_ssl else _IMAP4
-    return client_type(host=host, port=port, timeout=timeout)
+    # IMAP4_SSL has the same permissive stdlib default as SMTP_SSL.
+    tls_options = {"ssl_context": ssl.create_default_context()} if use_ssl else {}
+    return client_type(host=host, port=port, timeout=timeout, **tls_options)
+
+
+@contextlib.contextmanager
+def _authenticated_client(
+    *,
+    host: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+    use_starttls: bool,
+    use_ssl: bool,
+    timeout: float,
+) -> Iterator[smtplib.SMTP]:
+    """Connect, negotiate TLS and log in; the single SMTP session sequence."""
+    if use_ssl and use_starttls:
+        raise SMTPTransportConfigurationError(
+            "SMTP implicit TLS and STARTTLS cannot both be enabled",
+        )
+
+    with open_smtp_client(host, port, use_ssl=use_ssl, timeout=timeout) as client:
+        client.ehlo()
+        if use_starttls:
+            client.starttls(context=ssl.create_default_context())
+            client.ehlo()
+        if username:
+            client.login(username, password or "")
+        yield client
 
 
 def send_message(
@@ -131,21 +163,40 @@ def send_message(
     to_addrs: Iterable[str] | None = None,
 ) -> None:
     """Send one MIME message with the configured SMTP connection mode."""
-    if use_ssl and use_starttls:
-        raise SMTPTransportConfigurationError(
-            "SMTP implicit TLS and STARTTLS cannot both be enabled",
-        )
-
-    with open_smtp_client(host, port, use_ssl=use_ssl, timeout=timeout) as client:
-        client.ehlo()
-        if use_starttls:
-            client.starttls(context=ssl.create_default_context())
-            client.ehlo()
-        if username:
-            client.login(username, password or "")
+    with _authenticated_client(
+        host=host, port=port, username=username, password=password,
+        use_starttls=use_starttls, use_ssl=use_ssl, timeout=timeout,
+    ) as client:
         client.send_message(message, from_addr=from_addr, to_addrs=to_addrs)
 
 
 async def send_message_async(**kwargs: object) -> None:
     """Run the blocking SMTP session outside the caller's event loop."""
     await asyncio.to_thread(send_message, **kwargs)
+
+
+def check_login(
+    *,
+    host: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+    use_starttls: bool,
+    use_ssl: bool,
+    timeout: float,
+) -> None:
+    """Connect and authenticate exactly like ``send_message`` without sending.
+
+    Raises on any failure; ``smtplib.SMTPAuthenticationError`` means the
+    credentials were rejected.
+    """
+    with _authenticated_client(
+        host=host, port=port, username=username, password=password,
+        use_starttls=use_starttls, use_ssl=use_ssl, timeout=timeout,
+    ):
+        pass
+
+
+async def check_login_async(**kwargs: object) -> None:
+    """Run the blocking SMTP login check outside the caller's event loop."""
+    await asyncio.to_thread(check_login, **kwargs)

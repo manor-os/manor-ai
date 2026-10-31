@@ -218,7 +218,9 @@ def is_native_openai_base_url(base_url: str | None) -> bool:
     )
 
 
-async def _resolve_realtime_byok(entity_id: str | None, user_id: str | None = None) -> dict | None:
+async def _resolve_realtime_byok(
+    entity_id: str | None, user_id: str | None = None, *, workspace_id: str | None = None,
+) -> dict | None:
     if not entity_id:
         return None
     from packages.core.services.model_gateway import provider_for_model
@@ -231,6 +233,7 @@ async def _resolve_realtime_byok(entity_id: str | None, user_id: str | None = No
         "primary",
         user_id=user_id,
         entity_id=entity_id,
+        workspace_id=workspace_id,
     )
     if provider_for_model(selected_model) != "openai":
         return None
@@ -238,10 +241,11 @@ async def _resolve_realtime_byok(entity_id: str | None, user_id: str | None = No
         "primary",
         user_id=user_id,
         entity_id=entity_id,
+        workspace_id=workspace_id,
     )
 
 
-async def _has_audio_role_override(entity_id: str, user_id: str) -> bool:
+async def _has_audio_role_override(entity_id: str, user_id: str, *, workspace_id: str | None = None) -> bool:
     from packages.core.services.model_resolver import resolve_llm_metadata_for_user
 
     for role in ("voice", "stt"):
@@ -249,6 +253,7 @@ async def _has_audio_role_override(entity_id: str, user_id: str) -> bool:
             role,
             user_id=user_id,
             entity_id=entity_id,
+            workspace_id=workspace_id,
         )
         if str((metadata or {}).get("llm_api_key") or "").strip():
             return True
@@ -259,6 +264,7 @@ async def resolve_realtime_route(
     entity_id: str | None,
     *,
     user_id: str | None = None,
+    workspace_id: str | None = None,
     required: bool = True,
     allow_managed: bool = True,
     respect_audio_role_overrides: bool = False,
@@ -274,10 +280,10 @@ async def resolve_realtime_route(
         respect_audio_role_overrides
         and entity_id
         and user_id
-        and await _has_audio_role_override(entity_id, user_id)
+        and await _has_audio_role_override(entity_id, user_id, workspace_id=workspace_id)
     ):
         return None
-    byok = await _resolve_realtime_byok(entity_id, user_id) if user_id else await _resolve_realtime_byok(entity_id)
+    byok = await _resolve_realtime_byok(entity_id, user_id or None, workspace_id=workspace_id)
     byok_key = str((byok or {}).get("llm_api_key") or "").strip()
     byok_base_url = str(
         (byok or {}).get("llm_base_url") or OPENAI_API_BASE_URL
@@ -1231,6 +1237,7 @@ class RealtimeVoiceEngine:
         await runtime_assert_credit_available(
             billing.entity_id,
             source=billing.source or self.source,
+            workspace_id=billing.workspace_id,
         )
 
     async def create_response(
@@ -1260,6 +1267,7 @@ class RealtimeVoiceEngine:
                 await runtime_assert_credit_available(
                     billing.entity_id,
                     source=billing.source or self.source,
+                    workspace_id=billing.workspace_id,
                 )
         if before_send is not None and before_send() is False:
             return
@@ -1428,6 +1436,7 @@ class RealtimeVoiceEngine:
         operation_id: str,
         conversation_id: str | None,
     ) -> None:
+        from packages.core.ai.runtime.billing import runtime_bound_billing_payer
         from packages.core.database import async_session
         from packages.core.services.usage_service import record_llm_usage
 
@@ -1442,5 +1451,9 @@ class RealtimeVoiceEngine:
                 source=self.source,
                 operation_id=operation_id,
                 strict=True,
+                # The call session's pinned payer; None resolves it now.
+                payer_entity_id=runtime_bound_billing_payer(
+                    scope.get("entity_id"), scope.get("workspace_id"),
+                ),
             )
             await db.commit()

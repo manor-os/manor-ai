@@ -58,7 +58,43 @@ def test_cloud_jwt_secret_gate_rejects_short_and_shipped_values():
     assert is_insecure_jwt_secret("")
     assert is_insecure_jwt_secret("short")
     assert is_insecure_jwt_secret("replace-with-openssl-rand-hex-32")
+    # A shipped placeholder long enough to pass the length check.
+    assert is_insecure_jwt_secret("replace-with-a-strong-random-secret")
     assert not is_insecure_jwt_secret("a" * 32)
+
+
+@pytest.mark.parametrize(
+    ("deployment_mode", "secret", "refused"),
+    [
+        ("cloud", "", True),
+        ("cloud", "dev-secret-change-in-production-32-bytes", True),
+        ("cloud", "k" * 32, False),
+        ("oss", "dev-secret-change-in-production-32-bytes", False),
+    ],
+    ids=["cloud-empty", "cloud-placeholder", "cloud-strong", "oss-placeholder"],
+)
+def test_celery_worker_startup_enforces_cloud_jwt_secret_gate(
+    monkeypatch, deployment_mode, secret, refused
+):
+    """A worker signing approvals with a placeholder secret must not boot."""
+    import packages.core.celery_app  # noqa: F401 - connects the receiver
+    import packages.core.config as config_mod
+    from celery.signals import worker_init
+
+    monkeypatch.setattr(
+        config_mod,
+        "get_settings",
+        lambda: SimpleNamespace(JWT_SECRET_KEY=secret, DEPLOYMENT_MODE=deployment_mode),
+    )
+
+    # Dispatch through Celery's signal: it swallows ordinary receiver
+    # exceptions, so only an escaping SystemExit proves the worker stops.
+    if refused:
+        with pytest.raises(SystemExit, match="refusing to start in cloud mode"):
+            worker_init.send(sender=None)
+    else:
+        responses = worker_init.send(sender=None)
+        assert not [r for _, r in responses if isinstance(r, BaseException)]
 
 
 def test_production_password_policy_rejects_short_and_common_passwords(monkeypatch):
@@ -122,18 +158,6 @@ def test_cloud_cors_allows_a_hostless_public_ipv4_for_lb_bootstrap(monkeypatch):
     assert _cors_allowed_origins() == ["http://146.190.0.195"]
 
 
-def test_local_k8s_cloud_cors_allows_loopback_http(monkeypatch):
-    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    monkeypatch.setenv("MANOR_ENV", "local-k8s")
-    monkeypatch.setenv(
-        "CORS_ALLOWED_ORIGINS",
-        "http://localhost:18080,http://127.0.0.1:18082,http://[::1]:18082",
-    )
-    assert _cors_allowed_origins() == [
-        "http://127.0.0.1:18082",
-        "http://[::1]:18082",
-        "http://localhost:18080",
-    ]
 
 
 def test_active_content_is_forced_to_download(tmp_path):
@@ -179,6 +203,18 @@ async def test_required_malware_scanner_fails_closed(monkeypatch):
     with pytest.raises(UploadSecurityError) as raised:
         await inspect_upload_content(b"hello", filename="note.txt", declared_content_type="text/plain")
     assert raised.value.status_code == 503
+
+    # A scanner that stops answering still fails closed, and says the file can simply be sent again.
+    def stalled(*_args, **_kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setenv("CLAMAV_HOST", "clamav.invalid")
+    monkeypatch.setattr(upload_security.socket, "create_connection", stalled)
+    with pytest.raises(UploadSecurityError) as raised:
+        await inspect_upload_content(b"hello", filename="note.txt", declared_content_type="text/plain")
+    assert raised.value.status_code == 503
+    assert str(raised.value) == upload_security.SCAN_UNAVAILABLE_MESSAGE
+    assert "Try uploading it again" in str(raised.value)
 
 
 def test_oauth_account_tokens_encrypt_and_clear_legacy_columns():

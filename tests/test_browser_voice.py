@@ -108,8 +108,15 @@ def session():
     return call, ws, provider
 
 
+# A hang guard, not a latency assertion: shared CI runners stall the whole
+# process for seconds (observed 2.3-3.5 s inside AsyncMock-only spans), which
+# a tight budget misreports as a functional failure. Waits return as soon as
+# their condition holds; voice latency is measured by dedicated checks.
+HANG_GUARD_SECONDS = 30
+
+
 async def eventually(predicate):
-    async with asyncio.timeout(2):
+    async with asyncio.timeout(HANG_GUARD_SECONDS):
         while not predicate():
             await asyncio.sleep(0.005)
 

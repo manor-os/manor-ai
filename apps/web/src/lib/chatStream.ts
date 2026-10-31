@@ -8,10 +8,12 @@ import { useUpgradeStore } from "../stores/upgrade";
 import {
   api,
   type PlanLimitDetail,
+  type PlanLimitKind,
   type WorkspaceLedgerOverview,
   type WorkspaceLedgerQueryVisualization,
 } from "./api";
 import { t } from "./i18n";
+import { planLimitOffersUpgrade } from "./planLimit";
 import { normalizeFileRef } from "./fileReferences";
 import type { ManualSkillReference } from "./manualSkillRefs";
 import { TYPEWRITER_TICK_MS, nextTypewriterSlice } from "./chatTypewriter";
@@ -516,6 +518,11 @@ export interface RuntimeHumanInputState {
   options?: string[];
   fields?: RuntimeHumanInputField[];
   context?: string;
+  /** Files the agent asks the person to judge (`request_input` file_review), resolved to Documents. */
+  reviewFiles?: Array<{ document_id: string; name?: string; fs_path?: string }>;
+  /** Where in Manor the person acts before answering (an in-app path the runtime set, e.g. a screen hand-over). */
+  actionLink?: string;
+  actionToTake?: string;
   deadlineAt?: string;
   answered?: boolean;
 }
@@ -559,9 +566,21 @@ export function runtimeHumanInputFromPayload(raw: unknown): RuntimeHumanInputSta
     options: options && options.length > 0 ? options : undefined,
     fields: fields && fields.length > 0 ? fields : undefined,
     context: value.context ? String(value.context) : undefined,
+    reviewFiles: Array.isArray(value.review_files)
+      ? value.review_files.filter((item): item is { document_id: string; name?: string; fs_path?: string } =>
+        Boolean(item) && typeof item === "object" && typeof (item as { document_id?: unknown }).document_id === "string")
+      : undefined,
+    actionLink: inAppLink(value.action_link),
+    actionToTake: value.action_to_take ? String(value.action_to_take) : undefined,
     deadlineAt: value.deadline_at ? String(value.deadline_at) : undefined,
     answered: Boolean(value.answer) || String(value.status || "") !== "pending",
   };
+}
+
+/** Only a path inside Manor is followed from a question card. */
+function inAppLink(raw: unknown): string | undefined {
+  const link = typeof raw === "string" ? raw.trim() : "";
+  return link.startsWith("/") && !link.startsWith("//") && !/[\\\s]/.test(link) ? link : undefined;
 }
 
 export function formatRuntimeQueueStatus(queue: RuntimeQueueState): string {
@@ -820,6 +839,11 @@ export const LLM_CONFIGURATION_ERROR_MESSAGE =
 // text after the sentence is dropped here too, whichever layer sees it first.
 export const BYOK_PROVIDER_ERROR_MESSAGE =
   "Your BYOK model provider returned an error. Check the model, API key, and base URL in your AI settings and the provider's status, then try again.";
+// The same route failed transiently (no response, dropped stream, 429/5xx)
+// through the backend's automatic retries: an outage, not a settings problem.
+// Its detail adds "after <n> attempts over <s>s".
+export const BYOK_PROVIDER_UNAVAILABLE_MESSAGE =
+  "Your BYOK model provider stopped responding. This looks like a temporary outage at the provider, not a problem with your AI settings. Try again in a few minutes.";
 const BYOK_PROVIDER_ERROR_CODE = "byok_provider_error";
 const FILE_PERMISSION_ERROR_MESSAGES = {
   "You don't have permission to edit this file. Ask the file owner for edit access.": "lib.chat_stream.file_edit_denied",
@@ -836,10 +860,12 @@ export function formatFilePermissionErrorMessage(message: unknown): string | nul
 }
 
 const PUBLIC_BYOK_DETAIL_RE =
-  /^(?:HTTP [1-5]\d{2}|no response) from [A-Za-z0-9.-]{1,253}(?::\d{1,5})? \(model [A-Za-z0-9._:/-]{1,120}\)$/;
+  /^(?:HTTP [1-5]\d{2}|no response) from [A-Za-z0-9.-]{1,253}(?::\d{1,5})? \(model [A-Za-z0-9._:/-]{1,120}\)(?: after \d{1,3} attempts? over \d{1,6}s)?$/;
 
-function localizedByokProviderError(detail?: string): string {
-  const template = t("lib.chat_stream.byok_provider_error_with_detail");
+function localizedByokProviderError(detail?: string, transient = false): string {
+  const template = t(transient
+    ? "lib.chat_stream.byok_provider_unavailable_with_detail"
+    : "lib.chat_stream.byok_provider_error_with_detail");
   return detail ? template.replace("{detail}", detail) : template.split("\n\n", 1)[0];
 }
 
@@ -848,10 +874,19 @@ export function formatByokProviderErrorMessage(message: unknown): string | null 
   if (text === BYOK_PROVIDER_ERROR_CODE || text === BYOK_PROVIDER_ERROR_MESSAGE) {
     return localizedByokProviderError();
   }
-  const prefix = `${BYOK_PROVIDER_ERROR_MESSAGE}\n\nError detail: `;
-  if (!text.startsWith(prefix)) return null;
-  const detail = text.slice(prefix.length).trim();
-  return localizedByokProviderError(PUBLIC_BYOK_DETAIL_RE.test(detail) ? detail : undefined);
+  if (text === BYOK_PROVIDER_UNAVAILABLE_MESSAGE) {
+    return localizedByokProviderError(undefined, true);
+  }
+  for (const [sentence, transient] of [
+    [BYOK_PROVIDER_ERROR_MESSAGE, false],
+    [BYOK_PROVIDER_UNAVAILABLE_MESSAGE, true],
+  ] as const) {
+    const prefix = `${sentence}\n\nError detail: `;
+    if (!text.startsWith(prefix)) continue;
+    const detail = text.slice(prefix.length).trim();
+    return localizedByokProviderError(PUBLIC_BYOK_DETAIL_RE.test(detail) ? detail : undefined, transient);
+  }
+  return null;
 }
 
 function redactSensitiveText(value: string): string {
@@ -1184,6 +1219,8 @@ function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitD
       limit: typeof d.limit === "number" ? d.limit : null,
       current: typeof d.current === "number" ? d.current : null,
       plan: String(d.plan || "current"),
+      // "trial_credit" (a provider-paid trial ran dry) must reach the notice.
+      ...(typeof d.kind === "string" && d.kind ? { kind: d.kind as PlanLimitKind } : {}),
     };
   }
   return {
@@ -2030,7 +2067,8 @@ export async function processSSEStream(
             );
             result.stopReason = stopReason;
             result.limitDetail = detail;
-            useUpgradeStore.getState().show(detail);
+            // The inline notice already explains a provider-paid trial stop.
+            if (planLimitOffersUpgrade(detail.kind)) useUpgradeStore.getState().show(detail);
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];

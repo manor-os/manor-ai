@@ -364,8 +364,8 @@ Decision mode: {decision.mode}.
 
 Perform the requested research or checks using authorized read/action tools. Do
 not send a message, email, notification, or mutate this Initiative yourself;
-the platform owns delivery and lifecycle. Your final response MUST be one JSON
-object and nothing else, with exactly this shape:
+the platform owns delivery and lifecycle. Finish the Task with one decision
+object as its result, with exactly this shape:
 {{"version":"1","decision":"notify|silent","message":"required only for notify","reason_code":"lowercase_code","reason":"optional explanation","severity":"info|warn","dedupe_key":"optional stable key","evidence_refs":[{{"type":"source","id":"optional","url":"optional","label":"optional"}}]}}
 
 Use decision="silent" and omit message when the condition is not met or there

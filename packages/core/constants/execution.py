@@ -175,7 +175,22 @@ SCHEDULED_RESULT_PROJECTION_RECOVERY_DELAY_SECONDS = (
     SCHEDULED_RESULT_PROJECTION_MAX_RETRIES + 2
 ) * SCHEDULED_RESULT_PROJECTION_RETRY_SECONDS
 WORKFLOW_CONTINUATION_RETRY_SECONDS = 60
+WORKFLOW_CONTINUATION_MAX_RETRY_SECONDS = 600
 WORKFLOW_TERMINAL_EFFECT_RETRY_SECONDS = 60
+
+
+def workflow_continuation_retry_seconds(due_at, now) -> float:
+    """Seconds before a published Workflow continuation may be republished.
+
+    A continuation still waiting behind busy heavy workers is not lost, so
+    republishing it every minute only queues duplicates. The interval grows
+    with the continuation's age, from 60 s up to 10 min.
+    """
+    age = (now - due_at).total_seconds() if due_at is not None else 0.0
+    return float(min(
+        WORKFLOW_CONTINUATION_MAX_RETRY_SECONDS,
+        max(WORKFLOW_CONTINUATION_RETRY_SECONDS, age),
+    ))
 
 
 class ScheduledChildAdmissionStatus(str, Enum):
@@ -535,5 +550,4 @@ def without_rolled_up_coordinator_children(
         visible.append(step)
     return visible
 
-#: Dynamic tool the coordinator step uses to delegate to a workspace service.
-DELEGATE_TO_SERVICE_TOOL_NAME = "delegate_to_service"
+

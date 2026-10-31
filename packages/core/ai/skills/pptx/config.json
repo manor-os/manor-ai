@@ -2,7 +2,8 @@
   "id": "pptx",
   "name": "pptx",
   "type": "sandbox",
-  "description": "Use this skill to generate high-quality editable PowerPoint/PPTX decks from user requirements, topic prompts, or provided text/Markdown. Backed by PPT Master: plans the deck, writes SVG pages, quality-checks them, post-processes them, and exports to natively editable PPTX.",
+  "sandbox_read_only_paths": ["templates/icons"],
+  "description": "Generate editable PowerPoint (PPTX) decks from requirements, topics or provided text/Markdown. Pass params.mode='free_design' when the person asks, in any words or language, for no template, a different design or layout on every page, a bespoke or magazine-like look, or a reference deck to imitate; otherwise leave params.mode unset. Designed templates are the default (fast, for ordinary reports, proposals, training and pitches); free design designs every page individually and is slower.",
   "search": {
     "terms": ["powerpoint", "slide deck", "presentation", "slides", "pitch deck", "ppt", "editable deck", "deck"],
     "examples": ["make powerpoint presentation about quarterly results", "pitch deck slides for startup", "turn my notes into slide deck", "editable pptx from markdown"]

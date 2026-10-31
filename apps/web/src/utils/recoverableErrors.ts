@@ -5,13 +5,20 @@ const AUTO_RELOAD_RESET_AFTER_MS = 60_000;
 const STATEFUL_EDITING_PATH_PREFIXES = ["/video-editor", "/editor"] as const;
 let autoReloadScheduled = false;
 
+/** The customer-trial frame (marker left by public/embed-isolate.js; no imports here). */
+function inEmbeddedFrame(): boolean {
+  return typeof window !== "undefined" && Boolean(window.__manorEmbed);
+}
+
 export enum ApplicationReloadMode {
   Refresh = "refresh",
   RecoverAssets = "recover_assets",
 }
 
 export function reloadApplication(mode = ApplicationReloadMode.Refresh): void {
-  if (mode === ApplicationReloadMode.RecoverAssets) {
+  // The customer-trial frame cannot load the (unframeable) recovery page; its
+  // entry is served uncached, so a plain reload picks up the new release.
+  if (mode === ApplicationReloadMode.RecoverAssets && !inEmbeddedFrame()) {
     const next = `${window.location.pathname}${window.location.search || ""}${window.location.hash || ""}`;
     window.location.replace(`/app-recovery.html?next=${encodeURIComponent(next)}`);
     return;
@@ -131,6 +138,9 @@ export function isStatefulEditingRoute(pathname?: string): boolean {
 }
 
 export function shouldAutoReloadForRecoverableError(): boolean {
+  // The frame's sessionStorage is memory: the attempt bound would reset on
+  // every reload, so it never reloads by itself.
+  if (inEmbeddedFrame()) return false;
   try {
     return (
       !isStatefulEditingRoute() &&

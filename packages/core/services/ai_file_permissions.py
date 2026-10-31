@@ -98,13 +98,31 @@ def classify_file_approval_reply(message: str) -> str | None:
     compact = re.sub(r"[\s。.!！?？,，；;：:\"'“”‘’、]+", "", raw)
     if not compact or len(compact) > 24:
         return None
-    if compact in _NEGATIVE_REPLY_HINTS or any(h in compact for h in _NEGATIVE_REPLY_HINTS if len(h) > 1):
+    if compact in _NEGATIVE_REPLY_HINTS or _has_reply_hint(raw, compact, _NEGATIVE_REPLY_HINTS):
         return "reject"
+    # Always-hints are long compact phrases ("alwaysapprove"): no word inside them misreads.
     if compact in _ALWAYS_REPLY_HINTS or any(h in compact for h in _ALWAYS_REPLY_HINTS):
         return "always_approve"
-    if compact in _AFFIRMATIVE_REPLY_HINTS or any(h in compact for h in _AFFIRMATIVE_REPLY_HINTS if len(h) > 1):
+    if compact in _AFFIRMATIVE_REPLY_HINTS or _has_reply_hint(raw, compact, _AFFIRMATIVE_REPLY_HINTS):
         return "approve"
     return None
+
+
+def _has_reply_hint(raw: str, compact: str, hints: set[str]) -> bool:
+    """A hint inside a longer reply: English as a whole word, Chinese as text.
+
+    An English hint matched as a substring read "Knowledge" as "no", so a
+    request mentioning Knowledge rejected the pending card.
+    """
+    for hint in hints:
+        if len(hint) < 2:
+            continue
+        if hint.isascii():
+            if re.search(rf"(?<![a-z0-9']){re.escape(hint)}(?![a-z0-9'])", raw):
+                return True
+        elif hint in compact:
+            return True
+    return False
 
 
 def visible_user_paths(paths: Iterable[str]) -> list[str]:
@@ -163,8 +181,8 @@ def _require_canonical_file_paths(entity_id: str, visible_paths: list[str]) -> N
 
 
 def is_chat_upload_path(path: str) -> bool:
-    """Recognize an upload reference, not permission to read it."""
-    return bool(re.fullmatch(r"uploads/chat/[0-9a-f]{16}\.[a-zA-Z0-9]+", path))
+    """Recognize legacy and scope-hashed upload references, not read grants."""
+    return bool(re.fullmatch(r"uploads/chat/(?:[0-9a-f]{16}/)?[0-9a-f]{16}\.[a-zA-Z0-9]+", path))
 
 
 async def _chat_upload_readable(
@@ -526,16 +544,20 @@ def _receipt_mismatch_payload(
     authorized_action_key: str,
     authorized_paths: tuple[str, ...],
     attempted_action_key: str,
+    scope_mismatch: tuple[str, ...] = (),
 ) -> str:
     """An internal invariant violation, never a user permission decision.
 
     The public call was already authorized; its handler then tried to write
     somewhere else. No grant, approval or retry can repair that, so the model
     must report an internal error instead of asking the user to "allow" it.
+    ``scope_mismatch`` names the receipt scope fields that differ from the
+    write's: matching paths with a differing scope is not a path bug.
     """
     logger.error(
-        "authorization_receipt_mismatch tool=%s attempted=%s %s authorized=%s %s",
+        "authorization_receipt_mismatch tool=%s attempted=%s %s authorized=%s %s scope_mismatch=%s",
         tool_name, attempted_action_key, paths, authorized_action_key, list(authorized_paths),
+        list(scope_mismatch),
     )
     message = (
         "Internal Manor error: the file write did not match the action, file or "
@@ -555,6 +577,7 @@ def _receipt_mismatch_payload(
         "operation": {"tool": tool_name, "action": action, "paths": paths},
         "authorized": {"action_key": authorized_action_key, "paths": list(authorized_paths)},
         "attempted": {"action_key": attempted_action_key, "paths": paths},
+        **({"scope_mismatch": list(scope_mismatch)} if scope_mismatch else {}),
     }, ensure_ascii=False)
 
 
@@ -837,6 +860,84 @@ async def guard_ai_file_read_access(
     return None
 
 
+async def _file_mutation_policy(
+    db,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    workspace_id: str | None,
+    action: str,
+    action_key: str,
+    paths: list[str],
+    task_id: str | None = None,
+):
+    """The governance decision (account / Workspace / Task rules) for one file mutation."""
+    from packages.core.governance.service import check_step_policy
+
+    return await check_step_policy(
+        db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+        kind="action", action_key=action_key, resource_id=paths[0] if len(paths) == 1 else None,
+        resource_ids=tuple(paths), resource_kind="file",
+        risk_level="high" if action in {"delete", "remove"} else "medium",
+        capability_id="file.write", operation=action, task_id=task_id,
+    )
+
+
+async def guard_ai_file_governance_hard_block(
+    *,
+    entity_id: str,
+    user_id: str | None,
+    workspace_id: str | None,
+    tool_name: str,
+    action: FileMutationAction | str,
+    paths: Iterable[str],
+) -> str | None:
+    """Apply only governance hard blocks to a file mutation whose consent is already given.
+
+    For a write that belongs to an action the user already approved (e.g. the
+    outputs of an approved delegation, saved later by a background worker),
+    so no approval request is created here. The decision is the same one
+    ``guard_ai_file_mutation`` evaluates (same action key, facts and rule
+    chain), read-only. A ``deny`` outcome or a Workspace constraint (risk
+    ceiling) blocks; an outcome that would ask for approval does not, because
+    that approval was the original action's. An unreadable or missing
+    governance configuration fails closed, as it does everywhere else.
+    Resource ACLs are separate: see ``guard_ai_file_resource_access``.
+    """
+    raw_paths = tuple(paths)
+    try:
+        action = FileMutationAction.normalize(action).value
+        visible_paths = canonical_visible_user_paths(entity_id, raw_paths)
+    except ValueError as exc:
+        return _deny_payload(action=str(getattr(action, "value", action) or "invalid"), tool_name=tool_name,
+            paths=visible_user_paths(raw_paths), mode="entity_file_acl_denied", reason=str(exc))
+    if len(visible_paths) != len(raw_paths):
+        return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+            mode="entity_file_acl_denied", reason="File changes are limited to user-visible Entity paths.")
+    if not visible_paths:
+        return None
+    from packages.core.database import async_session
+    from packages.core.governance.approval_policy_service import ApprovalPolicyIntegrityError
+
+    action_key = _precise_workspace_file_action_key(entity_id=entity_id, action=action, paths=visible_paths)
+    async with async_session() as db:
+        try:
+            policy = await _file_mutation_policy(
+                db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+                action=action, action_key=action_key, paths=visible_paths,
+            )
+        except ApprovalPolicyIntegrityError as exc:
+            return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+                mode=FilePermissionMode.DENY.value, reason=f"Governance configuration is unavailable: {exc}")
+    if policy.allowed or policy.pause_for_hitl:
+        return None
+    detail = policy.reason or "Denied by governance policy"
+    if policy.matched_rule and policy.matched_rule != policy.reason:
+        detail = f"{detail} (rule {policy.matched_rule})"
+    return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+        mode=FilePermissionMode.DENY.value, reason=detail)
+
+
 async def guard_ai_file_mutation(
     *,
     entity_id: str,
@@ -994,6 +1095,17 @@ async def guard_ai_file_mutation(
                 authorized_action_key=authorization_receipt.action_key,
                 authorized_paths=authorization_receipt.resource_ids,
                 attempted_action_key=receipt_action_key,
+                scope_mismatch=tuple(
+                    name
+                    for name, attempted in (
+                        ("entity_id", entity_id),
+                        ("user_id", user_id),
+                        ("workspace_id", effective_workspace_id),
+                        ("conversation_id", conversation_id),
+                        ("task_id", task_id),
+                    )
+                    if (getattr(authorization_receipt, name) or None) != (str(attempted or "").strip() or None)
+                ),
             )
 
         acl_denial = await _resource_file_acl_denial(
@@ -1019,15 +1131,10 @@ async def guard_ai_file_mutation(
         if not operation_id and not approval_token:
             return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
                 mode="approval_operation_identity_missing", reason="A persisted execution identity is required for this file operation.")
-        resource_id = visible_paths[0] if len(visible_paths) == 1 else None
         from packages.core.governance.approvals import _consent_requirements
-        from packages.core.governance.service import check_step_policy
-        policy = await check_step_policy(
+        policy = await _file_mutation_policy(
             db, entity_id=entity_id, user_id=user_id, workspace_id=effective_workspace_id,
-            kind="action", action_key=receipt_action_key, resource_id=resource_id,
-            resource_ids=tuple(visible_paths), resource_kind="file",
-            risk_level="high" if action in {"delete", "remove"} else "medium",
-            capability_id="file.write", operation=action, task_id=task_id,
+            action=action, action_key=receipt_action_key, paths=visible_paths, task_id=task_id,
         )
         mode = FilePermissionMode.APPROVAL.value
         if not policy.allowed and not policy.pause_for_hitl:

@@ -11,8 +11,9 @@ PRACTICAL_CONFIG_DIR = Path(__file__).with_name("configs") / "practical"
 RECORDING_CONFIG_DIR = Path(__file__).with_name("configs") / "recording"
 RECORDING_CONFIG_ORDER = ("recording-shorts-v1.json", "recording-tutorial-v1.json")
 CREATIVE_CONFIG_DIR = Path(__file__).with_name("configs") / "creative"
-CREATIVE_CONFIG_ORDER = tuple(f"creative-{key}-v1.json" for key in
-                              ("presentation", "podcast", "carousel", "dubbing", "handbook"))
+# The Carousel studio is the Agent-and-Skill version; the Flow version is retired.
+CREATIVE_CONFIG_ORDER = ("creative-presentation-v1.json", "creative-podcast-v1.json", "creative-video-v1.json",
+                         "creative-carousel-agent-v1.json", "creative-dubbing-v1.json", "creative-handbook-v1.json")
 PRACTICAL_CONFIG_ORDER = (
     "practical-meeting-notes-v1.json",
     "practical-weekly-update-v1.json",

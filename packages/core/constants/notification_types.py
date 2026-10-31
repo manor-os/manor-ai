@@ -17,10 +17,10 @@ toggle 30 individual rows.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 Severity = Literal["info", "warn", "critical"]
-Category = Literal["task", "agent", "media", "system", "billing", "calendar"]
+Category = Literal["task", "agent", "media", "system", "billing", "calendar", "marketplace"]
 
 
 class NotificationChannel(str, Enum):
@@ -81,6 +81,10 @@ class EventDescriptor(TypedDict):
     severity: Severity
     label: str
     description: str
+    #: Channels this kind uses until the user overrides the kind. It outranks
+    #: the user's global ``default_channels`` and workspace/entity default
+    #: routes, but not a per-kind override. Without it, those apply.
+    default_channels: NotRequired[list[str]]
 
 
 # Order matters: it's the order the UI renders them.
@@ -96,7 +100,7 @@ EVENT_CATALOG: list[EventDescriptor] = [
     {
         "kind": "task_hitl_reminder",
         "category": "task",
-        "severity": "warn",
+        "severity": "info",
         "label": "Task input reminder",
         "description": "Reminder that a paused task is still waiting on you.",
     },
@@ -189,6 +193,27 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "description": "A required Workspace integration or session disconnected or was added by a Blueprint update.",
     },
     {
+        "kind": "integration_account_issue",
+        "category": "system",
+        "severity": "warn",
+        "label": "Connected account needs attention",
+        "description": "A connected account stopped working and the agents that use it are affected.",
+    },
+    {
+        "kind": "workspace_digest",
+        "category": "system",
+        "severity": "info",
+        "label": "Daily Workspace digest",
+        "description": "Once a day: what changed, what is waiting on you, and accounts that need attention.",
+    },
+    {
+        "kind": "integration_shared",
+        "category": "system",
+        "severity": "info",
+        "label": "Connected account shared with you",
+        "description": "A teammate shared one of their connected accounts so your agents can use it.",
+    },
+    {
         "kind": "automation_paused",
         "category": "system",
         "severity": "warn",
@@ -236,3 +261,8 @@ def event_default_severity(kind: str) -> Severity:
 def event_category(kind: str) -> Category | None:
     entry = EVENTS_BY_KIND.get(kind)
     return entry["category"] if entry else None
+
+
+def event_default_channels(kind: str) -> list[str]:
+    entry = EVENTS_BY_KIND.get(kind)
+    return list(entry.get("default_channels") or []) if entry else []

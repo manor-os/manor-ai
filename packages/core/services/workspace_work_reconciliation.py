@@ -7,7 +7,13 @@ terminal state. This module keeps that distinction explicit:
 * fresh active batches still block scheduled reviews;
 * completed-but-not-closed batches are closed;
 * stale batches are marked ``stalled`` and surfaced to Strategist so the next
-  proposal can repair, retry, or ask the operator to close the old work.
+  review can retry the original Task or ask the operator to close the old
+  work, instead of proposing a new recovery Task.
+
+A Task waiting on a person (``waiting_on_customer`` or an open HitlRequest it
+raised) is not stalled agent work: only that person's answer unblocks it, and
+its request card is already open. Such stale Tasks are tagged
+``waiting_on_human`` so the Strategist leaves them to the existing card.
 """
 from __future__ import annotations
 
@@ -17,6 +23,9 @@ from typing import Any, Iterable
 from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.approvals import ApprovalStatus
+from packages.core.constants.task import TaskStatus
+from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace, WorkspaceWorkBatch
 from packages.core.services.task_state_machine import TERMINAL_STATUSES
@@ -31,6 +40,33 @@ DEFAULT_STALE_AFTER_HOURS: dict[str, float] = {
 DEFAULT_OPEN_TASK_STALE_AFTER_HOURS = 24.0
 
 
+def is_waiting_on_human(status: Any, *, has_open_human_request: bool) -> bool:
+    """Whether an open Task is parked on a person rather than on an agent."""
+    status = str(getattr(status, "value", status) or "")
+    if status in TERMINAL_STATUSES:
+        return False
+    return status == TaskStatus.WAITING_ON_CUSTOMER.value or has_open_human_request
+
+
+async def task_ids_with_open_human_requests(
+    db: AsyncSession, *, entity_id: str, workspace_id: str, task_ids: Iterable[str],
+) -> set[str]:
+    """Task ids that raised a still-pending HitlRequest (approval or input card)."""
+    ids = _unique_strings(task_ids)
+    if not ids:
+        return set()
+    return {
+        str(task_id) for task_id in (await db.scalars(
+            select(HitlRequest.origin_task_id).where(
+                HitlRequest.entity_id == entity_id,
+                HitlRequest.workspace_id == workspace_id,
+                HitlRequest.origin_task_id.in_(ids),
+                HitlRequest.status == ApprovalStatus.PENDING,
+            )
+        )).all() if task_id
+    }
+
+
 def build_work_batch_reconciliation(
     batch: Any,
     tasks: Iterable[Any],
@@ -38,6 +74,7 @@ def build_work_batch_reconciliation(
     now: datetime | None = None,
     stale_after_hours: dict[str, float] | None = None,
     live_plan_task_ids: set[str] | None = None,
+    human_request_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Return a serializable reconciliation snapshot for one work batch."""
     now = _aware(now or datetime.now(timezone.utc))
@@ -78,6 +115,9 @@ def build_work_batch_reconciliation(
                 "stale_after_hours": threshold,
                 "last_activity_at": reference_time.isoformat() if reference_time else None,
                 "owner_service_key": getattr(task, "owner_service_key", None),
+                "waiting_on_human": is_waiting_on_human(
+                    status, has_open_human_request=task_id in (human_request_task_ids or set()),
+                ),
             })
 
     terminal_count = len(task_ids) - len(open_task_ids) - len(missing_task_ids)
@@ -136,42 +176,24 @@ async def reconcile_active_work_batches(
                     Task.id.in_(task_ids),
                 )
             )).scalars().all())
-        redispatched_ids: set[str] = set()
-        if tasks:
-            from packages.core.services.task_execution_reconcile import (
-                recover_orphaned_in_progress_task,
-                recover_misclassified_tool_error_human_wait,
-            )
-
-            for task in tasks:
-                action = await recover_orphaned_in_progress_task(db, task)
-                if action == "redispatched":
-                    redispatched_ids.add(str(task.id))
-                await recover_misclassified_tool_error_human_wait(db, task)
-
-        live_plan_task_ids = set(redispatched_ids)
+        # A Task's agent-loop run is its liveness record. An in-progress Task
+        # whose run has ended is stale at once; one without a run (not
+        # started yet, or a legacy Agent Task) keeps its age threshold.
+        live_plan_task_ids: set[str] = set()
         if task_ids:
-            from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
-            from packages.core.models.execution import ExecutionPlan
+            from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
 
-            plan_rows = list((await db.execute(
-                select(ExecutionPlan.task_id, ExecutionPlan.status).where(
-                    ExecutionPlan.entity_id == workspace.entity_id,
-                    ExecutionPlan.task_id.in_(task_ids),
+            run_phases = dict((await db.execute(
+                select(TaskCoordinatorRun.task_id, TaskCoordinatorRun.phase).where(
+                    TaskCoordinatorRun.entity_id == workspace.entity_id,
+                    TaskCoordinatorRun.task_id.in_(task_ids),
                 )
             )).all())
-            terminal = {status.value for status in PLAN_TERMINAL_STATUSES}
-            planned_task_ids: set[str] = set()
-            for plan_task_id, plan_status in plan_rows:
-                if not plan_task_id:
-                    continue
-                planned_task_ids.add(str(plan_task_id))
-                if str(plan_status or "") not in terminal:
-                    live_plan_task_ids.add(str(plan_task_id))
-            for task in tasks:
-                task_id = str(getattr(task, "id", "") or "")
-                if task_id and task_id not in planned_task_ids:
-                    live_plan_task_ids.add(task_id)
+            terminal_phases = TaskCoordinatorPhase.terminal()
+            live_plan_task_ids = {
+                task_id for task_id in task_ids
+                if str(run_phases.get(task_id) or "") not in terminal_phases
+            }
 
         # Recovery can flush Task.details, expiring server-updated timestamps.
         # Load them explicitly before the synchronous snapshot builder reads them.
@@ -189,6 +211,9 @@ async def reconcile_active_work_batches(
             now=now,
             stale_after_hours=stale_after_hours,
             live_plan_task_ids=live_plan_task_ids,
+            human_request_task_ids=await task_ids_with_open_human_requests(
+                db, entity_id=workspace.entity_id, workspace_id=workspace.id, task_ids=task_ids,
+            ),
         )
         details = dict(batch.details or {})
         details["last_reconciliation"] = snapshot

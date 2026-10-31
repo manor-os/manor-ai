@@ -1052,6 +1052,19 @@ def test_search_tools_compaction_keeps_skill_description_and_not_instructions() 
     assert "must not survive" not in json.dumps(compact)
 
 
+def test_search_shows_every_builtin_skill_description_whole() -> None:
+    """A caller reads only the description before invoke_skill; a rule cut from it is never followed."""
+    from packages.core.ai.runtime.capability_search import runtime_skill_manifest
+    from packages.core.services.builtin_skill_loader import _builtin_skill_dirs, _parse_frontmatter
+
+    for skill_dir in _builtin_skill_dirs():
+        frontmatter, _ = _parse_frontmatter((skill_dir / "SKILL.md").read_text(encoding="utf-8"))
+        description = frontmatter.get("description") or ""
+        shown = runtime_skill_manifest(SimpleNamespace(id="s", slug=skill_dir.name, name=skill_dir.name, description=description))
+        assert shown["description"] == description, f"{skill_dir.name}: {len(description)} characters"
+        assert "description_truncated" not in shown
+
+
 def test_invoke_skill_remains_directly_registered() -> None:
     pool = ToolPool()
     pool.initialize()
@@ -1558,7 +1571,7 @@ async def test_workspace_risk_ceiling_blocks_acquisition_offer(db_session, monke
 
 @pytest.mark.parametrize("tool,expected", [
     ("read_file", {"impact": "read", "operation": "read", "risk_level": "low"}),
-    ("generate_file", {"impact": None, "operation": "modify", "risk_level": "medium"}),
+    ("generate_file", {"impact": "reversible", "operation": "modify", "risk_level": "medium"}),
 ])
 def test_policy_action_for_classification_matches_the_execution_gate(tool, expected) -> None:
     from packages.core.ai.runtime.approval_classifier import (

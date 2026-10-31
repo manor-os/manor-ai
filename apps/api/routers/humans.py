@@ -315,18 +315,6 @@ async def get_human_queue(
             ),
         ).order_by(HitlRequest.created_at.asc())
     )).scalars().all())
-    # A coordinator child Runtime request is hidden from generic human queues
-    # even during the mint -> outer-card linking window. Its server-authored
-    # Step origin is durable before the context marker exists.
-    from packages.core.governance.approvals import (
-        is_coordinator_owned_nested_approval_durable,
-    )
-
-    approvals = [
-        request
-        for request in approvals
-        if not await is_coordinator_owned_nested_approval_durable(db, request)
-    ]
 
     assigned = list((await db.execute(
         select(Task).where(

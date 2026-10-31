@@ -6,6 +6,7 @@ import { t } from "../../lib/i18n";
 import { workflowPath } from "../../lib/workflowRoutes";
 import { IconArrowLeft, IconArrowRight, IconClock } from "../icons";
 import Button from "../ui/Button";
+import { getPreferredTimeZone } from "../../lib/format";
 
 function frequencyLabel(action: WorkspaceAppAction): string {
   const seconds = action.every_seconds;
@@ -24,7 +25,7 @@ function frequencyLabel(action: WorkspaceAppAction): string {
   }
   if (action.run_at) {
     const date = new Date(action.run_at);
-    if (!Number.isNaN(date.getTime())) return t("component.workspace_app_view.automation_once", { date: date.toLocaleString() });
+    if (!Number.isNaN(date.getTime())) return t("component.workspace_app_view.automation_once", { date: date.toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) });
   }
   if (action.cron_expr) return t("component.workspace_app_view.automation_custom_schedule");
   return t("component.workspace_app_view.automation_manual_only");
@@ -89,7 +90,7 @@ export default function WorkspaceAppActionAutomation({ action, canStart, onBack 
     </div>
     {recent.length > 0 && <div className="workspace-app-flow__panel">
       <span className="workspace-app-flow__kicker">{t("component.workspace_app_view.history")}</span>
-      <div className="workspace-app-automation__runs">{recent.map((run) => <Link key={run.id} to={`/jobs?job=${encodeURIComponent(jobId)}&run=${encodeURIComponent(run.id)}`}><span>{run.status}</span><span>{run.created_at ? new Date(run.created_at).toLocaleString() : ""}</span><IconArrowRight size={15} /></Link>)}</div>
+      <div className="workspace-app-automation__runs">{recent.map((run) => <Link key={run.id} to={`/jobs?job=${encodeURIComponent(jobId)}&run=${encodeURIComponent(run.id)}`}><span>{run.status}</span><span>{run.created_at ? new Date(run.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : ""}</span><IconArrowRight size={15} /></Link>)}</div>
     </div>}
   </div>;
 }

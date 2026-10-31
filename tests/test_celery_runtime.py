@@ -61,6 +61,52 @@ def test_celery_worker_allows_pricing_warmups_to_finish() -> None:
     assert celery_app.conf.worker_proc_alive_timeout == 30.0
 
 
+def test_sigterm_in_the_worker_main_process_reaches_its_pool_child(monkeypatch) -> None:
+    """Celery handles SIGTERM in the main process; the task runs in a child."""
+    import multiprocessing
+    import os
+    import signal
+    import time
+
+    from celery.signals import worker_shutting_down
+
+    import packages.core.celery_app  # noqa: F401 - connects the shutdown receiver
+    from packages.core import worker_drain
+
+    monkeypatch.setattr(worker_drain, "_drain_flag", None)
+    worker_drain.register_worker_main_process()
+    context = multiprocessing.get_context("fork")
+    started = context.Event()
+
+    def pool_child() -> None:
+        started.set()
+        deadline = time.monotonic() + 10
+        while not worker_drain.worker_drain_requested():
+            if time.monotonic() > deadline:
+                os._exit(1)
+            time.sleep(0.01)
+        os._exit(0)
+
+    child = context.Process(target=pool_child)
+    child.start()
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        assert started.wait(10)
+        assert not worker_drain.worker_drain_requested()
+        # Stand-in for Celery's warm-shutdown handler, which sends this signal.
+        signal.signal(signal.SIGTERM, lambda *_: worker_shutting_down.send(
+            sender="manor-worker-heavy@test", sig="SIGTERM", how="Warm", exitcode=0,
+        ))
+        os.kill(os.getpid(), signal.SIGTERM)
+        child.join(10)
+        assert child.exitcode == 0, "the pool child never saw the drain"
+        assert worker_drain.worker_drain_requested()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if child.is_alive():
+            child.kill()
+
+
 def test_sandbox_allocation_task_uses_existing_interactive_queue() -> None:
     assert queue_for_task("runtime.allocate_sandbox") is CeleryQueue.INTERACTIVE
 
@@ -121,13 +167,7 @@ def _host_loop():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("scheduler", "task_attr", "process_attr"), [
-    ("schedule_video_job", "process_video_job_task", "process_video_job"),
-    ("schedule_suno_audio_job", "process_suno_audio_job_task", "process_suno_audio_job"),
-])
-async def test_parking_host_dispatches_media_jobs_through_celery(
-    monkeypatch, scheduler, task_attr, process_attr,
-) -> None:
+async def test_parking_host_dispatches_media_jobs_through_celery(monkeypatch) -> None:
     """A Task agent loop parks instead of waiting: a job on its loop would be
     drained by run_in_worker after the park, holding the heavy worker."""
     from packages.core.ai.runtime.media_job_scope import runtime_media_jobs_detached_scope
@@ -139,25 +179,19 @@ async def test_parking_host_dispatches_media_jobs_through_celery(
         raise AssertionError("a parked Task's media job must not run on its loop")
 
     monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
-    monkeypatch.setattr(media_tasks, process_attr, must_not_run_inline)
-    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", lambda job_id: queued.append(job_id))
+    monkeypatch.setattr(media_tasks, "process_video_job", must_not_run_inline)
+    monkeypatch.setattr(media_tasks.process_video_job_task, "delay", lambda job_id: queued.append(job_id))
     before = set(media_tasks._background_tasks)
 
     with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"), _host_loop():
-        getattr(media_tasks, scheduler)("job-parked")
+        media_tasks.schedule_video_job("job-parked")
 
     assert queued == ["job-parked"]
     assert set(media_tasks._background_tasks) == before
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("scheduler", "task_attr"), [
-    ("schedule_video_job", "process_video_job_task"),
-    ("schedule_suno_audio_job", "process_suno_audio_job_task"),
-])
-async def test_parking_host_leaves_a_job_pending_when_the_broker_is_down(
-    monkeypatch, caplog, scheduler, task_attr,
-) -> None:
+async def test_parking_host_leaves_a_job_pending_when_the_broker_is_down(monkeypatch, caplog) -> None:
     """Neither its own loop (drained while parked) nor a daemon thread: the job
     stays PENDING and the stale-job sweeper dispatches it again."""
     import threading
@@ -172,21 +206,20 @@ async def test_parking_host_leaves_a_job_pending_when_the_broker_is_down(
         raise AssertionError("a parked Task's job must not start a daemon thread")
 
     monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
-    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", broker_down)
+    monkeypatch.setattr(media_tasks.process_video_job_task, "delay", broker_down)
     monkeypatch.setattr(threading, "Thread", no_thread)
     before = set(media_tasks._background_tasks)
 
     with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"), _host_loop():
-        getattr(media_tasks, scheduler)("job-broker-down")
+        media_tasks.schedule_video_job("job-broker-down")
 
     assert set(media_tasks._background_tasks) == before
     assert "left pending for the stale-job sweeper" in caplog.text
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["video", "audio"])
 async def test_stale_job_sweeper_dispatches_a_pending_job_that_never_started(
-    monkeypatch, db_session, kind,
+    monkeypatch, db_session,
 ) -> None:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -200,21 +233,17 @@ async def test_stale_job_sweeper_dispatches_a_pending_job_that_never_started(
         async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False),
     )
     queued: list[str] = []
-    task_attr = "process_video_job_task" if kind == "video" else "process_suno_audio_job_task"
-    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", lambda job_id: queued.append(job_id))
+    monkeypatch.setattr(media_tasks.process_video_job_task, "delay", lambda job_id: queued.append(job_id))
     job = MediaJob(
-        id=generate_ulid(), entity_id=generate_ulid(), kind=kind, status="pending", prompt="x",
-        model="suno/music" if kind == "audio" else "bytedance/seedance-2.0",
+        id=generate_ulid(), entity_id=generate_ulid(), kind="video", status="pending", prompt="x",
+        model="bytedance/seedance-2.0",
         params={"task_id": generate_ulid(), "provider_submit_state": "not_started"},
         created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
     )
     db_session.add(job)
     await db_session.commit()
 
-    if kind == "video":
-        await media_tasks.recover_stale_video_jobs(stale_after_seconds=60)
-    else:
-        await media_tasks.recover_stale_suno_audio_jobs(stale_after_seconds=60)
+    await media_tasks.recover_stale_video_jobs(stale_after_seconds=60)
 
     assert job.id in queued
 
@@ -870,6 +899,10 @@ async def test_sandbox_scheduler_only_queues_external_allocation(monkeypatch) ->
         lambda _db: _async_result(0),
         raising=False,
     )
+    monkeypatch.setattr(runtime_tasks, "recover_waiting_sandbox_runs", lambda _db: _async_result(0))
+    monkeypatch.setattr(runtime_tasks, "adopt_follower_reservations", lambda _db: _async_result(0))
+    monkeypatch.setattr(runtime_tasks, "redeliver_exec_slot_resumes", lambda _db: _async_result(0))
+    monkeypatch.setattr(runtime_tasks, "_wake_exec_slot_waiters", lambda _factory: _async_result(0))
     monkeypatch.setattr(
         runtime_tasks,
         "claim_next_sandbox_allocation",

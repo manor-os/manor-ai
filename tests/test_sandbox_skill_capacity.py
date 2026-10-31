@@ -52,6 +52,7 @@ async def test_sandbox_skill_reports_capacity_as_retryable_error(monkeypatch, tm
             entity_id="ent_1",
             user_id="user_1",
             input_text="run",
+            conversation_id="conversation_1",
         )
     finally:
         settings.SANDBOX_SERVICE_URL = old_url

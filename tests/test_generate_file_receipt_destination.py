@@ -301,6 +301,47 @@ async def test_nested_code_content_writes_inside_its_canonical_receipt_bundle(
     assert (context.root / written).read_text() == "# Receipt content"
 
 
+@pytest.mark.asyncio
+async def test_rewriting_a_code_bundle_in_place_is_authorized_as_a_modify(
+    db_session, attachment_fs, monkeypatch,  # noqa: F811
+):
+    """A retried Flow step rewrites its checkpoint files at the same paths.
+
+    Local 2026-10-25: retrying ``Save discovery checkpoint`` failed with
+    ``internal_authorization_error`` because a code bundle was always approved
+    as a create, while the guard saw existing files and asked for a modify.
+    """
+    context = await _seed(db_session, attachment_fs, "task")
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.approval_service.guard_runtime_tool_action",
+        AsyncMock(return_value=None),
+    )
+    _spy_inner_guard(monkeypatch, context)
+
+    def checkpoint(phase: str) -> dict:
+        return {
+            "kind": "code",
+            "name": "Product Videos/product-video-1",
+            "params": {"entry": "00-overview.md", "files": [
+                {"path": "00-overview.md", "content": f"# {phase}"},
+                {"path": "technical/run-state.json", "content": {"phase": phase}},
+            ]},
+            "storage_scope": "task",
+        }
+
+    first = await context.call(checkpoint("discovery"))
+    again = await context.call(checkpoint("discovery, retried"))
+
+    assert first.get("created") is True, first
+    assert again.get("created") is True, again
+    assert [guard["receipt_action_key"] for guard in context.guard_calls] == [
+        "workspace.file.create", "workspace.file.modify",
+    ]
+    assert (context.root / again["entry"]).read_text() == "# discovery, retried"
+
+
 # ------------------------------------------------------------------ matrix
 
 

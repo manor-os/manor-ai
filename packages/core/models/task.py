@@ -56,6 +56,9 @@ class Task(Base, TimestampMixin):
     # Dedicated lifecycle clock. ``updated_at`` also changes for title,
     # assignee, and other edits, so it cannot identify a new status occurrence.
     status_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cancel_source: Mapped[Optional[str]] = mapped_column(String(16))
+    """CancelSource when status is cancelled; NULL on older rows and while
+    the run is not cancelled."""
 
     # Automation fields
     sla_policy_id: Mapped[Optional[str]] = mapped_column(String(26))
@@ -91,6 +94,10 @@ class Task(Base, TimestampMixin):
     visibility: Mapped[str] = mapped_column(String(20), nullable=False, server_default="entity")
     owner_id: Mapped[Optional[str]] = mapped_column(String(26))
     client_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # External Workspace collaborators who steered this Task (created, edited,
+    # started, answered, approved or commented). Every run of the Task is
+    # narrowed to their live-granted Workspaces; see collaborator_steering.
+    collaborator_ids: Mapped[Optional[list]] = mapped_column(ARRAY(String(26)))
 
 
 class TaskSlaPolicy(Base, TimestampMixin):

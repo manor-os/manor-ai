@@ -1,4 +1,4 @@
-"""Checkout-path robustness: skip stamping, head-of-line blocking, strict refs.
+"""Checkout-path robustness: skip stamping, head-of-line blocking, shared predicate.
 
 * D4 — a PENDING step the dispatcher keeps declining used to look identical to
   a step nobody has looked at. The skip is now stamped on ``step.error`` so
@@ -7,17 +7,13 @@
 * D5 — the candidate window (``max_n * 4``, oldest first) filled up with
   dependent steps whose upstream was still running; a newer plan's root step
   never entered the window and the whole entity looked idle.
-* D6 — a consumer whose params feed an external publish must never receive a
-  degraded ref value (sibling field / JSON dump of the producer result).
-* D7 — one predicate for "may this agent run provider.action_key" shared with
-  the planner.
+* D7 — one shared predicate for "may this agent run provider.action_key".
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -38,15 +34,6 @@ from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 
 
 SERVICE_KEY = "writer"
-
-
-@pytest.fixture(autouse=True)
-def _no_blueprint_setup_gate(monkeypatch):
-    monkeypatch.setattr(
-        "packages.core.services.workspace_readiness."
-        "evaluate_current_workspace_blocking_setup",
-        AsyncMock(return_value=None),
-    )
 
 
 async def _seed_entity(
@@ -403,61 +390,6 @@ async def test_dependency_exclusion_keeps_the_failed_upstream_skip_path(db_sessi
 
     assert await Dispatcher().checkout_steps_for_worker(db_session, seeded["worker"], max_n=1) == []
     assert consumer.step_status == "pending"
-
-
-# ── D6: strict refs for publish consumers ────────────────────────────
-
-
-def _publish_dag(*, expects: list[str] | None) -> dict:
-    post = {"key": "post", "kind": "llm", "service_key": SERVICE_KEY, "depends_on": ["draft"]}
-    if expects:
-        post["expects"] = expects
-    return {
-        "steps": [
-            {"key": "draft", "kind": "llm", "service_key": SERVICE_KEY, "depends_on": []},
-            post,
-        ]
-    }
-
-
-@pytest.mark.asyncio
-async def test_publish_consumer_fails_instead_of_receiving_a_degraded_ref(db_session):
-    seeded = await _seed_entity(db_session)
-    plan = _plan(seeded, plan_dag=_publish_dag(expects=["publish"]))
-    draft = _step(seeded, plan, key="draft", status="done", result={"text": "hello"})
-    post = _step(
-        seeded, plan, key="post", depends_on=["draft"],
-        params={"prompt": "Post: ${{ steps.draft.result.tweet_text }}"},
-    )
-    db_session.add_all([plan, draft, post])
-    await db_session.flush()
-
-    assert await Dispatcher().checkout_steps_for_worker(db_session, seeded["worker"], max_n=1) == []
-
-    assert post.step_status == "failed"
-    assert post.error["type"] == "ReferenceError"
-    assert "tweet_text" in post.error["message"]
-
-
-@pytest.mark.asyncio
-async def test_ordinary_consumer_still_gets_the_degraded_ref(db_session):
-    seeded = await _seed_entity(db_session)
-    plan = _plan(seeded, plan_dag=_publish_dag(expects=None))
-    draft = _step(seeded, plan, key="draft", status="done", result={"text": "hello"})
-    post = _step(
-        seeded, plan, key="post", depends_on=["draft"],
-        params={"prompt": "Post: ${{ steps.draft.result.tweet_text }}"},
-    )
-    db_session.add_all([plan, draft, post])
-    await db_session.flush()
-
-    leases = await Dispatcher().checkout_steps_for_worker(db_session, seeded["worker"], max_n=1)
-
-    assert [leased.id for _lease, leased in leases] == [post.id]
-    assert post.params == {"prompt": "Post: hello"}
-
-
-# ── D7: one action-binding predicate ─────────────────────────────────
 
 
 @pytest.mark.asyncio

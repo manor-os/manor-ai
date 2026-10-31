@@ -830,6 +830,31 @@ async def runtime_guard_file_resource_access(
     )
 
 
+async def runtime_guard_file_governance_hard_block(
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    tool_name: str,
+    action: FileMutationAction | str,
+    paths: list[str],
+) -> str | None:
+    """Governance hard blocks only, for a write whose consent was already given."""
+
+    from packages.core.services.ai_file_permissions import (
+        guard_ai_file_governance_hard_block,
+    )
+
+    return await guard_ai_file_governance_hard_block(
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        tool_name=tool_name,
+        action=action,
+        paths=paths,
+    )
+
+
 async def runtime_guard_file_read_access(
     *,
     entity_id: str,

@@ -23,9 +23,12 @@ Public API:
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
+import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
@@ -89,6 +92,10 @@ class WorkspaceDraftNotReadyError(ValueError):
     """A verified lint result invalidated a previously ready Draft."""
 
 
+class WorkspaceDraftMaterializationError(ValueError):
+    """A resource failure after provisioning whose savepoint has rolled back."""
+
+
 def opening_user_message(initial_brief: Optional[str]) -> str:
     return (initial_brief or "").strip() or "begin"
 
@@ -104,6 +111,7 @@ async def get_draft(
     user_id: str,
     *,
     for_update: bool = False,
+    populate_existing: bool = False,
 ) -> Optional[WorkspaceDraft]:
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -115,8 +123,125 @@ async def get_draft(
     )
     if for_update:
         query = query.with_for_update()
+    if populate_existing:
+        query = query.execution_options(populate_existing=True)
     result = await db.execute(query)
     return result.scalar_one_or_none()
+
+
+# An Architect turn spans many model rounds (minutes). It owns its draft
+# through this claim, renewed whenever it re-locks the row, instead of an open
+# transaction: a transaction would keep the row lock, a pooled connection and
+# the process's database admission permit through every model call.
+TURN_CLAIM_FIELD = "_architect_turn"
+TURN_CLAIM_TTL_SECONDS = 300.0
+TURN_CLAIM_WAIT_SECONDS = 600.0
+_TURN_CLAIM_POLL_SECONDS = 0.5
+
+
+def _turn_claim_active(claim: Any, now: float) -> bool:
+    if not isinstance(claim, dict):
+        return False
+    try:
+        return float(claim.get("expires_at") or 0) > now
+    except (TypeError, ValueError):
+        return False
+
+
+class DraftTurn:
+    """One Architect turn's ownership of a draft between short transactions.
+
+    ``claim`` waits (without holding a transaction) for any other live turn,
+    then marks the draft as this turn's. Each draft write re-locks the row with
+    ``lock`` and commits with ``release``; ``lock`` aborts the turn if the
+    draft left an editable status or another turn took it over after this
+    turn's claim expired. Other draft writers (field edits, Blueprint apply)
+    are merged by re-reading the row at every lock.
+    """
+
+    def __init__(self, db: AsyncSession, *, draft_id: str, entity_id: str, user_id: str):
+        self.db = db
+        self.draft_id = draft_id
+        self.entity_id = entity_id
+        self.user_id = user_id
+        self.claim_id = uuid.uuid4().hex
+        self.claimed = False
+
+    async def _load(self) -> Optional[WorkspaceDraft]:
+        return await get_draft(
+            self.db, self.draft_id, self.entity_id, self.user_id,
+            for_update=True, populate_existing=True,
+        )
+
+    def _stamp(self, draft: WorkspaceDraft) -> None:
+        fields = dict(draft.fields or {})
+        fields[TURN_CLAIM_FIELD] = {
+            "id": self.claim_id,
+            "expires_at": time.time() + TURN_CLAIM_TTL_SECONDS,
+        }
+        draft.fields = fields
+        flag_modified(draft, "fields")
+
+    async def claim(self) -> WorkspaceDraft:
+        deadline = time.monotonic() + TURN_CLAIM_WAIT_SECONDS
+        while True:
+            draft = await self._load()
+            if draft is None:
+                raise ValueError("Draft not found")
+            if draft.status not in {"active", "ready"}:
+                raise ValueError(f"Draft is {draft.status} and cannot be changed")
+            if not _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time()):
+                self._stamp(draft)
+                self.claimed = True
+                return draft
+            # Another turn is running (e.g. the opening stream this resumed
+            # stream must replay). Wait for it without a transaction.
+            await self.db.commit()
+            if time.monotonic() >= deadline:
+                raise ValueError("The Architect is still working on this draft. Try again shortly.")
+            await asyncio.sleep(_TURN_CLAIM_POLL_SECONDS)
+
+    async def lock(self) -> WorkspaceDraft:
+        draft = await self._load()
+        if draft is None:
+            raise RuntimeTurnAborted("Draft not found")
+        if draft.status not in {"active", "ready"}:
+            raise RuntimeTurnAborted(f"Draft is {draft.status} and cannot be changed")
+        claim = (draft.fields or {}).get(TURN_CLAIM_FIELD)
+        if not isinstance(claim, dict) or claim.get("id") != self.claim_id:
+            raise RuntimeTurnAborted(
+                "Another Architect turn took over this draft; send the message again",
+            )
+        self._stamp(draft)
+        return draft
+
+    async def release(self) -> None:
+        """Commit this turn's draft writes; no transaction stays open."""
+        await self.db.commit()
+
+    def finish(self, draft: WorkspaceDraft) -> None:
+        """Drop the claim in the turn's final write (the caller commits it)."""
+        fields = dict(draft.fields or {})
+        if fields.pop(TURN_CLAIM_FIELD, None) is not None:
+            draft.fields = fields
+            flag_modified(draft, "fields")
+        self.claimed = False
+
+    async def abandon(self) -> None:
+        """Best effort after a failed or cancelled turn; expiry covers crashes."""
+        if not self.claimed:
+            return
+        try:
+            await self.db.rollback()
+            draft = await self._load()
+            claim = (draft.fields or {}).get(TURN_CLAIM_FIELD) if draft is not None else None
+            if isinstance(claim, dict) and claim.get("id") == self.claim_id:
+                self.finish(draft)
+            await self.db.commit()
+        except Exception:  # noqa: BLE001 - never mask the turn's own error
+            logger.warning("Could not release Architect turn claim for draft %s", self.draft_id, exc_info=True)
+        finally:
+            self.claimed = False
 
 
 def _session_from_draft(draft: WorkspaceDraft) -> WorkspaceSetupSession:
@@ -270,63 +395,73 @@ async def process_draft_message(
     dedupe_opening: bool = False,
     document_ids: Optional[list[str]] = None,
 ) -> Tuple[str, WorkspaceDraft]:
-    """Process one user turn against a persisted draft via the architect."""
-    draft = await get_draft(
-        db, draft_id, entity_id, user_id, for_update=True,
-    )
-    if draft is None:
-        raise ValueError("Draft not found")
-    if draft.status not in {"active", "ready"}:
-        raise ValueError(f"Draft is {draft.status} and cannot be changed")
+    """Process one user turn against a persisted draft via the architect.
 
-    # Opening streams are resumable.  If the first connection committed its
-    # turn but the browser missed the terminal SSE frame, replay the committed
-    # assistant text instead of spending another architect turn or appending a
-    # duplicate opening exchange.  The row lock above serializes this check
-    # with an opening stream that is still finishing.
-    if dedupe_opening:
-        previous_reply = next(
-            (
-                str(message.get("content") or "")
-                for message in reversed(draft.messages or [])
-                if message.get("role") == "assistant"
-                and str(message.get("content") or "").strip()
-            ),
-            "",
+    The draft is never locked across model calls. The turn claims the draft
+    (waiting for another live turn), commits, runs the Architect with every
+    tool write in its own short locked transaction, then re-locks to record
+    the transcript and readiness. The caller commits that final write.
+    Tool writes already committed stay applied if the turn later fails.
+    """
+    turn = DraftTurn(db, draft_id=draft_id, entity_id=entity_id, user_id=user_id)
+    draft = await turn.claim()
+    try:
+        # Opening streams are resumable.  If the first connection committed
+        # its turn but the browser missed the terminal SSE frame, replay the
+        # committed assistant text instead of spending another architect turn
+        # or appending a duplicate opening exchange.  The claim serializes
+        # this check with an opening stream that is still finishing.
+        if dedupe_opening:
+            previous_reply = next(
+                (
+                    str(message.get("content") or "")
+                    for message in reversed(draft.messages or [])
+                    if message.get("role") == "assistant"
+                    and str(message.get("content") or "").strip()
+                ),
+                "",
+            )
+            if previous_reply:
+                turn.finish(draft)
+                if stream_handler is not None:
+                    await stream_handler("text_delta", {"content": previous_reply})
+                return previous_reply, draft
+
+        added_sources = await register_draft_sources(
+            db,
+            draft=draft,
+            entity_id=entity_id,
+            user_id=user_id,
+            message=user_message,
+            document_ids=list(document_ids or []),
         )
-        if previous_reply:
-            if stream_handler is not None:
-                await stream_handler("text_delta", {"content": previous_reply})
-            return previous_reply, draft
-
-    added_sources = await register_draft_sources(
-        db,
-        draft=draft,
-        entity_id=entity_id,
-        user_id=user_id,
-        message=user_message,
-        document_ids=list(document_ids or []),
-    )
-    visible = await _architect_turn(
-        db,
-        draft=draft,
-        entity_id=entity_id,
-        user_id=draft.user_id,
-        user_message=user_message,
-        stream_handler=stream_handler,
-        on_tool_start=on_tool_start,
-        on_tool_end=on_tool_end,
-    )
-    note = sources_transcript_note(added_sources)
-    _record_visible_messages(
-        draft,
-        f"{user_message}\n{note}" if note else user_message,
-        visible,
-    )
-    await _refresh_missing_from_lint(db, draft)
-    await db.flush()
-    await db.refresh(draft)
-    return visible, draft
+        await turn.release()
+        visible = await _architect_turn(
+            db,
+            draft=draft,
+            entity_id=entity_id,
+            user_id=draft.user_id,
+            user_message=user_message,
+            stream_handler=stream_handler,
+            on_tool_start=on_tool_start,
+            on_tool_end=on_tool_end,
+            turn=turn,
+        )
+        draft = await turn.lock()
+        note = sources_transcript_note(added_sources)
+        _record_visible_messages(
+            draft,
+            f"{user_message}\n{note}" if note else user_message,
+            visible,
+        )
+        turn.finish(draft)
+        await _refresh_missing_from_lint(db, draft)
+        await db.flush()
+        await db.refresh(draft)
+        return visible, draft
+    except BaseException:
+        await turn.abandon()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +479,13 @@ async def _architect_turn(
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
     repair_service_keys: tuple[str, ...] | None = None,
+    turn: DraftTurn | None = None,
 ) -> str:
     """Invoke the typed-tool architect for one turn. Mutations land on
-    ``draft.fields`` via tool calls; this returns the visible reply."""
+    ``draft.fields`` via tool calls; this returns the visible reply.
+
+    With ``turn``, no transaction is held between tool calls; without it the
+    caller's transaction (and draft lock) spans the turn, as before."""
 
     history = [
         {"role": m.get("role"), "content": m.get("content")}
@@ -364,6 +503,7 @@ async def _architect_turn(
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
         **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
+        **({"turn": turn} if turn is not None else {}),
     )
 
 
@@ -1069,7 +1209,12 @@ async def apply_blueprint(
         ]
     if blueprint_goals:
         fields["goals"] = blueprint_goals
+    # These are portable native resource declarations, not a second
+    # implementation hidden in operating_model.  finalize_draft materializes
+    # them through the same installer primitives as direct Blueprint install.
+    fields["workflows"] = copy.deepcopy(recipe.get("workflows") or [])
     fields["stats"] = copy.deepcopy(recipe.get("stats") or [])
+    fields["scheduled_jobs"] = copy.deepcopy(recipe.get("scheduled_jobs") or [])
 
     scheduled_automations = [
         _blueprint_scheduled_job_to_draft(dict(job))
@@ -1087,6 +1232,9 @@ async def apply_blueprint(
             if str(item.get("automation_key") or item.get("name") or "").strip()
             not in existing_keys
         )
+
+    if isinstance(operating_model.get("app_view"), dict):
+        fields["app_view"] = copy.deepcopy(operating_model["app_view"])
 
     for object_key in ("evaluation", "budget_policy", "channel_config"):
         value = operating_model.get(object_key)
@@ -1225,6 +1373,7 @@ async def apply_blueprint(
         "agent_mappings",
         "heartbeat_enabled",
         "heartbeat_cadence",
+        "app_view",
     ):
         portable_operating_model.pop(transient_key, None)
     strategist = recipe.get("strategist")
@@ -1347,6 +1496,10 @@ async def finalize_draft(
         raise ValueError("Draft already finalized but missing workspace id")
     if draft.status == "abandoned":
         raise ValueError("Draft was abandoned and cannot be finalized")
+    # A live Architect turn no longer holds the row lock between its writes;
+    # do not materialize a half-applied turn.
+    if _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time()):
+        raise ValueError("The Architect is still working on this draft. Try again when it finishes.")
     issues: list[dict[str, Any]] = []
     lint_verified = await _refresh_missing_from_lint(db, draft, issues_out=issues)
     if not lint_verified:
@@ -1372,6 +1525,30 @@ async def finalize_draft(
         )
 
     draft_fields = dict(draft.fields or {})
+    # Compatibility for Drafts saved before portable resources became
+    # first-class fields.  Only fill absent fields from the immutable source;
+    # never overwrite a user's subsequent Draft edits.
+    source_recipe = (
+        ((draft_fields.get("_blueprint_source_payload") or {}).get("recipe") or {})
+        if isinstance(draft_fields.get("_blueprint_source_payload"), dict) else {}
+    )
+    for field, recipe_key in (
+        ("workflows", "workflows"),
+        ("scheduled_jobs", "scheduled_jobs"),
+    ):
+        if field not in draft_fields and isinstance(source_recipe.get(recipe_key), list):
+            draft_fields[field] = copy.deepcopy(source_recipe[recipe_key])
+    legacy_model = draft_fields.get("_blueprint_operating_model")
+    if "app_view" not in draft_fields and isinstance(legacy_model, dict) and isinstance(legacy_model.get("app_view"), dict):
+        draft_fields["app_view"] = copy.deepcopy(legacy_model["app_view"])
+    try:
+        from packages.core.blueprints.installer import validate_portable_recipe_resources
+        validate_portable_recipe_resources({
+            "workflows": draft_fields.get("workflows") or [],
+            "scheduled_jobs": draft_fields.get("scheduled_jobs") or [],
+        })
+    except ValueError as exc:
+        raise WorkspaceDraftNotReadyError(f"Draft resources are invalid: {exc}") from exc
     supplied_personalization: dict[str, Any] = {}
     variable_declarations = [
         dict(item)
@@ -1492,7 +1669,106 @@ async def finalize_draft(
     session = _session_from_draft(draft)
     session.fields = copy.deepcopy(draft_fields)
     session.fields.pop("_blueprint_source_payload", None)
-    workspace_id = await finalize_setup(session, db, progress=progress)
+    # Older Draft UI represents imported jobs as automation cards.  Their
+    # canonical scheduled_jobs declaration is materialized below, so do not
+    # let the legacy setup adapter create a second scheduler row first.
+    scheduled_job_keys = {
+        str(item.get("job_id") or "").strip()
+        for item in draft_fields.get("scheduled_jobs") or []
+        if isinstance(item, dict)
+    }
+    if scheduled_job_keys:
+        session.fields["automations"] = [
+            item for item in session.fields.get("automations") or []
+            if not isinstance(item, dict)
+            or str(item.get("automation_key") or "").strip() not in scheduled_job_keys
+        ]
+    # Keep shell provisioning and portable resources atomic even for a caller
+    # that catches this error and commits its outer transaction for another
+    # reason.  Lint corrections happened before this savepoint and remain
+    # retryable; a Workspace shell never survives a failed resource install.
+    materialization_savepoint = await db.begin_nested()
+    try:
+        workspace_id = await finalize_setup(session, db, progress=progress)
+    except BaseException:
+        if materialization_savepoint.is_active:
+            await materialization_savepoint.rollback()
+        raise
+
+    # Drafts may originate from the Architect or from an applied Blueprint.
+    # In both cases portable resources are materialized through the native
+    # Blueprint installer primitives, after the Workspace shell exists and in
+    # the caller's transaction.  This is intentionally separate from the
+    # legacy Draft `automations` prose field, which is not an executable job.
+    resource_recipe = {
+        "workflows": draft_fields.get("workflows") or [],
+        "scheduled_jobs": draft_fields.get("scheduled_jobs") or [],
+    }
+    if resource_recipe["workflows"] or resource_recipe["scheduled_jobs"] or isinstance(draft_fields.get("app_view"), dict):
+        from packages.core.blueprints.installer import (
+            InstallError,
+            InstallMode,
+            blueprint_workflow_installation_source_id,
+            materialize_workspace_recipe_resources,
+        )
+        from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+        from packages.core.models.workspace_stat import WorkspaceStat
+
+        try:
+            workspace = await db.get(Workspace, workspace_id)
+            if workspace is None:
+                raise WorkspaceDraftMaterializationError("Workspace creation did not return a Workspace row")
+            source_key = str(draft.applied_blueprint_id or draft.id)
+            materialized = await materialize_workspace_recipe_resources(
+                db, entity_id=entity_id, workspace=workspace, recipe=resource_recipe,
+                user_id=user_id, mode=InstallMode.LIVE,
+                source_template_id=blueprint_workflow_installation_source_id(
+                    f"workspace-draft:{source_key}", workspace_id,
+                ),
+            )
+            if isinstance(draft_fields.get("app_view"), dict):
+                from packages.core.blueprints.app_view import remap_app_view
+                from packages.core.blueprints.exporter import _portable_agent_slug
+                from packages.core.blueprints.installer import installed_blueprint_job_id
+                app_agents = (await db.execute(
+                    select(Agent).join(AgentSubscription, AgentSubscription.agent_id == Agent.id).where(
+                        AgentSubscription.workspace_id == workspace_id,
+                        AgentSubscription.entity_id == entity_id,
+                        AgentSubscription.status == "active",
+                    )
+                )).scalars().all()
+                materialized_stat_keys = set((await db.execute(
+                    select(WorkspaceStat.key).where(
+                        WorkspaceStat.workspace_id == workspace_id,
+                        WorkspaceStat.entity_id == entity_id,
+                        WorkspaceStat.status == "active",
+                    )
+                )).scalars())
+                operating_model = dict(workspace.operating_model or {})
+                operating_model["app_view"] = remap_app_view(
+                    draft_fields["app_view"],
+                    workflows=dict(materialized["workflow_binding_ids"]),
+                    workflow_definitions=dict(materialized["workflow_ids"]),
+                    stat_keys=materialized_stat_keys,
+                    agents={_portable_agent_slug(agent): agent.id for agent in app_agents},
+                    automations={
+                        str(job.get("job_id")): installed_blueprint_job_id(
+                            str(job.get("job_id")), workspace_id,
+                        )
+                        for job in draft_fields.get("scheduled_jobs") or [] if isinstance(job, dict) and job.get("job_id")
+                    },
+                )
+                workspace.operating_model = operating_model
+        except BaseException as exc:
+            if materialization_savepoint.is_active:
+                await materialization_savepoint.rollback()
+            # Preserve cancellation/system exceptions while giving ordinary
+            # resource failures one retriable, caller-visible contract.
+            if isinstance(exc, Exception) and not isinstance(exc, WorkspaceDraftMaterializationError):
+                raise WorkspaceDraftMaterializationError(str(exc)) from exc
+            raise
+
+    await materialization_savepoint.commit()
 
     if selected_channel_config_ids:
         from packages.core.blueprints.installer import _bind_blueprint_channel_configs
@@ -1569,7 +1845,15 @@ async def finalize_draft(
                     if key != "blueprint_personalization"
                 ),
             }
+            from packages.core.blueprints.registry import sync_installed_package
+
+            await sync_installed_package(db, settings[BLUEPRINT_SETTINGS_KEY])
             workspace.settings = settings
+            from packages.core.blueprints.reconfigure import capture_install_baseline
+
+            await capture_install_baseline(
+                db, workspace=workspace, payload=resolved_blueprint_payload
+            )
             await record_marketplace_resource_link(
                 db,
                 entity_id=entity_id,

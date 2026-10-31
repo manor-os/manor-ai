@@ -3,7 +3,7 @@ import type { QueryClient } from "@tanstack/react-query";
 export const TASK_UPDATE_INVALIDATION_WINDOW_MS = 250;
 
 export interface TaskUpdateInvalidationBatcher {
-  enqueue(update: { taskId?: string | null; planId?: string | null }): void;
+  enqueue(update: { taskId?: string | null }): void;
   flush(): Promise<void>;
   dispose(): void;
 }
@@ -19,7 +19,6 @@ export function createTaskUpdateInvalidationBatcher(
   { isCurrentScope = () => true }: TaskUpdateInvalidationOptions = {},
 ): TaskUpdateInvalidationBatcher {
   const taskIds = new Set<string>();
-  const planIds = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let pending = false;
   let disposed = false;
@@ -31,25 +30,20 @@ export function createTaskUpdateInvalidationBatcher(
     }
     if (disposed || !isCurrentScope()) {
       taskIds.clear();
-      planIds.clear();
       pending = false;
       return;
     }
     if (!pending) return;
 
     const queuedTaskIds = [...taskIds];
-    const queuedPlanIds = [...planIds];
     taskIds.clear();
-    planIds.clear();
     pending = false;
 
     await Promise.all([
       ...queuedTaskIds.flatMap((taskId) => [
         queryClient.invalidateQueries({ queryKey: ["task", taskId] }),
         queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] }),
-        queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] }),
       ]),
-      ...queuedPlanIds.map((planId) => queryClient.invalidateQueries({ queryKey: ["plan-steps", planId] })),
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] }),
       queryClient.invalidateQueries({ queryKey: ["tasks"] }),
       queryClient.invalidateQueries({ queryKey: ["workspaces"] }),
@@ -57,11 +51,10 @@ export function createTaskUpdateInvalidationBatcher(
   };
 
   return {
-    enqueue({ taskId, planId }) {
+    enqueue({ taskId }) {
       if (disposed || !isCurrentScope()) return;
       pending = true;
       if (taskId) taskIds.add(taskId);
-      if (planId) planIds.add(planId);
       if (timer === undefined) timer = setTimeout(() => { void flush(); }, TASK_UPDATE_INVALIDATION_WINDOW_MS);
     },
     flush,
@@ -70,7 +63,6 @@ export function createTaskUpdateInvalidationBatcher(
       if (timer !== undefined) clearTimeout(timer);
       timer = undefined;
       taskIds.clear();
-      planIds.clear();
       pending = false;
     },
   };

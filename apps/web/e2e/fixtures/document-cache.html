@@ -1,0 +1,22 @@
+<!doctype html><html lang="en"><head><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Document cache acceptance</title></head><body><div id="root"></div><script type="module">
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import FileViewer from '/src/pages/FileViewer.tsx';
+import { ArtifactViewer } from '/src/components/EmbeddedChat.tsx';
+import { api } from '/src/lib/api.ts';
+import '/src/index.css';
+localStorage.setItem('manor_locale','en');
+localStorage.setItem('manor_token',`h.${btoa(JSON.stringify({sub:'document-cache-test',entity_id:'cache-test',exp:9e9}))}.s`);
+window.cacheTestApi = api;
+const h=React.createElement;
+const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+const params = new URLSearchParams(location.search);
+const content = params.has('raw')
+  ? h(ArtifactViewer, { artifact: { id: 'raw-file', kind: 'file', title: 'notes.txt', href: '/api/v1/fs/cache-test/uploads/notes.txt', status: 'done' } })
+  : params.has('artifact')
+  ? h(ArtifactViewer, { artifact: { id: 'cache-image', kind: 'image', title: 'cached.svg', status: 'done', data: { document_id: 'cache-image' } } })
+  : h(Routes,null,h(Route,{path:'/files/:docId',element:h(FileViewer)}));
+createRoot(document.getElementById('root')).render(h(QueryClientProvider,{client},h(MemoryRouter,{initialEntries:['/files/cache-csv']},content)));
+</script></body></html>

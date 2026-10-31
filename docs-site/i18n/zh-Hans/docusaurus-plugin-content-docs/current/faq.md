@@ -39,9 +39,10 @@ Redis、MinIO 和执行沙箱。请从[快速开始](quickstart.md)入手。
 ## Manor AI 是开源软件吗？ {#is-manor-ai-open-source}
 
 Manor AI 是**源码可用**软件，而不是经 OSI 批准的开源软件。其公共源码采用
-[Manor Sustainable Use License 1.0](https://github.com/manor-os/manor-ai/blob/main/LICENSE)。
-该许可证允许在许可用途内自托管和修改，同时限制转售、白标和竞争性托管
-服务。请以许可证完整文本为准。
+[Sustainable Use License 1.0](https://github.com/manor-os/manor-ai/blob/main/LICENSE)。
+该许可证允许内部业务、个人与非商业用途的使用和修改。向他人分发或提供
+软件，必须免费且用于非商业目的；商业托管访问需要另行签署协议。必须保留
+所需声明并标明修改。商标许可单独约束；软件使用与分发以完整许可证文本为准。
 
 ## Manor AI 是 AI Agent 框架吗？ {#is-manor-ai-an-ai-agent-framework}
 
@@ -101,6 +102,13 @@ docker compose up --build -d
 
 然后打开 `http://localhost:18080`。在共享部署或使用真实数据前，请替换默认
 密钥。
+
+## 自托管用户如何获得支持？ {#where-can-self-hosted-users-get-support}
+
+使用 [GitHub Discussions](https://github.com/manor-os/manor-ai/discussions) 参与
+社区问答，通过 [GitHub Issues](https://github.com/manor-os/manor-ai/issues) 提交
+可复现的问题。应用中的“社区支持”链接会打开 Discussions。自托管版本不包含
+Manor Cloud 的托管客服工单收件箱。
 
 ## Manor AI 信息的权威来源是什么？ {#what-is-the-canonical-source-for-manor-ai-facts}
 

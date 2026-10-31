@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Iterable
 
 from .models import SkillManifest
 
@@ -39,8 +40,23 @@ class SkillScanner:
         root = Path(skill_dir).resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
+        relative = [item.relative_to(root).as_posix() for item in self._walk(root)]
+        return self.scan_listing(root.name, str(root), relative)
 
-        name = root.name
+    def scan_listing(
+        self,
+        name: str,
+        skill_dir: str,
+        relative_paths: Iterable[str],
+    ) -> SkillManifest:
+        """Describe a Skill from its file list; root-level files are read from ``skill_dir``.
+
+        ``scan`` lists a host directory; a Skill baked into the sandbox image
+        is described from the image's index instead, with its root-level texts
+        written to ``skill_dir`` (see ``baked_skills.BakedSkill``). Both share
+        this function, so the two paths cannot describe a Skill differently.
+        """
+        root = Path(skill_dir)
         scripts: list[str] = []
         requirements_txt: str | None = None
         package_json: str | None = None
@@ -48,24 +64,28 @@ class SkillScanner:
         description = ""
         entry_hint: str | None = None
 
-        for item in self._walk(root):
-            rel = str(item.relative_to(root))
+        for rel in relative_paths:
+            parts = PurePosixPath(rel).parts
+            if not parts or not self._visible(parts):
+                continue
+            filename = parts[-1]
+            at_root = len(parts) == 1
 
-            if item.suffix in SCRIPT_EXTENSIONS:
+            if PurePosixPath(filename).suffix in SCRIPT_EXTENSIONS:
                 scripts.append(rel)
 
-            if item.name == "requirements.txt" and item.parent == root:
+            if filename == "requirements.txt" and at_root:
                 requirements_txt = rel
 
-            if item.name == "package.json" and item.parent == root:
+            if filename == "package.json" and at_root:
                 package_json = rel
 
-            if item.name in (".env", ".env.example", "env.json") and item.parent == root:
-                env_vars.update(self._parse_env_file(item))
+            if filename in (".env", ".env.example", "env.json") and at_root:
+                env_vars.update(self._parse_env_file(root / filename))
 
-            if item.name == "SKILL.md" and item.parent == root:
+            if filename == "SKILL.md" and at_root:
                 try:
-                    description = item.read_text(encoding="utf-8")[:8000]
+                    description = (root / filename).read_text(encoding="utf-8")[:8000]
                 except OSError:
                     pass
 
@@ -102,16 +122,19 @@ class SkillScanner:
     # ── internals ──
 
     @staticmethod
-    def _walk(root: Path):
+    def _visible(parts: tuple[str, ...]) -> bool:
+        """Skip hidden/excluded dirs and hidden files other than env declarations."""
+        if any(p.startswith(".") or p in SKIP_DIRS for p in parts[:-1]):
+            return False
+        return not (parts[-1].startswith(".") and parts[-1] not in (".env", ".env.example"))
+
+    @classmethod
+    def _walk(cls, root: Path):
         """Yield all regular files, skipping hidden/excluded dirs."""
         for item in root.rglob("*"):
             if not item.is_file():
                 continue
-            # Skip hidden files/dirs and excluded dir names
-            parts = item.relative_to(root).parts
-            if any(p.startswith(".") or p in SKIP_DIRS for p in parts[:-1]):
-                continue
-            if item.name.startswith(".") and item.name not in (".env", ".env.example"):
+            if not cls._visible(item.relative_to(root).parts):
                 continue
             yield item
 

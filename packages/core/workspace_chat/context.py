@@ -176,6 +176,35 @@ async def get_summary(db: AsyncSession, workspace_id: str, entity_id: str) -> st
     return text
 
 
+_RULE_PROMPT_MAX_CHARS = 2000
+_RULES_PROMPT_MAX_CHARS = 5000
+
+
+def _operating_rules_block(rules: list[Any]) -> str:
+    """The Workspace's operating rules as instructions, bounded.
+
+    A rule's description is how the operator tells every agent here how to
+    work; a count alone left those instructions invisible unless the model
+    happened to search for rules.
+    """
+    lines = [f"Operating rules ({len(rules)}) -- follow these in this Workspace:"]
+    used = len(lines[0])
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        name = " ".join(str(rule.get("name") or rule.get("rule_key") or "Rule").split())
+        description = str(rule.get("description") or "").strip()
+        if len(description) > _RULE_PROMPT_MAX_CHARS:
+            description = description[:_RULE_PROMPT_MAX_CHARS].rstrip() + " ..."
+        entry = f"- {name}: {description}" if description else f"- {name}"
+        if used + len(entry) > _RULES_PROMPT_MAX_CHARS:
+            lines.append("- More rules: search rules with manor(action='workspace') for the rest.")
+            break
+        lines.append(entry)
+        used += len(entry)
+    return "\n".join(lines)
+
+
 async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) -> str:
     """Build a concise workspace status block for the system prompt."""
     from packages.core.models.workspace import Workspace, AgentSubscription, Agent
@@ -378,7 +407,7 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
 
     op_rules = (ws.operating_model or {}).get("rules") or []
     if op_rules:
-        parts.append(f"Operating rules: {len(op_rules)}")
+        parts.append(_operating_rules_block(op_rules))
 
     from packages.core.services.workspace_integration_scope import disabled_workspace_providers
 

@@ -179,6 +179,53 @@ async def test_new_login_without_remember_revokes_prior_browser_family(client):
     assert (await refresh(client, cookie)).status_code == 401
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["change", "reset"])
+async def test_password_changes_revoke_bearer_and_persistent_sessions(client, monkeypatch, isolated_test_redis, operation):
+    signed = await sign_in(client)
+    token = signed.json()["access_token"]
+    cookie = signed.cookies[sessions.COOKIE]
+    bearer = {"Authorization": "Bearer " + token}
+    assert (await client.get("/api/v1/auth/me", headers=bearer)).status_code == 200
+    replacement = "replacement-session-password-456"
+    if operation == "change":
+        wrong = await client.put("/api/v1/auth/password", headers=bearer,
+                                 json={"old_password": "incorrect-password", "new_password": replacement})
+        assert wrong.status_code == 400
+        assert (await client.get("/api/v1/auth/me", headers=bearer)).status_code == 200
+        changed = await client.put("/api/v1/auth/password", headers=bearer,
+                                   json={"old_password": PASSWORD, "new_password": replacement})
+    else:
+        from redis.asyncio import Redis
+        from packages.core.services import email_service, password_reset_service
+
+        sent = []
+        store = Redis.from_url(isolated_test_redis, decode_responses=True)
+
+        async def capture_email(email, reset_token):
+            sent.append(reset_token)
+            return True
+
+        monkeypatch.setattr(email_service, "send_password_reset_email", capture_email)
+        try:
+            requested = await client.post("/api/v1/auth/forgot-password", json={"email": "session@example.com"})
+            assert requested.status_code == 200 and len(sent) == 1
+            changed = await client.post("/api/v1/auth/reset-password",
+                                        json={"token": sent[0], "new_password": replacement})
+            replay = await client.post("/api/v1/auth/reset-password",
+                                       json={"token": sent[0], "new_password": replacement})
+            assert replay.status_code == 400
+        finally:
+            if sent:
+                await store.delete(*[password_reset_service._token_key(value) for value in sent])
+            await store.aclose()
+    assert changed.status_code == 200, changed.text
+    assert (await client.get("/api/v1/auth/me", headers=bearer)).status_code == 401
+    assert (await refresh(client, cookie)).status_code == 401
+    assert (await client.post("/api/v1/auth/login", json={"email": "session@example.com", "password": PASSWORD})).status_code == 401
+    assert (await client.post("/api/v1/auth/login", json={"email": "session@example.com", "password": replacement})).status_code == 200
+
+
 def test_https_cookie_and_migration_model_match(monkeypatch):
     from starlette.requests import Request
     from starlette.responses import Response
@@ -200,6 +247,33 @@ def test_https_cookie_and_migration_model_match(monkeypatch):
         assert created[column.name].nullable == column.nullable
         assert str(created[column.name].type.compile(dialect=dialect())) == str(column.type.compile(dialect=dialect()))
     assert indexes == {index.name: [c.name for c in index.columns] for index in BrowserSession.__table__.indexes}
+
+
+@pytest.mark.parametrize(
+    "deployment_mode,manor_env,origin,expected_secure",
+    [
+        ("cloud", "production", "http://manor.example", True),
+        ("oss", "development", "http://localhost:3000", False),
+        ("oss", "development", "https://manor.example", True),
+    ],
+)
+def test_cookie_transport_policy_cannot_be_downgraded_in_cloud(
+    monkeypatch, deployment_mode, manor_env, origin, expected_secure,
+):
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    monkeypatch.setattr(get_settings(), "DEPLOYMENT_MODE", deployment_mode)
+    monkeypatch.setenv("MANOR_ENV", manor_env)
+    request = Request({"type": "http", "headers": [(b"origin", origin.encode())],
+                       "scheme": "http", "server": ("internal-api", 8000), "path": "/"})
+    response = Response()
+    sessions.set_cookie(request, response,
+                        SimpleNamespace(id="test", expires_at=datetime.now(timezone.utc) + timedelta(days=30)),
+                        "synthetic-test-secret")
+    header = response.headers["set-cookie"]
+    assert ("Secure" in header) is expected_secure
+    assert "HttpOnly" in header and "SameSite=strict" in header
 
 
 @pytest.mark.parametrize("remember", [False, True])

@@ -26,7 +26,9 @@ For discussion, explanations, questions or an honest blocker use:
 {"kind":"answer","text":"your full user-facing answer"}.
 Zero-tool answers are valid. An answer is not an execution receipt. Do not put
 claims of dispatch, execution, saved delivery or background progress in answer
-text. Do not copy progress from older messages or unrelated scheduled work.
+text, and never state that a Workspace Task started, ran or completed: work done
+in Chat (delegation, generated files) does not run or finish a Task record.
+Do not copy progress from older messages or unrelated scheduled work.
 For Task execution/progress use only:
 {"kind":"execution_summary","references":[{"kind":"task","id":"exact task id","scope":"current_turn","revision":"host supplied revision"}]}.
 Use scope=existing_record when reporting an earlier Task, not a new dispatch.
@@ -187,7 +189,9 @@ def render_verified_task_status(
                 detail = (f"{count} 个媒体任务" if chinese else f"for {count} media job(s)")
             state = f"{state} {_safe_label(detail)}"
         prefix = "已有任务 · " if chinese else "Existing task · "
-        if ref["scope"] == "current_turn":
+        if ref["scope"] == "current_turn" and ref.get("effect") == "started":
+            prefix = "本轮启动 · " if chinese else "Started this turn · "
+        elif ref["scope"] == "current_turn":
             prefix = "本轮创建 · " if chinese else "Created this turn · "
         lines.append(f"- [{_safe_label(fact['title'])}]({fact['url']}) — {prefix}{state}")
     return "\n".join(lines)

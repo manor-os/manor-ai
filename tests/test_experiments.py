@@ -64,7 +64,6 @@ from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.models.user import User, UserMembership
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.strategist import service as strategist_service
-from packages.core.tasks import ai_tasks
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 FLAG_KEY = "strategist_review_v2"
@@ -752,7 +751,6 @@ async def _run_v2_review(db, monkeypatch, workspace: Workspace, *, payload: dict
         return None
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop_post)
     monkeypatch.setattr(strategist_service, "_post_human_request_chat", _noop_post)
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
     return await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
 
 

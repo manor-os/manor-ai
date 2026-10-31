@@ -31,6 +31,7 @@ from packages.core.services.scheduler_service import (
     create_agent_execution, list_agent_executions, update_agent_execution,
     defer_scheduled_job_skill_generation,
     scheduled_job_workspace_scope,
+    scheduled_job_is_workspace_independent,
 )
 from packages.core.services.scheduled_run_lifecycle import (
     ScheduledAgentLineageDeletionBlockedError,
@@ -65,6 +66,14 @@ async def _legacy_compatible_workspace_gate(
 ) -> bool:
     """Gate real Workspace ids while preserving old opaque job labels."""
     normalized = str(workspace_id or "").strip()
+    if getattr(user, "_collaborator_workspace_ids", None) is not None:
+        # No legacy leniency for an external collaborator: an entity-level job
+        # or an opaque label is outside every Workspace they were granted.
+        if writable:
+            await require_workspace_writable(db, user, normalized)
+        else:
+            await require_workspace_readable(db, user, normalized)
+        return True
     if not normalized:
         return False
     known = (await db.execute(
@@ -131,7 +140,13 @@ class ScheduledJobResponse(BaseModel):
     job_id: str
     entity_id: str | None = None
     workspace_id: str | None = None
+    owner_project_id: str | None = None
+    idempotency_key: str | None = None
+    stop_after: str | None = None
     workspace_status: str | None = None
+    # True when the source Workspace lifecycle stops this job from dispatching
+    # regardless of its own switch; ``enabled`` is already projected with it.
+    workspace_blocked: bool = False
     name: str | None = None
     job_type: str = "cron"
     schedule_kind: str | None = None
@@ -180,6 +195,9 @@ class ScheduledJobCreateRequest(BaseModel):
     execution_type: str | None = None
     execution_target: dict | None = None
     workspace_id: str | None = None
+    owner_project_id: str | None = None
+    idempotency_key: str | None = None
+    stop_after: str | None = None
     conversation_id: str | None = None
     default_delivery_mode: str | None = None
 
@@ -286,6 +304,7 @@ def _job_response(
     last_error: str | None = None,
     can_manage: bool = True,
     workspace_status: str | None = None,
+    independent_while_paused: bool = False,
 ) -> ScheduledJobResponse:
     generation_revision = getattr(j, "skill_generation_revision", None)
     generation_error = getattr(j, "skill_generation_last_error", None)
@@ -299,10 +318,18 @@ def _job_response(
         generation_status = ScheduledJobSkillGenerationStatus.FAILED
     else:
         generation_status = ScheduledJobSkillGenerationStatus.IDLE
+    workspace_blocked = (
+        workspace_status is not None
+        and workspace_status != "active"
+        and not (workspace_status == "paused" and independent_while_paused)
+    )
     return ScheduledJobResponse(
         id=j.id, job_id=j.job_id, entity_id=j.entity_id,
         workspace_id=j.workspace_id, name=j.name, job_type=j.job_type,
+        owner_project_id=j.owner_project_id, idempotency_key=j.idempotency_key,
+        stop_after=j.stop_after.isoformat() if j.stop_after else None,
         workspace_status=workspace_status,
+        workspace_blocked=workspace_blocked,
         schedule_kind=j.schedule_kind, cron_expr=j.cron_expr,
         every_seconds=j.every_seconds, run_at=j.run_at, timezone=j.timezone,
         payload_message=j.payload_message, agent_id=j.agent_id,
@@ -313,7 +340,8 @@ def _job_response(
         default_delivery_mode=j.default_delivery_mode,
         goal_id=j.goal_id, goal_step_id=j.goal_step_id,
         manor_task_id=j.manor_task_id,
-        enabled=bool(j.enabled and (workspace_status is None or workspace_status == "active")), delete_after_run=j.delete_after_run,
+        enabled=bool(j.enabled and not workspace_blocked),
+        delete_after_run=j.delete_after_run,
         last_run_at=j.last_run_at.isoformat() if j.last_run_at else None,
         last_status=j.last_status,
         last_error=last_error,
@@ -464,6 +492,11 @@ async def list_jobs(
             )
         )).all()
     } if real_job_workspace_ids else {}
+    independent_while_paused = {
+        job.id: await scheduled_job_is_workspace_independent(db, job)
+        for job in jobs
+        if workspace_statuses.get(str(job.workspace_id)) == "paused"
+    }
     writable_ws = await user_writable_workspace_ids(
         db,
         entity_id=user.entity_id,
@@ -482,6 +515,7 @@ async def list_jobs(
                     or str(job.workspace_id) in writable_ws
                 ),
                 workspace_status=workspace_statuses.get(str(job.workspace_id)) if job.workspace_id else None,
+                independent_while_paused=independent_while_paused.get(job.id, False),
             )
             for job in jobs
         ],
@@ -528,6 +562,9 @@ async def create_job(
             workspace_id=req.workspace_id,
             conversation_id=req.conversation_id,
             default_delivery_mode=req.default_delivery_mode,
+            owner_project_id=req.owner_project_id,
+            idempotency_key=req.idempotency_key,
+            stop_after=datetime.fromisoformat(req.stop_after) if req.stop_after else None,
             user_id=user.id,
             require_workspace=bool(req.workspace_id),
         )
@@ -543,11 +580,20 @@ async def create_job(
                 Workspace.deleted_at.is_(None),
             )
         )).scalar_one_or_none()
-        if workspace is not None and workspace.status != "active":
+        if (
+            workspace is not None
+            and workspace.status != "active"
+            and not (
+                workspace.status == "paused"
+                and await scheduled_job_is_workspace_independent(db, job)
+            )
+        ):
             job.enabled = False
             job.next_run_at = None
             job.skill_generation_next_attempt_at = None
             await db.flush()
+            # The flush expires server-maintained columns the response reads.
+            await db.refresh(job)
 
     # Commit the producer before publishing its background consumer. This also
     # releases every lifecycle/resource lock before billable provider work.
@@ -591,10 +637,15 @@ async def get_job(
         raise HTTPException(404, "Scheduled job not found")
     _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
+    workspace_status = await _workspace_status_for_job(db, user, job.workspace_id)
     return _job_response(
         job,
         can_manage=await _can_manage_workspace_resource(db, user, job.workspace_id),
-        workspace_status=await _workspace_status_for_job(db, user, job.workspace_id),
+        workspace_status=workspace_status,
+        independent_while_paused=(
+            workspace_status == "paused"
+            and await scheduled_job_is_workspace_independent(db, job)
+        ),
     )
 
 
@@ -652,12 +703,17 @@ async def update_job(
             or "agent_id" in mutation.content_patch
         )
     )
+    workspace_status = await _workspace_status_for_job(
+        db,
+        user,
+        job.workspace_id,
+    )
     response = _job_response(
         job,
-        workspace_status=await _workspace_status_for_job(
-            db,
-            user,
-            job.workspace_id,
+        workspace_status=workspace_status,
+        independent_while_paused=(
+            workspace_status == "paused"
+            and await scheduled_job_is_workspace_independent(db, job)
         ),
     )
     if generation_inputs_changed:
@@ -736,7 +792,14 @@ async def toggle_job(
                 Workspace.deleted_at.is_(None),
             )
         )).scalar_one_or_none()
-        if workspace is not None and workspace.status != "active":
+        if (
+            workspace is not None
+            and workspace.status != "active"
+            and not (
+                workspace.status == "paused"
+                and await scheduled_job_is_workspace_independent(db, existing)
+            )
+        ):
             raise HTTPException(409, "Workspace is not active - resume it before enabling automations")
     job = await toggle_scheduled_job(
         db,
@@ -748,9 +811,14 @@ async def toggle_job(
     )
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    workspace_status = await _workspace_status_for_job(db, user, job.workspace_id)
     return _job_response(
         job,
-        workspace_status=await _workspace_status_for_job(db, user, job.workspace_id),
+        workspace_status=workspace_status,
+        independent_while_paused=(
+            workspace_status == "paused"
+            and await scheduled_job_is_workspace_independent(db, job)
+        ),
     )
 
 

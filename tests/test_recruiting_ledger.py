@@ -231,6 +231,37 @@ async def test_recruiting_idempotency_retry_reads_only_the_keyed_record(
 
 
 @pytest.mark.asyncio
+async def test_recruiting_replay_from_another_run_keeps_first_provenance(
+    recruiting_runtime: Path,
+) -> None:
+    request = {
+        "entity_id": "entity-1",
+        "workspace_id": "workspace-1",
+        "record_key": "candidate-1",
+        "stage": "screening",
+        "event": "screen_completed",
+        "occurred_at": "2026-10-24T08:00:00Z",
+        "idempotency_key": "candidate-1-screen",
+    }
+    first = await recruiting_ledger.record_recruiting_event(
+        **request, task_id="task-1", workflow_run_id="run-1",
+    )
+    replay = await recruiting_ledger.record_recruiting_event(
+        **request, task_id="task-2", workflow_run_id="run-2",
+    )
+
+    assert replay["idempotent"] is True
+    assert replay["event_id"] == first["event_id"]
+    ledger = await recruiting_ledger.read_recruiting_ledger(
+        entity_id="entity-1", workspace_id="workspace-1",
+    )
+    assert [
+        (entry["source_task_id"], entry["source_workflow_run_id"])
+        for entry in ledger["entries"]
+    ] == [("task-1", "run-1")]
+
+
+@pytest.mark.asyncio
 async def test_recruiting_projection_is_cached_and_loaded_off_event_loop(
     recruiting_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -20,7 +20,9 @@ from sqlalchemy.ext.compiler import compiles
 
 from packages.core.blueprints import InstallMode, export_workspace, install_blueprint, promote_workspace
 from packages.core.blueprints import configuration_upgrade as upgrade
+from packages.core.blueprints import report as report_module
 from packages.core.blueprints.exporter import ExportContext
+from packages.core.blueprints.launch_review import OperationsSection, RunOutcomes
 from packages.core.blueprints.report import simulate_report
 from packages.core.governance.approval_policy import ApprovalPolicyOverride, ApprovalRule
 from packages.core.governance.approval_policy_service import account_defaults, load_policy_chain
@@ -28,6 +30,8 @@ from packages.core.governance.approval_projection import policy_override, replac
 from packages.core.governance.policy import WorkspacePolicy
 from packages.core.governance.policy_cache import GovernancePolicyCacheFactory, GovernancePolicyMutationFence
 from packages.core.governance.service import update_policy
+from tests.approval_settings_test_utils import POLICY_WRITE_SIDE_EFFECT_MODELS
+from packages.core.models.billing import CreditUsageLog
 from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
 from packages.core.models.document import DocumentFolder
 from packages.core.models.execution import ExecutionStep
@@ -89,11 +93,18 @@ async def test_real_export_install_upgrade_revert_and_promote(monkeypatch):
         begin_mutation=AsyncMock(side_effect=lambda workspace_id: GovernancePolicyMutationFence(workspace_id, "isolated", True)),
         commit_mutation=AsyncMock(), rollback_mutation=AsyncMock())
     monkeypatch.setattr(GovernancePolicyCacheFactory, "_default", cache)
+    # The report's run outcomes read PostgreSQL-only tables and have their own
+    # coverage (test_blueprint_launch_review); this SQLite roundtrip checks the
+    # approval counterfactual.
+    monkeypatch.setattr(report_module, "build_operations", AsyncMock(return_value=OperationsSection(
+        tasks=RunOutcomes(), agents=RunOutcomes(), workflows=RunOutcomes(), automations=RunOutcomes(),
+    )))
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     tables = [Entity, Workspace, DocumentFolder, GovernancePolicy, GovernanceRevision,
               WorkspaceBlueprintUpgradeState, MarketplaceResourceLink, Agent, Skill,
               WorkflowTemplateInstallation, ScheduledJob, Goal, GoalMeasurement,
-              ExecutionStep, RuntimeEvidence, ToolDefinition]
+              ExecutionStep, RuntimeEvidence, ToolDefinition, CreditUsageLog,
+              *POLICY_WRITE_SIDE_EFFECT_MODELS]
     try:
         async with engine.begin() as connection:
             for model in tables:

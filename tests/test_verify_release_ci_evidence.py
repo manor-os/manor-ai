@@ -105,12 +105,60 @@ def test_verifier_emits_matching_successful_regression_evidence(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
+    ("event", "gate_conclusion", "accepted"),
+    [("workflow_dispatch", "success", True), ("push", "success", False), ("workflow_dispatch", "skipped", False)],
+)
+def test_hotfix_requires_manual_full_regression(
+    tmp_path: Path, event: str, gate_conclusion: str, accepted: bool,
+) -> None:
+    branch = "codex/hotfix-chat-media"
+    completed = run_verifier(
+        tmp_path,
+        [evidence_run(event=event, head_branch=branch)],
+        [{"name": "Python regression gate", "conclusion": gate_conclusion}],
+        "--branch", branch, "--event", "workflow_dispatch",
+    )
+    assert (completed.returncode == 0) is accepted, completed.stderr
+    if accepted:
+        assert completed.stdout == f"ci_run_id=42\nci_source_sha={SHA}\nrelease_source_sha={SHA}\n"
+    else:
+        assert not completed.stdout
+
+
+def test_verifier_encodes_a_branch_without_changing_its_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = load_verifier_module()
+    branch = "codex/hotfix-chat-media"
+    endpoints: list[str] = []
+
+    def gh_json(endpoint: str) -> dict:
+        endpoints.append(endpoint)
+        return {"workflow_runs": [evidence_run(event="workflow_dispatch", head_branch=branch)]}
+
+    monkeypatch.setattr(verifier, "gh_json", gh_json)
+    args = Namespace(branch=branch, workflow="ci.yml", repository=REPOSITORY, events=["workflow_dispatch"])
+    assert len(verifier.runs_for_candidate(args, SHA)) == 1
+    assert endpoints == [
+        f"repos/{REPOSITORY}/actions/workflows/ci.yml/runs?"
+        f"branch=codex%2Fhotfix-chat-media&head_sha={SHA}&per_page=100"
+    ]
+
+
+def test_verifier_accepts_both_events_only_when_explicitly_requested(tmp_path: Path) -> None:
+    completed = run_verifier(
+        tmp_path, [evidence_run()], [{"name": "Python regression gate", "conclusion": "success"}],
+        "--event", "push", "--event", "workflow_dispatch",
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
     "run_overrides",
     [
         {"event": "pull_request"},
         {"head_branch": "main"},
         {"head_sha": "b" * 40},
         {"repository": {"full_name": "other/repo"}},
+        {"head_repository": {"full_name": "other/repo"}},
     ],
 )
 def test_verifier_rejects_untrusted_run_identity(tmp_path: Path, run_overrides: dict) -> None:
@@ -233,6 +281,65 @@ def test_verifier_gives_exact_source_failure_precedence_over_a_parent_green(tmp_
 
     assert completed.returncode != 0
     assert "latest matching CI evidence is a completed failure" in completed.stderr
+
+
+def merge_queue_run(**overrides: object) -> dict:
+    return evidence_run(event="merge_group", head_branch="gh-readonly-queue/dev/pr-7-" + "b" * 40) | overrides
+
+
+def test_verifier_accepts_the_exact_merge_queue_run_for_its_target_branch(tmp_path: Path) -> None:
+    completed = run_verifier(
+        tmp_path,
+        [merge_queue_run(id=77), evidence_run(id=78, event="push")],
+        [{"name": "PR fast gate", "conclusion": "success"}],
+        "--merge-queue",
+        "--gate-name",
+        "PR fast gate",
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("ci_run_id=77\n")
+
+
+@pytest.mark.parametrize(
+    "run_overrides",
+    [
+        {"event": "push", "head_branch": "dev"},
+        {"head_branch": "gh-readonly-queue/main/pr-7-" + "b" * 40},
+        {"conclusion": "failure"},
+    ],
+)
+def test_verifier_rejects_merge_queue_evidence_for_another_branch_event_or_result(
+    tmp_path: Path, run_overrides: dict
+) -> None:
+    completed = run_verifier(
+        tmp_path,
+        [merge_queue_run(**run_overrides)],
+        [{"name": "PR fast gate", "conclusion": "success"}],
+        "--merge-queue",
+        "--gate-name",
+        "PR fast gate",
+        "--wait-seconds",
+        "60",
+    )
+    assert completed.returncode != 0
+    assert not completed.stdout
+
+
+def test_verifier_does_not_wait_for_a_merge_queue_run_that_never_existed(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = load_verifier_module()
+    args = Namespace(
+        candidate_shas=[SHA],
+        source_sha=SHA,
+        expected_run_id=None,
+        wait_seconds=600,
+        poll_interval_seconds=15,
+        merge_queue=True,
+    )
+    monkeypatch.setattr(verifier, "runs_for_candidate", lambda _args, _sha: [])
+    monkeypatch.setattr(verifier.time, "sleep", lambda _seconds: pytest.fail("must not wait"))
+
+    with pytest.raises(SystemExit, match="2"):
+        verifier.select_run(args)
 
 
 def test_verifier_rejects_newer_failed_parent_before_an_older_green_parent(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -95,7 +95,8 @@ async def test_workspace_file_query_count_does_not_grow_per_document_or_group(
 
 
 @pytest.mark.asyncio
-async def test_workspace_file_snapshot_preserves_acl_deduplication_and_lifecycle(client, db_session):
+@pytest.mark.parametrize("initialize", [True, False])
+async def test_workspace_file_snapshot_preserves_acl_deduplication_and_lifecycle(client, db_session, initialize):
     owner_headers = await _auth(client, "file_snapshot_acl")
     response = await client.post(
         "/api/v1/workspaces", headers=owner_headers, json={"name": "File ACL"},
@@ -143,7 +144,7 @@ async def test_workspace_file_snapshot_preserves_acl_deduplication_and_lifecycle
     ))
     await db_session.commit()
 
-    url = f"/api/v1/workspaces/{workspace_id}/documents"
+    url = f"/api/v1/workspaces/{workspace_id}/documents?initialize={str(initialize).lower()}"
     for headers, expected_ids in [
         (member["headers"], {visible.id, shared.id, deleted.id}),
         (owner_headers, {visible.id, private.id, shared.id, deleted.id}),
@@ -160,6 +161,8 @@ async def test_workspace_file_snapshot_preserves_acl_deduplication_and_lifecycle
             assert groups[group_id]["folders"] == []
             assert next(doc for doc in groups[group_id]["documents"] if doc["id"] == shared.id)["folder_id"] is None
 
+    outsider = await _create_entity_user(entity_id, "file_snapshot_outsider")
+    assert (await client.get(url, headers=outsider["headers"])).status_code == 404
     ws = await db_session.get(Workspace, workspace_id)
     ws.status = "paused"
     await db_session.commit()

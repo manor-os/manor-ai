@@ -7,7 +7,7 @@ Never read another group, personal Knowledge, or Workspace path merely because
 the user mentions it.
 
 Run `scripts/pptx_template_import.py <reference.pptx> --output
-<project>/reference --inheritance-mode both` as specified by `SKILL.md`.
+<project>/reference --inheritance-mode both` as specified by `workflows/free-design.md`.
 Read the resulting master, layout and slide hierarchy, palette, typography
 and recurring elements,
 then record the relevant traits in `design_spec.md` and `spec_lock.md`.

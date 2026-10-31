@@ -84,6 +84,7 @@ import {
   workflowNodeDisplayStatus,
   workflowRunBackgroundWait,
   workflowRunFailure,
+  workflowRunProgressPercent,
   workflowStepTargets,
   buildWorkflowSnapshotNodes,
   buildWorkflowRunTimeline,
@@ -93,7 +94,10 @@ import {
   type WorkflowHistoryRun,
   type WorkflowFinalResult,
   type WorkflowRunFailure,
+  workflowRunStateKey,
 } from "../components/workflows/workflowRunDisplay";
+import { getPreferredTimeZone } from "../lib/format";
+import WorkflowErrorText from "../components/workflows/WorkflowErrorText";
 
 const ACTIVE_RUN_STATUSES = new Set(["pending", "running", "paused"]);
 
@@ -256,7 +260,7 @@ function fmtRunTime(iso?: string): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() });
 }
 
 function formatWorkflowTimestamp(iso?: string | null): string {
@@ -266,6 +270,7 @@ function formatWorkflowTimestamp(iso?: string | null): string {
   return value.toLocaleString(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
+    timeZone: getPreferredTimeZone(),
   });
 }
 
@@ -406,8 +411,6 @@ function WorkflowFinalResultPanel({
   processedCount,
   outputPending,
   failure,
-  retrying,
-  onRetry,
   onRunAgain,
   onClose,
   onOpenNode,
@@ -420,8 +423,6 @@ function WorkflowFinalResultPanel({
   /** The run is a compact history row whose step results are still loading. */
   outputPending: boolean;
   failure: WorkflowRunFailure | null;
-  retrying: boolean;
-  onRetry?: () => void;
   onRunAgain?: () => void;
   onClose: () => void;
   onOpenNode: (stepId: string) => void;
@@ -533,16 +534,16 @@ function WorkflowFinalResultPanel({
         {failure ? (
           <section className="workflow-final-result-failure" role="alert">
             <strong>{failure.title}</strong>
-            <p>{failure.detail}</p>
+            <WorkflowErrorText text={failure.detail} />
             {failure.hint && <p className="workflow-final-result-failure-hint">{failure.hint}</p>}
+            {failure.technicalDetails && (
+              <details className="workflow-final-result-failure-details">
+                <summary>{t("component.workflow_run.technical_details")}</summary>
+                <pre>{failure.technicalDetails}</pre>
+              </details>
+            )}
             <div className="workflow-final-result-failure-actions">
-              {failure.stepId && onRetry && (
-                <Button size="sm" onClick={onRetry} disabled={retrying}>
-                  <IconRefresh size={13} />
-                  {retrying ? "Retrying…" : "Retry from this step"}
-                </Button>
-              )}
-              {onRunAgain && <Button variant="outline" size="sm" onClick={onRunAgain} disabled={retrying}>
+              {onRunAgain && <Button variant="outline" size="sm" onClick={onRunAgain}>
                 Edit inputs and run again
               </Button>}
             </div>
@@ -725,6 +726,17 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   const runDetailReloadRef = useRef("");
   const [liveStatus, setLiveStatus] = useState<Record<string, string>>({});
   const [streaming, setStreaming] = useState(false);
+  // Full run responses own the frozen graph and receipts; compact responses
+  // own current recovery controls (including recovery of nested attempts).
+  const runControlQuery = useQuery({
+    queryKey: ["workflow-run-history-control", runResult?.id],
+    queryFn: ({ signal }) => api.workflows.getRun(runResult.id, false, signal),
+    enabled: Boolean(runResult?.id) && !streaming && runResult?.capabilities?.can_control === true
+      && (["failed", "cancelled"].includes(runResult?.status || "") || (runResult?.status === "completed"
+        && ["needs_input", "revision_required"].includes(runResult?.business_outcome))),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
   const [runInputFlow, setRunInputFlow] = useState<Flow | null>(null);
   // Inputs of the run being repeated, so "run again" only asks for changes.
   const [runInputPrefill, setRunInputPrefill] = useState<Record<string, unknown> | null>(null);
@@ -1101,20 +1113,16 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   });
 
   const retryMutation = useMutation({
-    // Retry keeps every completed node and re-runs from the one that failed
-    // (or the step the failing node names, such as the publishing fan-out).
-    mutationFn: (run: any) =>
-      api.workflows.retryRun(run.id, {
-        from_step_id: run.retry_from_step_id || workflowRunFailure(run)?.retryFromStepId || run.current_step_id,
-        execute: true,
-      }),
+    mutationFn: (run: any) => api.workflows.retryRun(run.id, {
+      from_step_id: run.retry_from_step_id,
+      execute: true,
+    }),
     onSuccess: (retriedRun: any) => {
       observedActiveRunIdsRef.current.add(retriedRun.id);
       setShowFinalResult(false);
       for (const key of ["workflow-runs", "workspace-workflow-runs", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail", "workflow-run-history-detail", "workflow-run-history-family", "workspace-chat", "workflow-run"]) {
         void queryClient.invalidateQueries({ queryKey: [key] });
       }
-      toast.success("Retry started", "Continuing from the failed node.");
       if (readOnly) {
         navigate(workflowRunPath(retriedRun.workflow_id || requestedWorkflowId || "", retriedRun.id), { state: location.state });
         return;
@@ -1711,6 +1719,9 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       streaming ? liveStatus : runStatusById,
       streaming ? { status: "running" } : lastRun,
     );
+    const runPercent = workflowRunProgressPercent(
+      runProgress.processed, runProgress.total, streaming ? "running" : lastRun?.status,
+    );
     const showBanner = streaming || !!lastRun;
     const bannerStatus = (workflowRunBackgroundWait(lastRun) ? "running" : lastRun?.status) || (streaming ? "starting" : undefined);
     const runBannerColor = lastRun
@@ -1722,17 +1733,45 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     const runBackgroundWait = workflowRunBackgroundWait(lastRun);
     const runCanResume = runCanControl && !!lastRun && lastRun.status === "paused" && !runBackgroundWait;
     const runCanStop = !!lastRun && (readOnly ? canCancelWorkflowRun(lastRun) : ["pending", "running", "paused"].includes(lastRun.status));
-    const runCanRetry = !streaming
-      && !!lastRun
-      && lastRun.status === "failed"
-      && (!readOnly || canRetryWithoutCorrection(lastRun))
-      && !(readOnly && lastRun.intervention?.kind === "workflow_retry")
-      && Boolean(lastRun.retry_from_step_id || lastRun.current_step_id);
-    const retryControl = readOnly && runCanControl && lastRun?.intervention?.kind === "workflow_retry"
+    const recoveryRun = runControlQuery.isSuccess && !runControlQuery.isError
+      && runControlQuery.data?.id === lastRun?.id
+      && runControlQuery.data?.workflow_id === lastRun?.workflow_id
+      && runControlQuery.data?.workspace_id === lastRun?.workspace_id
+      ? runControlQuery.data : null;
+    const recoveryAction = recoveryRun?.intervention;
+    const runCanRetry = Boolean(
+      !streaming
+      && recoveryRun && canRetryWithoutCorrection(recoveryRun)
+      && !recoveryAction,
+    );
+    const hasServerRetryAction = Boolean(
+      !streaming
+      && ((recoveryAction?.kind === "workflow_retry" && recoveryAction.options?.includes("retry"))
+        || (recoveryAction?.kind === "workflow_effect_review" && recoveryAction.options?.some((option: string) => option === "review" || option === "review_applied"))),
+    );
+    const retryControl = recoveryRun?.capabilities?.can_control && lastRun && !streaming
+      && (hasServerRetryAction || (recoveryRun.status === "failed" && !runCanRetry && !recoveryRun.superseded))
       ? <WorkflowRunRetryControl
           runId={lastRun.id} workflowId={flow.id} workspaceId={lastRun.workspace_id || ""}
           bindingId={lastRun.binding_id} businessOutcome={lastRun.business_outcome} size="sm"
-          onRetried={(next) => navigate(workflowRunPath(flow.id, next.id), { state: location.state })}
+          reviewRequired={recoveryAction?.kind === "workflow_effect_review" && recoveryAction.options?.some((option: string) => option === "review" || option === "review_applied")}
+          onRetried={(next) => {
+            observedActiveRunIdsRef.current.add(next.id);
+            setShowFinalResult(false);
+            for (const key of ["workflow-runs", "workspace-workflow-runs", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail", "workflow-run-history-detail", "workflow-run-history-family", "workspace-chat", "workflow-run"]) {
+              void queryClient.invalidateQueries({ queryKey: [key] });
+            }
+            if (readOnly) {
+              navigate(workflowRunPath(flow.id, next.id), { state: location.state });
+              return;
+            }
+            const nextSearch = new URLSearchParams(searchParams);
+            nextSearch.delete("workflow");
+            nextSearch.set("run", next.id);
+            nextSearch.delete("workflow_run");
+            setSearchParams(nextSearch, { replace: true, state: location.state });
+            setRunResult(next);
+          }}
         />
       : undefined;
     const openNode = (id: string) => {
@@ -1787,7 +1826,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             <div className="workflow-editor-meta" aria-label="Workflow status">
               {readOnly ? <>
                 <StatusBadge type={lastRun?.status === "failed" ? "error" : "gray"} dot>
-                  {t(`component.workflow_run.status.${lastRun?.status || "pending"}`)}
+                  {t(workflowRunStateKey(lastRun?.status || "pending"))}
                 </StatusBadge>
                 <StatusBadge type="gray">{t("component.workflow_run_history.attempts", { count: lastRun?.attempt_number || 1 })}</StatusBadge>
                 {lastRun && workflowRunIsLegacy(lastRun) && <span title={t("component.workflow_run_history.legacy")}>
@@ -1942,7 +1981,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             >
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: runBannerColor || "#a8a29e", animation: streaming ? "pulse 1.2s ease-in-out infinite" : "none" }} />
               <span style={{ color: "var(--text-strong)", textTransform: "capitalize" }}>{bannerStatus}</span>
-              {lastRun?.status !== "completed" && <span className="mono" style={{ color: "var(--text-faint)" }}>{runProgress.processed}/{runProgress.total}</span>}
+              {lastRun?.status !== "completed" && runPercent !== null && <span className="mono" style={{ color: "var(--text-faint)" }}>{Math.floor(runPercent)}%</span>}
               {runBackgroundWait && <span style={{ color: "var(--text-faint)" }}>· {runBackgroundWait}</span>}
               {!streaming && lastRun?.error && <span style={{ color: "#d65f59", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {lastRun.error}</span>}
               {runCanPause && (
@@ -1982,16 +2021,21 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                 <button
                   type="button"
                   className="workflow-run-banner-action"
-                  onClick={() => retryMutation.mutate(lastRun)}
+                  onClick={() => retryMutation.mutate(recoveryRun)}
                   disabled={retryMutation.isPending}
-                  aria-label="Retry workflow from the failed node"
-                  title="Continue from the failed node"
+                  aria-label="Retry workflow from the authorized checkpoint"
+                  title="Continue from the authorized recovery checkpoint"
                 >
                   <IconRefresh size={12} />
                   {retryMutation.isPending ? "Retrying…" : "Retry"}
                 </button>
               )}
               {retryControl}
+              {runCanControl && recoveryAction?.blocked_reason === "external_effect_requires_reconciliation" && (
+                <span role="status" title={t("component.workflow_run_history.external_effect_blocked")}>
+                  {t("component.workflow_run_history.retry_needs_verification")}
+                </span>
+              )}
               {!streaming && lastRun && ["completed", "failed"].includes(lastRun.status) && (
                 <Button
                   variant="ghost"
@@ -2081,8 +2125,6 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             processedCount={runProgress.processed}
             outputPending={!runResultHasDetail}
             failure={workflowRunFailure(lastRun, steps)}
-            retrying={retryMutation.isPending}
-            onRetry={runCanRetry ? () => retryMutation.mutate(lastRun) : undefined}
             retryControl={retryControl}
             onRunAgain={readOnly ? undefined : () => {
               setShowFinalResult(false);

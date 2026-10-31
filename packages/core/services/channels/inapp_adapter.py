@@ -16,9 +16,10 @@ Outbound:
     the reply when they reopen the app.
 
 Inbound:
-  - The in-app chat UI POSTs user messages to
-    ``/api/v1/channels/inapp/callback`` with a JSON body. No signature
-    verification — auth happens at the HTTP layer (JWT middleware).
+  - In-app users talk to agents through the authenticated chat API. The
+    generic ``/api/v1/channels/inapp/callback`` route has no user auth, so
+    this adapter keeps the base ``verify_inbound`` (reject): a body's
+    ``user_id`` must never be trusted from an unauthenticated POST.
 """
 from __future__ import annotations
 
@@ -61,11 +62,6 @@ class InAppChannelAdapter(ChannelAdapter):
             delivered_via="websocket",
             user_id=to,
         )
-
-    async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
-        # Auth happens at the HTTP middleware layer — this path is only
-        # reachable via authenticated JWT.
-        return True
 
     async def parse_inbound(
         self, cc: ChannelConfig, *, headers, query, body,

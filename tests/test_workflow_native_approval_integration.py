@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -20,6 +22,7 @@ from packages.core.blueprints.installer import _materialize_knowledge_pack_docum
 from packages.core.config import get_settings
 from packages.core.models.document import DocumentGroup
 from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.task import Conversation
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import Workspace
@@ -137,6 +140,12 @@ async def approval_case(client, db, monkeypatch, tmp_path):
                                     'trigger_data': {'workspace_manual': True},
                                 })
     assert response.status_code == 201, response.text
+    queued = response.json()
+    assert queued['status'] in {'pending', 'running'} and not executions
+    # Binding runs are queued; execute what the run_workflow worker would.
+    await WorkflowRunner().run(queued['id'])
+    response = await client.get(f"/api/v1/workflows/runs/{queued['id']}", headers=headers)
+    assert response.status_code == 200, response.text
     run = response.json()
     assert run['status'] == 'paused', run
     assert run['current_step_id'] == 'read'
@@ -169,6 +178,377 @@ async def decide(client, case, choice='approve', *, request_id=None, headers=Non
         f'/api/v1/workflows/runs/{case.run_id}/approvals/{request_id or case.request_id}/resolve',
         headers=headers or case.headers, json={'choice': choice},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,deadline_state", [
+    ("mcp__tiktok__post_video", "none"),
+    ("mcp__tiktok__post_photo", "none"),
+    ("mcp__tiktok__post_video", "future"),
+    ("mcp__tiktok__post_video", "expired_on_open"),
+    ("mcp__tiktok__post_photo", "expired_on_submit"),
+])
+async def test_scheduled_tiktok_review_uses_operator_conversation_and_resumes_once(
+    client, db_session, monkeypatch, isolated_test_redis, tool_name, deadline_state,
+):
+    """A scheduler-run TikTok post retains its native review origin on resume."""
+    from packages.core.ai.mcp import tiktok
+    from packages.core.ai.runtime import approval_service as approvals
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.workflow_tools import (
+        RuntimeWorkflowToolStepResult,
+        runtime_workflow_tool_context_args,
+        runtime_workflow_run_context,
+    )
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.services import tiktok_publish_review as review_service
+    from packages.core.services.workflow_service import schedule_workflow
+    from packages.core.tasks.scheduler_tasks import _dispatch_job
+    from apps.api.routers.chat import refresh_tiktok_publish_review
+    from tests.test_runtime_guard_unified_store import _runtime_envelope
+
+    deadline_at = "2099-01-01T00:00:00Z"
+    deadline_context = {} if deadline_state == "none" else {
+        "workflow_effect_deadline_at": deadline_at,
+        "workflow_effect_deadline_action_keys": ["social_post.publish"],
+    }
+
+    def expire_window():
+        from packages.core.services import workflow_runtime_approvals
+
+        class AfterDeadline(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 1, 1, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(workflow_runtime_approvals, "datetime", AfterDeadline)
+
+    headers = await _auth(client, "scheduled_tiktok_native")
+    workspace_id = await _create_workspace(client, headers, "Scheduled TikTok review")
+    photo = tool_name == "mcp__tiktok__post_photo"
+    source_path = "uploads/chat/0123456789abcdef.jpg" if photo else "uploads/chat/0123456789abcdef.mp4"
+    tool_args = {
+        "photo_urls": [source_path],
+        "title": "Scheduled post",
+        "integration_account_id": "account-1",
+    } if photo else {
+        "video_url": source_path,
+        "title": "Scheduled post",
+        "integration_account_id": "account-1",
+    }
+    actor = (await db_session.execute(select(User).where(
+        User.email == "scheduled_tiktok_native@test.com",
+    ))).scalar_one()
+    conversation = Conversation(
+        entity_id=actor.entity_id,
+        user_id=actor.id,
+        workspace_id=workspace_id,
+        scope="workspace_main",
+        status="active",
+    )
+    db_session.add(conversation)
+    await db_session.flush()
+    await set_workspace_test_approval(
+        db_session,
+        workspace_id=workspace_id,
+        entity_id=actor.entity_id,
+        actor_id=actor.id,
+        mode="confirm_changes",
+        user_rules=[action_rule("social_post.publish", effect="allow")],
+    )
+    workflow_response = await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Publish scheduled TikTok post",
+        "steps": [
+            {"id": "start", "type": "trigger", "config": {}, "next": ["publish" if deadline_state == "none" else "deadline"]},
+            *([] if deadline_state == "none" else [{
+                "id": "deadline", "type": "workflow_effect_deadline", "config": {
+                    "deadline_at": deadline_at, "action_keys": ["social_post.publish"],
+                }, "next": ["publish"],
+            }]),
+            {"id": "publish", "type": "tool", "name": "Publish TikTok", "config": {
+                "tool": tool_name,
+                "args": tool_args,
+            }, "next": ["end"]},
+            {"id": "end", "type": "end", "config": {}, "next": []},
+        ],
+    })
+    assert workflow_response.status_code == 201, workflow_response.text
+    workflow_id = workflow_response.json()["id"]
+    job = await schedule_workflow(
+        db_session,
+        entity_id=actor.entity_id,
+        workflow_id=workflow_id,
+        workspace_id=workspace_id,
+        cron="0 9 * * *",
+        created_by=actor.id,
+        conversation_id=conversation.id,
+    )
+    await db_session.commit()
+
+    creator = {
+        "creator_username": "manor",
+        "creator_nickname": "Manor AI",
+        "creator_avatar_url": "",
+        "privacy_level_options": ["PUBLIC_TO_EVERYONE", "SELF_ONLY"],
+        "comment_disabled": False,
+        "duet_disabled": False,
+        "stitch_disabled": False,
+        "max_video_post_duration_sec": 300,
+    }
+    if photo:
+        monkeypatch.setattr(
+            review_service,
+            "inspect_tiktok_photo_sources",
+            AsyncMock(return_value=[{
+                "source_kind": "chat_attachment",
+                "rel_path": source_path,
+                "source_sha256": "a" * 64,
+                "size_bytes": 1024,
+            }]),
+        )
+    else:
+        monkeypatch.setattr(
+            review_service,
+            "inspect_chat_video",
+            AsyncMock(return_value={
+                "rel_path": source_path,
+                "source_sha256": "a" * 64,
+                "size_bytes": 1024,
+                "duration_seconds": 45.25,
+                "width": 1080,
+                "height": 1920,
+            }),
+        )
+    monkeypatch.setattr(
+        review_service, "_creator_for_actor", AsyncMock(return_value=("account-1", creator)),
+    )
+    schema = next(item for item in tiktok.list_tools() if item["name"] == tool_name.removeprefix("mcp__tiktok__"))
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.tool_registry.runtime_tool_schema_for_actor",
+        AsyncMock(return_value=schema),
+    )
+    provider_calls = []
+    blocked_calls = []
+
+    async def guarded_tiktok_step(*, request, tool_name, arguments, workflow_context, **_kwargs):
+        envelope = replace(
+            _runtime_envelope(
+                {
+                    "entity_id": request.entity_id,
+                    "user_id": request.user_id,
+                    "conversation_id": request.conversation_id,
+                    "workspace_id": request.workspace_id,
+                },
+                name=tool_name,
+            ),
+            surface=ChatSurface.WORKFLOW_AGENT_STEP,
+        )
+        run_id = workflow_context["workflow_run_id"]
+        step_id = workflow_context["workflow_step_id"]
+        runtime_arguments = {
+            **arguments,
+            **runtime_workflow_tool_context_args(workflow_context),
+            "_runtime_run_id_from_context": f"workflow:{run_id}",
+            "_runtime_tool_call_id_from_context": f"node:{step_id}",
+        }
+        gate = await approvals.guard_runtime_tool_action(
+            name=tool_name,
+            arguments=runtime_arguments,
+            entity_id=request.entity_id,
+            user_id=request.user_id,
+            conversation_id=request.conversation_id,
+            workspace_id=request.workspace_id,
+            runtime_envelope=envelope,
+            operation_id=f"runtime:workflow:{run_id}:call:node:{step_id}",
+        )
+        if gate is not None:
+            if "approval_token" in runtime_arguments:
+                raise AssertionError(gate)
+            blocked_calls.append(gate)
+            return RuntimeWorkflowToolStepResult(gate, None, envelope, {tool_name})
+        provider_calls.append(dict(runtime_arguments))
+        return RuntimeWorkflowToolStepResult(
+            json.dumps({"data": {"publish_id": "provider-mocked"}}),
+            None,
+            envelope,
+            {tool_name},
+        )
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.runtime_execute_workflow_tool_step",
+        guarded_tiktok_step,
+    )
+    wakes = []
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue_resume",
+        staticmethod(lambda run_id, _delay, *, continuation_token=None: wakes.append((run_id, continuation_token)) or True),
+    )
+
+    job = await db_session.get(ScheduledJob, job.id)
+    prepared = await _dispatch_job(
+        db_session,
+        job,
+        datetime.now(timezone.utc),
+        occurrence_key="scheduled-tiktok-native",
+    )
+    assert prepared is not None
+    await db_session.commit()
+    workflow_run_id = prepared[0]["args"][0]
+    await WorkflowRunner().run(workflow_run_id)
+
+    run = await db_session.get(WorkflowRun, workflow_run_id)
+    assert run.trigger_source == "schedule"
+    assert run.started_by == actor.id
+    assert runtime_workflow_run_context(run)["conversation_id"] == conversation.id
+    assert run.trigger_data["_workflow_runtime_context"] == {
+        "workspace_id": workspace_id,
+        "conversation_id": conversation.id,
+        **deadline_context,
+    }
+    request_id = run.step_results["publish"]["runtime_approval"]["request_id"]
+    request = await db_session.get(HitlRequest, request_id)
+    assert request.origin_conversation_id == conversation.id
+    assert request.context["requested_by"] == actor.id
+    evidence = request.context["tiktok_publish_evidence"]
+    assert (evidence["media_sources"][0]["source_sha256"] if photo else evidence["source_sha256"]) == "a" * 64
+    assert provider_calls == []
+    assert len(blocked_calls) == 1
+
+    projected = await client.get(
+        f"/api/v1/workflows/runs/{workflow_run_id}", headers=headers,
+        params={"detail": "false"},
+    )
+    assert projected.status_code == 200, projected.text
+    intervention = projected.json()["intervention"]
+    assert intervention["runtime_approval_id"] == request_id
+    assert intervention["tool"] == tool_name
+    assert intervention["review"]["kind"] == "tiktok_publish"
+    assert intervention["review_read_only"] is False
+
+    missing_review = await client.post(
+        f"/api/v1/workflows/runs/{workflow_run_id}/approvals/{request_id}/resolve",
+        headers=headers, json={"choice": "approve"},
+    )
+    assert missing_review.status_code == 409, missing_review.text
+    assert not wakes and provider_calls == []
+
+    if deadline_state == "expired_on_open":
+        expire_window()
+    creator_reads = review_service._creator_for_actor.await_count
+    refreshed_review = await refresh_tiktok_publish_review(
+        request_id,
+        user=actor,
+        db=db_session,
+    )
+    await db_session.refresh(request)
+    if deadline_state != "none":
+        window = refreshed_review["publication_window"]
+        assert window["deadline_at"] == deadline_at
+        assert window["expired"] is (deadline_state == "expired_on_open")
+        assert window["run_url"] == f"/flows/{workflow_id}/runs/{workflow_run_id}"
+        assert "publication_window" not in request.context["review"]
+    if deadline_state == "expired_on_open":
+        assert "review_id" not in refreshed_review
+        assert review_service._creator_for_actor.await_count == creator_reads
+    submitted_review = {
+        "kind": "tiktok_publish",
+        "version": 2 if photo else 1,
+        "review_id": request.context["review"]["review_id"],
+        "caption": "Operator approved scheduled post",
+        "privacy_level": "SELF_ONLY",
+        "allow_comment": False,
+        "allow_duet": True,
+        "allow_stitch": False,
+        "commercial_content": False,
+        "brand_organic_toggle": False,
+        "brand_content_toggle": False,
+        "music_usage_confirmed": True,
+        "branded_content_policy_confirmed": False,
+        "consent_confirmed": True,
+        **({"photo_cover_index": 0} if photo else {}),
+    }
+    await db_session.commit()
+    if deadline_state.startswith("expired_"):
+        expire_window()
+        response = await client.post(
+            f"/api/v1/workflows/runs/{workflow_run_id}/approvals/{request_id}/resolve",
+            headers=headers, json={"choice": "approve", "review": submitted_review},
+        )
+        assert response.status_code == 409, response.text
+        assert "publishing window ended" in response.json()["detail"]
+        await db_session.refresh(request)
+        await db_session.refresh(run)
+        assert request.status == "pending"
+        assert "tiktok_publish_consent" not in request.context
+        assert run.status == "paused" and not wakes and not provider_calls
+        # The ordinary cancellation remains available; expiry grants nothing.
+        cancelled = await client.post(
+            f"/api/v1/workflows/runs/{workflow_run_id}/approvals/{request_id}/resolve",
+            headers=headers, json={"choice": "reject"},
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        await db_session.refresh(request)
+        assert request.status == "denied" and not wakes and not provider_calls
+        return
+    changed_review = await client.post(
+        f"/api/v1/workflows/runs/{workflow_run_id}/approvals/{request_id}/resolve",
+        headers=headers,
+        json={"choice": "approve", "review": {**submitted_review, "review_id": "changed"}},
+    )
+    assert changed_review.status_code == 409, changed_review.text
+    assert not wakes and provider_calls == []
+    response = await client.post(
+        f"/api/v1/workflows/runs/{workflow_run_id}/approvals/{request_id}/resolve",
+        headers=headers,
+        json={"choice": "approve", "review": submitted_review},
+    )
+    assert response.status_code == 200, response.text
+    assert len(wakes) == 1
+    await db_session.refresh(request)
+    from packages.core.ai.runtime.approval_messages import approval_args_hash
+
+    resumed_arguments = {
+        **request.context["continuation"]["arguments"],
+        "_workflow_run_id_from_context": workflow_run_id,
+        "_workflow_lineage_root_run_id_from_context": workflow_run_id,
+        "_workflow_step_id_from_context": "publish",
+        "_performance_run_id_from_context": workflow_run_id,
+        "_runtime_run_id_from_context": f"workflow:{workflow_run_id}",
+        "_runtime_tool_call_id_from_context": "node:publish",
+    }
+    assert request.context["args_hash"] == approval_args_hash(
+        resumed_arguments, tool_name=tool_name,
+    )
+    await WorkflowRunner.resume(workflow_run_id, continuation_token=wakes[0][1])
+
+    await db_session.refresh(run)
+    await db_session.refresh(request)
+    assert run.status == "completed", run.step_results["publish"]
+    assert request.status == "consumed"
+    expected_arguments = {
+        **({"photo_urls": [source_path], "photo_cover_index": 0} if photo else {"video_url": source_path}),
+        "title": "Operator approved scheduled post",
+        "integration_account_id": "account-1",
+        "privacy_level": "SELF_ONLY",
+        "disable_comment": True,
+        "disable_duet": False,
+        "disable_stitch": True,
+        "commercial_content": False,
+        "brand_content_toggle": False,
+        "brand_organic_toggle": False,
+        "_workflow_run_id_from_context": workflow_run_id,
+        "_workflow_lineage_root_run_id_from_context": workflow_run_id,
+        "_workflow_step_id_from_context": "publish",
+        "_performance_run_id_from_context": workflow_run_id,
+        "_runtime_run_id_from_context": f"workflow:{workflow_run_id}",
+        "_runtime_tool_call_id_from_context": "node:publish",
+        "_workflow_effect_deadline_action_keys_from_context": deadline_context.get("workflow_effect_deadline_action_keys", []),
+        **({"_workflow_effect_deadline_at_from_context": deadline_at} if deadline_context else {}),
+    }
+    assert provider_calls == [expected_arguments]
+    await WorkflowRunner.resume(workflow_run_id, continuation_token=wakes[0][1])
+    assert len(provider_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -388,10 +768,15 @@ async def test_resume_rechecks_lifecycle_and_definition_after_grant(
     await db_session.rollback()
     run = await db_session.get(WorkflowRun, case.run_id)
     request = await db_session.get(HitlRequest, case.request_id)
+    assert case.executions['before'] == 1
+    if change == 'workspace_paused':
+        assert run.status == 'completed'
+        assert 'source' in run.variables
+        assert request.status == 'consumed'
+        return
     assert run.status != 'completed'
     assert 'source' not in run.variables
     assert request.status != 'consumed', 'lost authority cannot spend approval'
-    assert case.executions['before'] == 1
     if change == 'execution_snapshot':
         assert run.step_results['read']['retry_blocked'] is True
         retry = await client.post(f'/api/v1/workflows/runs/{case.run_id}/retry',

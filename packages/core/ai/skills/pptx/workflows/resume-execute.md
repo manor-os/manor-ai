@@ -1,10 +1,10 @@
 ---
-description: Phase B entry — resume PPT execution in a fresh chat after Phase A (SKILL.md Step 1-5) completed in a previous session. Reads project state from disk and runs Step 6 + Step 7 with no Phase-A context carry-over.
+description: Phase B entry — resume PPT execution in a fresh chat after Phase A (workflows/free-design.md Step 1-5) completed in a previous session. Reads project state from disk and runs Step 6 + Step 7 with no Phase-A context carry-over.
 ---
 
 # Resume Execute Workflow
 
-> Standalone Phase-B entry. Run when Phase A (SKILL.md Step 1–5) completed in a previous session and the user wants to continue with SVG generation + export. Loads project state from disk and runs Step 6 + Step 7 in a clean session.
+> Standalone Phase-B entry. Run when Phase A (workflows/free-design.md Step 1–5) completed in a previous session and the user wants to continue with SVG generation + export. Loads project state from disk and runs Step 6 + Step 7 in a clean session.
 
 This workflow is **independent**: it owns Phase B starting from a fresh chat — no upstream conversation context required. By isolating SVG generation in its own session, the model gains 20–40K context headroom by not carrying Phase A's eight-confirmation dialogue, image search/fetch results, or Strategist references.
 
@@ -37,10 +37,10 @@ If any required artifact is missing → report which one(s) and stop. Do NOT aut
 
 ---
 
-## Step 2: Load SKILL.md, proceed from Step 6
+## Step 2: Load workflows/free-design.md, proceed from Step 6
 
 ```
-Read /skill/SKILL.md
+Read /skill/workflows/free-design.md
 ```
 
 Then jump to `### Step 6: Executor Phase` and run the documented pipeline:
@@ -57,7 +57,7 @@ The fresh session pays the cost of re-reading references (~14K tokens) but earns
 
 **Source materials**: Phase B is a fresh session; `<project_path>/sources/<file>.md` is NOT in context. The Executor SHOULD read the relevant `sources/` files when crafting per-page content — they hold the concrete facts, quotes, names, and details that turn skeleton outlines into substantive slides. `design_spec.md §IX` only carries the per-page intent; the source materials carry the texture. The Phase A → Phase B split is designed to free context budget precisely for this kind of high-quality enrichment.
 
-> Note: this workflow does NOT duplicate Step 6 / Step 7 content. SKILL.md is the authoritative procedure; resume-execute only adds the resumption entry (When to Run + Step 1 sanity check above) and the source-materials guidance above.
+> Note: this workflow does NOT duplicate Step 6 / Step 7 content. workflows/free-design.md is the authoritative procedure; resume-execute only adds the resumption entry (When to Run + Step 1 sanity check above) and the source-materials guidance above.
 
 ---
 
@@ -65,4 +65,4 @@ The fresh session pays the cost of re-reading references (~14K tokens) but earns
 
 When Step 7 completes and `exports/<project_name>_<timestamp>.pptx` is produced, the workflow ends. Report the export path to the user.
 
-If the deck contains data charts, the [`verify-charts`](verify-charts.md) workflow runs between Step 6 and Step 7 as documented in SKILL.md — resume mode handles it the same way the continuous mode does.
+If the deck contains data charts, the [`verify-charts`](verify-charts.md) workflow runs between Step 6 and Step 7 as documented in workflows/free-design.md — resume mode handles it the same way the continuous mode does.

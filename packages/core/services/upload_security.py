@@ -125,6 +125,11 @@ def validate_upload_header(
     return inferred
 
 
+# Every upload is virus-scanned; when the scan cannot finish, the file is
+# fine to send again, so the person is told exactly that.
+SCAN_UNAVAILABLE_MESSAGE = "The virus check didn't finish, so the file wasn't added. Try uploading it again."
+
+
 def _av_required() -> bool:
     if get_settings().DEPLOYMENT_MODE.strip().lower() == "cloud":
         return True
@@ -138,14 +143,11 @@ def _clamav_scan(stream: BinaryIO) -> None:
     required = _av_required()
     if not host:
         if required:
-            raise UploadSecurityError(
-                "Malware scanner is unavailable",
-                status_code=503,
-            )
+            raise UploadSecurityError(SCAN_UNAVAILABLE_MESSAGE, status_code=503)
         return
 
     port = int(os.getenv("CLAMAV_PORT", "3310"))
-    timeout = float(os.getenv("CLAMAV_TIMEOUT_SECONDS", "30"))
+    timeout = float(os.getenv("CLAMAV_TIMEOUT_SECONDS", "300"))
     try:
         with socket.create_connection((host, port), timeout=timeout) as client:
             client.settimeout(timeout)
@@ -159,19 +161,13 @@ def _clamav_scan(stream: BinaryIO) -> None:
         raise
     except Exception as exc:
         if required:
-            raise UploadSecurityError(
-                "Malware scanner is unavailable",
-                status_code=503,
-            ) from exc
+            raise UploadSecurityError(SCAN_UNAVAILABLE_MESSAGE, status_code=503) from exc
         return
 
     if response.endswith(" FOUND"):
         raise UploadSecurityError("Upload rejected by malware scanner")
     if not response.endswith(" OK"):
-        raise UploadSecurityError(
-            "Malware scanner could not verify the upload",
-            status_code=503,
-        )
+        raise UploadSecurityError(SCAN_UNAVAILABLE_MESSAGE, status_code=503)
 
 
 async def inspect_upload_content(
@@ -215,3 +211,29 @@ async def inspect_upload_path(
 
     await asyncio.to_thread(_scan_path)
     return media_type
+
+
+async def inspect_upload_stream(
+    source: BinaryIO,
+    *,
+    filename: str | None,
+    declared_content_type: str | None = None,
+    allowed_extensions: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Scan a private, seekable upload without materializing its full bytes."""
+    def _inspect() -> str:
+        try:
+            source.seek(0)
+            media_type = validate_upload_header(
+                filename=filename,
+                header=source.read(8192),
+                declared_content_type=declared_content_type,
+                allowed_extensions=allowed_extensions,
+            )
+            source.seek(0)
+            _clamav_scan(source)
+            return media_type
+        finally:
+            source.seek(0)
+
+    return await asyncio.to_thread(_inspect)

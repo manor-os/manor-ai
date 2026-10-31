@@ -1,5 +1,6 @@
 import type { PlanLimitKind } from "./api";
 import { getLocale, t } from "./i18n";
+import { getPreferredTimeZone } from "./format";
 
 /**
  * Single source of truth for how a plan-limit reminder presents itself, so the
@@ -18,6 +19,8 @@ export function planLimitTitle(kind?: PlanLimitKind): string {
       return t("component.upgrade_prompt.title_users");
     case "generic":
       return t("component.upgrade_prompt.title_generic");
+    case "trial_credit":
+      return t("component.upgrade_prompt.title_trial_credit");
     case "credit":
     default:
       // Legacy payloads (no kind) are credit-exhaustion, the original case.
@@ -28,6 +31,16 @@ export function planLimitTitle(kind?: PlanLimitKind): string {
 /** Buying credits only resolves the credit limit; other limits need a plan change. */
 export function planLimitOffersCredits(kind?: PlanLimitKind): boolean {
   return !kind || kind === "credit";
+}
+
+/**
+ * Whether the viewer's own plan or credits can lift the limit. A client
+ * delivery trial runs on its provider's credits, so its stop (trial_credit)
+ * offers no upgrade or purchase: only the provider, or accepting the
+ * delivery, resolves it.
+ */
+export function planLimitOffersUpgrade(kind?: PlanLimitKind): boolean {
+  return kind !== "trial_credit";
 }
 
 /** Human-readable local timestamp for the next included-credit refill. */
@@ -45,6 +58,7 @@ export function planLimitResetText(
     hour: "numeric",
     minute: "2-digit",
     timeZoneName: "short",
+    timeZone: getPreferredTimeZone(),
   }).format(resetDate);
   return t("component.upgrade_prompt.resets_at").replace("{date}", formatted);
 }

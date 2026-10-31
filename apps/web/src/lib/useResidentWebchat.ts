@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { residentStatusAllowsHistory, type PublicChatRequestFence } from "./publicChatRequestFence";
+import { residentStatusAllowsHistory, residentStatusSessionMissing, type PublicChatRequestFence } from "./publicChatRequestFence";
 
 export type ResidentPhase = "checking" | "unverified" | "verified" | "expired" | "unavailable" | "redirecting" | "disconnecting";
+/** "missing": the server has no conversation for this session ID. */
+export type ResidentCheckResult = "allowed" | "missing" | "denied";
 export type ResidentMaintenance = { id: number; title: string; status: string; priority?: string; category?: string; created_at?: string; updated_at?: string; description?: string };
-export function useResidentWebchat({ token, sessionId, fence, headers, onInvalidate, onDisconnected }: {
+export function useResidentWebchat({ token, sessionId, fence, headers, onInvalidate, onDisconnected, onSessionMissing }: {
   token?: string; sessionId: string | null; fence: PublicChatRequestFence;
   headers: () => HeadersInit; onInvalidate: () => void; onDisconnected: () => void;
+  /** The active session's conversation is gone; return true when a fresh session is being started. */
+  onSessionMissing?: () => boolean;
 }) {
   const [phase, setPhase] = useState<ResidentPhase>("checking");
   const [historyReady, setHistoryReady] = useState(false);
@@ -18,8 +22,8 @@ export function useResidentWebchat({ token, sessionId, fence, headers, onInvalid
   const [notice, setNotice] = useState<"cancelled" | "error" | "revoke_pending" | null>(null);
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
-  const current = useRef({ onInvalidate, onDisconnected });
-  current.current = { onInvalidate, onDisconnected };
+  const current = useRef({ onInvalidate, onDisconnected, onSessionMissing });
+  current.current = { onInvalidate, onDisconnected, onSessionMissing };
   const endpoint = `/api/v1/public/chat/${encodeURIComponent(token || "")}/resident`;
 
   const invalidate = useCallback((next: ResidentPhase = "expired") => {
@@ -28,23 +32,29 @@ export function useResidentWebchat({ token, sessionId, fence, headers, onInvalid
     current.current.onInvalidate();
   }, [fence]);
 
-  const check = useCallback(async (id = sessionId): Promise<boolean> => {
-    if (!token || !id) return false;
-    if (phaseRef.current === "redirecting" || phaseRef.current === "disconnecting") return false;
+  const check = useCallback(async (id = sessionId): Promise<ResidentCheckResult> => {
+    if (!token || !id) return "denied";
+    if (phaseRef.current === "redirecting" || phaseRef.current === "disconnecting") return "denied";
     const request = fence.begin();
     try {
       const response = await fetch(`${endpoint}?session_id=${encodeURIComponent(id)}`, { credentials: "include", cache: "no-store", headers: headers(), signal: request.signal });
       const data = await response.json().catch(() => null);
-      if (!request.isCurrent()) return false;
+      if (!request.isCurrent()) return "denied";
+      if (residentStatusSessionMissing(response.status, data)) {
+        invalidate("unavailable");
+        // A remembered ID that was never adopted is the caller's to replace.
+        if (id === sessionId && current.current.onSessionMissing?.()) setPhase("checking");
+        return "missing";
+      }
       if (!response.ok || !residentStatusAllowsHistory(data)) {
         invalidate(response.status === 401 || response.status === 403 ? "expired" : "unavailable");
-        return false;
+        return "denied";
       }
       setCheckedSessionId(id); setHistoryReady(true); setPhase(data.verified ? "verified" : "unverified"); setExpiresAt(data.verified ? data.expires_at : null);
-      return true;
+      return "allowed";
     } catch {
       if (request.isCurrent()) invalidate("unavailable");
-      return false;
+      return "denied";
     } finally { request.release(); }
   }, [sessionId, token, endpoint, headers, fence, invalidate]);
 

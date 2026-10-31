@@ -11,10 +11,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.execution import (
-    ExecutionPlanStatus,
-    ExecutionStepStatus,
-)
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import get_db
 from packages.core.models.task import Task, TaskLog
@@ -27,6 +23,7 @@ from packages.core.constants.task_notifications import (
 )
 from packages.core.services.task_service import (
     list_tasks, get_task, create_task, update_task, ensure_workspace_agent_assignment,
+    ensure_workspace_owner_subscription,
     add_task_log, get_task_logs,
     list_categories, create_category, update_category, delete_category,
     get_tasks_by_status, move_task,
@@ -52,9 +49,6 @@ from apps.api.deps import (
 logger = logging.getLogger(__name__)
 
 _TASK_RUNTIME_DETAIL_KEYS = frozenset({
-    # Private pointer to the resolver-owned scheduled Task approval
-    # checkpoint. It may only be advanced by task_runtime_approvals.
-    "_runtime_tool_hitl_v1",
     "_pending_plan_dispatch",
     "_replan_context",
     "_manual_execution",
@@ -74,6 +68,44 @@ router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
 _TASK_BOARD_COLUMNS = ("todo", "scheduled", "in_progress", "review", "done")
 _TASK_BOARD_PREFERENCES_KEY = "task_board"
+_MAX_REQUIRED_SKILLS = 10
+
+
+async def _required_skill_refs(db: AsyncSession, user: User, refs: list[str]) -> list[str]:
+    """Canonical refs (slug, else id) of Skills the caller can see, or 422.
+
+    A ref is resolved as ``invoke_skill`` resolves it (an id, else a slug of
+    this entity or a built-in), then authorized like a Skill read: built-ins
+    are readable by every entity, an entity Skill through the resource
+    gateway. Unknown and invisible refs get the same answer.
+    """
+    from packages.core.models.permission import Capability, ResourceType
+    from packages.core.services.resource_access import ResourceDescriptor, user_can_access_resource
+    from packages.core.services.skill_service import get_skill, get_skill_by_slug
+
+    canonical: list[str] = []
+    rejected: list[str] = []
+    for ref in dict.fromkeys(str(value or "").strip() for value in refs):
+        if not ref:
+            continue
+        skill = await get_skill(db, ref)
+        if skill is None or skill.entity_id not in {None, user.entity_id}:
+            skill = await get_skill_by_slug(db, ref, user.entity_id)
+        visible = skill is not None and skill.status == "active" and (
+            skill.entity_id is None
+            or await user_can_access_resource(
+                db, descriptor=ResourceDescriptor.from_row(skill, ResourceType.SKILL),
+                entity_id=user.entity_id, user_id=user.id, role=getattr(user, "role", None),
+                capability=Capability.VIEW,
+            )
+        )
+        if not visible:
+            rejected.append(ref)
+        else:
+            canonical.append(skill.slug or skill.id)
+    if rejected:
+        raise HTTPException(422, f"Unknown or inaccessible Skills in required_skills: {rejected}")
+    return list(dict.fromkeys(canonical))
 
 
 def _schedule_background(coro) -> None:
@@ -215,14 +247,6 @@ async def _enqueue_learning_candidate_applies(
 
 # ── Schemas ──
 
-class TaskInputRequestResponse(BaseModel):
-    message_id: str
-    request_id: str
-    plan_id: str
-    step_id: str
-    pending_action: dict
-
-
 class TaskResponse(BaseModel):
     id: str
     entity_id: str
@@ -243,7 +267,6 @@ class TaskResponse(BaseModel):
     owner_agent_name: str | None = None
     owner_agent_avatar: str | None = None
     current_blocker: dict | None = None
-    pending_input_requests: list[TaskInputRequestResponse] = Field(default_factory=list)
     session_host_agent_id: str | None = None
     session_host_subscription_id: str | None = None
     session_host_name: str | None = None
@@ -283,6 +306,9 @@ class TaskResponse(BaseModel):
     author_agent_id: str | None = None
     author_agent_name: str | None = None
     author_agent_avatar: str | None = None
+    # An external Workspace collaborator steered this Task: its runs stay in
+    # their Workspace, and stop once their access ends until a member re-saves it.
+    steered_by_collaborator: bool = False
 
 
 class TaskCreateRequest(BaseModel):
@@ -297,10 +323,20 @@ class TaskCreateRequest(BaseModel):
     agent_type: str | None = None
     owner_service_key: str | None = None
     owner_subscription_id: str | None = None
+    # Skill ids or slugs this Task carries out (merged with its Workspace
+    # service's required_skills). Each must be a Skill the caller can see.
+    required_skills: list[str] | None = Field(default=None, max_length=_MAX_REQUIRED_SKILLS)
     details: dict = {}
     deadline: str | None = None
     scheduled_at: str | None = None
     duration_minutes: int | None = None
+
+
+# Saving any of these is a member's review of the Task (see update_one_task).
+_TASK_CONTENT_FIELDS = frozenset({
+    "title", "description", "details", "assignee_id", "agent_id", "agent_type",
+    "owner_service_key", "owner_subscription_id",
+})
 
 
 class TaskUpdateRequest(BaseModel):
@@ -315,6 +351,8 @@ class TaskUpdateRequest(BaseModel):
     owner_subscription_id: str | None = None
     category_id: str | None = None
     sla_policy_id: str | None = None
+    # Replaces the Task's required Skills; [] clears them.
+    required_skills: list[str] | None = Field(default=None, max_length=_MAX_REQUIRED_SKILLS)
     details: dict | None = None
     deadline: str | None = None
     scheduled_at: str | None = None
@@ -362,6 +400,7 @@ class AddLogRequest(BaseModel):
     log_type: TaskLogType = TaskLogType.COMMENT
     attachments: list[dict] = []
     mentions: list[dict] = Field(default_factory=list, max_length=50)
+    request_id: str | None = Field(default=None, max_length=26)
 
 
 class CategoryResponse(BaseModel):
@@ -395,11 +434,6 @@ class RetryTaskRequest(BaseModel):
     note: str | None = None
 
 
-class ResumeDeliveryReviewRequest(BaseModel):
-    expected_plan_id: str = Field(min_length=1, max_length=26)
-    expected_state_version: int = Field(ge=0, strict=True)
-
-
 class ApprovalDecisionRequest(BaseModel):
     choice: str
     note: str | None = None
@@ -409,12 +443,10 @@ class RetryTaskResponse(BaseModel):
     task: TaskResponse
     dispatched: bool
     mode: str
-    plan_id: str | None = None
-    reset_steps: int = 0
 
 
 class HITLResponseRequest(BaseModel):
-    step_id: str | None = None
+    request_id: str | None = Field(default=None, max_length=26)
     response: str | None = None
     choice: str | None = None
     fields: dict = {}
@@ -426,8 +458,6 @@ class HITLResponseResponse(BaseModel):
     resumed: bool
     dispatched: bool
     mode: str | None = None
-    plan_id: str | None = None
-    step_id: str | None = None
 
 
 # ── Constants endpoint ──
@@ -823,26 +853,22 @@ async def _current_task_blockers(db: AsyncSession, tasks) -> dict[str, dict]:
 
 
 async def _active_execution_task_ids(db: AsyncSession, tasks) -> set[str]:
-    """Return Task IDs with a running materialized execution step.
+    """Return Task IDs whose agent loop is running right now.
 
-    A business Task in ``in_progress`` can be manually moved there before a
-    plan exists. The board's live indicator must represent executor state,
-    rather than that broad business status.
+    A business Task in ``in_progress`` can be manually moved there before
+    its run starts. The board's live indicator must represent the run's
+    state, rather than that broad business status.
     """
     task_ids = {task.id for task in tasks if getattr(task, "id", None)}
     if not task_ids:
         return set()
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
 
     rows = await db.execute(
-        select(ExecutionPlan.task_id)
-        .join(ExecutionStep, ExecutionStep.plan_id == ExecutionPlan.id)
-        .where(
-            ExecutionPlan.task_id.in_(task_ids),
-            ExecutionPlan.status == ExecutionPlanStatus.RUNNING.value,
-            ExecutionStep.step_status == ExecutionStepStatus.RUNNING.value,
+        select(TaskCoordinatorRun.task_id).where(
+            TaskCoordinatorRun.task_id.in_(task_ids),
+            TaskCoordinatorRun.phase == TaskCoordinatorPhase.RUNNING.value,
         )
-        .distinct()
     )
     return {task_id for task_id in rows.scalars() if task_id}
 
@@ -995,6 +1021,7 @@ def _to_response(
 
     return TaskResponse(
         id=t.id, entity_id=t.entity_id, title=t.title,
+        steered_by_collaborator=bool(getattr(t, "collaborator_ids", None)),
         description=t.description, status=t.status, priority=t.priority,
         task_type=t.task_type, workspace_id=t.workspace_id,
         workspace_name=workspace_name,
@@ -1281,8 +1308,15 @@ async def create_new_task(
             workspace_id=req.workspace_id,
             agent_id=req.agent_id,
         )
+        await ensure_workspace_owner_subscription(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=req.workspace_id,
+            subscription_id=req.owner_subscription_id,
+        )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    required_skills = await _required_skill_refs(db, user, req.required_skills or [])
     from packages.core.services.task_session import TaskSessionHostError
 
     try:
@@ -1295,6 +1329,7 @@ async def create_new_task(
             agent_type=req.agent_type, creator_id=user.id,
             owner_service_key=req.owner_service_key,
             owner_subscription_id=req.owner_subscription_id,
+            required_skills=required_skills,
             details=_without_task_runtime_details(req.details), deadline=req.deadline,
             scheduled_at=req.scheduled_at, duration_minutes=req.duration_minutes,
         )
@@ -1510,54 +1545,6 @@ async def move_task_endpoint(
     )
 
 
-@router.post("/{task_id}/resume-delivery-review")
-async def resume_delivery_review_endpoint(
-    task_id: str,
-    req: ResumeDeliveryReviewRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Explicitly recheck a stopped delivery without retrying any writer."""
-    task = await get_task(db, task_id, user.entity_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    await require_workspace_writable(db, user, task.workspace_id)
-    from packages.core.plans.executor import (
-        resume_task_coordinator_delivery_review, resolve_resumed_delivery_review_hitl,
-    )
-    from packages.core.services.task_acceptance_review import TaskAcceptanceError
-
-    try:
-        resumed = await resume_task_coordinator_delivery_review(
-            db, task_id=task_id, plan_id=req.expected_plan_id,
-            expected_state_version=req.expected_state_version, actor_user_id=user.id,
-        )
-    except TaskAcceptanceError as exc:
-        await db.rollback()
-        raise HTTPException(409, {"code": exc.code, "message": str(exc)}) from exc
-    except ValueError as exc:
-        await db.rollback()
-        raise HTTPException(409, str(exc)) from exc
-    await add_task_log(
-        db, task_id, TaskLogType.AI_HITL_RESUMED,
-        "Resumed verification of the existing delivery; completed Steps were not retried.",
-        actor=TaskActor.USER, created_by=user.display_name or user.email,
-        metadata={"plan_id": req.expected_plan_id, "mode": "delivery_review", "state_version": resumed["state_version"]},
-    )
-    await db.commit()
-    cleanup_pending = False
-    try:
-        await resolve_resumed_delivery_review_hitl(db, task_id=task_id, plan_id=req.expected_plan_id, actor_user_id=user.id)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        cleanup_pending = True
-        logger.exception("Resumed Task delivery review; obsolete HITL cleanup deferred: %s", task_id)
-    # The durable coordinator outbox owns dispatch. Do not also enqueue a
-    # Plan/Task retry, which would create a second execution intention.
-    return {"status": "review_queued", **resumed, "reset_steps": 0, "hitl_cleanup_pending": cleanup_pending}
-
-
 @router.post("/{task_id}/retry", response_model=RetryTaskResponse)
 async def retry_task_endpoint(
     task_id: str,
@@ -1567,8 +1554,7 @@ async def retry_task_endpoint(
 ):
     """Manually retry a failed/blocked/HITL task.
 
-    For plan-backed tasks, reset failed or waiting steps and re-enqueue
-    the plan runner. For legacy agent tasks, re-dispatch TaskRunner.
+    A Task's run (its agent loop) restarts.
     """
     task = await get_task(db, task_id, user.entity_id)
     if not task:
@@ -1638,7 +1624,6 @@ async def retry_task_endpoint(
         task.entity_id,
         task_id=task.id,
         workspace_id=task.workspace_id,
-        plan_id=retry_result.plan_id,
         event="task_retry_resolved",
     )
 
@@ -1657,8 +1642,6 @@ async def retry_task_endpoint(
         ),
         dispatched=dispatched,
         mode=retry_result.mode,
-        plan_id=retry_result.plan_id,
-        reset_steps=retry_result.reset_steps,
     )
 
 
@@ -1667,263 +1650,19 @@ async def _resume_hitl(
     task,
     user: User,
     *,
-    step_id: str | None = None,
     response_text: str,
     payload: dict,
 ) -> dict:
     """Resume a task waiting on structured human input.
 
-    ``step_id`` names a plan step; a legacy agent task (parked by
-    ``request_input`` or by the supervisor's needs_hitl verdict) has none,
-    which is how the comment path calls this.
+    A Task agent loop parked on its question takes the answer. The comment
+    path and a Task's question card outside Workspace Chat call this too.
     """
-    from datetime import datetime, timezone
-
     submitted_by = user.display_name or user.email
-    now = datetime.now(timezone.utc)
-    meta = {
-        "response": response_text,
-        "choice": payload.get("choice"),
-        "fields": payload.get("fields") or {},
-        "submitted_by": user.id,
-        "submitted_at": now.isoformat(),
-    }
 
-    # Plan-based HITL: resume the exact input Step named by the client. An
-    # approval/review/error card is a different decision surface and must not
-    # be collapsed into this free-form input endpoint.
-    try:
-        from packages.core.models.execution import ExecutionPlan, ExecutionStep
-        from packages.core.services.task_state_machine import apply_task_status_transition
-
-        live_plan_statuses = (
-            ExecutionPlanStatus.RUNNING,
-            ExecutionPlanStatus.PAUSED,
-            ExecutionPlanStatus.NEEDS_ATTENTION,
-        )
-        if step_id:
-            waiting_step = (await db.execute(
-                select(ExecutionStep).where(
-                    ExecutionStep.id == step_id,
-                    ExecutionStep.entity_id == user.entity_id,
-                    ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
-                )
-            )).scalar_one_or_none()
-            if waiting_step is None:
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": None,
-                    "step_id": step_id,
-                    "detail": "The requested input step is no longer waiting.",
-                }
-            plan = (await db.execute(
-                select(ExecutionPlan).where(
-                    ExecutionPlan.id == waiting_step.plan_id,
-                    ExecutionPlan.task_id == task.id,
-                    ExecutionPlan.entity_id == user.entity_id,
-                    ExecutionPlan.status.in_(live_plan_statuses),
-                )
-            )).scalar_one_or_none()
-            if plan is None:
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": waiting_step.plan_id,
-                    "step_id": step_id,
-                    "detail": "The requested input step does not belong to an active Plan for this task.",
-                }
-        else:
-            waiting_step = None
-            plan = (await db.execute(
-                select(ExecutionPlan).where(
-                    ExecutionPlan.task_id == task.id,
-                    ExecutionPlan.entity_id == user.entity_id,
-                    ExecutionPlan.status.in_(live_plan_statuses),
-                ).order_by(ExecutionPlan.created_at.desc()).limit(1)
-            )).scalar_one_or_none()
-            if plan is not None:
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": plan.id,
-                    "step_id": None,
-                    "detail": "step_id is required to answer a Plan input request.",
-                }
-
-        if plan is not None and waiting_step is not None:
-            from packages.core.constants.approvals import HitlType
-            from packages.core.services.hitl_options import human_step_hitl_type
-
-            step_hitl_type = human_step_hitl_type(waiting_step.params)
-            if step_hitl_type != HitlType.INPUT.value:
-                detail = (
-                    "This review requires an explicit approve, request-changes, "
-                    "or reject decision on its Workspace Chat card."
-                    if step_hitl_type == HitlType.REVIEW.value
-                    else (
-                        "This step requires an explicit Workspace Chat decision; "
-                        "respond to its card to continue."
-                    )
-                )
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": plan.id,
-                    "step_id": waiting_step.id,
-                    "detail": detail,
-                }
-            try:
-                from packages.core.governance.approvals import (
-                    ApprovalDecisionRequiredError,
-                    grant_open_request_for_step,
-                )
-                from packages.core.services.step_resume import (
-                    lock_waiting_step_for_decision,
-                )
-                await grant_open_request_for_step(
-                    db,
-                    entity_id=user.entity_id,
-                    step_id=waiting_step.id,
-                    by_user_id=user.id,
-                    via="task_input",
-                    expected_hitl_type=HitlType.INPUT.value,
-                )
-                locked_step = await lock_waiting_step_for_decision(
-                    db,
-                    entity_id=user.entity_id,
-                    workspace_id=plan.workspace_id,
-                    task_id=task.id,
-                    plan_id=plan.id,
-                    step_id=waiting_step.id,
-                )
-            except ApprovalDecisionRequiredError as exc:
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": plan.id,
-                    "step_id": waiting_step.id,
-                    "detail": str(exc),
-                }
-            except Exception:
-                logger.warning(
-                    "task input: request resolution failed for step %s",
-                    waiting_step.id, exc_info=True,
-                )
-                await db.rollback()
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": plan.id,
-                    "step_id": waiting_step.id,
-                }
-            if locked_step is None:
-                return {
-                    "resumed": False,
-                    "dispatched": False,
-                    "mode": None,
-                    "plan_id": plan.id,
-                    "step_id": waiting_step.id,
-                }
-            waiting_step = locked_step
-            waiting_step.human_input_response = {
-                **meta,
-                "user": submitted_by,
-                "payload": payload,
-            }
-            # M9.2 — the human just delivered the awaited input: fulfil
-            # any open commitment rows for this step (best-effort).
-            try:
-                from packages.core.humans import resolve_commitments_for_step
-                await resolve_commitments_for_step(
-                    db, waiting_step.id,
-                    {"kind": "hitl_response"},
-                )
-            except Exception:
-                logger.warning(
-                    "human commitment resolve failed for step %s (ignored)",
-                    waiting_step.id, exc_info=True,
-                )
-            waiting_step.step_status = ExecutionStepStatus.PENDING.value
-            waiting_step.human_input_prompt = None
-            waiting_step.current_lease_id = None
-            plan.status = ExecutionPlanStatus.RUNNING.value
-            plan.completed_at = None
-            plan.last_error = None
-            if task.status == TaskStatus.WAITING_ON_CUSTOMER:
-                await apply_task_status_transition(
-                    task, "in_progress", now=now, db=db,
-                    actor_kind="user", actor_id=user.id,
-                )
-            await add_task_log(
-                db,
-                task.id,
-                TaskLogType.AI_HITL_RESUMED,
-                f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
-                actor=TaskActor.USER,
-                created_by=submitted_by,
-                metadata={
-                    **meta,
-                    "mode": "plan",
-                    "plan_id": plan.id,
-                    "step_id": waiting_step.id,
-                },
-            )
-            from packages.core.plans.wakeup import stage_plan_cycle_wake
-
-            plan_wake = await stage_plan_cycle_wake(
-                db,
-                plan.id,
-                reason="task_hitl_resumed",
-            )
-            await db.commit()
-            from packages.core.plans.wakeup import dispatch_plan_cycle_wake_hint
-
-            if plan_wake is not None:
-                dispatch_plan_cycle_wake_hint(
-                    plan_wake,
-                    reason="task_hitl_post_commit_hint",
-                )
-            dispatched = plan_wake is not None
-            from packages.core.services.realtime import broadcast_task_runtime_update
-
-            await broadcast_task_runtime_update(
-                task.entity_id,
-                task_id=task.id,
-                workspace_id=task.workspace_id,
-                plan_id=plan.id,
-                event="task_hitl_resolved",
-            )
-            return {
-                "resumed": True,
-                "dispatched": dispatched,
-                "mode": "plan",
-                "plan_id": plan.id,
-                "step_id": waiting_step.id,
-            }
-    except Exception as exc:
-        logger.warning("Plan HITL structured response failed: %s", exc)
-        await db.rollback()
-        return {
-            "resumed": False,
-            "dispatched": False,
-            "mode": None,
-            "plan_id": None,
-            "step_id": step_id,
-            "detail": "The Plan input could not be applied safely.",
-        }
-
-    # Re-read and lock the Task before entering the compatibility runtime. The
-    # closed factory owns this decision; assignment fields are not a second
-    # routing switch. An exact Plan row remains an authoritative origin record,
-    # including states intentionally outside ``live_plan_statuses`` above.
-    # The per-Task approval boundary comes first: a terminal transition takes
+    # Re-read and lock the Task before entering the runtime. The closed
+    # factory owns this decision; assignment fields are not a second routing
+    # switch. The per-Task approval boundary comes first: a terminal transition takes
     # it before the input request and the Task, so an answer serializes with
     # it (and with a Task agent loop's park) instead of locking in reverse.
     from packages.core.services.task_runtime_approvals import lock_task_runtime_approval_boundary
@@ -1940,15 +1679,20 @@ async def _resume_hitl(
             "resumed": False,
             "dispatched": False,
             "mode": None,
-            "plan_id": None,
-            "step_id": step_id,
             "detail": "This Task is no longer available for input resume.",
         }
     task = locked_task
 
     from packages.core.services.task_agent_loop_hitl import task_agent_loop_waiting_on_input
 
-    if not step_id and await task_agent_loop_waiting_on_input(db, task):
+    if (
+        # A comment or the Task page answers only a Task that waits on its
+        # person. While the Task is in progress (a delegated agent asked
+        # while others still work) it stays a plain comment; that agent's
+        # card names its request and answers it at any time.
+        task.status == TaskStatus.WAITING_ON_CUSTOMER
+        and await task_agent_loop_waiting_on_input(db, task)
+    ):
         # A Task agent loop parked on its question: the shared answer service
         # writes the answer into its checkpoint and stages its wake.
         from packages.core.services.task_input_resume import apply_task_input_answer
@@ -1977,92 +1721,21 @@ async def _resume_hitl(
                 "resumed": True,
                 "dispatched": True,
                 "mode": "agent_loop",
-                "plan_id": None,
-                "step_id": None,
             }
         return {
             "resumed": False,
             "dispatched": False,
             "mode": None,
-            "plan_id": None,
-            "step_id": None,
             "detail": "This Task is no longer waiting for an answer.",
         }
 
-    from packages.core.constants.task import TaskRuntimeKind
-    from packages.core.services.task_execution import resolve_task_execution
-
-    execution = await resolve_task_execution(db, task)
-    origin_plan_id = (await db.execute(
-        select(ExecutionPlan.id).where(
-            ExecutionPlan.task_id == task.id,
-            ExecutionPlan.entity_id == task.entity_id,
-        ).order_by(ExecutionPlan.created_at.desc()).limit(1)
-    )).scalar_one_or_none()
-    if origin_plan_id is not None:
-        return {
-            "resumed": False,
-            "dispatched": False,
-            "mode": None,
-            "plan_id": origin_plan_id,
-            "step_id": step_id,
-            "detail": "This Task is owned by Planner execution; resolve its Plan approval, input, or recovery action instead.",
-        }
-    if execution.runtime_kind is not TaskRuntimeKind.LEGACY_AGENT:
-        detail = (
-            "This Task is owned by Planner execution; resolve its Plan "
-            "approval, input, or recovery action instead."
-            if execution.runtime_kind in {
-                TaskRuntimeKind.COORDINATED_PLAN,
-                TaskRuntimeKind.PLAN_RESUME,
-            }
-            else (
-                f"Task runtime {execution.runtime_kind.value!r} does not "
-                "support legacy Agent input resume."
-            )
-        )
-        return {
-            "resumed": False,
-            "dispatched": False,
-            "mode": None,
-            "plan_id": None,
-            "step_id": step_id,
-            "detail": detail,
-        }
-
-    # Only an origin-free, factory-selected legacy Agent task may resume
-    # through run_agent_task.
-    from packages.core.services.task_input_resume import (
-        apply_task_input_answer,
-        dispatch_task_input_resume,
-    )
-
-    if task.status == TaskStatus.WAITING_ON_CUSTOMER:
-        applied = await apply_task_input_answer(
-            db,
-            task=task,
-            user_id=user.id,
-            user_label=submitted_by,
-            response_text=response_text,
-            payload=payload,
-        )
-        if applied["resumed"]:
-            await db.commit()
-            dispatched = dispatch_task_input_resume(task.id, applied["dispatch_agent_id"])
-            return {
-                "resumed": True,
-                "dispatched": dispatched,
-                "mode": "agent",
-                "plan_id": None,
-                "step_id": None,
-            }
-
+    # Every Task run is an agent loop: one not parked on a question above has
+    # nothing to resume.
     return {
         "resumed": False,
         "dispatched": False,
         "mode": None,
-        "plan_id": None,
-        "step_id": None,
+        "detail": "This Task is not waiting for an answer.",
     }
 
 
@@ -2089,12 +1762,12 @@ async def respond_to_hitl(
         "choice": req.choice,
         "fields": fields,
         "note": req.note,
+        "request_id": req.request_id,
     }
     result = await _resume_hitl(
         db,
         task,
         user,
-        step_id=req.step_id,
         response_text=response_text,
         payload=payload,
     )
@@ -2282,123 +1955,6 @@ async def decide_approval_task(
     )
 
 
-async def _task_input_requests(db: AsyncSession, task: Task) -> list[TaskInputRequestResponse]:
-    """Project existing, live INPUT cards; never mint a decision from Step prose.
-
-    The Workspace Chat resolver remains the sole writer for these cards. In
-    particular a subagent's WAITING_HUMAN state alone cannot identify an input
-    rather than permission, login, review, or effect reconciliation.
-    """
-    if not task.workspace_id or task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
-        return []
-    from sqlalchemy.orm import aliased
-
-    from packages.core.ai.runtime import runtime_public_tool_payload
-    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus, HitlType
-    from packages.core.constants.execution import WorkLeaseStatus
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.hitl_request import HitlRequest
-    from packages.core.models.task import Conversation, Message
-    from packages.core.models.worker import WorkLease
-    from packages.core.workspace_chat.service import open_pending_action_filters
-
-    newer_request = aliased(HitlRequest)
-    latest_request_id = (
-        select(newer_request.id)
-        .where(
-            newer_request.entity_id == task.entity_id,
-            newer_request.workspace_id == task.workspace_id,
-            newer_request.origin_task_id == task.id,
-            newer_request.origin_plan_id == ExecutionStep.plan_id,
-            newer_request.origin_step_id == ExecutionStep.id,
-            newer_request.origin_kind.in_((ApprovalOriginKind.LEASE.value, ApprovalOriginKind.STEP.value)),
-        )
-        .order_by(newer_request.created_at.desc(), newer_request.id.desc())
-        .limit(1).correlate(ExecutionStep).scalar_subquery()
-    )
-    latest_lease_id = (
-        select(WorkLease.id)
-        .where(
-            WorkLease.step_id == ExecutionStep.id,
-            WorkLease.plan_id == ExecutionStep.plan_id,
-            WorkLease.entity_id == task.entity_id,
-            WorkLease.workspace_id == task.workspace_id,
-        )
-        .order_by(WorkLease.leased_at.desc(), WorkLease.id.desc())
-        .limit(1).correlate(ExecutionStep).scalar_subquery()
-    )
-    live_lease = (
-        select(WorkLease.id).where(
-            WorkLease.id == latest_lease_id,
-            WorkLease.status == WorkLeaseStatus.NEEDS_HUMAN.value,
-            HitlRequest.dedup_key == "lease:" + WorkLease.id + ":" + Message.pending_action["kind"].as_string(),
-        ).correlate(ExecutionStep, HitlRequest, Message).exists()
-    )
-    rows = (await db.execute(
-        select(Message, HitlRequest, ExecutionStep)
-        .join(Conversation, Conversation.id == Message.conversation_id)
-        .join(HitlRequest, HitlRequest.id == Message.pending_action["approval_request_id"].as_string())
-        .join(ExecutionStep, ExecutionStep.id == HitlRequest.origin_step_id)
-        .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
-        .where(
-            *open_pending_action_filters(task.entity_id, task.workspace_id),
-            Message.message_kind == "hitl_request",
-            or_(
-                Conversation.scope == "workspace_main",
-                and_(Conversation.scope == "workspace_thread", Conversation.thread_ref_kind == "plan", Conversation.thread_ref_id == ExecutionPlan.id),
-            ),
-            ExecutionPlan.task_id == task.id,
-            ExecutionPlan.entity_id == task.entity_id,
-            ExecutionPlan.workspace_id == task.workspace_id,
-            ExecutionPlan.status.in_(("running", "paused", "needs_attention")),
-            ExecutionStep.entity_id == task.entity_id,
-            ExecutionStep.workspace_id == task.workspace_id,
-            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN.value,
-            HitlRequest.id == latest_request_id,
-            HitlRequest.hitl_type == HitlType.INPUT.value,
-            HitlRequest.status == ApprovalStatus.PENDING.value,
-            or_(HitlRequest.origin_message_id.is_(None), HitlRequest.origin_message_id == Message.id),
-            or_(HitlRequest.origin_conversation_id.is_(None), HitlRequest.origin_conversation_id == Conversation.id),
-            Message.pending_action["kind"].as_string().in_(("human_input", "needs_input")),
-            or_(Message.pending_action["hitl_type"].as_string().is_(None), Message.pending_action["hitl_type"].as_string() == HitlType.INPUT.value),
-            Message.pending_action["step_id"].as_string() == ExecutionStep.id,
-            Message.pending_action["plan_id"].as_string() == ExecutionPlan.id,
-            or_(
-                and_(HitlRequest.origin_kind == ApprovalOriginKind.LEASE.value, live_lease),
-                and_(HitlRequest.origin_kind == ApprovalOriginKind.STEP.value, ExecutionStep.kind == "human"),
-            ),
-        )
-        .order_by(ExecutionStep.created_at.asc(), ExecutionStep.id.asc(), Message.created_at.desc(), Message.id.desc())
-        .limit(100)
-    )).all()
-    requests: list[TaskInputRequestResponse] = []
-    seen: set[str] = set()
-    for message, request, step in rows:
-        if step.id in seen:
-            continue
-        seen.add(step.id)
-        # Public form fields only: no continuation, token, argument preview,
-        # or arbitrary provider payload is copied into the Task response.
-        action = runtime_public_tool_payload({
-            key: value for key, value in message.pending_action.items()
-            if key in {"kind", "title", "context_summary", "questions", "input_schema", "prompt", "question", "options"}
-        })
-        action.update({
-            "hitl_type": HitlType.INPUT.value,
-            "approval_request_id": request.id,
-            "plan_id": step.plan_id,
-            "step_id": step.id,
-            "task_id": task.id,
-        })
-        if action["kind"] == "human_input":
-            action.setdefault("prompt", step.human_input_prompt or request.reason or "")
-        requests.append(TaskInputRequestResponse(
-            message_id=message.id, request_id=request.id,
-            plan_id=step.plan_id, step_id=step.id, pending_action=action,
-        ))
-    return requests
-
-
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_one_task(
     task_id: str,
@@ -2409,12 +1965,6 @@ async def get_one_task(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_workspace_readable(db, user, task.workspace_id)
-    try:
-        from packages.core.services.task_execution_reconcile import reconcile_task_from_latest_completed_plan
-
-        await reconcile_task_from_latest_completed_plan(db, task)
-    except Exception:
-        logger.debug("Task execution reconciliation skipped for %s", task_id, exc_info=True)
     users, agents, staff, workspaces, requester_ids, author_agent_ids = (
         await _resolve_lookups(db, [task])
     )
@@ -2423,7 +1973,6 @@ async def get_one_task(
         task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
         current_blocker=blockers.get(task.id),
     )
-    response.pending_input_requests = await _task_input_requests(db, task)
     return response
 
 
@@ -2513,6 +2062,16 @@ async def update_one_task(
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+    if req.owner_subscription_id:
+        try:
+            await ensure_workspace_owner_subscription(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=getattr(req, "workspace_id", None) or (old_task.workspace_id if old_task else None),
+                subscription_id=req.owner_subscription_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     # Build update payload — empty strings mean "clear this field"
     update_data = {}
@@ -2530,6 +2089,8 @@ async def update_one_task(
             update_data[key] = None
         else:
             update_data[key] = val
+    if "required_skills" in update_data:
+        update_data["required_skills"] = await _required_skill_refs(db, user, update_data["required_skills"])
     if "details" in update_data:
         update_data["details"] = _merge_task_details(
             old_task.details if old_task else None,
@@ -2556,6 +2117,14 @@ async def update_one_task(
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
+    if (
+        getattr(user, "_collaborator_workspace_ids", None) is None
+        and task.collaborator_ids
+        and _TASK_CONTENT_FIELDS & set(update_data)
+    ):
+        # A customer member saving the Task's content takes ownership of it:
+        # its runs are no longer narrowed to the collaborators who steered it.
+        task.collaborator_ids = None
     # Any explicit execution-identity change enters the closed factory. The
     # factory, not this API, decides whether that Task type/runtime starts.
     from packages.core.constants.agents import is_master_agent as _is_master
@@ -2719,7 +2288,7 @@ async def add_log(
         if mention_agent_items or mention_user_items:
             meta["mentions"] = mention_agent_items + mention_user_items
     if (
-        task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,)
+        (task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,) or req.request_id)
         and req.log_type == TaskLogType.COMMENT
     ):
         # This comment may answer a waiting Task (_resume_hitl below). Take the
@@ -2738,9 +2307,10 @@ async def add_log(
     hitl_result = {"resumed": False}
     queued_learning_ids: list[str] = []
     # HITL resumption: comment on a waiting task resumes execution
-    if task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,) and req.log_type == TaskLogType.COMMENT:
-        payload = {"response": req.content, "fields": {}, "source": "comment"}
-        hitl_result = await _resume_hitl(db, task, user, step_id=None, response_text=req.content.strip(), payload=payload)
+    if (task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,) or req.request_id) and req.log_type == TaskLogType.COMMENT:
+        payload = {"response": req.content, "fields": {}, "source": "comment", "request_id": req.request_id,
+                   "attachments": req.attachments}
+        hitl_result = await _resume_hitl(db, task, user, response_text=req.content.strip(), payload=payload)
         if hitl_result.get("resumed"):
             queued_learning_ids.extend(await _record_task_user_decision_evidence(
                 db,
@@ -2820,6 +2390,7 @@ async def add_log(
         and bool((req.content or "").strip())
         and bool(task.workspace_id)
         and not bool(hitl_result.get("resumed"))
+        and not bool(hitl_result.get("handled"))
         and not _is_attachment_only_comment(req.content, req.attachments)
         and bool(responder_agent_ids)
     )

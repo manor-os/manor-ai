@@ -9,7 +9,11 @@ export type ResultFileMetadata = {
 };
 
 export function isVideoResultFile(file: ResultFileMetadata): boolean {
-  return fileReferenceKind(file.name, file.mimeType, file.fileType) === "video";
+  return isMediaResultFile(file, "video");
+}
+
+export function isMediaResultFile(file: ResultFileMetadata, media: "video" | "audio" | "image"): boolean {
+  return fileReferenceKind(file.name, file.mimeType, file.fileType) === media;
 }
 
 export function isVideoPreviewFile(file: ResultFileMetadata): boolean {
@@ -24,9 +28,35 @@ export function prioritizeVideoResultFiles<T extends ResultFileMetadata>(files: 
   return [...videos, ...previews, ...other];
 }
 
+const PAGED_SOURCE = /\.(?:pptx?|docx?|xlsx?|key|pages)$/i;
+const RESULT_THUMBNAIL = /\.(?:png|jpe?g|gif|webp|bmp|avif|mp4|mov|webm|m4v|mkv|pptx?|pdf|docx?|xlsx?)$/i;
+
+/** A PDF made from an editable file of the same name in the same result (deck.pptx → deck.pdf). */
+export function isRenderedCopy(file: ResultFileMetadata, files: readonly ResultFileMetadata[]): boolean {
+  const match = file.name.match(/^(.*)\.pdf$/i);
+  if (!match) return false;
+  const stem = match[1].toLowerCase();
+  return files.some((other) => other !== file && PAGED_SOURCE.test(other.name)
+    && other.name.replace(/\.[^.]+$/, "").toLowerCase() === stem);
+}
+
+/**
+ * Which final files are shown by what they look like (a picture, a frame, a
+ * first page) and which as a plain file link: text files, and the PDF copy of
+ * a deck or document already shown by its own first page.
+ */
+export function partitionPreviewedResultFiles<T extends ResultFileMetadata>(files: readonly T[]): { previewed: T[]; listed: T[] } {
+  const previewed = files.filter((file) => RESULT_THUMBNAIL.test(file.name) && !isRenderedCopy(file, files));
+  return { previewed, listed: files.filter((file) => !previewed.includes(file)) };
+}
+
 /** Legacy output bundles include production evidence alongside deliverables. */
+/** A record ID or a content hash in a file name: a working file a run named for itself, not for a person. */
+const MACHINE_NAMED = /(?:^|[^0-9A-Za-z])(?:[0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{24,})(?:[^0-9A-Za-z]|$)/;
+
 export function isSupportingResultFile(file: ResultFileMetadata): boolean {
   return isVideoPreviewFile(file)
+    || MACHINE_NAMED.test(file.name)
     || /(?:^|[\s_.\/-])(?:qa|canvas|storyboard|manifest|timeline|ledger|reference|thumbnail|preview|draft|source|raw|editable|subtitles?)(?:$|[\s_.\/-])|quality[-_ ]?review|internal[-_ ]?review|(?:first|last)[-_ ]?frames?|frame[-_ ]?samples?|contact[-_ ]?sheet|\.video-edit\.json$|\.(?:srt|vtt)$|分镜|字幕|质检|预览|草稿|素材/i.test(file.name);
 }
 

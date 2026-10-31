@@ -114,6 +114,7 @@ def test_reconnect_overwrites_unreadable_credentials_without_preserving_refresh(
                 "error": "credential_decrypt_failed",
             },
             "last_health_check": {"ok": False},
+            "health_incident": {"opened_at": "2026-10-22T09:00:00+00:00", "notified_at": None},
         },
     )
     stored: dict[str, str] = {}
@@ -148,6 +149,7 @@ def test_reconnect_overwrites_unreadable_credentials_without_preserving_refresh(
     assert account.credential_ref == "vault:v1:replacement"
     assert "oauth_refresh" not in account.profile
     assert "last_health_check" not in account.profile
+    assert "health_incident" not in account.profile
 
 
 # ── User-scope refresh ──────────────────────────────────────────────────────

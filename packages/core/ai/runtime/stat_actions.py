@@ -17,9 +17,43 @@ STAT_ASSESSMENT_GUIDANCE = (
     "Read get_stat_status before assessing metrics. To record_stat_assessment pass "
     "stat_id, expected_revision, stable idempotency_key, status=measured|insufficient_evidence, "
     "value (number or null), reasoning, evidence=[{document_id,updated_at,locator,reason}], gaps=[...]. "
-    "get_stat_status accepts document_ids to obtain accessible source versions. "
+    "get_stat_status accepts document_ids to obtain accessible source versions, and stat_ids or key_prefix "
+    "to read only the Stats being assessed. "
     "Unknown is not zero. Only a returned persisted observation_id proves a saved assessment."
 )
+ADD_ASSESSED_METRICS_GUIDANCE = (
+    "To track audience numbers an agent assesses on a schedule, add_assessed_metrics with "
+    "templates=[latest_video_views|latest_video_comments|latest_video_likes|followers|active_users], "
+    "optional service_key (the service whose agent assesses) and cadence=daily|weekly."
+)
+_STAT_ACTIONS = {"get_stat_status", "record_stat_assessment", "add_assessed_metrics"}
+
+
+async def _add_assessed_metrics(db, *, entity_id: str, workspace_id: str, user_id: str, params: dict[str, Any]) -> str:
+    """Same service and checks as the Stats API; this path commits its own session."""
+    from packages.core.models.user import User
+    from packages.core.models.workspace import Workspace
+    from packages.core.stats.assessment_templates import add_assessed_metrics
+
+    templates = params.get("templates")
+    if not isinstance(templates, list) or not all(isinstance(key, str) for key in templates):
+        raise StatError("templates must be a list of template keys")
+    workspace = (await db.execute(select(Workspace).where(
+        Workspace.id == workspace_id, Workspace.entity_id == entity_id,
+    ))).scalar_one_or_none()
+    user = (await db.execute(select(User).where(User.id == user_id, User.entity_id == entity_id))).scalar_one_or_none()
+    if workspace is None or user is None:
+        raise StatError("an explicit authorized workspace is required")
+    result = await add_assessed_metrics(
+        db, workspace=workspace, user=user, template_keys=templates,
+        service_key=params.get("service_key") or None, cadence=str(params.get("cadence") or "daily"),
+    )
+    await db.commit()
+    return json.dumps({
+        "stat_ids": result["stat_ids"], "job_id": result["job_id"], "service_key": result["service_key"],
+        "schedule_enabled": result["enabled"],
+        "note": None if result["enabled"] else "The assessment Automation is paused; resume it in Automations to assess on schedule.",
+    })
 
 
 async def runtime_stat_action(
@@ -30,7 +64,7 @@ async def runtime_stat_action(
     from packages.core.database import async_session
 
     try:
-        if action not in {"get_stat_status", "record_stat_assessment"}:
+        if action not in _STAT_ACTIONS:
             raise StatError("unsupported assessment action")
         if not workspace_id:
             raise StatError("an explicit authorized workspace is required")
@@ -40,8 +74,21 @@ async def runtime_stat_action(
                 db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
             ):
                 raise StatError("the current actor cannot manage assessments in this workspace")
+            if action == "add_assessed_metrics":
+                return await _add_assessed_metrics(db, entity_id=entity_id, workspace_id=workspace_id,
+                                                   user_id=user_id, params=params)
             if action == "get_stat_status":
                 rows = await list_stats(db, entity_id=entity_id, workspace_id=workspace_id)
+                stat_ids = params.get("stat_ids")
+                if stat_ids is not None:
+                    if not isinstance(stat_ids, list) or len(stat_ids) > 50:
+                        raise StatError("stat_ids must be an array of at most 50 IDs")
+                    rows = [row for row in rows if row.id in set(stat_ids)]
+                key_prefix = params.get("key_prefix")
+                if key_prefix is not None:
+                    if not isinstance(key_prefix, str):
+                        raise StatError("key_prefix must be a string")
+                    rows = [row for row in rows if row.key.startswith(key_prefix.strip().lower())]
                 items = []
                 for row in rows:
                     history = await list_observations(db, stat_id=row.id, limit=1)

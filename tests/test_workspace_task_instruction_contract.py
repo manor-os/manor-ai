@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from packages.core.ai.runtime import workspace_task_actions
-from packages.core.ai.runtime.planning import runtime_planner_task_prompt
 from packages.core.ai.tools.manor_tool import _manor_handler
 from packages.core.constants.task_actors import TaskActor
 from packages.core.models.task import Task
 from packages.core.models.workspace import AgentSubscription
 from packages.core.services import task_service
+from packages.core.workers.task_agent_loop import task_brief
 
 
 @pytest.mark.asyncio
@@ -35,6 +35,8 @@ async def test_composite_task_instructions_reach_planner_without_losing_rules(mo
     monkeypatch.setattr("packages.core.database.async_session", session)
     monkeypatch.setattr(workspace_task_actions, "_load_workspace", AsyncMock(return_value=SimpleNamespace(id="workspace")))
     monkeypatch.setattr(workspace_task_actions, "_resolve_owner_binding", AsyncMock(return_value=(None, None, [])))
+    monkeypatch.setattr(workspace_task_actions, "pending_chat_draft", AsyncMock(return_value=None))
+    monkeypatch.setattr(workspace_task_actions, "open_chat_draft_preparing", AsyncMock(return_value=None))
     monkeypatch.setattr(workspace_task_actions, "_resolve_goal_links_for_task", AsyncMock(return_value=([], "none")))
     monkeypatch.setattr(workspace_task_actions, "runtime_tool_is_user_requested", AsyncMock(return_value=True))
     monkeypatch.setattr(task_service, "agent_log_authorship", AsyncMock(return_value=("user", {}, TaskActor.USER)))
@@ -43,8 +45,6 @@ async def test_composite_task_instructions_reach_planner_without_losing_rules(mo
     locale = AsyncMock(return_value="zh")
     monkeypatch.setattr(task_service, "_task_log_locale", locale)
     monkeypatch.setattr("packages.core.services.workspace_service.record_activity", AsyncMock())
-    dispatch = Mock()
-    monkeypatch.setattr("packages.core.tasks.ai_tasks.plan_and_run_task.delay", dispatch)
     saved = []
 
     async def create_task(_db, entity_id, **fields):
@@ -94,7 +94,6 @@ async def test_composite_task_instructions_reach_planner_without_losing_rules(mo
     # Subscription resolution plus the transactional Task execution outbox.
     assert db.execute.await_count == 2
     db.commit.assert_awaited_once()
-    dispatch.assert_not_called()
     assert params == original
     assert saved[0].description == ""
     assert saved[0].creator_id == "user"
@@ -104,11 +103,10 @@ async def test_composite_task_instructions_reach_planner_without_losing_rules(mo
     assert [rule["description"] for rule in runtime["rules"]] == [rule["description"] for rule in rules]
     assert runtime["captured_from"] == {"conversation_id": "conversation", "user_id": "user"}
 
-    # This is the actual task/user message builder used by Planner._generate_plan.
-    prompt = runtime_planner_task_prompt(saved[0])
-    binding_prompt = prompt.split("Details JSON:", 1)[0]
-    assert expected in binding_prompt
-    assert all(rule["description"] in binding_prompt for rule in rules)
+    # This is the actual Task brief the agent loop runs on.
+    prompt = task_brief(saved[0])
+    assert expected in prompt
+    assert all(rule["description"] in prompt for rule in rules)
     if canonical and canonical.strip():
         assert instructions not in prompt
     else:

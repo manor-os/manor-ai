@@ -6,12 +6,14 @@ configured. Its action enum covers lifecycle, background execution status,
 file access, result projection, and cancellation. The former tool names remain
 execution-only compatibility aliases.
 
-Sandbox context (sandbox_id plus exact owner per conversation) is tracked via
-Redis so sessions survive across chat turns. Admission fails closed when that
-authorization context cannot be persisted.
+Sandbox bindings (which sandbox each caller may operate, one slot per owner,
+conversation or task binding key, agent, and sandbox kind) are tracked via
+Redis so sessions survive across chat turns. Admission fails closed when a
+binding cannot be persisted, and a call without a binding scope is denied.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -19,37 +21,46 @@ import logging
 import mimetypes
 import os
 import shlex
+import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any
 
+from packages.core.ai.runtime.artifact_save import project_bytes_into_knowledge
+from packages.core.ai.runtime.file_images import FILE_IMAGE_DELIVERY_CONTRACT
 from packages.core.ai.runtime.file_actions import (
     RuntimeFileCommitError,
     RuntimeFileProjectionError,
     RuntimeFileProjectionTransactionFactory,
     runtime_entity_file_root,
-    runtime_entity_filesystem_read_lock,
     runtime_entity_filesystem_mutation_lock,
-    runtime_guard_file_read_access,
     runtime_guard_file_mutation,
-    runtime_open_entity_file_snapshot,
     runtime_write_entity_file_atomic,
 )
+from packages.core.ai.runtime.workspace_reads import runtime_read_workspace_file
 from packages.core.ai.runtime.file_contracts import FileMutationAction
 from packages.core.ai.runtime.composite_tools import (
     RuntimeCompositeToolCallFactory,
     SandboxToolAction,
     SandboxToolErrorCode,
 )
+from packages.core.ai.runtime.sandbox_toolset import sandbox_toolset_summary
+from packages.core.services.runtime_activity import sandbox_activity_recorder
 from packages.core.ai.runtime.sandbox import (
-    RUNTIME_SANDBOX_CONTEXT_PREFIX,
-    RUNTIME_SANDBOX_CONTEXT_TTL,
-    RUNTIME_SANDBOX_IDLE_THRESHOLD,
-    runtime_delete_sandbox_context,
-    runtime_init_sandbox_context,
-    runtime_load_sandbox_context,
-    runtime_sandbox_context_owner_matches,
-    runtime_save_sandbox_context,
+    RUNTIME_SANDBOX_LAYOUT_NOTE,
+    RuntimeSandboxKind,
+    RuntimeSandboxScope,
+    primary_sandbox_scope_for,
+    runtime_agent_sandbox,
+    runtime_agent_skill_in,
+    runtime_agent_viewed_skill_in,
+    runtime_binding_is_live,
+    runtime_binding_skills,
+    runtime_binding_was_released,
+    runtime_load_sandbox_binding,
+    runtime_sandbox_agent_workdir,
+    runtime_sandbox_credentials_refused,
 )
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
@@ -57,6 +68,8 @@ from packages.core.ai.runtime.tool_context import (
     runtime_tool_call_context_from_kwargs,
 )
 from packages.core.services.sandbox_session_service import (
+    GENERIC_SANDBOX_REUSE_SCOPE,
+    GENERIC_SANDBOX_SKILL_NAME,
     SandboxBinding,
     SandboxBundle,
     SandboxOwner,
@@ -67,19 +80,31 @@ from packages.core.services.sandbox_session_service import (
     forget_vanished_sandbox,
     release_sandbox_session,
 )
+from packages.core.services import sandbox_session_service as _sessions
+from packages.core.services.sandbox_sdk.capabilities import (
+    EXEC_START,
+    SKILL_SLOTS,
+    WORK_AREAS,
+    RunnerCapabilities,
+    outdated_message,
+)
+from packages.core.services.sandbox_sdk.exceptions import SandboxRunnerOutdatedError
 from packages.core.services.generated_media_naming import (
     collision_safe_artifact_path,
     resolve_workspace_artifact_base_dir,
     scope_workspace_artifact_path,
 )
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
-from packages.core.services.file_refs import file_ref, is_internal_file_target, parse_file_reference
+from packages.core.services.file_refs import file_ref
 from packages.core.services.generated_file_refs import entity_fs_open_url
 
 logger = logging.getLogger(__name__)
 
 
-_GENERIC_SANDBOX_NAME = "generic-sandbox"
+_GENERIC_SANDBOX_NAME = GENERIC_SANDBOX_SKILL_NAME
+# What the model needs to know about sharing, kept short (tool result and
+# schema): one sandbox per user, each conversation or task in its own area.
+_SHARED_SANDBOX_NOTE = RUNTIME_SANDBOX_LAYOUT_NOTE
 _GENERIC_SANDBOX_FILES = {
     "README.md": (
         "# Generic sandbox\n\n"
@@ -101,6 +126,13 @@ def _sandbox_error(code: SandboxToolErrorCode, message: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _runner_outdated_error(exc: BaseException) -> str:
+    """The runner lacks what this call needs: nothing ran, and retrying will not help."""
+
+    logger.warning("[sandbox] runner outdated: %s", exc)
+    return _sandbox_error(SandboxToolErrorCode.RUNNER_OUTDATED, str(exc))
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -146,93 +178,92 @@ def _get_sandbox_api_token() -> str:
 
 SANDBOX_SERVICE_URL = _get_sandbox_service_url()
 
-_SANDBOX_CTX_PREFIX = RUNTIME_SANDBOX_CONTEXT_PREFIX
-_SANDBOX_CTX_TTL = RUNTIME_SANDBOX_CONTEXT_TTL
-_SANDBOX_IDLE_THRESHOLD = RUNTIME_SANDBOX_IDLE_THRESHOLD
-
 
 # ────────────────────────────────────────────────────────────────
-# Sandbox context helpers (Redis-backed, async, graceful fallback)
+# Sandbox bindings (Redis-backed, owned by owner x conversation)
 # ────────────────────────────────────────────────────────────────
 
-async def _save_ctx(conversation_id: str, ctx: dict) -> None:
-    await runtime_save_sandbox_context(conversation_id, ctx)
+def _caller_scope(runtime_context: Any, entity_id: str | None = None) -> RuntimeSandboxScope | None:
+    """The owner x conversation scope this call operates sandboxes in.
 
-
-async def _load_ctx(conversation_id: str) -> dict | None:
-    """Load the sandbox context bound to one scope.
-
-    The scope is the sandbox *binding key*, which is the conversation id for a
-    chat run and the synthetic task key for a conversation-less task-worker
-    run. Handlers therefore pass ``runtime_context.sandbox_binding_key``, never
-    their ``conversation_id`` argument: the latter is empty for a worker run,
-    so scoping by it would deny every call. Everything in a handler that is not
-    sandbox scope (file-mutation guards, knowledge-sync provenance) keeps the
-    real conversation id.
+    Built from the sandbox *binding key* -- the root conversation id for a
+    human run (delegates and sub-agents run in their parent's conversation),
+    the synthetic task key for user-less and conversation-less runs -- never
+    from a handler's ``conversation_id`` argument alone: that is empty for a
+    worker run. Everything in a handler that is not sandbox scope
+    (file-mutation guards, knowledge-sync provenance) keeps the real
+    conversation id. The acting agent is NOT part of the scope: every agent
+    of the conversation may operate its sandboxes.
     """
 
-    return await runtime_load_sandbox_context(conversation_id)
+    if entity_id and not getattr(runtime_context, "entity_id", None):
+        # A handler whose context came from ``runtime_tool_call_context_from_handler``
+        # carries the entity only as its explicit argument.
+        from dataclasses import replace
+
+        runtime_context = replace(runtime_context, entity_id=entity_id)
+    return primary_sandbox_scope_for(runtime_context)
 
 
-async def _delete_ctx(conversation_id: str) -> None:
-    await runtime_delete_sandbox_context(conversation_id)
+async def _load_binding(scope: RuntimeSandboxScope, sandbox_id: str) -> dict | None:
+    """The conversation's binding record for ``sandbox_id`` (None: not this scope's)."""
+
+    ctx = await runtime_load_sandbox_binding(scope, sandbox_id)
+    return ctx if scope.owns(ctx) else None
 
 
-async def _init_ctx(
-    conversation_id: str,
-    sandbox_id: str,
-    skill_id: str,
-    *,
-    entity_id: str = "",
-    user_id: str = "",
-    agent_id: str = "",
-) -> dict:
-    return await runtime_init_sandbox_context(
-        conversation_id,
-        sandbox_id,
-        skill_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=agent_id,
-    )
+def _scope_owner(scope: RuntimeSandboxScope) -> SandboxOwner:
+    return SandboxOwner(entity_id=scope.entity_id, user_id=scope.user_id, workspace_id=scope.workspace_id)
+
+
+_NO_SANDBOX_SCOPE_MESSAGE = (
+    "Sandbox access denied: this run has no sandbox binding scope (it has neither "
+    "a conversation nor a task to bind a sandbox to, or no entity). Sandboxes can "
+    "only be opened and operated from a conversation or task run."
+)
 
 
 async def _sandbox_instance_access_error(
     *,
     sandbox_id: str,
-    entity_id: str,
-    user_id: str | None,
-    agent_id: str | None,
-    conversation_id: str,
+    scope: RuntimeSandboxScope | None,
 ) -> str | None:
-    """Bind model-supplied Sandbox ids to the current Runtime owner."""
+    """Allow a model-supplied sandbox id only if it belongs to the caller's scope.
 
-    # Identity-free calls are retained for trusted internal compatibility
-    # helpers. Runtime tool calls always carry a conversation and actor scope.
-    if not conversation_id and not user_id:
+    The sandbox must be bound to the same owner (user, or the workspace of
+    user-less work) in the same conversation (or task) the acting principal
+    runs in. It does NOT have to be the acting agent's own: any agent of the
+    conversation may operate the conversation's sandboxes, while another
+    user, or the same user in another conversation, never can. There is no
+    unscoped path: a call without a scope is denied, never waved through.
+    """
+
+    if scope is None:
+        return _sandbox_error(SandboxToolErrorCode.ACCESS_DENIED, _NO_SANDBOX_SCOPE_MESSAGE)
+    ctx = await _load_binding(scope, sandbox_id)
+    if runtime_binding_is_live(ctx, sandbox_id) and scope.owns(ctx):
+        if await runtime_sandbox_credentials_refused(
+            ctx, entity_id=scope.entity_id, user_id=scope.user_id or None,
+        ):
+            # Every sandbox tool call names its sandbox by id and passes here, so
+            # a collaborator's run neither drives nor reattaches to it.
+            return _sandbox_error(
+                SandboxToolErrorCode.ACCESS_DENIED,
+                "This sandbox holds a skill's stored credentials and is not available to "
+                "runs involving an external collaborator.",
+            )
         return None
-    ctx = await _load_ctx(conversation_id)
-    if (
-        _expired_binding(ctx, sandbox_id)
-        and str(ctx.get("agent_id") or "") == str(agent_id or "")
-        and runtime_sandbox_context_owner_matches(ctx, entity_id=entity_id, user_id=user_id)
-    ):
-        return _sandbox_expired_error(sandbox_id, str(ctx.get("expired_skill") or ""), bool(ctx.get("skill_id")))
-    if (
-        not isinstance(ctx, dict)
-        or str(ctx.get("sandbox_id") or "") != sandbox_id
-        or str(ctx.get("agent_id") or "") != str(agent_id or "")
-        or not runtime_sandbox_context_owner_matches(
-            ctx,
-            entity_id=entity_id,
-            user_id=user_id,
+    if _expired_binding(ctx, sandbox_id):
+        return _sandbox_expired_error(
+            sandbox_id,
+            str(ctx.get("expired_skill") or ""),
+            bool(ctx.get("skill_id")),
         )
-    ):
-        return _sandbox_error(
-            SandboxToolErrorCode.ACCESS_DENIED,
-            "Sandbox access denied for the current conversation owner.",
-        )
-    return None
+    return _sandbox_error(
+        SandboxToolErrorCode.ACCESS_DENIED,
+        f"Sandbox access denied: sandbox {sandbox_id} does not belong to this conversation. "
+        "Use the sandbox_id returned by sandbox action='create' or invoke_skill in this conversation.",
+    )
 
 
 def _expired_binding(ctx: Any, sandbox_id: str) -> bool:
@@ -246,6 +277,10 @@ def _expired_binding(ctx: Any, sandbox_id: str) -> bool:
 
 
 def _sandbox_expired_error(sandbox_id: str, skill: str, governed: bool) -> str:
+    # The generic sandbox is registered under a placeholder skill name; only
+    # a real Skill can be re-opened through invoke_skill.
+    if skill == _GENERIC_SANDBOX_NAME:
+        skill, governed = "", False
     if skill:
         reopen = (
             f"invoke_skill(skill='{skill}') (or repeat the generate_file call that opened it)"
@@ -286,7 +321,25 @@ async def _sandbox_is_gone(sandbox_id: str) -> bool:
     return False
 
 
-async def _vanished_sandbox_error(exc: Exception, *, sandbox_id: str, binding_key: str) -> str | None:
+async def _runner_failure_error(
+    exc: Exception,
+    *,
+    sandbox_id: str,
+    scope: RuntimeSandboxScope | None,
+) -> str | None:
+    """A runner failure with its own answer: an outdated runner, or a vanished sandbox."""
+
+    if isinstance(exc, SandboxRunnerOutdatedError):
+        return _runner_outdated_error(exc)
+    return await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, scope=scope)
+
+
+async def _vanished_sandbox_error(
+    exc: Exception,
+    *,
+    sandbox_id: str,
+    scope: RuntimeSandboxScope | None,
+) -> str | None:
     """Map a failure caused by a reclaimed container to ``sandbox_expired``.
 
     A 404 from the runner may concern an execution or a file inside a live
@@ -306,9 +359,9 @@ async def _vanished_sandbox_error(exc: Exception, *, sandbox_id: str, binding_ke
         return None
     if not gone:
         return None
-    ctx = await _load_ctx(binding_key) if binding_key else None
-    governed = isinstance(ctx, dict) and bool(ctx.get("skill_id"))
-    skill = await forget_vanished_sandbox(sandbox_id, conversation_id=binding_key or None)
+    ctx = await _load_binding(scope, sandbox_id) if scope is not None else None
+    governed = runtime_binding_is_live(ctx, sandbox_id) and bool(str(ctx.get("skill_id") or ""))
+    skill = await forget_vanished_sandbox(sandbox_id, scope=scope)
     logger.warning("[sandbox] sandbox=%s vanished from its runner; binding dropped", sandbox_id)
     return _sandbox_expired_error(sandbox_id, skill or "", governed)
 
@@ -361,55 +414,173 @@ async def _sandbox_admission_db():
 
 
 def _get_client():
-    from packages.core.services.sandbox_sdk import SandboxClient
-    return SandboxClient(
-        base_url=_get_sandbox_service_url(),
-        timeout=180.0,
-        api_token=_get_sandbox_api_token(),
-    )
+    from packages.core.services.sandbox_session_service import sandbox_runner_client
+
+    return sandbox_runner_client(_get_sandbox_service_url(), timeout=180.0)
 
 
 async def _get_client_for_sandbox(sandbox_id: str):
     from packages.core.config import get_settings
-    from packages.core.services.sandbox_sdk import SandboxClient
+    from packages.core.services.sandbox_session_service import sandbox_client_for
 
-    settings = get_settings()
-    if settings.SANDBOX_COORDINATION_MODE != "external-runner":
+    if get_settings().SANDBOX_COORDINATION_MODE != "external-runner":
         return _get_client()
-    from packages.core.database import async_session
-    from packages.core.services.sandbox_queue_service import (
-        SandboxRouteNotFoundError,
-        resolve_sandbox_runner,
-    )
-    from packages.core.services.sandbox_session_service import warm_sandbox_base_url
-
-    try:
-        async with async_session() as db:
-            runner = await resolve_sandbox_runner(db, sandbox_id)
-        base_url = runner.base_url
-    except SandboxRouteNotFoundError:
-        # The instance row is the primary route; a container the owner
-        # registry still keeps warm must stay reachable even if that row was
-        # released by run-level bookkeeping.
-        base_url = await warm_sandbox_base_url(sandbox_id)
-        if not base_url:
-            raise
-        logger.info("[sandbox] routing sandbox=%s through its warm registry record", sandbox_id)
-    return SandboxClient(
-        base_url=base_url,
-        timeout=180.0,
-        api_token=_get_sandbox_api_token(),
-    )
+    return await sandbox_client_for(sandbox_id, timeout=180.0)
 
 
-def _runtime_sandbox_execution_id(runtime_context: Any, sandbox_id: str) -> str | None:
+async def _agent_exec_placement(
+    scope: RuntimeSandboxScope | None,
+    agent_id: str | None,
+    sandbox_id: str,
+    *,
+    capabilities: RunnerCapabilities | None = None,
+) -> dict[str, Any]:
+    """Where one agent's command runs in its owner's shared sandbox, and with which env.
+
+    The agent that invoked a Skill loaded in this sandbox (in this
+    conversation or task) sees that Skill as /skill: it starts in the Skill's
+    directory with the Skill's credentials. Every other agent -- and every
+    other conversation or task of the user -- runs in its own work-area
+    directory (``/workspace/c/<work>/agents/<agent>``, created on demand) with
+    no Skill view and none of a Skill's credentials: credentials reach only
+    the agents that invoked the Skill, per command, never persisted in the
+    container.
+
+    An older runner (no ``work_areas`` / ``skill_slots``) has neither the
+    work areas nor per-command Skill views: every command runs in its
+    default workdir, as before those existed. It cannot keep a Skill's
+    credentials from another agent either, so another agent's command in a
+    container that holds credentials is refused (``SandboxRunnerOutdatedError``).
+    """
+
+    held = await runtime_agent_skill_in(scope, agent_id, sandbox_id) if scope is not None else None
+    if capabilities is None:
+        capabilities = await _sessions.runner_capabilities_for_sandbox(sandbox_id)
+    missing = capabilities.missing(WORK_AREAS, SKILL_SLOTS)
+    if missing:
+        if held is None and await _sessions.sandbox_holds_credentials(sandbox_id) is not False:
+            raise SandboxRunnerOutdatedError(
+                outdated_message(
+                    [SKILL_SLOTS],
+                    build_version=capabilities.build_version,
+                    what="Running a command next to another agent's credentialed Skill",
+                ),
+                missing=[SKILL_SLOTS],
+                build_version=capabilities.build_version,
+            )
+        # The runner's own default workdir and its single /skill view.
+        return {}
+    if held is not None and held.get("skill_key"):
+        return {"skill": held["skill_key"]}
+    if held is not None:
+        return {}
+    return {
+        "workdir": runtime_sandbox_agent_workdir(agent_id, scope.binding_key if scope is not None else None),
+        "skill_env": False,
+        "skill": "",
+    }
+
+
+def runner_skill_slot(skill_name: str | None) -> str:
+    """The runner's directory name for a Skill (``sandbox/docker_backend.skill_slot``).
+
+    Kept identical to the runner's; ``tests/test_sandbox_per_user_layout.py``
+    holds them together.
+    """
+
+    raw = str(skill_name or "").strip().lower()
+    safe = "".join(char if char.isalnum() or char in "-_." else "-" for char in raw).strip(".-")
+    return safe[:64] or "skill"
+
+
+def _skill_view_path(path: str, skill_view: str | None) -> str:
+    """Map the viewed Skill's real directory (``/skills/<slot>``) back to ``/skill``."""
+
+    if not path or not skill_view:
+        return path
+    real = f"/skills/{runner_skill_slot(skill_view)}"
+    if path == real:
+        return "/skill"
+    if path.startswith(real + "/"):
+        return "/skill" + path[len(real):]
+    return path
+
+
+def _view_kwargs(skill_view: str | None) -> dict[str, Any]:
+    """The ``skill`` argument of a runner call (omitted: the runner's legacy single view)."""
+
+    return {} if skill_view is None else {"skill": skill_view}
+
+
+async def _agent_file_view(
+    scope: RuntimeSandboxScope | None,
+    agent_id: str | None,
+    sandbox_id: str,
+) -> tuple[str | None, str]:
+    """(Skill view, base directory for relative paths) of one agent's file operations.
+
+    The agent that invoked a Skill reads and writes through that Skill's
+    view. Any other agent's relative paths land in its own work-area
+    directory; an absolute ``/skill/...`` path it names is read through the
+    runner's default view (the Skill loaded last), as before Skills coexisted
+    -- file operations carry no credentials.
+    """
+
+    placement = await _agent_exec_placement(scope, agent_id, sandbox_id)
+    if "workdir" in placement:
+        return None, str(placement["workdir"])
+    return placement.get("skill"), "/skill"
+
+
+def _is_runner_busy(exc: BaseException) -> bool:
+    """The runner's typed ``sandbox_busy`` 409 (too many concurrent commands, or a Skill load)."""
+
+    return getattr(exc, "status_code", None) == 409 and getattr(exc, "code", None) == "sandbox_busy"
+
+
+def _runtime_sandbox_execution_id(runtime_context: Any, sandbox_id: str) -> str:
+    """Name every Sandbox command, so the runner can always stop it.
+
+    The runner kills a timed-out or cancelled command by its execution id;
+    a command sent without one only loses its ``docker exec`` client and keeps
+    running inside the container. A call that a checkpoint may replay keeps a
+    deterministic id (run, call, attempt) so the runner deduplicates it; any
+    other call gets a fresh one.
+    """
+
     run_id = str(getattr(runtime_context, "runtime_run_id", None) or "")
     tool_call_id = str(getattr(runtime_context, "runtime_tool_call_id", None) or "")
-    if not run_id or not tool_call_id:
-        return None
+    if not tool_call_id:
+        return f"manor-{uuid.uuid4().hex}"
     attempt = max(1, int(getattr(runtime_context, "runtime_tool_attempt", 1) or 1))
-    digest = hashlib.sha256(f"{run_id}:{tool_call_id}:{attempt}".encode("utf-8")).hexdigest()[:32]
+    scope = run_id or f"sandbox:{sandbox_id}"
+    digest = hashlib.sha256(f"{scope}:{tool_call_id}:{attempt}".encode("utf-8")).hexdigest()[:32]
     return f"manor-{digest}"
+
+
+async def _stop_execution(sandbox_id: str, execution_id: str) -> bool:
+    """Stop a command by name after its call gave up; True when confirmed.
+
+    The runner kills a command that hits its own limit, but the HTTP call can
+    give up first, and only an explicit cancel stops the command then.
+    Cancelling one that already ended is harmless.
+    """
+
+    try:
+        client = await _get_client_for_sandbox(sandbox_id)
+        try:
+            await client.cancel_execution(sandbox_id, execution_id)
+        finally:
+            await client.close()
+        return True
+    except Exception as exc:
+        if type(exc).__name__ == "SandboxNotFoundError" and "execution" in str(exc).lower():
+            return True  # never started, or already ended and pruned
+        logger.warning(
+            "[sandbox] could not stop timed-out execution sandbox=%s execution=%s: %s",
+            sandbox_id, execution_id, exc,
+        )
+        return False
 
 
 async def _set_runtime_active_execution(
@@ -457,38 +628,6 @@ async def _clear_runtime_active_execution(
 # Workspace input collection
 # ────────────────────────────────────────────────────────────────
 
-def _workspace_path_candidates(workspace_path: str, entity_id: str = "") -> list[str]:
-    """Entity-relative path named by any file address (fs URL, /workspace/…, path)."""
-    raw = workspace_path.replace("\\", "/").strip()
-    if not raw or raw == "/workspace":
-        return []
-    parsed = parse_file_reference(raw, entity_id=entity_id, allow_relative=True)
-    if parsed is None and raw.startswith("/") and not is_internal_file_target(raw):
-        parsed = parse_file_reference(raw.lstrip("/"), entity_id=entity_id, allow_relative=True)
-    if parsed is None or not parsed.fs_path or (entity_id and parsed.entity_id not in {"", entity_id}):
-        return []
-    return [parsed.fs_path]
-
-
-async def _workspace_document_path(entity_id: str, workspace_path: str) -> str:
-    """The fs_path of a /viewer/<document_id> address, if it names one."""
-    parsed = parse_file_reference(workspace_path.strip(), entity_id=entity_id)
-    if parsed is None or not parsed.document_id:
-        return ""
-    from sqlalchemy import select
-
-    from packages.core.database import async_session
-    from packages.core.models.document import Document
-
-    async with async_session() as db:
-        fs_path = await db.scalar(select(Document.fs_path).where(
-            Document.id == parsed.document_id,
-            Document.entity_id == entity_id,
-            Document.is_trashed == False,  # noqa: E712
-        ))
-    return str(fs_path or "")
-
-
 async def _read_workspace_bytes(
     entity_id: str,
     workspace_path: str,
@@ -498,110 +637,32 @@ async def _read_workspace_bytes(
     workspace_id: str | None,
     runtime_envelope: Any | None,
 ) -> tuple[bytes | None, str | None]:
-    candidates = _workspace_path_candidates(workspace_path, entity_id)
-    if not candidates:
-        document_path = await _workspace_document_path(entity_id, workspace_path)
-        candidates = [document_path] if document_path else []
-    if not candidates:
-        return None, None
+    """``(bytes, None)``, ``(None, blocked_json)``, or ``(None, None)`` when unreadable."""
 
-    rel_path = candidates[0]
-    entity_root = runtime_entity_file_root(entity_id)
-    if not entity_root:
-        return None, None
-    try:
-        async with runtime_entity_filesystem_read_lock(entity_root):
-            blocked = await runtime_guard_file_read_access(
-                entity_id=entity_id,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                workspace_id=workspace_id,
-                runtime_envelope=runtime_envelope,
-                tool_name="sandbox",
-                paths=[rel_path],
-            )
-            if blocked:
-                return None, blocked
-            with runtime_open_entity_file_snapshot(entity_id, rel_path) as snapshot:
-                with open(snapshot.descriptor_path, "rb") as handle:
-                    return handle.read(), None
-    except Exception as exc:
-        logger.debug("[sandbox] entity FS workspace read failed path=%s: %s", workspace_path, exc)
-        return None, None
+    read = await runtime_read_workspace_file(
+        entity_id=entity_id,
+        workspace_path=workspace_path,
+        tool_name="sandbox",
+        user_id=user_id,
+        conversation_id=conversation_id,
+        workspace_id=workspace_id,
+        runtime_envelope=runtime_envelope,
+    )
+    if read.status == "ok":
+        return read.content, None
+    if read.status == "denied":
+        return None, read.blocked
+    return None, None
 
 
 # ────────────────────────────────────────────────────────────────
 # sandbox_create
 # ────────────────────────────────────────────────────────────────
 
-async def _sandbox_create(
-    entity_id: str = "",
-    user_id: str = "",
-    skill_id: str = "",
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
-    binding_key = runtime_context.sandbox_binding_key or conversation_id
-    skill_id = str(skill_id or "").strip()
-    if skill_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.SKILL_REQUIRES_INVOKE,
-            "Stored Skills must be opened with invoke_skill so Skill permissions "
-            "and bindings are enforced. Omit skill_id to create a generic sandbox.",
-        )
-    if user_id and not binding_key:
-        return _sandbox_error(
-            SandboxToolErrorCode.ACCESS_DENIED,
-            "Authenticated sandbox creation requires a conversation owner context.",
-        )
-    if not entity_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.ACCESS_DENIED,
-            "Sandbox creation requires an entity context.",
-        )
-    if binding_key:
-        try:
-            existing_ctx = await _load_ctx(binding_key)
-        except Exception as exc:
-            return _sandbox_error(
-                SandboxToolErrorCode.CREATE_FAILED,
-                f"Sandbox owner context could not be loaded: {exc}",
-            )
-        if isinstance(existing_ctx, dict) and str(existing_ctx.get("sandbox_id") or ""):
-            # Any bound context — governed or generic — must belong to this
-            # caller before we touch it.
-            owner_matches = (
-                str(existing_ctx.get("agent_id") or "") == str(runtime_context.agent_id or "")
-                and runtime_sandbox_context_owner_matches(
-                    existing_ctx,
-                    entity_id=entity_id,
-                    user_id=user_id,
-                )
-            )
-            if not owner_matches:
-                return _sandbox_error(
-                    SandboxToolErrorCode.ACCESS_DENIED,
-                    "An existing Sandbox context belongs to another Runtime owner.",
-                )
-            if str(existing_ctx.get("skill_id") or ""):
-                return _sandbox_error(
-                    SandboxToolErrorCode.ALREADY_ACTIVE,
-                    "This conversation already has a governed Skill sandbox. Destroy "
-                    "or finish it before creating a generic sandbox.",
-                )
+def generic_sandbox_bundle() -> SandboxBundle:
+    """The bundle every generic sandbox (``sandbox`` tool and ``bash``) is admitted with."""
 
-    try:
-        owner = SandboxOwner(entity_id=entity_id, user_id=str(user_id or ""))
-    except ValueError as exc:
-        return _sandbox_error(SandboxToolErrorCode.ACCESS_DENIED, f"Invalid sandbox owner: {exc}")
-    bundle = SandboxBundle(
+    return SandboxBundle(
         skill_name=_GENERIC_SANDBOX_NAME,
         files=dict(_GENERIC_SANDBOX_FILES),
         env={},
@@ -609,15 +670,39 @@ async def _sandbox_create(
         source="workspace",
         config=None,
         auto_install=False,
-        reuse_scope="generic",
+        reuse_scope=GENERIC_SANDBOX_REUSE_SCOPE,
     )
+
+
+async def acquire_generic_sandbox(
+    *,
+    scope: RuntimeSandboxScope,
+    runtime_context: Any,
+    tool_call_id: str | None = None,
+) -> "SandboxSession | SandboxSessionError | Any":
+    """Admit (or reuse) the caller's generic sandbox: the owner's general sandbox.
+
+    One path for the ``sandbox`` tool and ``bash``: same owner, binding scope
+    and sandbox kind, so a command run by either sees the other's state. A
+    durable run under external-runner coordination queues a reservation and
+    gets back a suspension (the call is re-executed on resume and attaches
+    the allocated container); a task worker waits on its task reservation.
+    ``tool_call_id`` overrides the call's reservation key (a replacement
+    admission inside a call that already has a ticket). Raises
+    ``ValueError`` for an invalid owner.
+    """
+
+    owner = _scope_owner(scope)
+    bundle = generic_sandbox_bundle()
+    call_id = runtime_context.runtime_tool_call_id if tool_call_id is None else tool_call_id
     binding = SandboxBinding(
-        conversation_id=binding_key or None,
+        conversation_id=scope.binding_key,
         agent_id=runtime_context.agent_id or "",
         skill_id="",
         task_id=runtime_context.task_id or None,
+        workflow_run_id=runtime_context.workflow_run_id or None,
         runtime_run_id=runtime_context.runtime_run_id or None,
-        runtime_tool_call_id=runtime_context.runtime_tool_call_id or None,
+        runtime_tool_call_id=call_id or None,
         parent_skill=runtime_context.parent_skill or None,
     )
     if _sandbox_uses_durable_admission() and binding.runtime_run_id and binding.runtime_tool_call_id:
@@ -632,8 +717,66 @@ async def _sandbox_create(
                 session = await acquire_sandbox_session(
                     owner=owner, bundle=bundle, binding=binding, db=db,
                 )
-    else:
-        session = await acquire_sandbox_session(owner=owner, bundle=bundle, binding=binding)
+        return session
+    return await acquire_sandbox_session(owner=owner, bundle=bundle, binding=binding)
+
+
+async def _sandbox_create(
+    entity_id: str = "",
+    user_id: str = "",
+    skill_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(
+        kwargs,
+        entity_id=entity_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
+    binding_key = runtime_context.sandbox_binding_key or conversation_id
+    skill_id = str(skill_id or "").strip()
+    if skill_id:
+        return _sandbox_error(
+            SandboxToolErrorCode.SKILL_REQUIRES_INVOKE,
+            "Stored Skills must be opened with invoke_skill so Skill permissions "
+            "and bindings are enforced. Omit skill_id to create a generic sandbox.",
+        )
+    if not entity_id:
+        return _sandbox_error(
+            SandboxToolErrorCode.ACCESS_DENIED,
+            "Sandbox creation requires an entity context.",
+        )
+    scope = _caller_scope(runtime_context, entity_id)
+    if scope is None:
+        return _sandbox_error(SandboxToolErrorCode.ACCESS_DENIED, _NO_SANDBOX_SCOPE_MESSAGE)
+    # Governance: while this agent drives a governed Skill in this
+    # conversation, a blank sandbox would let the model step around the
+    # Skill's workflow. Only this agent's own Skill counts; another agent
+    # driving a Skill in the shared sandbox never blocks it.
+    try:
+        driving = await runtime_agent_sandbox(scope, runtime_context.agent_id, RuntimeSandboxKind.SKILL)
+    except Exception as exc:
+        return _sandbox_error(
+            SandboxToolErrorCode.CREATE_FAILED,
+            f"Sandbox owner context could not be loaded: {exc}",
+        )
+    active_skill_sandbox = driving[0] if driving is not None else ""
+    if active_skill_sandbox:
+        return _sandbox_error(
+            SandboxToolErrorCode.ALREADY_ACTIVE,
+            f"This agent already has an active governed Skill sandbox ({active_skill_sandbox}) "
+            "in this conversation. Continue the Skill's workflow in that sandbox. A generic "
+            "sandbox can be created only after that sandbox is released with sandbox "
+            f"action='destroy' sandbox_id='{active_skill_sandbox}'; finishing or saving a "
+            "result does not release it.",
+        )
+
+    try:
+        session = await acquire_generic_sandbox(scope=scope, runtime_context=runtime_context)
+    except ValueError as exc:
+        return _sandbox_error(SandboxToolErrorCode.ACCESS_DENIED, f"Invalid sandbox owner: {exc}")
     if isinstance(session, SandboxSessionError):
         if session.code == "capacity_full":
             logger.warning("[sandbox] capacity full: kind=generic error=%s", session.message)
@@ -649,12 +792,21 @@ async def _sandbox_create(
     if not isinstance(session, SandboxSession):
         return session
 
+    # An older runner has no work areas: commands run in its own workdir.
+    legacy_layout = (await _sessions.runner_capabilities(session.base_url)).lacks(WORK_AREAS)
     parts = [
         f"sandbox_id: {session.sandbox_id}",
         "status: ready" if session.reused else "status: running",
-        f"workdir: {session.workdir}",
+        "workdir: "
+        + (
+            session.workdir
+            if legacy_layout
+            else runtime_sandbox_agent_workdir(runtime_context.agent_id, scope.binding_key)
+        ),
         "sandbox_kind: generic",
     ]
+    if not legacy_layout:
+        parts.append(f"shared: {_SHARED_SANDBOX_NOTE}")
     if session.reused:
         parts.append("reused: true")
     if session.entry_hint:
@@ -668,12 +820,16 @@ async def _sandbox_create(
         parts.append(f"env_blocked: {', '.join(session.env_blocked)}")
     parts.append(
         "workspace_mount: (none; use sandbox action='write_file' with "
-        "workspace_path or direct content to inject inputs)"
+        "workspace_path or direct content to inject inputs). Your bash working "
+        "copy (workspace/ in your working directory) holds the entity files bash "
+        "commands named; files changed there are saved by the next bash command"
     )
     parts.append(
-        "NOTE: This is a blank isolated sandbox. Proceed with sandbox "
-        "action='exec' or action='write_file'."
+        "NOTE: This is this user's isolated sandbox; other users never see it. Proceed with "
+        "sandbox action='exec' or action='write_file'."
     )
+    # Generated from the image's toolset manifest, which the release verifies.
+    parts.append(sandbox_toolset_summary())
     logger.info(
         "[sandbox] %s: kind=generic sandbox=%s entity=%s",
         "reused" if session.reused else "created",
@@ -713,14 +869,23 @@ async def _sandbox_exec(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
+    """Run one command in the owner's shared sandbox; never "busy", never silently lost.
+
+    The command takes a slot of the sandbox -- or waits its turn in the
+    runner's fair FIFO: a durable run parks meanwhile (``sandbox_exec_slot``)
+    and resumes to collect it; anything else waits in-process up to
+    ``SANDBOX_EXEC_QUEUE_WAIT_SECONDS``. A command that never started on a
+    sandbox that was lost (or reclaimed) runs on the owner's new general
+    sandbox; one that was running when it was lost is reported, never re-run.
+    """
+
+    replacement_of = str(kwargs.pop("_sandbox_replacement_of", "") or "")
     runtime_context = runtime_tool_call_context_from_kwargs(
         kwargs,
         entity_id=entity_id,
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
-    binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     command = command.strip()
     try:
@@ -733,101 +898,633 @@ async def _sandbox_exec(
             SandboxToolErrorCode.INVALID_REQUEST,
             "sandbox_id and command are required.",
         )
+    retry = {
+        "entity_id": entity_id, "user_id": user_id, "conversation_id": conversation_id,
+        "command": command, "timeout": timeout, "background": background, "kwargs": kwargs,
+        "replacement_of": replacement_of,
+    }
 
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
-        return access_error
+        if replacement_of or SandboxToolErrorCode.EXPIRED.value not in access_error:
+            return access_error
+        if _sandbox_parks_on_slots(runtime_context):
+            # A run that parked on this sandbox's slot queue is done with that ticket.
+            await _consume_exec_slot_wait(runtime_context)
+        # A command for a reclaimed sandbox has not started anywhere yet.
+        return await _retry_not_started(
+            runtime_context=runtime_context, scope=scope, sandbox_id=sandbox_id,
+            fallback=access_error, **retry,
+        )
+    background = _coerce_bool(background, False)
+    capabilities = await _sessions.runner_capabilities_for_sandbox(sandbox_id)
+    try:
+        placement = await _agent_exec_placement(
+            scope, runtime_context.agent_id, sandbox_id, capabilities=capabilities,
+        )
+    except SandboxRunnerOutdatedError as exc:
+        return _runner_outdated_error(exc)
+    # A runner without /exec/start runs a command synchronously, as before it
+    # had one; a background command cannot run there at all.
+    synchronous = capabilities.lacks(EXEC_START)
+    if synchronous and background:
+        return _runner_outdated_error(
+            SandboxRunnerOutdatedError(
+                outdated_message(
+                    [EXEC_START], build_version=capabilities.build_version, what="A background command",
+                )
+                + " Run it without background=true instead.",
+                missing=[EXEC_START],
+            )
+        )
 
+    durable = _sandbox_parks_on_slots(runtime_context)
+    parked = await _exec_slot_ticket(runtime_context, sandbox_id) if durable else None
+    execution_id = (parked or {}).get("execution_id") or _runtime_sandbox_execution_id(runtime_context, sandbox_id)
+    queue_wait = _exec_queue_wait_seconds()
+    fair_key = scope.binding_key if scope is not None else None
+    started = None
+    last_status = "queued" if parked else None
+    keep_active = False
     try:
         client = await _get_client_for_sandbox(sandbox_id)
-        execution_id = _runtime_sandbox_execution_id(runtime_context, sandbox_id)
-        if _coerce_bool(background, False):
-            result = None
-            try:
-                result = await client.start_exec(
+        try:
+            if not background:
+                await _set_runtime_active_execution(
+                    runtime_context, sandbox_id=sandbox_id, execution_id=execution_id,
+                )
+            if synchronous:
+                result = await client.exec(
                     sandbox_id=sandbox_id,
                     command=command,
                     timeout=timeout,
                     execution_id=execution_id,
+                    **placement,
                 )
-                try:
-                    await _set_runtime_active_execution(
-                        runtime_context,
-                        sandbox_id=sandbox_id,
-                        execution_id=result.execution_id,
-                    )
-                except Exception:
-                    await client.cancel_execution(sandbox_id, result.execution_id)
-                    raise
-            finally:
-                await client.close()
-            assert result is not None
-            return json.dumps(
-                {
-                    "sandbox_id": result.sandbox_id,
-                    "execution_id": result.execution_id,
-                    "status": result.status,
-                    "created_at": result.created_at,
-                    "poll_after_seconds": 1,
-                    "hint": (
-                        "Poll with sandbox action='status' and the same sandbox_id/"
-                        "execution_id; use action='cancel' to stop it."
-                    ),
-                },
-                ensure_ascii=False,
-            )
-
-        try:
-            await _set_runtime_active_execution(
-                runtime_context,
-                sandbox_id=sandbox_id,
-                execution_id=execution_id,
-            )
-            result = await client.exec(
+                started = final = _finished_exec_status(result, sandbox_id=sandbox_id, execution_id=execution_id)
+                last_status = "running"
+                return _exec_result_text(final, sandbox_id=sandbox_id, command=command, timeout=timeout)
+            started = await client.start_exec(
                 sandbox_id=sandbox_id,
                 command=command,
                 timeout=timeout,
                 execution_id=execution_id,
+                fair_key=fair_key,
+                queue_timeout=queue_wait,
+                **placement,
             )
+            if background:
+                try:
+                    await _set_runtime_active_execution(
+                        runtime_context,
+                        sandbox_id=sandbox_id,
+                        execution_id=started.execution_id,
+                    )
+                except Exception:
+                    await client.cancel_execution(sandbox_id, started.execution_id)
+                    raise
+                return _background_started_text(started)
+
+            # "queued" with a queue position: waiting for a slot (a record
+            # whose slot was granted at once is "queued" until its task starts).
+            waiting_for_slot = started.status == "queued" and getattr(started, "queue_position", None)
+            last_status = "queued" if waiting_for_slot else "running"
+            if waiting_for_slot and durable:
+                suspension = await _park_on_exec_slot(
+                    runtime_context, sandbox_id=sandbox_id, execution_id=execution_id, wait_seconds=queue_wait,
+                )
+                if suspension is not None:
+                    # The run stays on record as executing this command, so
+                    # cancelling the parked run withdraws it from the queue.
+                    keep_active = True
+                    return suspension
+            final, last_status = await _await_execution(
+                client,
+                sandbox_id=sandbox_id,
+                execution_id=execution_id,
+                first=started,
+                budget_seconds=queue_wait + timeout + 30,
+                on_status=sandbox_activity_recorder(runtime_context),
+            )
+        except asyncio.CancelledError:
+            # This call's run (or the delegate running inside it) was
+            # cancelled: stop -- or withdraw from the slot queue -- exactly
+            # this command in the shared sandbox, never another's, never the
+            # container.
+            await asyncio.shield(_stop_execution(sandbox_id, execution_id))
+            raise
         finally:
             await client.close()
-            await _clear_runtime_active_execution(runtime_context, execution_id)
-
-        parts = []
-        if result.stdout:
-            parts.append(result.stdout)
-        if result.stderr:
-            parts.append(f"[stderr]\n{result.stderr}")
-        parts.append(f"[exit_code: {result.exit_code}]")
-
-        logger.info("[sandbox] exec: sandbox=%s exit=%s cmd=%s", sandbox_id, result.exit_code, command[:80])
-        return "\n".join(parts)
-
+            if not background and not keep_active:
+                await _clear_runtime_active_execution(runtime_context, execution_id)
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        if parked and last_status == "queued":
+            await _consume_exec_slot_wait(runtime_context)
+        if isinstance(exc, SandboxRunnerOutdatedError):
+            # Refused before it was sent: nothing ran, and no retry helps.
+            return _runner_outdated_error(exc)
+        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
-            return expired
-        logger.exception("[sandbox] exec failed: sandbox=%s error=%s", sandbox_id, exc)
-        err_msg = str(exc).lower()
-        exc_type = type(exc).__name__.lower()
-        is_timeout = "timed out" in err_msg or "timeout" in err_msg or "readtimeout" in exc_type
-        if is_timeout:
+            if last_status in (None, "queued") and not replacement_of:
+                return await _retry_not_started(
+                    runtime_context=runtime_context, scope=scope, sandbox_id=sandbox_id,
+                    fallback=expired, forget=False, **retry,
+                )
+            if last_status in (None, "queued"):
+                return expired
+            return _sandbox_lost_while_running_error(sandbox_id)
+        return await _exec_failure_text(
+            exc, sandbox_id=sandbox_id, execution_id=execution_id, timeout=timeout, admitted=started is not None,
+        )
+    if durable:
+        await _consume_exec_slot_wait(runtime_context)
+    outcome = str(getattr(final, "outcome", "") or "")
+    if outcome == "sandbox_lost" and str(getattr(final, "outcome_detail", "") or "") == "never started":
+        if replacement_of:
             return _sandbox_error(
-                SandboxToolErrorCode.EXEC_TIMEOUT,
-                f"Command exceeded its {timeout}s limit and was cancelled. Do not "
-                "automatically repeat a command with side effects. For long-running "
-                "work, start it with background=true and poll action='status'.",
+                SandboxToolErrorCode.EXEC_NOT_STARTED,
+                f"Sandbox {sandbox_id} was lost before your command started, so it did not run.",
             )
+        return await _retry_not_started(
+            runtime_context=runtime_context, scope=scope, sandbox_id=sandbox_id, fallback=None, **retry,
+        )
+    if outcome == "sandbox_lost":
+        if scope is not None:
+            await forget_vanished_sandbox(sandbox_id, scope=scope)
+        return _sandbox_lost_while_running_error(sandbox_id)
+    return _exec_result_text(final, sandbox_id=sandbox_id, command=command, timeout=timeout)
+
+
+def _finished_exec_status(result: Any, *, sandbox_id: str, execution_id: str) -> Any:
+    """A synchronous exec's result in the shape of a finished execution record."""
+
+    from types import SimpleNamespace
+
+    exit_code = getattr(result, "exit_code", None)
+    return SimpleNamespace(
+        sandbox_id=sandbox_id,
+        execution_id=getattr(result, "execution_id", None) or execution_id,
+        status="completed" if exit_code == 0 else "failed",
+        terminal=True,
+        stdout=getattr(result, "stdout", ""),
+        stderr=getattr(result, "stderr", ""),
+        exit_code=exit_code,
+        error=None,
+        outcome=getattr(result, "outcome", None),
+        outcome_detail=getattr(result, "outcome_detail", None),
+    )
+
+
+def _background_started_text(started: Any) -> str:
+    payload = {
+        "sandbox_id": started.sandbox_id,
+        "execution_id": started.execution_id,
+        "status": started.status,
+        "created_at": started.created_at,
+        "poll_after_seconds": 1,
+        "hint": (
+            "Poll with sandbox action='status' and the same sandbox_id/"
+            "execution_id; use action='cancel' to stop it."
+        ),
+    }
+    if started.status == "queued" and getattr(started, "queue_position", None):
+        payload["queue_position"] = started.queue_position
+        payload["hint"] = (
+            "Every command slot of the shared sandbox is taken: this command waits its "
+            "turn and starts automatically. " + payload["hint"]
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _exec_failure_text(
+    exc: Exception,
+    *,
+    sandbox_id: str,
+    execution_id: str,
+    timeout: int,
+    admitted: bool,
+) -> str:
+    if getattr(exc, "code", None) == _DISK_QUOTA_CODE:
+        return _disk_quota_error(str(exc))
+    if _is_runner_busy(exc):
+        # Only a runner without a slot queue, or with a full one, answers busy.
+        return _sandbox_error(
+            SandboxToolErrorCode.SANDBOX_BUSY,
+            f"Sandbox {sandbox_id} is busy: {exc}. All of this user's work shares it. "
+            "Wait for a running command to finish (or poll a background one) and retry; "
+            "do not start a second copy of the same command.",
+        )
+    if _is_transport_error(exc):
+        never_sent = not admitted and _transport_error_before_send(exc)
+        return _sandbox_error(
+            SandboxToolErrorCode.RUNNER_UNREACHABLE,
+            f"The sandbox runner did not answer ({type(exc).__name__}). "
+            + (
+                "The command was never sent, so it did not run; retry it shortly."
+                if never_sent
+                else f"The command (execution {execution_id}) may or may not have run: check its "
+                "effects, or its status with action='status' once the runner answers, before "
+                "repeating it."
+            ),
+        )
+    err_msg = str(exc).lower()
+    exc_type = type(exc).__name__.lower()
+    is_timeout = (
+        isinstance(exc, asyncio.TimeoutError)
+        or "timed out" in err_msg
+        or "timeout" in err_msg
+        or "readtimeout" in exc_type
+    )
+    if is_timeout:
+        stopped = await _stop_execution(sandbox_id, execution_id)
+        outcome = (
+            "was stopped" if stopped
+            else "could not be confirmed stopped and may still be running; check "
+            "with a short command before starting more work in this sandbox"
+        )
+        return _sandbox_error(
+            SandboxToolErrorCode.EXEC_TIMEOUT,
+            f"Command exceeded its {timeout}s limit and {outcome}. Do not "
+            "automatically repeat a command with side effects. For long-running "
+            "work, start it with background=true and poll action='status'.",
+        )
+    logger.exception("[sandbox] exec failed: sandbox=%s error=%s", sandbox_id, exc)
+    return _sandbox_error(
+        SandboxToolErrorCode.EXEC_FAILED,
+        f"Sandbox exec failed: {exc}",
+    )
+
+
+def _exec_queue_wait_seconds() -> int:
+    try:
+        from packages.core.config import get_settings
+
+        return max(1, int(get_settings().SANDBOX_EXEC_QUEUE_WAIT_SECONDS))
+    except Exception:
+        return 600
+
+
+def _sandbox_parks_on_slots(runtime_context: Any) -> bool:
+    """A durable run parks while its command waits for a slot; anything else waits in-process."""
+
+    return bool(
+        _sandbox_uses_durable_admission()
+        and getattr(runtime_context, "runtime_run_id", None)
+        and getattr(runtime_context, "runtime_tool_call_id", None)
+        and not getattr(runtime_context, "parent_skill", None)
+    )
+
+
+async def _exec_slot_ticket(runtime_context: Any, sandbox_id: str | None) -> dict[str, Any] | None:
+    """The command a resumed call parked on: it is collected, never started twice.
+
+    A resume re-executes the tool call with a new attempt number, which would
+    name a new execution; the parked ticket remembers the original one.
+    ``sandbox_id`` None: whichever sandbox the call parked on (``bash`` learns
+    it from the ticket).
+    """
+
+    from packages.core.models.runtime_run import SandboxReservationStatus
+    from packages.core.services.sandbox_queue_service import find_exec_slot_wait
+
+    try:
+        async with _sandbox_admission_db() as db:
+            ticket = await find_exec_slot_wait(
+                db,
+                run_id=str(runtime_context.runtime_run_id),
+                tool_call_id=str(runtime_context.runtime_tool_call_id),
+            )
+    except Exception:  # noqa: BLE001 - no ticket is the normal first call
+        logger.warning("[sandbox] exec-slot ticket lookup failed", exc_info=True)
+        return None
+    if ticket is None or ticket.status == SandboxReservationStatus.CONSUMED.value:
+        return None
+    payload = ticket.request_payload if isinstance(ticket.request_payload, dict) else {}
+    if not payload.get("execution_id") or not payload.get("sandbox_id"):
+        return None
+    if sandbox_id is not None and str(payload.get("sandbox_id") or "") != sandbox_id:
+        return None
+    return dict(payload)
+
+
+async def _park_on_exec_slot(
+    runtime_context: Any,
+    *,
+    sandbox_id: str,
+    execution_id: str,
+    wait_seconds: int,
+    continuation: dict[str, Any] | None = None,
+) -> Any | None:
+    """Park the durable run while its command waits for a slot (``sandbox_exec_slot``).
+
+    ``continuation`` rides on the ticket for the resumed call (see
+    ``enqueue_exec_slot_wait``).
+    """
+
+    from packages.core.ai.runtime.control import RuntimeToolSuspension
+    from packages.core.models.runtime_run import RuntimeRun
+    from packages.core.services.sandbox_queue_service import (
+        SANDBOX_EXEC_WAIT_REASON,
+        enqueue_exec_slot_wait,
+    )
+
+    try:
+        async with _sandbox_admission_db() as db:
+            run = await db.get(RuntimeRun, str(runtime_context.runtime_run_id))
+            if run is None:
+                return None
+            ticket = await enqueue_exec_slot_wait(
+                db,
+                run=run,
+                tool_call_id=str(runtime_context.runtime_tool_call_id),
+                sandbox_id=sandbox_id,
+                execution_id=execution_id,
+                # The runner gives up on the command at the same budget; the
+                # ticket outlives it a little so the run always wakes to its outcome.
+                wait_seconds=wait_seconds + 60,
+                continuation=continuation,
+            )
+            await db.commit()
+            return RuntimeToolSuspension(
+                kind="waiting_resource",
+                reservation_id=ticket.id,
+                poll_after_seconds=_settings_poll_seconds(),
+                deadline_at=ticket.deadline_at,
+                reason=SANDBOX_EXEC_WAIT_REASON,
+            )
+    except Exception:  # noqa: BLE001 - waiting in-process is the safe fallback
+        logger.warning("[sandbox] could not park on the exec-slot queue; waiting in-process", exc_info=True)
+        return None
+
+
+async def _consume_exec_slot_wait(runtime_context: Any) -> None:
+    """Latch the call's exec-slot ticket once its command was collected."""
+
+    from datetime import datetime, timezone
+
+    from packages.core.models.runtime_run import SandboxReservationStatus
+    from packages.core.services.sandbox_queue_service import find_exec_slot_wait
+
+    try:
+        async with _sandbox_admission_db() as db:
+            ticket = await find_exec_slot_wait(
+                db,
+                run_id=str(runtime_context.runtime_run_id),
+                tool_call_id=str(runtime_context.runtime_tool_call_id),
+            )
+            if ticket is None or ticket.status == SandboxReservationStatus.CONSUMED.value:
+                return
+            ticket.status = SandboxReservationStatus.CONSUMED.value
+            ticket.consumed_at = datetime.now(timezone.utc)
+            ticket.version += 1
+            await db.commit()
+    except Exception:  # noqa: BLE001 - a stale ticket is cancelled by the wake sweep
+        logger.warning("[sandbox] exec-slot ticket could not be consumed", exc_info=True)
+
+
+def _settings_poll_seconds() -> int:
+    try:
+        from packages.core.config import get_settings
+
+        return max(1, int(get_settings().SANDBOX_QUEUE_POLL_SECONDS))
+    except Exception:
+        return 5
+
+
+# A runner restart drops in-flight HTTP calls; a long-poll rides out this much
+# of it before it reports the runner unreachable.
+_RUNNER_BLIP_SECONDS = 20.0
+# How often a command someone is watching is asked what it is doing.
+_WATCHED_POLL_SECONDS = 4.0
+
+
+async def _await_execution(
+    client: Any,
+    *,
+    sandbox_id: str,
+    execution_id: str,
+    first: Any,
+    budget_seconds: float,
+    on_status: Callable[[Any], Awaitable[None]] | None = None,
+) -> tuple[Any, str]:
+    """Long-poll one execution until it ends. Returns (final status, last seen status).
+
+    Never hangs: ``asyncio.TimeoutError`` once the budget runs out; the
+    transport error once the runner stays unreachable for
+    ``_RUNNER_BLIP_SECONDS``; the runner's own error (404 when the sandbox is
+    gone) otherwise. The last status seen tells the caller whether the
+    command had started.
+
+    ``on_status`` sees every status with only the events new since the last
+    one; the runner's long-poll wakes only when the command ends, so a
+    watched command is polled every few seconds instead.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, float(budget_seconds))
+    status = first
+    last_status = str(getattr(first, "status", "") or "")
+    unreachable_since: float | None = None
+    after_sequence = 0
+    poll_ceiling = _WATCHED_POLL_SECONDS if on_status is not None else 30.0
+    if on_status is not None:
+        after_sequence = int(getattr(first, "next_sequence", 0) or 0)
+        await on_status(first)
+    while not getattr(status, "terminal", False):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError(f"execution {execution_id} did not end within {budget_seconds:.0f}s")
+        try:
+            status = await client.execution_status(
+                sandbox_id, execution_id,
+                **({"after_sequence": after_sequence} if after_sequence else {}),
+                wait_seconds=min(poll_ceiling, max(1.0, remaining)),
+            )
+            last_status = str(getattr(status, "status", "") or last_status)
+            unreachable_since = None
+            if on_status is not None:
+                after_sequence = max(after_sequence, int(getattr(status, "next_sequence", 0) or 0))
+                await on_status(status)
+        except Exception as exc:
+            if not _is_transport_error(exc):
+                setattr(exc, "_manor_last_status", last_status)
+                raise
+            now = loop.time()
+            unreachable_since = unreachable_since or now
+            if now - unreachable_since >= _RUNNER_BLIP_SECONDS:
+                raise
+            await asyncio.sleep(1.0)
+    return status, last_status
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx ships with the SDK
+        return False
+    return isinstance(exc, httpx.TransportError) and not isinstance(exc, httpx.TimeoutException)
+
+
+def _transport_error_before_send(exc: BaseException) -> bool:
+    """True when the request certainly never reached the runner."""
+
+    import httpx
+
+    return isinstance(exc, httpx.ConnectError)
+
+
+def _sandbox_lost_while_running_error(sandbox_id: str) -> str:
+    return _sandbox_error(
+        SandboxToolErrorCode.SANDBOX_LOST,
+        f"Sandbox {sandbox_id} was lost while your command was running (its container stopped "
+        "or was replaced). The command was NOT retried because it may not be idempotent, and "
+        "files that were only inside the sandbox are gone. Check what it already changed, then "
+        "open a fresh sandbox (sandbox action='create', or invoke_skill for a Skill) and continue.",
+    )
+
+
+# The runner's disk-quota refusal (``sandbox.disk_quota``): HTTP 409 code for
+# a command refused at admission, outcome for one refused while it waited.
+_DISK_QUOTA_CODE = "sandbox_disk_quota"
+_DISK_QUOTA_OUTCOME = "disk_quota"
+
+
+def _disk_quota_error(detail: str) -> str:
+    return _sandbox_error(
+        SandboxToolErrorCode.DISK_QUOTA,
+        (detail.strip() or "Not started: this work area is over its share of the sandbox's disk.")
+        + " Nothing ran. Do not retry the same command before freeing space.",
+    )
+
+
+def _exec_result_text(final: Any, *, sandbox_id: str, command: str, timeout: int) -> str:
+    """The model-facing outcome of a finished command, with accurate kill reasons."""
+
+    outcome = str(getattr(final, "outcome", "") or "")
+    detail = str(getattr(final, "outcome_detail", "") or "")
+    error = str(getattr(final, "error", "") or "")
+    exit_code = getattr(final, "exit_code", None)
+    if outcome == _DISK_QUOTA_OUTCOME:
+        return _disk_quota_error(detail or error)
+    if outcome == "queue_timeout":
+        return _sandbox_error(
+            SandboxToolErrorCode.EXEC_NOT_STARTED,
+            f"The command was not started: every command slot of sandbox {sandbox_id} stayed taken "
+            f"for {_exec_queue_wait_seconds()}s by other work of this user. Nothing ran. Retry it "
+            "later, or start it with background=true so it waits its turn without blocking you.",
+        )
+    if str(getattr(final, "status", "")) == "cancelled" and exit_code is None:
         return _sandbox_error(
             SandboxToolErrorCode.EXEC_FAILED,
-            f"Sandbox exec failed: {exc}",
+            f"The command was cancelled ({error or 'by a cancel request'}).",
         )
+    if exit_code is None and "timed out" in error.lower():
+        return _sandbox_error(
+            SandboxToolErrorCode.EXEC_TIMEOUT,
+            f"Command exceeded its {timeout}s limit and was stopped. Do not automatically repeat "
+            "a command with side effects. For long-running work, start it with background=true "
+            "and poll action='status'.",
+        )
+    parts = []
+    if getattr(final, "stdout", None):
+        parts.append(final.stdout)
+    if getattr(final, "stderr", None):
+        parts.append(f"[stderr]\n{final.stderr}")
+    if outcome in {"oom_killed", "pids_killed", "disk_killed"}:
+        parts.append(f"[{detail or outcome}]")
+    elif exit_code is None and error:
+        parts.append(f"[error: {error}]")
+    parts.append(f"[exit_code: {exit_code if exit_code is not None else 'unknown'}]")
+    logger.info(
+        "[sandbox] exec: sandbox=%s exit=%s outcome=%s cmd=%s",
+        sandbox_id, exit_code, outcome or "-", command[:80],
+    )
+    return "\n".join(parts)
+
+
+async def _acquire_general_sandbox(runtime_context: Any, scope: RuntimeSandboxScope) -> Any:
+    """The owner's live general sandbox id (created on demand), a suspension, or None."""
+
+    tool_call_id = str(getattr(runtime_context, "runtime_tool_call_id", "") or "")
+    try:
+        session = await acquire_generic_sandbox(
+            scope=scope,
+            runtime_context=runtime_context,
+            tool_call_id=f"{tool_call_id}:replacement" if tool_call_id else "",
+        )
+    except ValueError:
+        return None
+    if isinstance(session, SandboxSession):
+        return session.sandbox_id
+    if isinstance(session, SandboxSessionError):
+        logger.warning("[sandbox] no replacement sandbox: %s", session.message)
+        return None
+    return session
+
+
+async def _retry_not_started(
+    *,
+    runtime_context: Any,
+    scope: RuntimeSandboxScope | None,
+    sandbox_id: str,
+    fallback: str | None,
+    forget: bool = True,
+    entity_id: str,
+    user_id: str,
+    conversation_id: str,
+    command: str,
+    timeout: int,
+    background: Any,
+    kwargs: dict[str, Any],
+    replacement_of: str,
+) -> Any:
+    """A command that never started on a lost (or reclaimed) sandbox runs on the owner's new one.
+
+    Only for the owner's GENERAL sandbox: a Skill's container is re-opened
+    through the Skill, so its command is answered "not started" instead.
+    """
+
+    # A command that saw a Skill as /skill needs that Skill re-opened first;
+    # only a plain command (the agent's own work area) moves on its own.
+    # A sandbox that held a Skill (any agent's) is re-opened through the
+    # Skill, never replaced behind the agents' backs.
+    skill_container = scope is not None and (
+        await runtime_agent_viewed_skill_in(scope, runtime_context.agent_id, sandbox_id)
+        or bool(runtime_binding_skills(await _load_binding(scope, sandbox_id)))
+    )
+    if scope is not None and forget:
+        await forget_vanished_sandbox(sandbox_id, scope=scope)
+    replacement = None
+    if not skill_container and scope is not None and not replacement_of:
+        replacement = await _acquire_general_sandbox(runtime_context, scope)
+    if replacement is None:
+        return fallback or _sandbox_error(
+            SandboxToolErrorCode.EXEC_NOT_STARTED,
+            f"Sandbox {sandbox_id} was lost before your command started, so it did not run. "
+            "Open a fresh sandbox (sandbox action='create', or invoke_skill for a Skill) and run it there.",
+        )
+    if not isinstance(replacement, str):
+        return replacement  # a durable run waits for the owner's new container
+    logger.info("[sandbox] running a not-started command of %s in replacement %s", sandbox_id, replacement)
+    result = await _sandbox_exec(
+        entity_id=entity_id,
+        user_id=user_id,
+        sandbox_id=replacement,
+        command=command,
+        timeout=timeout,
+        background=background,
+        conversation_id=conversation_id,
+        _sandbox_replacement_of=sandbox_id,
+        **kwargs,
+    )
+    if not isinstance(result, str):
+        return result
+    return (
+        f"[sandbox {sandbox_id} was gone before this command started, so it ran in this user's "
+        f"new sandbox {replacement}. Use sandbox_id {replacement} from now on; files that were "
+        "only in the old sandbox are gone.]\n" + result
+    )
 
 
 _SANDBOX_EXEC_SCHEMA = {
@@ -896,6 +1593,12 @@ def _sandbox_execution_payload(result: Any) -> dict[str, Any]:
         "next_sequence": result.next_sequence,
         "waiting_for_response": result.waiting_for_response,
     }
+    if getattr(result, "outcome", None):
+        # Why it ended when the runner (not the command) ended it.
+        payload["outcome"] = result.outcome
+        payload["outcome_detail"] = getattr(result, "outcome_detail", None)
+    if result.status == "queued":
+        payload["queue_position"] = getattr(result, "queue_position", None)
     if not result.terminal:
         payload["poll_after_seconds"] = 1
         payload["hint"] = (
@@ -925,7 +1628,7 @@ async def _sandbox_status(
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     execution_id = execution_id.strip()
@@ -938,13 +1641,8 @@ async def _sandbox_status(
             SandboxToolErrorCode.INVALID_REQUEST,
             "sandbox_id and execution_id are required.",
         )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
         return access_error
 
@@ -960,7 +1658,7 @@ async def _sandbox_status(
             await _clear_runtime_active_execution(runtime_context, execution_id)
         return json.dumps(_sandbox_execution_payload(result), ensure_ascii=False)
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
             return expired
         from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
@@ -1089,7 +1787,7 @@ async def _sandbox_respond(
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     execution_id = execution_id.strip()
@@ -1106,13 +1804,8 @@ async def _sandbox_respond(
             SandboxToolErrorCode.INVALID_REQUEST,
             "payload must be an object.",
         )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
         return access_error
 
@@ -1148,7 +1841,7 @@ async def _sandbox_respond(
             ensure_ascii=False,
         )
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
             return expired
         from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
@@ -1204,7 +1897,7 @@ async def _sandbox_cancel(
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     execution_id = execution_id.strip()
@@ -1213,13 +1906,8 @@ async def _sandbox_cancel(
             SandboxToolErrorCode.INVALID_REQUEST,
             "sandbox_id and execution_id are required.",
         )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
         return access_error
 
@@ -1237,7 +1925,7 @@ async def _sandbox_cancel(
             ensure_ascii=False,
         )
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
             return expired
         return _sandbox_error(
@@ -1289,7 +1977,7 @@ async def _sandbox_read_file(
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     path = (path or kwargs.get("file_path") or "").strip()
@@ -1299,18 +1987,17 @@ async def _sandbox_read_file(
             "sandbox_id and path are required.",
         )
 
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
         return access_error
 
+    try:
+        skill_view, base_dir = await _agent_file_view(scope, runtime_context.agent_id, sandbox_id)
+    except SandboxRunnerOutdatedError as exc:
+        return _runner_outdated_error(exc)
     if not path.startswith("/"):
-        path = f"/skill/{path}"
+        path = f"{base_dir}/{path}"
 
     try:
         offset = max(0, int(kwargs.get("offset") or 0))
@@ -1348,6 +2035,7 @@ async def _sandbox_read_file(
 
                 image = await client.read_file_base64(
                     sandbox_id=sandbox_id, path=path, max_size=READ_FILE_MAX_IMAGE_BYTES,
+                    **_view_kwargs(skill_view),
                 )
                 if (
                     image.size > READ_FILE_MAX_IMAGE_BYTES
@@ -1361,10 +2049,10 @@ async def _sandbox_read_file(
                     "image": {
                         "data_url": f"data:{image_mime_type};base64,{image.content_base64}",
                         "mime_type": image_mime_type, "bytes": len(image_bytes),
-                        "delivery": "ephemeral_multimodal",
+                        "delivery": FILE_IMAGE_DELIVERY_CONTRACT,
                     },
                 })
-            result = await client.read_file(sandbox_id=sandbox_id, path=path)
+            result = await client.read_file(sandbox_id=sandbox_id, path=path, **_view_kwargs(skill_view))
         finally:
             await client.close()
         full_content = result.content
@@ -1404,7 +2092,7 @@ async def _sandbox_read_file(
             ensure_ascii=False,
         )
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
             return expired
         logger.exception("[sandbox] read_file failed: sandbox=%s error=%s", sandbox_id, exc)
@@ -1464,7 +2152,7 @@ async def _sandbox_write_file(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     path = (path or kwargs.get("file_path") or "").strip()
@@ -1475,8 +2163,6 @@ async def _sandbox_write_file(
             SandboxToolErrorCode.INVALID_REQUEST,
             "sandbox_id and path are required.",
         )
-    if not path.startswith("/"):
-        path = f"/skill/{path}"
     if content is not None and workspace_path:
         return _sandbox_error(
             SandboxToolErrorCode.INVALID_REQUEST,
@@ -1488,15 +2174,16 @@ async def _sandbox_write_file(
             "Either `content` or `workspace_path` must be provided.",
         )
 
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
         return access_error
+    try:
+        skill_view, base_dir = await _agent_file_view(scope, runtime_context.agent_id, sandbox_id)
+    except SandboxRunnerOutdatedError as exc:
+        return _runner_outdated_error(exc)
+    if not path.startswith("/"):
+        path = f"{base_dir}/{path}"
 
     try:
         client = await _get_client_for_sandbox(sandbox_id)
@@ -1525,17 +2212,19 @@ async def _sandbox_write_file(
                     path=path,
                     content_base64=base64.b64encode(workspace_bytes).decode("ascii"),
                     mkdir=True,
+                    **_view_kwargs(skill_view),
                 )
             else:
                 result = await client.write_file(
                     sandbox_id=sandbox_id, path=path, content=str(content), mkdir=True,
+                    **_view_kwargs(skill_view),
                 )
         finally:
             await client.close()
         source = f"workspace:{workspace_path}" if workspace_path else "direct content"
         return f"Written to {result.path} (source: {source})"
     except Exception as exc:
-        expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+        expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
         if expired:
             return expired
         logger.exception("[sandbox] write_file failed: sandbox=%s error=%s", sandbox_id, exc)
@@ -1710,7 +2399,12 @@ def _pptx_quality_evidence_error(
         return "the report is stale or belongs to a different PPTX", payload
     if metrics.get("pptx_size_bytes") != len(content_bytes):
         return "the report file-size evidence does not match the PPTX", payload
-    if metrics.get("rendered_slide_count") != slide_count:
+    if metrics.get("pipeline") == "template":
+        # Template decks are proven by re-planning deck.json shape by shape
+        # instead of a raster render (see deck_engine/verify.py).
+        if metrics.get("template_verified_slide_count") != slide_count:
+            return "not every slide was verified against its deck.json template plan", payload
+    elif metrics.get("rendered_slide_count") != slide_count:
         return "not every final slide has verified render evidence", payload
 
     reported_path = str(payload.get("pptx") or "")
@@ -1819,16 +2513,21 @@ async def _sandbox_save_result(
             "To save a file generated inside the sandbox, use sandbox_id + file_path instead of url.",
         )
 
+    scope = _caller_scope(runtime_context, entity_id)
+    skill_view: str | None = None
     if sandbox_id:
-        access_error = await _sandbox_instance_access_error(
-            sandbox_id=sandbox_id,
-            entity_id=entity_id,
-            user_id=runtime_context.user_id,
-            agent_id=runtime_context.agent_id,
-            conversation_id=binding_key,
-        )
+        access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
         if access_error:
             return access_error
+        try:
+            skill_view, base_dir = await _agent_file_view(scope, runtime_context.agent_id, sandbox_id)
+        except SandboxRunnerOutdatedError as exc:
+            return _runner_outdated_error(exc)
+        if file_path and not file_path.startswith("/"):
+            file_path = f"{base_dir}/{file_path}"
+        # Scripts print the Skill's real directory (/skills/<name>); the
+        # agent's view of it is /skill, which the export gates check.
+        file_path = _skill_view_path(file_path, skill_view)
 
     content_bytes: bytes | None = None
     quality_evidence: dict[str, Any] | None = None
@@ -1906,16 +2605,23 @@ async def _sandbox_save_result(
                         sandbox_id=sandbox_id,
                         command=" ".join(command_parts),
                         timeout=240,
+                        execution_id=f"manor-{uuid.uuid4().hex}",
+                        # A gate never fails "busy": it waits its turn.
+                        queue_timeout=_exec_queue_wait_seconds(),
+                        fair_key=scope.binding_key if scope is not None else None,
+                        **_view_kwargs(skill_view),
                     )
                 result = await client.read_file_base64(
                     sandbox_id=sandbox_id,
                     path=file_path,
+                    **_view_kwargs(skill_view),
                 )
                 if gate_context is not None:
                     try:
                         report_result = await client.read_file_base64(
                             sandbox_id=sandbox_id,
                             path=gate_context[2],
+                            **_view_kwargs(skill_view),
                         )
                         report_bytes = base64.b64decode(report_result.content_base64)
                     except Exception:
@@ -1957,16 +2663,26 @@ async def _sandbox_save_result(
                         file_path,
                         evidence_error,
                     )
+                    evidence_metrics = (quality_evidence or {}).get("metrics")
+                    if isinstance(evidence_metrics, dict) and evidence_metrics.get("pipeline") == "template":
+                        repair = (
+                            "Fix deck.json, rerun `python3 scripts/build_deck.py "
+                            "projects/<project>/deck.json` without editing the built PPTX, "
+                            "and call sandbox action='save_result' again."
+                        )
+                    else:
+                        repair = (
+                            "Fix the source, re-export it, render every "
+                            f"{'slide' if gate_kind == 'pptx' else 'page'}, and call "
+                            "sandbox action='save_result' again."
+                        )
                     return _sandbox_error(
                         SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
-                        f"{label}_FINAL_QUALITY_GATE_BLOCKED: "
-                        f"{evidence_error}. Fix the source, re-export it, render every "
-                        f"{'slide' if gate_kind == 'pptx' else 'page'}, and call "
-                        "sandbox action='save_result' again. "
+                        f"{label}_FINAL_QUALITY_GATE_BLOCKED: {evidence_error}. {repair} "
                         f"The current {label} was not saved.",
                     )
         except Exception as exc:
-            expired = await _vanished_sandbox_error(exc, sandbox_id=sandbox_id, binding_key=binding_key)
+            expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
             if expired:
                 return expired
             logger.exception("[sandbox] save_result read failed: %s", exc)
@@ -2136,63 +2852,43 @@ async def _sandbox_save_result(
             })
 
         try:
-            content_sha256 = hashlib.sha256(content_bytes).hexdigest()
-            async with RuntimeFileProjectionTransactionFactory.create(
-                entity_id,
-            ) as transaction:
-                target = await transaction.write_bytes(
-                    rel_path,
-                    content_bytes,
-                    expected_content_sha256=content_sha256,
-                    expected_size=len(content_bytes),
-                    allow_empty=False,
-                    require_missing=True,
-                )
-                sync = await transaction.project_file(
-                    abs_path=target,
-                    entity_root=entity_dir,
-                    source="sandbox",
-                    created_by=runtime_context.user_id or "ai-agent",
-                    force=True,
-                    workspace_id=runtime_context.workspace_id,
-                    task_id=runtime_context.task_id,
-                    agent_id=runtime_context.agent_id,
-                    conversation_id=runtime_context.conversation_id,
-                    user_id=runtime_context.user_id,
-                    tool_name="sandbox_save_result",
-                    expected_content_sha256=content_sha256,
-                )
-                await transaction.commit()
-            rel_path = _os.path.relpath(target, entity_dir).replace(_os.sep, "/")
-            canonical_path = getattr(sync, "fs_path", None) or rel_path
-            saved_name = getattr(sync, "name", None) or _os.path.basename(target)
-            file_size = getattr(sync, "file_size", None)
-            mime_type = getattr(sync, "mime_type", None)
-            if file_size is None:
-                file_size = len(content_bytes)
-            if not mime_type:
-                mime_type = mimetypes.guess_type(saved_name)[0] or "application/octet-stream"
+            record = await project_bytes_into_knowledge(
+                entity_id=entity_id,
+                entity_dir=entity_dir,
+                rel_path=rel_path,
+                content_bytes=content_bytes,
+                source="sandbox",
+                created_by=runtime_context.user_id or "ai-agent",
+                tool_name="sandbox_save_result",
+                workspace_id=runtime_context.workspace_id,
+                task_id=runtime_context.task_id,
+                agent_id=runtime_context.agent_id,
+                conversation_id=runtime_context.conversation_id,
+                user_id=runtime_context.user_id,
+                transaction_factory=RuntimeFileProjectionTransactionFactory,
+            )
             logger.info(
                 "[sandbox] save_result: registered %s → doc=%s",
                 filename,
-                sync.document_id,
+                record.document_id,
             )
             return json.dumps({
                 "saved": True,
                 "saved_to_knowledge": True,
                 "display_as_artifact": display_as_artifact,
                 "artifact_role": artifact_role,
-                "document_id": sync.document_id,
-                "name": saved_name,
-                "file_size": file_size,
-                "mime_type": mime_type,
-                "fs_path": canonical_path,
-                "result_url": entity_fs_open_url(entity_id, canonical_path),
+                "document_id": record.document_id,
+                "name": record.name,
+                "file_size": record.file_size,
+                "mime_type": record.mime_type,
+                "fs_path": record.fs_path,
+                "result_url": entity_fs_open_url(entity_id, record.fs_path),
                 "file": file_ref(
-                    entity_id=entity_id, fs_path=canonical_path, document_id=sync.document_id,
-                    name=saved_name, mime=mime_type, size=file_size, sha256=content_sha256,
+                    entity_id=entity_id, fs_path=record.fs_path, document_id=record.document_id,
+                    name=record.name, mime=record.mime_type, size=record.file_size,
+                    sha256=hashlib.sha256(content_bytes).hexdigest(),
                 ),
-                "message": f"File '{saved_name}' saved to knowledge base.",
+                "message": f"File '{record.name}' saved to knowledge base.",
                 **({"quality_gate": quality_evidence} if quality_evidence else {}),
             })
         except RuntimeFileCommitError as exc:
@@ -2264,7 +2960,7 @@ async def _sandbox_destroy(
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    # Sandbox scope is the binding key, not the conversation; see _load_ctx.
+    # Sandbox scope is the binding key, not the conversation; see _caller_scope.
     binding_key = runtime_context.sandbox_binding_key or conversation_id
     sandbox_id = sandbox_id.strip()
     if not sandbox_id:
@@ -2273,38 +2969,38 @@ async def _sandbox_destroy(
             "sandbox_id is required.",
         )
 
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=binding_key,
-    )
+    scope = _caller_scope(runtime_context, entity_id)
+    access_error = await _sandbox_instance_access_error(sandbox_id=sandbox_id, scope=scope)
     if access_error:
-        # No binding at all means this scope already released its sandbox.
-        # Releasing twice is benign, so say so instead of reporting a denial
-        # for a binding that no longer exists. A binding for a *different*
-        # sandbox or agent is a real access error and still surfaces as one.
-        bound = await _load_ctx(binding_key)
-        if bound is None:
-            return f"Sandbox {sandbox_id} was already released."
-        if _expired_binding(bound, sandbox_id):
+        if scope is None:
+            return access_error
+        # The conversation's own sandbox, released or reclaimed before:
+        # releasing twice is benign, so say so instead of reporting a denial.
+        # A sandbox that was never the conversation's stays denied.
+        ctx = await _load_binding(scope, sandbox_id)
+        if _expired_binding(ctx, sandbox_id):
             return f"Sandbox {sandbox_id} was already reclaimed after sitting idle; nothing to release."
+        if runtime_binding_was_released(ctx, sandbox_id):
+            return f"Sandbox {sandbox_id} was already released."
         return access_error
 
-    owner = None
-    if entity_id:
-        try:
-            owner = SandboxOwner(entity_id=entity_id, user_id=str(user_id or ""))
-        except ValueError:
-            owner = None
+    try:
+        owner = _scope_owner(scope)
+    except ValueError:
+        owner = None
     outcome = await release_sandbox_session(
         owner=owner,
         sandbox_id=sandbox_id,
-        conversation_id=binding_key or None,
+        scope=scope,
+        agent_id=runtime_context.agent_id,
         db=None,
     )
-    logger.info("[sandbox] released: sandbox=%s outcome=%s", sandbox_id, outcome)
+    logger.info(
+        "[sandbox] released: sandbox=%s agent=%s outcome=%s",
+        sandbox_id,
+        runtime_context.agent_id or "main",
+        outcome,
+    )
     if outcome == "destroyed":
         return f"Sandbox {sandbox_id} released and destroyed (not reusable)."
     if outcome == "destroy_failed":
@@ -2312,7 +3008,10 @@ async def _sandbox_destroy(
             f"Sandbox {sandbox_id} released; destroying the container failed "
             "and it will be reclaimed by the idle reaper."
         )
-    return f"Sandbox {sandbox_id} released for reuse; the container stays warm for this user."
+    return (
+        f"Sandbox {sandbox_id} released for reuse; the container stays warm for this "
+        "conversation's other agents and later turns."
+    )
 
 
 _SANDBOX_DESTROY_SCHEMA = {
@@ -2320,9 +3019,9 @@ _SANDBOX_DESTROY_SCHEMA = {
     "function": {
         "name": "sandbox_destroy",
         "description": (
-            "Release this conversation's sandbox binding when you are done. The "
-            "container stays warm for the same user's next request; call at most "
-            "once and do not call again after it succeeds."
+            "Release your use of this conversation's sandbox when you are done. The "
+            "container stays warm for the conversation's other agents and the next "
+            "request; call at most once and do not call again after it succeeds."
         ),
         "parameters": {
             "type": "object",
@@ -2349,8 +3048,8 @@ SANDBOX_SCHEMA = {
             "destroy once when finished to release the sandbox for reuse. "
             "Allowed action values are exactly create, "
             "exec, status, respond, cancel, read_file, write_file, save_result, and destroy; do not substitute "
-            "run, shell, execute, exec_command, or command. Create always returns a "
-            "blank sandbox; use invoke_skill when a stored Skill is required."
+            "run, shell, execute, exec_command, or command. Create returns the "
+            "conversation's shared sandbox; use invoke_skill for stored Skills."
         ),
         "parameters": {
             "type": "object",

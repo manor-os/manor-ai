@@ -7,21 +7,85 @@ import Button from "../ui/Button";
 import Input from "../ui/Input";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Select from "../ui/Select";
+import StatusPill from "../ui/StatusPill";
 import { api } from "../../lib/api";
 import { formatBlueprintVariableValue, parseBlueprintVariableValue } from "../../lib/blueprintVariables.mjs";
 import { t } from "../../lib/i18n";
+import { getPreferredTimeZone } from "../../lib/format";
 
 type ConflictChoice = "keep_yours" | "use_blueprint";
 type UpgradePlan = Awaited<ReturnType<typeof api.workspaces.blueprintUpgradePlan>>;
 type UpgradeItem = UpgradePlan["items"][number];
 
 function defaultChoice(item: UpgradeItem): ConflictChoice {
-  return item.blocked_reason ? "keep_yours" : "use_blueprint";
+  // Edits to items the Blueprint did not change stay yours unless you switch them.
+  return item.blocked_reason || item.action === "customized" ? "keep_yours" : "use_blueprint";
+}
+
+function compatibilityText(issue: NonNullable<UpgradeItem["compatibility_issues"]>[number]): string {
+  const users = issue.required_by.map((dependant) => dependant.name).join(", ")
+    || t("page.blueprints.upgrade_issue_blueprint");
+  return t(`page.blueprints.upgrade_issue_${issue.code}`)
+    .replace("{names}", issue.names.join(", ")).replace("{users}", users);
 }
 
 function contentText(value: unknown): string {
   if (value === undefined || value === null) return t("page.blueprints.upgrade_content_absent");
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+/** Which release to move to, what kind of step that is, and what changed on the way. */
+function VersionChoice({ plan, disabled, onChange }: {
+  plan: UpgradePlan; disabled: boolean; onChange: (version: string | undefined) => void;
+}) {
+  const versions = plan.available_versions ?? [];
+  if (versions.length === 0) return null;
+  const latest = plan.latest_version;
+  const installed = plan.installed_version;
+  const target = plan.target_version ?? latest ?? versions[0].version;
+  const change = plan.version_change;
+  const label = (version: (typeof versions)[number]) => [
+    version.version,
+    version.version === latest ? t("page.blueprints.upgrade_version_latest") : null,
+    version.version === installed ? t("page.blueprints.upgrade_version_installed") : null,
+    version.deprecated ? t("page.blueprints.upgrade_version_deprecated") : null,
+  ].filter(Boolean).join(" · ");
+  // Notes of the releases an upgrade crosses (after the installed one, up to the target), oldest first.
+  const toIndex = versions.findIndex((version) => version.version === target);
+  const fromIndex = versions.findIndex((version) => version.version === installed);
+  const crossed = plan.downgrade || toIndex < 0 || fromIndex < 0 ? []
+    : versions.slice(toIndex, fromIndex).filter((version) => version.changelog).reverse();
+  return (
+    <section aria-label={t("page.blueprints.upgrade_version_title")} className="rounded-xl bg-stone-50 p-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h3 className="font-semibold">{t("page.blueprints.upgrade_version_title")}</h3>
+          <p className="mt-1 text-xs text-stone-500">
+            <span className="font-mono">{installed || "—"}</span> → <span className="font-mono">{target}</span>
+          </p>
+        </div>
+        <Select value={target} disabled={disabled}
+          onChange={(value) => onChange(value === latest ? undefined : value)}
+          options={versions.map((version) => ({ value: version.version, label: label(version) }))}
+          ariaLabel={t("page.blueprints.upgrade_version_title")}
+          style={{ width: "min(100%, 260px)" }} />
+      </div>
+      {change && <div className="mt-2 space-y-1 text-xs leading-relaxed text-stone-600">
+        <p>{t(plan.downgrade ? "page.blueprints.upgrade_version_downgrade" : `page.blueprints.upgrade_version_${change.min_bump}`)}</p>
+        {change.reasons.length > 0 && <ul className="list-disc space-y-0.5 pl-4">
+          {change.reasons.slice(0, 8).map((reason) => <li key={reason} className="break-words">{reason}</li>)}
+        </ul>}
+      </div>}
+      {crossed.length > 0 && <details className="mt-2">
+        <summary className="cursor-pointer text-xs font-semibold text-stone-700">{t("page.blueprints.upgrade_version_notes")}</summary>
+        <ul className="mt-2 space-y-2 text-xs leading-relaxed text-stone-600">
+          {crossed.map((version) => <li key={version.version}>
+            <span className="font-mono font-semibold">{version.version}</span> — <span className="whitespace-pre-wrap break-words">{version.changelog}</span>
+          </li>)}
+        </ul>
+      </details>}
+    </section>
+  );
 }
 
 export interface BlueprintUpgradeDialogProps {
@@ -35,14 +99,18 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
   const queryClient = useQueryClient();
   const [applied, setApplied] = useState<{
     updated: number; kept: number; canRevert: boolean; customized: boolean;
+    /** Set when the review moved to a release other than the latest. */
+    version?: { to: string; latest: string };
   } | null>(null);
   const [conflictChoices, setConflictChoices] = useState<Record<string, ConflictChoice>>({});
   const [variableValues, setVariableValues] = useState<Record<string, string>>({});
   const [channelConfigIds, setChannelConfigIds] = useState<Record<string, string>>({});
+  // A listed release to move to, newer or older; undefined = the latest.
+  const [targetVersion, setTargetVersion] = useState<string | undefined>(undefined);
 
   const basePlanQuery = useQuery({
-    queryKey: ["blueprint-upgrade-plan", workspaceId],
-    queryFn: () => api.workspaces.blueprintUpgradePlan(workspaceId),
+    queryKey: ["blueprint-upgrade-plan", workspaceId, targetVersion],
+    queryFn: () => api.workspaces.blueprintUpgradePlan(workspaceId, undefined, undefined, targetVersion),
     enabled: open,
   });
   // The server only exposes declarations that affect materialized configuration.
@@ -60,8 +128,8 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
   }
   const hasOverrides = Object.keys(variableValues).length > 0 || Object.keys(channelConfigIds).length > 0;
   const overridePlanQuery = useQuery({
-    queryKey: ["blueprint-upgrade-plan", workspaceId, variableOverrides, channelConfigIds],
-    queryFn: () => api.workspaces.blueprintUpgradePlan(workspaceId, variableOverrides, channelConfigIds),
+    queryKey: ["blueprint-upgrade-plan", workspaceId, targetVersion, variableOverrides, channelConfigIds],
+    queryFn: () => api.workspaces.blueprintUpgradePlan(workspaceId, variableOverrides, channelConfigIds, targetVersion),
     enabled: open && hasOverrides && invalidVariableKeys.size === 0,
   });
   const currentPlanQuery = hasOverrides ? overridePlanQuery : basePlanQuery;
@@ -131,6 +199,7 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
         throw new Error(t("page.blueprints.upgrade_plan_changed"));
       }
       const result = await api.workspaces.applyBlueprintUpgrade(workspaceId, {
+        ...(targetVersion ? { target_version: targetVersion } : {}),
         expected_blueprint_fingerprint: plan.blueprint_fingerprint,
         expected_plan_fingerprint: plan.plan_fingerprint,
         variable_values: variableOverrides,
@@ -142,12 +211,15 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
         })),
       });
       if (result.upgrade_protocol_version !== 3) throw new Error(t("page.blueprints.upgrade_plan_changed"));
-      return result;
+      const to = plan.target_version;
+      const latest = plan.latest_version;
+      return { ...result, version: to && latest && to !== latest ? { to, latest } : undefined };
     },
     onSuccess: async (result) => {
       setApplied({
         updated: result.updated.length, kept: result.kept_yours.length,
         canRevert: result.can_revert, customized: result.synchronization_status === "customized",
+        version: result.version,
       });
       await invalidate();
     },
@@ -184,6 +256,7 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
     setVariableValues({});
     setChannelConfigIds({});
     setConflictChoices({});
+    setTargetVersion(undefined);
     applyMutation.reset();
     revertMutation.reset();
     // Mutation reset functions are stable; opening another Workspace starts a new review.
@@ -222,17 +295,21 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
         <div className="space-y-3" role="status">
           <p className="text-sm text-stone-800">{t("page.blueprints.upgrade_done")
             .replace("{updated}", String(applied.updated)).replace("{kept}", String(applied.kept))}</p>
-          <p className="text-sm text-stone-600">{t(applied.customized
-            ? "page.blueprints.upgrade_customized_done" : "page.blueprints.upgrade_synchronized_done")}</p>
+          <p className="text-sm text-stone-600">{applied.version
+            ? t("page.blueprints.upgrade_synchronized_to_version")
+              .replace("{version}", applied.version.to).replace("{latest}", applied.version.latest)
+            : t(applied.customized
+              ? "page.blueprints.upgrade_customized_done" : "page.blueprints.upgrade_synchronized_done")}</p>
           {revertError}
         </div>
       ) : (
         <div className="space-y-4 text-sm">
           <p className="leading-relaxed text-stone-600">{t("page.blueprints.upgrade_in_place_help")
             .replace("{workspace}", workspaceName)}</p>
+          {plan && <VersionChoice plan={plan} disabled={busy} onChange={setTargetVersion} />}
           {plan?.restore_point && <p className="text-xs text-stone-500">
             {t("page.blueprints.upgrade_restore_point")
-              .replace("{date}", new Date(plan.restore_point.applied_at).toLocaleString())
+              .replace("{date}", new Date(plan.restore_point.applied_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }))
               .replace("{version}", plan.restore_point.blueprint_version || "—")}
           </p>}
           {plan?.variables_ready && plan.baseline_known === false && <p className="rounded-xl bg-stone-100 p-3 text-xs leading-relaxed text-stone-700">
@@ -283,12 +360,19 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
               <p className="text-xs leading-relaxed text-stone-500">{t("page.blueprints.upgrade_conflicts_help")}</p>
               {visibleItems.map((item) => {
                 const choice = conflictChoices[item.key] ?? defaultChoice(item);
-                const action = choice === "keep_yours" ? "keep_yours" : item.action === "keep_yours" ? "update" : item.action;
+                const action = choice === "keep_yours"
+                  ? item.action === "customized" ? "customized" : "keep_yours"
+                  : item.action === "keep_yours" || item.action === "customized" ? "update" : item.action;
+                const issues = choice === "keep_yours" ? item.compatibility_issues ?? [] : [];
                 return <section key={item.key} aria-label={item.name} className="rounded-xl bg-stone-50 p-3">
                   <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                     <div className="min-w-0 flex-1">
                       <h3 className="break-words font-semibold text-stone-800">{item.name}</h3>
-                      <span className="text-xs text-stone-500">{t(`page.blueprints.upgrade_action_${action}`)}</span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs text-stone-500">{t(`page.blueprints.upgrade_action_${action}`)}</span>
+                        {issues.length > 0 && <StatusPill status="needs_setup" size="sm"
+                          label={t("page.blueprints.upgrade_incompatible")} />}
+                      </div>
                     </div>
                     <Select value={choice} disabled={busy || Boolean(item.blocked_reason)}
                       onChange={(value) => setConflictChoices((current) => ({ ...current, [item.key]: value as ConflictChoice }))}
@@ -301,6 +385,10 @@ export default function BlueprintUpgradeDialog({ open, onClose, workspaceId, wor
                   </div>
                   {item.changes.length > 0 && <p className="mt-2 break-words text-xs text-stone-500">{item.changes.join(" · ")}</p>}
                   {item.blocked_reason && <p className="mt-2 text-xs leading-relaxed text-stone-600">{item.blocked_reason}</p>}
+                  {issues.length > 0 && <ul className="mt-2 space-y-1 text-xs leading-relaxed text-stone-700">
+                    {issues.map((issue) => <li key={issue.code} className="break-words">{compatibilityText(issue)}</li>)}
+                    <li className="text-stone-500">{t("page.blueprints.upgrade_incompatible_help")}</li>
+                  </ul>}
                   <details className="mt-3">
                     <summary className="cursor-pointer text-xs font-semibold text-stone-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4">
                       {t("page.blueprints.upgrade_show_diff")}

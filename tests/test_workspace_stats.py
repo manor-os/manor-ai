@@ -7,6 +7,7 @@ import json
 import pytest
 from sqlalchemy import select
 
+from packages.core.constants.execution import COORDINATOR_PARAM_KEY
 from packages.core.goals.measurers import twitter_x as twitter_x_measurer
 from packages.core.goals.service import create_goal, update_goal
 from packages.core.blueprints.exporter import _export_goals, _export_stats
@@ -19,9 +20,11 @@ from packages.core.models.document import (
     Integration,
     VectorStatus,
 )
+from packages.core.models.execution import ExecutionStep
 from packages.core.models.goal import GoalMeasurement
-from packages.core.models.scheduler import AgentExecution, ScheduledJob
+from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.task import Task
+from packages.core.models.task_agent_child import TaskAgentChildRun
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.stats.integration_keys import (
@@ -50,9 +53,13 @@ INTERNAL_LIBRARY_EXPECTATIONS = {
     "workspace.tasks.blocked": 2,
     "workspace.tasks.avg_cycle_time_hours": 4,
     "workspace.workflows.runs": 4,
-    "workspace.workflows.success_rate": 100 / 3,
-    "workspace.agents.runs": 4,
-    "workspace.agents.success_rate": 100 / 3,
+    # completed / (completed + failed): the cancelled run is nobody's failure.
+    "workspace.workflows.success_rate": 50,
+    # Four legacy agent steps plus three agent-loop delegations.
+    "workspace.agents.runs": 7,
+    # Delivered / judged: done + delivered child over done, failed, delivered
+    # and not-delivered children; the cancelled step is not judged.
+    "workspace.agents.success_rate": 50,
     "workspace.knowledge.ready_documents": 2,
 }
 
@@ -201,23 +208,53 @@ async def test_every_internal_library_stat_records_the_documented_value(db_sessi
         ),
     ])
 
+    agent_plan_id = generate_ulid()
+    stats_agent_id = generate_ulid()
+
+    def agent_step(status: str, **overrides) -> ExecutionStep:
+        values = {
+            "id": generate_ulid(), "plan_id": agent_plan_id,
+            "entity_id": workspace.entity_id, "workspace_id": workspace.id,
+            "step_key": f"step_{generate_ulid()}", "kind": "subagent",
+            "resolved_agent_id": stats_agent_id, "step_status": status,
+            "created_at": current,
+        }
+        values.update(overrides)
+        return ExecutionStep(**values)
+
     agent_rows = [
-        AgentExecution(
-            id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
-            agent_id="stats-agent", status=status, created_at=current,
-        )
-        for status in ("completed", "failed", "cancelled", "running")
+        agent_step(status) for status in ("done", "failed", "cancelled", "running")
     ]
     agent_rows.extend([
-        AgentExecution(
-            id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
-            agent_id="stats-agent", status="completed",
-            created_at=observed_at - timedelta(days=40),
-        ),
-        AgentExecution(
-            id=generate_ulid(), entity_id=other_entity_id, workspace_id=workspace.id,
-            agent_id="stats-agent", status="completed", created_at=current,
-        ),
+        agent_step("done", created_at=observed_at - timedelta(days=40)),
+        agent_step("done", entity_id=other_entity_id),
+        # Not agent work: unassigned, never-run and legacy coordinator fold roots.
+        agent_step("done", resolved_agent_id=None, kind="action"),
+        agent_step("skipped"),
+        agent_step("done", params={COORDINATOR_PARAM_KEY: True}),
+    ])
+
+    def agent_child(phase: str, outcome_status: str | None, **overrides) -> TaskAgentChildRun:
+        root_run_id = generate_ulid()
+        values = {
+            "id": generate_ulid(), "task_id": generate_ulid(),
+            "entity_id": workspace.entity_id, "workspace_id": workspace.id,
+            "root_run_id": root_run_id, "parent_ref": root_run_id,
+            "parent_tool_call_id": "call-1", "item_index": 0, "batch_size": 1, "depth": 1,
+            "agent_subscription_id": generate_ulid(), "agent_id": stats_agent_id,
+            "prompt": "Draft the note.", "answer_max_chars": 4000,
+            "lifecycle_generation": "lifecycle-1", "phase": phase,
+            "outcome_status": outcome_status, "state_version": 0, "created_at": current,
+        }
+        values.update(overrides)
+        return TaskAgentChildRun(**values)
+
+    agent_rows.extend([
+        agent_child("completed", "completed"),
+        # Finished but did not deliver.
+        agent_child("completed", "blocked"),
+        agent_child("running", None),
+        agent_child("completed", "completed", entity_id=other_entity_id),
     ])
 
     group_a = DocumentGroup(
@@ -830,3 +867,128 @@ async def test_workspace_stats_quick_view_is_personal_and_filters_unknown_stats(
     )
     assert loaded.status_code == 200, loaded.text
     assert loaded.json() == saved.json()
+
+
+@pytest.mark.asyncio
+async def test_assessed_audience_metrics_share_one_scheduled_assessment(client) -> None:
+    import packages.core.database as db_module
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.models.workspace import AgentSubscription, WorkspaceStaff
+    from packages.core.models.user import User
+    from packages.core.services.auth_service import create_access_token, hash_password
+    from packages.core.models.workspace_stat import WorkspaceStat
+    from packages.core.stats.assessment import validate_assessment
+    from packages.core.stats.service import StatError
+
+    register = await client.post("/api/v1/auth/register", json={
+        "username": "audience_metrics", "email": "audience_metrics@test.com",
+        "password": "pass123", "entity_name": "Audience Metrics",
+    })
+    headers = {"Authorization": f"Bearer {register.json()['access_token']}"}
+    entity_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["entity_id"]
+    workspace_id = (await client.post("/api/v1/workspaces", headers=headers, json={"name": "Channel"})).json()["id"]
+    async with db_module.async_session() as session:
+        session.add(AgentSubscription(entity_id=entity_id, workspace_id=workspace_id, agent_id=generate_ulid(),
+                                      service_key="analyst", status="active"))
+        viewer = User(entity_id=entity_id, email="audience_viewer@test.com", display_name="Viewer",
+                      password_hash=hash_password("pass123"), role="member", status="active")
+        session.add(viewer)
+        await session.flush()
+        session.add(WorkspaceStaff(workspace_id=workspace_id, user_id=viewer.id, role="viewer", status="active"))
+        await session.commit()
+        viewer_headers = {"Authorization": f"Bearer {create_access_token(viewer.id, entity_id, 'member')}"}
+
+    templates = await client.get("/api/v1/workspaces/stats/assessment-templates", headers=headers)
+    assert {item["key"] for item in templates.json()["items"]} >= {"latest_video_views", "followers", "active_users"}
+
+    endpoint = f"/api/v1/workspaces/{workspace_id}/stats/assessed-metrics"
+    first = await client.post(endpoint, headers=headers, json={"templates": ["latest_video_views", "followers"]})
+    assert first.status_code == 201, first.text
+    body = first.json()
+    assert {item["key"] for item in body["items"]} == {"latest_video_views", "followers"}
+    assert all(item["collector_type"] == "agent_review" for item in body["items"])
+    assert body["service_key"] == "analyst"
+    # The heartbeat (off by default) drives the Strategist only; tracking runs on its own.
+    assert body["schedule_enabled"] is True
+
+    # More metrics join the same assessment instead of creating a second producer.
+    second = await client.post(endpoint, headers=headers, json={"templates": ["latest_video_comments"]})
+    assert second.status_code == 201, second.text
+    assert second.json()["job_id"] == body["job_id"]
+    async with db_module.async_session() as session:
+        bindings = (await session.execute(select(WorkflowBinding).where(WorkflowBinding.workspace_id == workspace_id))).scalars().all()
+        assert len(bindings) == 1
+        flow = await session.get(WorkflowDefinition, bindings[0].workflow_id)
+        producer = next(step for step in flow.steps if step["type"] == "agent")
+        assert producer["config"]["stat_assessment_keys"] == ["followers", "latest_video_comments", "latest_video_views"]
+        job = (await session.execute(select(ScheduledJob).where(ScheduledJob.job_id == body["job_id"]))).scalar_one()
+        assert job.every_seconds == 86400
+        views = (await session.execute(select(WorkspaceStat).where(
+            WorkspaceStat.workspace_id == workspace_id, WorkspaceStat.key == "latest_video_views",
+        ))).scalar_one()
+    # A count has a floor but no ceiling, unlike a 0–100 score.
+    accepted = validate_assessment({
+        "value": 12480, "expected_revision": views.revision, "idempotency_key": "run:views", "reasoning": "Read the channel page.",
+        "evidence": [{"document_id": "doc", "updated_at": "2026-10-14T00:00:00Z", "locator": "note", "reason": "snapshot"}],
+    }, views)
+    assert accepted["value"] == 12480
+    with pytest.raises(StatError):
+        validate_assessment({
+            "value": -1, "expected_revision": views.revision, "idempotency_key": "run:negative", "reasoning": "x",
+            "evidence": [{"document_id": "doc", "updated_at": "2026-10-14T00:00:00Z", "locator": "note", "reason": "snapshot"}],
+        }, views)
+
+    assert (await client.post(endpoint, headers=viewer_headers, json={"templates": ["active_users"]})).status_code == 403
+    unknown = await client.post(endpoint, headers=headers, json={"templates": ["revenue"]})
+    assert unknown.status_code == 400 and "unknown assessment templates" in unknown.text
+
+
+async def test_stat_collection_job_never_collects_another_companys_stat(db_session, monkeypatch) -> None:
+    # Catches: a scheduled job of one company (or Workspace) naming another
+    # company's Stat id and collecting, or reading back, that Stat's value -
+    # both at dispatch and in the worker that performs the collection.
+    from contextlib import asynccontextmanager
+
+    import packages.core.database as database
+    from packages.core.models.workspace_stat import WorkspaceStatObservation
+    from packages.core.tasks import ai_tasks, scheduler_tasks
+
+    home, foreign = _workspace(db_session), _workspace(db_session)
+    await db_session.flush()
+    stat = await create_stat_from_library(
+        db_session, entity_id=foreign.entity_id, workspace_id=foreign.id, library_key="workspace.tasks.completed",
+    )
+    job = ScheduledJob(
+        id=generate_ulid(), job_id=f"borrowed:{generate_ulid()}", entity_id=home.entity_id, workspace_id=home.id,
+        name="Borrowed stat", execution_type="workspace_stat_collection", execution_target={"stat_id": stat.id},
+        schedule_kind="every", every_seconds=86400, enabled=True,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def no_credit_gate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(scheduler_tasks, "_preflight_scheduled_job_credits", no_credit_gate)
+    dispatched = await scheduler_tasks._dispatch_job(
+        db_session, job, datetime.now(timezone.utc), manual=True, occurrence_key=f"manual:{generate_ulid()}",
+    )
+    assert not (dispatched and dispatched[0])
+
+    # A worker message naming the Stat directly is scoped by its job too.
+    @asynccontextmanager
+    async def session():
+        yield db_session
+
+    bodies = []
+    monkeypatch.setattr(database, "create_worker_session", lambda: session)
+    monkeypatch.setattr(ai_tasks, "_run_scheduled", lambda _self, _label, _id, body, **_kw: bodies.append(body))
+    ai_tasks.run_workspace_stat_collection.run(stat.id, job_id_str=job.job_id)
+    with pytest.raises(Exception, match="not found"):
+        await bodies[0]()
+
+    await db_session.refresh(stat)
+    assert stat.current_value is None and stat.last_collection_status is None
+    assert not (await db_session.scalars(
+        select(WorkspaceStatObservation).where(WorkspaceStatObservation.stat_id == stat.id)
+    )).all()

@@ -123,5 +123,6 @@ async def test_runtime_manor_document_actions_delegate_to_shared_document_action
             "workspace_id": "ws_1",
             "params": {"query": "brief"},
             "db": db,
+            "user_wording": None,
         },
     ]

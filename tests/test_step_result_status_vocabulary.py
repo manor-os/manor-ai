@@ -1,17 +1,14 @@
-"""One status vocabulary, end to end.
+"""One step-result status vocabulary, end to end.
 
 Staging incident (task 01KYGH41T0D0ACSNN9XKVSPP1B): chat announced
 "✅ Task complete — Completed 1/1 step" while the task sat in
 ``waiting_on_customer`` showing "Needs input" with an unresolvable prompt.
 
-Two vocabularies caused it. ``submit_result`` advertised
-``done | partial | blocked`` to the agent; the envelope only accepted
-``succeeded | partial | failed``. An agent reporting ``done`` fell through
-the envelope's "unknown word" branch and was inferred as ``partial`` — which
-the dispatcher counts as success (step done → plan completed → announcement)
-and the executor's supervisor counts as a blocker (task → waiting_on_customer).
-``blocked`` — an explicit "I could not proceed" — was likewise recorded as
-partial success.
+Two vocabularies caused it: the agent was offered ``done | partial | blocked``
+while the envelope only accepted ``succeeded | partial | failed``. An agent
+reporting ``done`` fell through the envelope's "unknown word" branch and was
+inferred as ``partial``; ``blocked`` — an explicit "I could not proceed" — was
+likewise recorded as partial success.
 """
 from __future__ import annotations
 
@@ -22,74 +19,10 @@ from packages.core.contracts.envelope import (
     build_step_result_envelope,
     envelope_indicates_failure,
     normalize_step_result_status,
-    step_result_envelope_schema,
 )
 
 
 # ── One vocabulary ────────────────────────────────────────────────────
-
-
-def test_submit_result_tool_advertises_the_canonical_enum():
-    """The words offered to the agent must be the words the system accepts."""
-    from packages.core.workers.submit_result import build_submit_result_tool
-
-    schema = build_submit_result_tool(None)
-    advertised = schema["function"]["parameters"]["properties"]["status"]["enum"]
-
-    assert advertised == list(StepResultStatus.values())
-    assert (
-        advertised
-        == step_result_envelope_schema()["properties"]["status"]["enum"]
-    ), "submit_result and the envelope schema must share one enum"
-
-
-def test_canonical_statuses_are_judged_by_the_enum_not_the_keyword_set():
-    """The keyword set exists only for custom (non-envelope) schemas.
-
-    Listing canonical values there too would mean two judgements of one word —
-    exactly the split that let a step be "done" to the agent and "incomplete"
-    to the supervisor."""
-    from packages.core.plans.executor import (
-        _STRUCTURED_BLOCKER_STATUSES,
-        _structured_result_blocker,
-    )
-
-    for member in StepResultStatus:
-        assert member.value not in _STRUCTURED_BLOCKER_STATUSES
-    # Words that normalize onto the enum are owned by the enum branch too.
-    for alias in ("done", "blocked", "failure", "incomplete"):
-        assert alias not in _STRUCTURED_BLOCKER_STATUSES
-
-    def blocker(result):
-        return _structured_result_blocker(result, artifact_required=False)
-
-    assert blocker({"status": "succeeded", "summary": "s"}) is None
-    assert blocker({"status": "done", "summary": "s"}) is None
-    assert blocker({"status": "partial", "summary": "s"}) == "step reported status=partial"
-    assert blocker({
-        "status": "partial",
-        "summary": "verified artifact with unavailable checksum",
-        "outputs": {"data": {
-            "mp4_fs_path": "Workspaces/Demo/final.mp4",
-            "verification_status": "verified",
-        }},
-    }) == "step reported status=partial"
-    assert blocker({"status": "blocked", "summary": "s"}) == "step reported status=failed"
-    # Custom-schema words still handled by the keyword set.
-    assert blocker({"status": "needs_input"}) == "step reported status=needs_input"
-
-
-def test_verified_artifact_partial_envelope_is_not_a_blocker_for_file_tasks():
-    from packages.core.plans.executor import _structured_result_blocker
-
-    assert _structured_result_blocker({
-        "status": "partial",
-        "summary": "verified artifact with unavailable checksum",
-        "outputs": {"data": {
-            "mp4_fs_path": "Workspaces/Demo/final.mp4",
-            "verification_status": "verified",
-        }},
-    }, artifact_required=True) is None
 
 
 def test_envelope_emitted_as_json_text_is_parsed_not_double_wrapped():
@@ -116,24 +49,6 @@ def test_non_envelope_text_is_still_wrapped_as_output():
         envelope = build_step_result_envelope(raw)
         assert envelope["status"] in StepResultStatus.values()
         assert envelope["outputs"]
-
-
-def test_submit_without_explicit_status_counts_as_succeeded():
-    """submit_result IS the deliberate hand-off — it registers a terminal
-    SUCCESS stop — and `status` is optional in its schema. Inferring partial
-    from an omitted optional field asked the operator to resolve steps that
-    had finished."""
-    from packages.core.workers.submit_result import step_result_from_submit
-
-    captured = step_result_from_submit({"summary": "wrote the script"})
-    assert captured["status"] == StepResultStatus.SUCCEEDED.value
-
-    envelope = build_step_result_envelope(captured)
-    assert envelope["status"] == StepResultStatus.SUCCEEDED.value
-
-    # An explicit non-success answer is still honoured.
-    blocked = step_result_from_submit({"summary": "no creds", "status": "blocked"})
-    assert blocked["status"] == StepResultStatus.FAILED.value
 
 
 # ── The downgrade that caused the incident ────────────────────────────
@@ -177,128 +92,3 @@ def test_inference_still_never_invents_success():
     assert build_step_result_envelope("some prose")["status"] == "partial"
     assert build_step_result_envelope(None)["status"] == "failed"
     assert build_step_result_envelope({"error": "boom"})["status"] == "failed"
-
-
-def test_submit_result_payload_keeps_the_agents_declared_outcome():
-    from packages.core.workers.submit_result import step_result_from_submit
-
-    captured = step_result_from_submit(
-        {"summary": "made the video", "status": "done", "result": {"path": "final.mp4"}}
-    )
-    assert captured["status"] == StepResultStatus.SUCCEEDED.value
-
-    envelope = build_step_result_envelope(captured)
-    assert envelope["status"] == StepResultStatus.SUCCEEDED.value
-
-
-# ── The announcement must not contradict the supervisor ───────────────
-
-
-@pytest.mark.asyncio
-async def test_completion_is_not_announced_when_supervisor_held_the_task(monkeypatch):
-    from packages.core.plans import executor as executor_module
-
-    calls: list[str] = []
-
-    async def fake_completed(**_kwargs):
-        calls.append("completed")
-
-    async def fake_started(**_kwargs):
-        calls.append("started")
-
-    monkeypatch.setattr(executor_module.chat_notify, "notify_plan_completed", fake_completed)
-    monkeypatch.setattr(executor_module.chat_notify, "notify_plan_started", fake_started)
-
-    await executor_module.PlanExecutor._announce(
-        "ent_1", "ws_1", "plan_1",
-        task_id="task_1",
-        started=False,
-        step_count=1,
-        execution_mode="auto",
-        chat_events=[],
-        plan_done="completed",
-        plan_started_at=None,
-        plan_completed_at=None,
-        plan_cost=None,
-        plan_error=None,
-        task_title="Clean retry: generate a 3-minute stickman video",
-        step_snapshots=[],
-        task_status="waiting_on_customer",
-    )
-    assert calls == [], "held task must not be announced as complete"
-
-
-@pytest.mark.asyncio
-async def test_completion_is_announced_when_the_task_actually_completed(monkeypatch):
-    from packages.core.plans import executor as executor_module
-
-    calls: list[str] = []
-
-    async def fake_completed(**_kwargs):
-        calls.append("completed")
-
-    monkeypatch.setattr(executor_module.chat_notify, "notify_plan_completed", fake_completed)
-
-    await executor_module.PlanExecutor._announce(
-        "ent_1", "ws_1", "plan_1",
-        task_id="task_1",
-        started=False,
-        step_count=1,
-        execution_mode="auto",
-        chat_events=[],
-        plan_done="completed",
-        plan_started_at=None,
-        plan_completed_at=None,
-        plan_cost=None,
-        plan_error=None,
-        task_title="ok",
-        step_snapshots=[],
-        task_status="completed",
-    )
-    assert calls == ["completed"]
-
-
-def test_task_status_from_event_reads_the_committed_status():
-    from packages.core.plans.executor import _task_status_from_event
-
-    assert _task_status_from_event(
-        {"payload": {"task_status": "waiting_on_customer"}}
-    ) == "waiting_on_customer"
-    assert _task_status_from_event(None) is None
-    assert _task_status_from_event({"payload": {}}) is None
-
-
-# ── A missing deliverable is a failed step, never a placeholder success ──
-
-
-def test_submit_result_contract_makes_a_missing_deliverable_a_failed_status():
-    """Prod incident (task FQ2881, 2026-09-14): a content step could not write
-    the post, filled the text field with a "暂缺 / not generated" explanation
-    and submitted a non-failed status. The step rendered Done, the dependent
-    publish step ran on that empty input and failed, and the operator was only
-    asked afterwards — with the real reason buried in the first step's text.
-
-    The words the model reads are the contract: ``failed`` must be defined as
-    "the deliverable was not produced" (blocked, missing input, no evidence),
-    a placeholder standing in for the deliverable must be named as a failed
-    outcome, and the failure block must tell the model to list what is missing
-    so the operator is asked immediately with a concrete blocker."""
-    from packages.core.contracts.task_output import task_failure_control_schema
-    from packages.core.workers.submit_result import (
-        SUBMIT_RESULT_PROMPT_SUFFIX,
-        build_submit_result_tool,
-    )
-
-    props = build_submit_result_tool(None)["function"]["parameters"]["properties"]
-    status_desc = props["status"]["description"]
-    assert "not produced" in status_desc, status_desc
-    assert "placeholder" in SUBMIT_RESULT_PROMPT_SUFFIX
-    assert "failure.blockers" in SUBMIT_RESULT_PROMPT_SUFFIX
-    assert "requires_human=true" in SUBMIT_RESULT_PROMPT_SUFFIX
-
-    # Both failure-control shapes (tolerant default and hard contract) must
-    # tell the model what a blocker entry is — one description, not two.
-    default_items = props["failure"]["properties"]["blockers"]["items"]
-    hard_items = task_failure_control_schema()["properties"]["blockers"]["items"]
-    assert default_items.get("description"), "blockers items need a description"
-    assert default_items == hard_items

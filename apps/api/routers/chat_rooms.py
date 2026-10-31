@@ -8,7 +8,7 @@ import secrets
 import tempfile
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Literal
+from typing import Awaitable, BinaryIO, Callable, Literal
 from urllib.parse import quote
 
 import anyio
@@ -17,9 +17,10 @@ from pydantic import BaseModel, Field, StrictBool
 from sqlalchemy import delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from apps.api.deps import get_current_user
-from apps.api.file_responses import PinnedFileStreamingResponse
+from apps.api.file_responses import PinnedFileStreamingResponse, room_file_snapshot_budget
 from apps.api.web_base import public_web_base
 from packages.core.constants.agents import MANOR_AGENT_ID, MANOR_AGENT_NAME, is_master_agent
 from packages.core.constants.notification_types import NotificationDispatchStatus
@@ -31,6 +32,7 @@ from packages.core.models.notification import Notification
 from packages.core.models.chat_room import ChatRoom, ChatRoomAgentBinding, ChatRoomAgentRun, ChatRoomFile, ChatRoomInvite, ChatRoomMember, ChatRoomMessage, ChatRoomMessageReaction, ChatRoomToolApproval
 from packages.core.models.document import Document
 from packages.core.models.permission import Capability, Classification
+from packages.core.models.staff import Staff
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.user_session import UserSessionLease, UserSessionLog
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
@@ -64,7 +66,13 @@ from packages.core.services.room_tool_approval_service import (
     RoomToolApprovalError, decide_room_tool_approval, invalidate_stale_room_tool_approvals,
 )
 from packages.core.services.workspace_access import lock_workspace_access_boundary, user_can_manage_workspace
-from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content, inspect_upload_stream
+from packages.core.services.user_avatars import person_avatar_url, real_avatar_url
+from packages.core.services.room_file_storage import (
+    ROOM_FILE_CHUNK_BYTES, ROOM_FILE_INLINE_MAX_BYTES, ROOM_FILE_MAX_BYTES,
+    ROOM_FILES_TOTAL_MAX_BYTES, RoomFileStorageError, copy_room_file_content,
+    store_room_file_chunks,
+)
 
 
 router = APIRouter(prefix="/api/v1/chat/rooms", tags=["chat-rooms"])
@@ -79,8 +87,8 @@ async def _commit_room_change(
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _INVITE_LIFETIME = timedelta(days=7)
-_ROOM_FILE_MAX_BYTES = 100 * 1024 * 1024
-_ROOM_FILES_TOTAL_MAX_BYTES = 500 * 1024 * 1024
+_ROOM_FILE_MAX_BYTES = ROOM_FILE_MAX_BYTES
+_ROOM_FILES_TOTAL_MAX_BYTES = ROOM_FILES_TOTAL_MAX_BYTES
 
 def _valid_reaction_emoji(value: str) -> bool:
     if not 1 <= len(value) <= 16:
@@ -153,6 +161,10 @@ class UpdateMemberRoleRequest(BaseModel):
 
 class AcceptInviteRequest(BaseModel):
     token: str = Field(min_length=32, max_length=256)
+
+
+class PublicInviteRequest(BaseModel):
+    reset: StrictBool = False
 
 
 class PostMessageRequest(BaseModel):
@@ -299,6 +311,33 @@ async def _active_room(
     return room, member
 
 
+async def _person_avatar_urls(
+    db: AsyncSession, users: list[User | None], *, owner_entity_id: str | None,
+) -> dict[str, str | None]:
+    """Each person's avatar by the shared people rule.
+
+    Without an own avatar, the staff photo comes from the room's owning Entity
+    (whose team page the members share), else from the person's home Entity.
+    """
+    people = {user.id: user for user in users if user is not None}
+    missing = [user.id for user in people.values() if not real_avatar_url(user.avatar_url)]
+    staff_photos: dict[tuple[str, str], str] = {}
+    if missing:
+        rows = (await db.execute(select(Staff.user_id, Staff.entity_id, Staff.avatar_url).where(
+            Staff.user_id.in_(missing), Staff.deleted_at.is_(None), Staff.avatar_url.is_not(None),
+        ).order_by(Staff.created_at.desc()))).all()
+        for staff_user_id, entity_id, avatar_url in rows:
+            staff_photos.setdefault((staff_user_id, entity_id), avatar_url)
+    return {
+        user.id: person_avatar_url(
+            user.avatar_url,
+            (owner_entity_id and staff_photos.get((user.id, owner_entity_id)))
+            or staff_photos.get((user.id, user.entity_id)),
+        )
+        for user in people.values()
+    }
+
+
 async def _room_view(db: AsyncSession, room: ChatRoom, user_id: str) -> dict:
     members = (await db.execute(
         select(ChatRoomMember, User).join(User, User.id == ChatRoomMember.user_id)
@@ -317,6 +356,7 @@ async def _room_view(db: AsyncSession, room: ChatRoom, user_id: str) -> dict:
     latest_message_at = (await db.execute(select(ChatRoomMessage.created_at).where(
         ChatRoomMessage.room_id == room.id,
     ).order_by(ChatRoomMessage.created_at.desc(), ChatRoomMessage.id.desc()).limit(1))).scalar_one_or_none()
+    avatars = await _person_avatar_urls(db, [user for _, user in members], owner_entity_id=room.owner_entity_id)
     return {
         "id": room.id,
         "kind": room.kind,
@@ -328,7 +368,7 @@ async def _room_view(db: AsyncSession, room: ChatRoom, user_id: str) -> dict:
         "members": [{
             "user_id": user.id,
             "name": user.display_name or user.email,
-            "avatar_url": user.avatar_url,
+            "avatar_url": avatars[user.id],
             "role": member.role,
         } for member, user in members],
         "agents": [await _binding_view(db, binding, manager=manager) for binding in bindings],
@@ -1029,7 +1069,7 @@ async def get_messages(
 ):
     if before and after:
         raise HTTPException(422, "Use either before or after")
-    _, member = await _active_room(db, room_id, user.id)
+    room, member = await _active_room(db, room_id, user.id)
     query = select(ChatRoomMessage, User).outerjoin(User, User.id == ChatRoomMessage.sender_user_id).where(
         ChatRoomMessage.room_id == room_id,
         ChatRoomMessage.created_at >= member.visible_from,
@@ -1110,11 +1150,12 @@ async def get_messages(
     files_by_message: dict[str, list] = {}
     for file in file_rows:
         files_by_message.setdefault(file.message_id, []).append(file)
+    avatars = await _person_avatar_urls(db, [sender for _, sender in rows], owner_entity_id=room.owner_entity_id)
     return [{
         "id": message.id, "room_id": room_id,
         "sender_user_id": message.sender_user_id,
         "sender_name": message.sender_agent_name or ((sender.display_name or sender.email) if sender else "Deleted user"),
-        "sender_user_avatar_url": sender.avatar_url if sender and message.sender_user_id else None,
+        "sender_user_avatar_url": avatars[sender.id] if sender and message.sender_user_id else None,
         "sender_agent_binding_id": message.sender_agent_binding_id,
         "sender_agent_name": message.sender_agent_name,
         "sender_agent_avatar_url": message.sender_agent_avatar_url,
@@ -1374,6 +1415,7 @@ async def post_message(
     # independent senders to insert concurrently. Room recency is derived from
     # the indexed message timeline instead of updating one hot room row.
     room, sender_member = await _active_room(db, room_id, user.id)
+    sender_avatar_url = (await _person_avatar_urls(db, [user], owner_entity_id=room.owner_entity_id))[user.id]
     content = body.content.strip()
     if not content:
         raise HTTPException(422, "Message cannot be empty")
@@ -1410,7 +1452,7 @@ async def post_message(
     return {
         "id": message.id, "room_id": room_id, "sender_user_id": user.id,
         "sender_name": user.display_name or user.email,
-        "sender_user_avatar_url": user.avatar_url, "content": content,
+        "sender_user_avatar_url": sender_avatar_url, "content": content,
         "reply_to_message_id": body.reply_to_message_id,
         "mentioned_user_ids": mentioned, "created_at": now, "attachments": [],
         "agent_runs": [{"id": run.id, "binding_id": run.binding_id, "status": run.status} for run in runs],
@@ -1454,7 +1496,9 @@ async def _create_room_file_message(
     owner_user_id: str | None,
     name: str,
     mime_type: str,
-    payload: bytes,
+    payload: bytes | BinaryIO,
+    payload_size: int | None = None,
+    payload_sha256: str | None = None,
     content: str,
     mentioned: list[str],
     mentioned_agent_binding_ids: list[str] | None = None,
@@ -1466,6 +1510,11 @@ async def _create_room_file_message(
     pre_insert_check: Callable[[], Awaitable[None]] | None = None,
 ) -> dict:
     """Apply the same membership, mention, and storage limits to every file source."""
+    size = len(payload) if isinstance(payload, bytes) else payload_size
+    if size is None or size <= 0:
+        raise HTTPException(422, "File cannot be empty")
+    if size > _ROOM_FILE_MAX_BYTES:
+        raise HTTPException(413, "Group files must be 1 GiB or smaller")
     if not owner_locked:
         storage_entity_id = await _lock_room_file_owner(
             db, owner_entity_id=owner_entity_id, owner_user_id=owner_user_id,
@@ -1497,13 +1546,13 @@ async def _create_room_file_message(
     used_bytes = (await db.execute(select(func.coalesce(func.sum(ChatRoomFile.size), 0))
         .join(ChatRoomMessage, ChatRoomMessage.id == ChatRoomFile.message_id)
         .where(ChatRoomMessage.room_id == room_id, ChatRoomFile.document_id.is_(None)))).scalar_one()
-    if used_bytes + len(payload) > _ROOM_FILES_TOTAL_MAX_BYTES:
-        raise HTTPException(413, "This group has reached its 500 MiB file limit")
+    if used_bytes + size > _ROOM_FILES_TOTAL_MAX_BYTES:
+        raise HTTPException(413, "This group has reached its 10 GiB file limit")
     from packages.core.services.plan_gate import check as check_plan_storage
 
     gate = await check_plan_storage(db, storage_entity_id, "storage_mb", use_cache=False)
     if not gate.allowed or (gate.limit is not None and gate.current is not None
-                            and gate.current + len(payload) / (1024 * 1024) > gate.limit):
+                            and gate.current + size / (1024 * 1024) > gate.limit):
         raise StorageLimitExceeded(
             gate.message or "Knowledge base storage limit reached. Upgrade for more.",
             plan=gate.plan, limit=gate.limit, current=gate.current,
@@ -1518,11 +1567,16 @@ async def _create_room_file_message(
     )
     attachment = ChatRoomFile(
         id=generate_ulid(), message_id=message.id, name=name, mime_type=mime_type,
-        size=len(payload), content=payload, created_at=now,
+        size=size, content=payload if isinstance(payload, bytes) else None, created_at=now,
+        chunk_count=None if isinstance(payload, bytes) else (size + ROOM_FILE_CHUNK_BYTES - 1) // ROOM_FILE_CHUNK_BYTES,
+        content_sha256=None if isinstance(payload, bytes) else payload_sha256,
     )
     db.add(message)
     await db.flush()
     db.add(attachment)
+    if not isinstance(payload, bytes):
+        await db.flush()
+        await store_room_file_chunks(db, attachment, payload)
     runs = await _create_mentioned_agent_runs(
         db, room=room, member=sender_member, source_message_id=message.id,
         agent_binding_ids=mentioned_agent_binding_ids or [], now=now,
@@ -1564,8 +1618,8 @@ async def upload_room_file(
     """Post one room-only attachment without exposing Knowledge or entity FS."""
     user_id = user.id
     sender_name = user.display_name or user.email
-    sender_avatar_url = user.avatar_url
     room, _ = await _active_room(db, room_id, user_id)
+    sender_avatar_url = (await _person_avatar_urls(db, [user], owner_entity_id=room.owner_entity_id))[user_id]
     if room.kind != "group":
         raise HTTPException(403, "Files are available in group chats only")
     owner_entity_id, owner_user_id = room.owner_entity_id, room.owner_user_id
@@ -1590,13 +1644,13 @@ async def upload_room_file(
     if (not isinstance(mentioned_agents, list) or len(mentioned_agents) > 5
             or any(not isinstance(item, str) or len(item) != 26 for item in mentioned_agents)):
         raise HTTPException(422, "Invalid mentioned Agent IDs")
-    payload = await file.read(_ROOM_FILE_MAX_BYTES + 1)
-    if not payload:
-        raise HTTPException(422, "File cannot be empty")
-    if len(payload) > _ROOM_FILE_MAX_BYTES:
-        raise HTTPException(413, "Group files must be 100 MiB or smaller")
+    size, digest = await anyio.to_thread.run_sync(_room_file_digest, file.file)
+    payload: bytes | BinaryIO = file.file
+    if size <= ROOM_FILE_INLINE_MAX_BYTES:
+        payload = await file.read(size)
     try:
-        mime_type = await inspect_upload_content(
+        inspect = inspect_upload_content if isinstance(payload, bytes) else inspect_upload_stream
+        mime_type = await inspect(
             payload, filename=name, declared_content_type=file.content_type,
         )
     except UploadSecurityError as exc:
@@ -1606,6 +1660,7 @@ async def upload_room_file(
         sender_avatar_url=sender_avatar_url,
         owner_entity_id=owner_entity_id, owner_user_id=owner_user_id,
         name=name, mime_type=mime_type, payload=payload,
+        payload_size=size, payload_sha256=digest,
         content=content, mentioned=mentioned,
         mentioned_agent_binding_ids=mentioned_agents, background_tasks=background_tasks,
         reply_to_message_id=reply_to_message_id,
@@ -1671,17 +1726,44 @@ async def _authorized_knowledge_source(
     return name, rel_path, document.mime_type
 
 
-def _read_knowledge_snapshot(entity_id: str, rel_path: str) -> bytes:
+def _room_file_digest(source: BinaryIO, target: BinaryIO | None = None) -> tuple[int, str]:
+    """Measure real bytes with bounded reads, optionally pinning a private copy."""
+    source.seek(0)
+    size = 0
+    digest = hashlib.sha256()
+    try:
+        while chunk := source.read(1024 * 1024):
+            size += len(chunk)
+            if size > _ROOM_FILE_MAX_BYTES:
+                raise HTTPException(413, "Group files must be 1 GiB or smaller")
+            digest.update(chunk)
+            if target is not None:
+                target.write(chunk)
+        if not size:
+            raise HTTPException(422, "File cannot be empty")
+        if target is not None:
+            target.seek(0)
+        return size, digest.hexdigest()
+    finally:
+        source.seek(0)
+
+
+def _knowledge_snapshot_identity(entity_id: str, rel_path: str, target: BinaryIO | None = None) -> tuple[int, str]:
     with open_entity_file_snapshot(entity_id, rel_path) as snapshot:
         if snapshot.stat.st_size > _ROOM_FILE_MAX_BYTES:
-            raise HTTPException(413, "Group files must be 100 MiB or smaller")
+            raise HTTPException(413, "Group files must be 1 GiB or smaller")
         with open(snapshot.descriptor_path, "rb") as source:
-            payload = source.read(_ROOM_FILE_MAX_BYTES + 1)
-    if not payload:
-        raise HTTPException(422, "File cannot be empty")
-    if len(payload) > _ROOM_FILE_MAX_BYTES:
-        raise HTTPException(413, "Group files must be 100 MiB or smaller")
-    return payload
+            return _room_file_digest(source, target)
+
+
+def _read_knowledge_snapshot(entity_id: str, rel_path: str) -> tuple[BinaryIO, int, str]:
+    output = tempfile.TemporaryFile(mode="w+b")
+    try:
+        size, digest = _knowledge_snapshot_identity(entity_id, rel_path, output)
+        return output, size, digest
+    except BaseException:
+        output.close()
+        raise
 
 
 @router.post("/{room_id}/files/from-knowledge", status_code=201)
@@ -1696,23 +1778,28 @@ async def add_room_file_from_knowledge(
     user_id = user.id
     entity_id = user.entity_id
     sender_name = user.display_name or user.email
-    sender_avatar_url = user.avatar_url
     credential = AuthenticatedUserCredential.from_user(user)
     room, _ = await _active_room(db, room_id, user_id)
+    sender_avatar_url = (await _person_avatar_urls(db, [user], owner_entity_id=room.owner_entity_id))[user_id]
     if room.kind != "group":
         raise HTTPException(403, "Files are available in group chats only")
     owner_entity_id, owner_user_id = room.owner_entity_id, room.owner_user_id
     await db.rollback()
+    pinned_source = None
     try:
         async with entity_filesystem_read_lock(canonical_entity_root(entity_id)):
             source = await _authorized_knowledge_source(
                 db, user_id=user_id, entity_id=entity_id,
                 credential=credential, document_id=body.document_id,
             )
-            payload = await anyio.to_thread.run_sync(_read_knowledge_snapshot, entity_id, source[1])
+            pinned_source, size, digest = await anyio.to_thread.run_sync(_read_knowledge_snapshot, entity_id, source[1])
             await db.rollback()
+        payload: bytes | BinaryIO = pinned_source
+        if size <= ROOM_FILE_INLINE_MAX_BYTES:
+            payload = await anyio.to_thread.run_sync(pinned_source.read, size)
         try:
-            mime_type = await inspect_upload_content(
+            inspect = inspect_upload_content if isinstance(payload, bytes) else inspect_upload_stream
+            mime_type = await inspect(
                 payload, filename=source[0], declared_content_type=source[2],
             )
         except UploadSecurityError as exc:
@@ -1736,8 +1823,8 @@ async def add_room_file_from_knowledge(
             )
             if current_source != source:
                 raise HTTPException(409, "Knowledge file changed during sharing; retry")
-            current_payload = await anyio.to_thread.run_sync(_read_knowledge_snapshot, entity_id, source[1])
-            if current_payload != payload:
+            current_identity = await anyio.to_thread.run_sync(_knowledge_snapshot_identity, entity_id, source[1])
+            if current_identity != (size, digest):
                 raise HTTPException(409, "Knowledge file changed during sharing; retry")
 
             async def recheck_source_policy() -> None:
@@ -1756,6 +1843,7 @@ async def add_room_file_from_knowledge(
                 sender_avatar_url=sender_avatar_url,
                 owner_entity_id=owner_entity_id, owner_user_id=owner_user_id,
                 name=source[0], mime_type=mime_type, payload=payload,
+                payload_size=size, payload_sha256=digest,
                 content=body.content, mentioned=list(dict.fromkeys(body.mentioned_user_ids)),
                 mentioned_agent_binding_ids=body.mentioned_agent_binding_ids,
                 background_tasks=background_tasks,
@@ -1770,6 +1858,9 @@ async def add_room_file_from_knowledge(
         raise HTTPException(423, "Knowledge file is busy; retry shortly") from exc
     except (EntityFilesystemError, DocumentMutationConflictError, OSError) as exc:
         raise HTTPException(409, "Knowledge file is unavailable or changed") from exc
+    finally:
+        if pinned_source is not None:
+            pinned_source.close()
 
 
 @router.get("/{room_id}/files")
@@ -1857,13 +1948,17 @@ async def remove_room_file(
 
 async def _authorized_room_download(
     db: AsyncSession, room_id: str, file_id: str, credential: AuthenticatedUserCredential,
+    *, metadata_only: bool = False,
 ) -> tuple[ChatRoomFile, Document | None]:
     if await resolve_current_user_actor(db, credential) is None:
         raise HTTPException(404, "File not found")
     room, member = await _active_room(db, room_id, credential.user_id)
     if room.kind != "group":
         raise HTTPException(403, "Files are available in group chats only")
-    row = (await db.execute(select(ChatRoomFile)
+    query = select(ChatRoomFile)
+    if metadata_only:
+        query = query.options(defer(ChatRoomFile.content))
+    row = (await db.execute(query
         .join(ChatRoomMessage, ChatRoomMessage.id == ChatRoomFile.message_id)
         .where(ChatRoomFile.id == file_id, ChatRoomFile.deleted_at.is_(None), ChatRoomMessage.room_id == room_id,
                ChatRoomMessage.created_at >= member.visible_from))).scalar_one_or_none()
@@ -1922,8 +2017,33 @@ async def download_room_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    credential = AuthenticatedUserCredential.from_user(user)
+    return await _room_file_download_response(
+        db, room_id, file_id, AuthenticatedUserCredential.from_user(user),
+    )
+
+
+async def _room_file_download_response(
+    db: AsyncSession, room_id: str, file_id: str, credential: AuthenticatedUserCredential,
+):
     row, document = await _authorized_room_download(db, room_id, file_id, credential)
+    reserved = row.size if document is not None or row.chunk_count else 0
+    if reserved and not await room_file_snapshot_budget.reserve(reserved, timeout=0):
+        raise HTTPException(503, "File downloads are busy; retry shortly", headers={"Retry-After": "5"})
+    try:
+        return await _build_room_file_download_response(
+            db, room_id, file_id, credential, row, document,
+            on_close=(lambda: room_file_snapshot_budget.release(reserved)) if reserved else None,
+        )
+    except BaseException:
+        if reserved:
+            room_file_snapshot_budget.release(reserved)
+        raise
+
+
+async def _build_room_file_download_response(
+    db: AsyncSession, room_id: str, file_id: str, credential: AuthenticatedUserCredential,
+    row: ChatRoomFile, document: Document | None, *, on_close,
+):
     headers = {
         "Content-Disposition": f"attachment; filename=\"download\"; filename*=UTF-8''{quote(row.name, safe='')}",
         "Cache-Control": "private, no-store",
@@ -1981,12 +2101,44 @@ async def download_room_file(
             response = PinnedFileStreamingResponse(
                 pinned_copy, media_type="application/octet-stream",
                 headers={**headers, "Content-Length": str(row.size)},
+                on_close=on_close,
             )
             # No DB work remains: bytes and metadata are pinned. The request
             # dependency otherwise keeps its connection until a slow client
             # finishes reading (or disconnects), starving unrelated requests.
             await db.commit()
             return response
+        except BaseException:
+            pinned_copy.close()
+            raise
+    if row.chunk_count:
+        admitted_identity = (row.id, row.message_id, row.name, row.size, row.mime_type, row.chunk_count, row.content_sha256)
+        size = row.size
+        pinned_copy = tempfile.TemporaryFile(mode="w+b")
+        try:
+            await copy_room_file_content(db, row, pinned_copy)
+            await db.commit()
+            db.expire_all()
+            current, current_document = await _authorized_room_download(db, room_id, file_id, credential)
+            if current_document is not None or (
+                current.id, current.message_id, current.name, current.size,
+                current.mime_type, current.chunk_count, current.content_sha256,
+            ) != admitted_identity:
+                raise HTTPException(409, "File changed after sharing")
+            pinned_copy.seek(0)
+            response = PinnedFileStreamingResponse(
+                pinned_copy, media_type="application/octet-stream",
+                headers={**headers, "Content-Length": str(size)},
+                on_close=on_close,
+            )
+            await db.commit()
+            return response
+        except RoomFileStorageError as exc:
+            pinned_copy.close()
+            raise HTTPException(409, "File changed after sharing") from exc
+        except OSError as exc:
+            pinned_copy.close()
+            raise HTTPException(503, "File temporarily unavailable") from exc
         except BaseException:
             pinned_copy.close()
             raise
@@ -1998,6 +2150,94 @@ async def download_room_file(
     )
     await db.commit()
     return response
+
+
+async def _join_room(db: AsyncSession, room: ChatRoom, user: User, now: datetime) -> None:
+    """Both invite types share the audience boundary; retries preserve history."""
+    member = (await db.execute(select(ChatRoomMember).where(
+        ChatRoomMember.room_id == room.id, ChatRoomMember.user_id == user.id,
+    ).with_for_update())).scalar_one_or_none()
+    if member is not None and member.status == "active":
+        return
+    if member is None:
+        db.add(ChatRoomMember(
+            id=generate_ulid(), room_id=room.id, user_id=user.id,
+            role="member", status="active", visible_from=now, last_read_at=now,
+        ))
+    else:
+        member.status = "active"
+        member.role = "member"
+        member.left_at = None
+        member.visible_from = now
+        member.last_read_at = now
+    # A new audience cannot inherit the previous audience's Agent context.
+    await discard_room_transcripts(db, room.id)
+
+
+async def _manage_public_invite(db: AsyncSession, room_id: str, user_id: str, *, write: bool = False) -> ChatRoom:
+    room, member = await _active_room(db, room_id, user_id, write=write)
+    if room.kind != "group" or member.role not in {"owner", "admin"}:
+        raise HTTPException(403, "Only the group owner or an administrator can manage public invitations")
+    return room
+
+
+@router.get("/{room_id}/public-invite")
+async def get_public_invite(
+    room_id: str, response: Response,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    room = await _manage_public_invite(db, room_id, user.id)
+    response.headers["Cache-Control"] = "private, no-store"
+    return {"token": room.public_invite_token}
+
+
+@router.put("/{room_id}/public-invite")
+async def enable_public_invite(
+    room_id: str, body: PublicInviteRequest, response: Response,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    room = await _manage_public_invite(db, room_id, user.id, write=True)
+    if body.reset or not room.public_invite_token:
+        room.public_invite_token = secrets.token_urlsafe(32)
+        await _commit_room_change(db, room_id)
+    response.headers["Cache-Control"] = "private, no-store"
+    return {"token": room.public_invite_token}
+
+
+@router.delete("/{room_id}/public-invite", status_code=204)
+async def disable_public_invite(
+    room_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    room = await _manage_public_invite(db, room_id, user.id, write=True)
+    room.public_invite_token = None
+    await _commit_room_change(db, room_id)
+
+
+@router.post("/public-invites/join")
+async def join_public_invite(
+    body: AcceptInviteRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    # Serialize with reset/disable/close and other membership changes. PostgreSQL
+    # rechecks the token predicate after waiting for a concurrent room update.
+    room = (await db.execute(select(ChatRoom).where(
+        ChatRoom.public_invite_token == body.token,
+        ChatRoom.kind == "group", ChatRoom.status == "active",
+    ).with_for_update())).scalar_one_or_none()
+    if room is None:
+        raise HTTPException(404, "Public invitation is unavailable")
+    if room.owner_entity_id:
+        owner = await db.scalar(select(Entity.id).where(
+            Entity.id == room.owner_entity_id, Entity.deleted_at.is_(None),
+        ))
+    else:
+        owner = await db.scalar(select(User.id).where(
+            User.id == room.owner_user_id, User.deleted_at.is_(None), User.status == "active",
+        ))
+    if owner is None:
+        raise HTTPException(404, "Public invitation is unavailable")
+    await _join_room(db, room, user, datetime.now(timezone.utc))
+    await _commit_room_change(db, room.id)
+    return await _room_view(db, room, user.id)
 
 
 @router.post("/{room_id}/invites", status_code=201)
@@ -2178,25 +2418,10 @@ async def accept_invite(
         else:
             room.dm_key = key
             room.title = None
-    member = (await db.execute(select(ChatRoomMember).where(
-        ChatRoomMember.room_id == room.id, ChatRoomMember.user_id == user.id,
-    ).with_for_update())).scalar_one_or_none()
-    if member is None:
-        db.add(ChatRoomMember(
-            id=generate_ulid(), room_id=room.id, user_id=user.id,
-            role="member", status="active", visible_from=now, last_read_at=now,
-        ))
-    elif member.status == "left":
-        member.status = "active"
-        member.role = "member"
-        member.left_at = None
-        member.visible_from = now
-        member.last_read_at = now
+    await _join_room(db, room, user, now)
     invite.status = "accepted"
     invite.accepted_by_user_id = user.id
     invite.accepted_at = now
-    # New audience: Agents must not carry context from before this member joined.
-    await discard_room_transcripts(db, room.id)
     await _retire_invite_notifications(db, [invite])
     await _commit_room_change(db, room.id)
     return await _room_view(db, room, user.id)

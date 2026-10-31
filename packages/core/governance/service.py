@@ -178,6 +178,7 @@ async def workflow_run_is_executable(
     workspace_id: str | None,
     user_id: str | None,
     workflow_run_id: str | None,
+    statuses: set[str] | None = None,
 ) -> bool:
     """Validate delegated execution against the current durable Workflow origin.
 
@@ -190,13 +191,54 @@ async def workflow_run_is_executable(
     if not entity_id or not user_id or not workflow_run_id:
         return False
     run = await db.get(WorkflowRun, workflow_run_id, populate_existing=True)
-    return bool(
+    if not (
         run is not None
         and run.entity_id == entity_id
         and (run.workspace_id or None) == (workspace_id or None)
         and run.started_by == user_id
-        and run.status == "running"
+        and run.status in (statuses or {"running"})
+    ):
+        return False
+    if not workspace_id:
+        return True
+
+    from packages.core.models.user import User
+    from packages.core.models.workspace import Workspace
+    from packages.core.permissions import resolve_effective_user_role_name
+    from packages.core.services.workspace_access import user_can_read_workspace_by_identity
+    from packages.core.services.workspace_autonomy import workspace_allows_configured_work
+    from packages.core.services.workspace_readiness import evaluate_workspace_blocking_setup
+    from packages.core.workspaces import is_sandbox_workspace
+
+    actor = await db.get(User, user_id, populate_existing=True)
+    workspace = await db.get(Workspace, workspace_id, populate_existing=True)
+    actor_role = await resolve_effective_user_role_name(
+        db,
+        user_id=user_id,
+        entity_id=entity_id,
+        legacy_role=(actor.role if actor is not None and actor.entity_id == entity_id else None),
     )
+    if (
+        actor is None
+        or actor.status != "active"
+        or actor.deleted_at is not None
+        or not actor_role
+        or workspace is None
+        or workspace.entity_id != entity_id
+        or not workspace_allows_configured_work(workspace)
+        or is_sandbox_workspace(workspace)
+    ):
+        return False
+    if not await user_can_read_workspace_by_identity(
+        db,
+        workspace=workspace,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=actor_role,
+    ):
+        return False
+    setup_status = await evaluate_workspace_blocking_setup(db, workspace)
+    return setup_status is None or not setup_status.blocks_work
 
 
 async def automated_run_always_allowed(
@@ -230,6 +272,82 @@ async def scheduled_automation_origin_is_valid(
         scheduled_run_id=scheduled_run_id,
         execution_type=execution_type,
     )
+
+
+async def scheduled_workflow_admission_is_valid(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+    workflow_id: str,
+    binding_id: str | None = None,
+) -> bool:
+    """Validate one enabled scheduled Workflow deployment before it starts.
+
+    This is an admission check only. Once a child WorkflowRun has been
+    persisted, its durable identity controls continuation even if the schedule
+    is later disabled.
+    """
+    from packages.core.constants.execution import ScheduledRunStatus
+
+    origin = await _load_scheduled_automation_origin(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+        execution_type="workflow",
+    )
+    return bool(
+        origin is not None
+        and origin[0].enabled
+        and origin[1].status == ScheduledRunStatus.RUNNING.value
+        and _scheduled_workflow_target_matches(
+            origin[0], workflow_id=workflow_id, binding_id=binding_id,
+        )
+    )
+
+
+async def scheduled_workflow_origin_is_valid(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+    workflow_id: str,
+    binding_id: str | None = None,
+) -> bool:
+    """Validate immutable scheduled Workflow provenance for continuation."""
+    origin = await _load_scheduled_automation_origin(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+        execution_type="workflow",
+    )
+    return bool(
+        origin is not None
+        and _scheduled_workflow_target_matches(
+            origin[0], workflow_id=workflow_id, binding_id=binding_id,
+        )
+    )
+
+
+def _scheduled_workflow_target_matches(
+    job: Any,
+    *,
+    workflow_id: str,
+    binding_id: str | None,
+) -> bool:
+    target = job.execution_target if isinstance(job.execution_target, dict) else {}
+    configured_workflow_id = str(target.get("workflow_id") or job.goal_id or "")
+    if configured_workflow_id != str(workflow_id):
+        return False
+    return not binding_id or str(target.get("binding_id") or "") == str(binding_id)
 
 
 async def _scheduled_automation_origin_matches(
@@ -474,6 +592,13 @@ async def update_policy(
     except Exception:
         pass
     await db.flush()
+    # Pending policy asks in this Workspace are re-decided after commit.
+    from packages.core.governance.approval_policy import ApprovalScope
+    from packages.core.governance.approval_policy_reevaluation import stage_pending_approval_reevaluation
+    await stage_pending_approval_reevaluation(
+        db, scope=ApprovalScope(kind="workspace", id=workspace_id, entity_id=entity_id),
+        revision=next_revision, actor_id=changed_by,
+    )
     return row
 
 
@@ -502,11 +627,17 @@ async def check_step_policy(
     entity_id: str | None = None, user_id: str | None = None,
     room_id: str | None = None, resource_kind: str | None = None,
     account_id: str | None = None, operation: str | None = None,
-    impact: str | None = None, category: str | None = None,
-    workflow_run_id: str | None = None,
+    impact: str | None = None, category: str | None = None, gate: str | None = None,
+    workflow_run_id: str | None = None, facts=None, aliases: tuple[str, ...] = (),
+    restrict_only_keys: tuple[str, ...] = (), conversation_id: str | None = None,
 ) -> PolicyDecision:
-    """Check independent constraints and the same current inherited consent policy."""
-    from packages.core.governance.approval_facts import action_facts
+    """Check independent constraints and the same current inherited consent policy.
+
+    ``facts`` may carry the caller's already-built ``ActionFacts``, or
+    ``EXEMPT`` for a subject with no effect of its own: then only the hard
+    constraints run and consent is not evaluated.
+    """
+    from packages.core.governance.approval_facts import EXEMPT, action_facts
     from packages.core.governance.approval_policy import evaluate_policy
     from packages.core.governance.approval_policy_service import (
         ApprovalPolicyIntegrityError, load_policy_chain,
@@ -528,15 +659,20 @@ async def check_step_policy(
             spent_credits_per_kind=spent_credits_per_kind)
         if not constraints.allowed:
             return constraints
+    if facts is EXEMPT:
+        return PolicyDecision(True, reason="approval.no_effect", matched_rule="approval.no_effect",
+            explanation={"outcome": "allow", "reason_code": "approval.no_effect", "source": "constraint",
+                         "reason_params": {"kind": kind}})
     if not entity_id:
         return PolicyDecision(False, reason="Approval scope is missing", matched_rule="approval.scope")
     try:
         chain = await load_policy_chain(db, entity_id=entity_id,
             workspace_id=workspace_id, user_id=user_id, room_id=room_id)
-        facts = action_facts(
+        facts = facts or action_facts(
             action_key=action_key, capability_id=capability_id, resource_kind=resource_kind,
             resource_id=resource_id, resource_ids=resource_ids, account_id=account_id,
             operation=operation, risk_level=risk_level, impact=impact, category=category,
+            gate=gate, aliases=aliases, restrict_only_keys=restrict_only_keys,
         )
         evaluation = evaluate_policy(chain, facts)
     except ApprovalPolicyIntegrityError as exc:
@@ -544,22 +680,59 @@ async def check_step_policy(
     decision = PolicyDecision(
         allowed=evaluation.outcome == "allow", pause_for_hitl=evaluation.outcome == "ask",
         reason=evaluation.reason_code, matched_rule=evaluation.rule_id or evaluation.reason_code,
-        explanation=evaluation.model_dump(mode="json"),
+        explanation=evaluation.model_dump(mode="json"), facts=facts,
     )
     if evaluation.outcome == "deny":
         return decision
     task_decision = await _check_task_runtime_rules(db, task_id=task_id,
         action_key=action_key, capability_id=capability_id, risk_level=risk_level, facts=facts)
     if task_decision is None:
-        return decision
+        return await _apply_conversation_holds(db, decision, conversation_id=conversation_id, facts=facts)
     if not task_decision.pause_for_hitl:
-        return task_decision
+        if task_decision.allowed:
+            return await _apply_conversation_holds(
+                db, replace(task_decision, facts=facts), conversation_id=conversation_id, facts=facts,
+            )
+        return replace(task_decision, facts=facts)
     # A task restriction adds a requirement; it must not hide an account/local
     # requirement when checking whether an earlier exact grant still covers it.
     policy_targets = decision.explanation.get("target_decisions") or [decision.explanation]
     task_targets = task_decision.explanation.get("target_decisions") or [task_decision.explanation]
-    return replace(task_decision, explanation={**task_decision.explanation,
+    return replace(task_decision, facts=facts, explanation={**task_decision.explanation,
         "target_decisions": [*policy_targets, *task_targets]})
+
+
+async def _apply_conversation_holds(
+    db: AsyncSession, decision: PolicyDecision, *, conversation_id: str | None, facts,
+) -> PolicyDecision:
+    """Turn an allow into an ask when the user held this kind of action in this conversation.
+
+    Holds only tighten: an ask or a deny is returned unchanged.
+    """
+    if not decision.allowed or not conversation_id or facts is None:
+        return decision
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
+    from packages.core.governance.conversation_holds import conversation_hold_rules
+
+    rules = await conversation_hold_rules(db, conversation_id)
+    if not rules:
+        return decision
+    scope = ApprovalScope(kind="account", id=conversation_id, entity_id=conversation_id)
+    chain = build_policy_chain(scope=scope, root={"revision": 1, "policy": {
+        "mode": "automatic", "rules": [rule.model_dump() for rule in rules],
+    }})
+    result = evaluate_policy(chain, facts)
+    if result.outcome != "ask":
+        return decision
+    held = [{**item.model_dump(mode="json"), "source": "constraint",
+             "scope": {"kind": "conversation", "id": conversation_id},
+             "reason_code": "approval.conversation_hold"}
+            for item in result.target_decisions if item.source == "rule"]
+    return PolicyDecision(
+        False, True, "approval.conversation_hold", held[0]["rule_id"],
+        {**held[0], "outcome": "ask", "target_decisions": held}, facts=facts,
+    )
 
 
 async def workspace_policy_auto_approves(

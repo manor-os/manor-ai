@@ -79,9 +79,16 @@ def test_replay_fields_from_result_reads_an_unconfirmed_ledger_without_control()
     calls_only = SimpleNamespace(control=None, tool_evidence={"effect_state": "none", "unconfirmed_calls": [{"call_id": "c1"}]})
     assert replay_fields_from_result(calls_only) == {"do_not_replay": True, "effect_state": "unconfirmed"}
 
-    # A clean ledger adds nothing; the control's own fields still pass through.
+    # A valid host ledger state remains available to retry callers.
     clean = SimpleNamespace(control={"retryable": True}, tool_evidence={"effect_state": "confirmed", "unconfirmed_calls": []})
-    assert replay_fields_from_result(clean) == {"retryable": True}
+    assert replay_fields_from_result(clean) == {"retryable": True, "effect_state": "confirmed"}
+    # A nested receipt cannot be weakened by an incomplete outer ledger. This
+    # is the same monotonic ordering used by the host receipt aggregator.
+    nested_effect = SimpleNamespace(
+        control={"effect_state": "confirmed"},
+        tool_evidence={"effect_state": "none", "unconfirmed_calls": []},
+    )
+    assert replay_fields_from_result(nested_effect) == {"effect_state": "confirmed"}
     assert replay_fields_from_result(SimpleNamespace(control=None, tool_evidence={})) == {}
     assert replay_fields_from_result(None) == {}
 
@@ -99,16 +106,23 @@ def test_replay_fields_from_result_reads_a_dict_skill_result_ledger():
         "retryable": True, "do_not_replay": True, "effect_state": "unconfirmed",
     }
     assert replay_fields_from_result({"control": {"do_not_replay": True}}) == {"do_not_replay": True}
-    assert replay_fields_from_result({"content": "ok", "tool_evidence": {"effect_state": "none"}}) == {}
+    assert replay_fields_from_result({"content": "ok", "tool_evidence": {"effect_state": "none"}}) == {
+        "effect_state": "none",
+    }
 
 
-def test_attempt_forbids_replay_gates_only_on_do_not_replay():
+def test_attempt_forbids_replay_gates_on_derived_marker_or_effect_receipt():
     from packages.core.ai.runtime.outcome import attempt_forbids_replay
 
     assert attempt_forbids_replay({"do_not_replay": True}) is True
     assert attempt_forbids_replay({"do_not_replay": True, "retryable": True}) is True
+    # Older result projections can retain a host receipt without the derived
+    # marker. A retry could duplicate a delivered report or another effect.
+    assert attempt_forbids_replay({"effect_state": "confirmed"}) is True
+    assert attempt_forbids_replay({"effect_state": "unconfirmed"}) is True
     # retryable=False alone is an exhausted in-loop budget, not an unknown effect.
     assert attempt_forbids_replay({"retryable": False}) is False
     assert attempt_forbids_replay({"retryable": False, "retry_budget_exhausted": True}) is False
+    assert attempt_forbids_replay({"effect_state": "none"}) is False
     assert attempt_forbids_replay({"do_not_replay": False}) is False
     assert attempt_forbids_replay(None) is False

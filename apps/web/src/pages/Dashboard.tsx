@@ -8,7 +8,7 @@ import {
 } from "../lib/api";
 import { t } from "../lib/i18n";
 import type { Task, Workspace } from "../lib/types";
-import { currentZonedHour, formatTodayFull, isDeadlineOverdue, relativeTime } from "../lib/format";
+import { currentZonedHour, formatDateShort, formatTodayFull, isDeadlineOverdue, relativeTime } from "../lib/format";
 import TrendChart from "../components/ui/TrendChart";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import Button from "../components/ui/Button";
@@ -2811,12 +2811,7 @@ export default function Dashboard() {
               <TrendChart
                 data={((taskTrends as Record<string, any>[]) ?? []).map(
                   (d: Record<string, any>) => ({
-                    label: d.date
-                      ? new Date(d.date as string).toLocaleDateString("en-US", {
-                          month: "short",
-                          day: "numeric",
-                        })
-                      : "",
+                    label: formatDateShort(d.date as string | undefined),
                     value: (d.created ?? d.count ?? 0) as number,
                     value2: (d.completed ?? 0) as number | undefined,
                   }),

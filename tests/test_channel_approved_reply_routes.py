@@ -2210,7 +2210,8 @@ async def test_channel_approve_once_sends_without_saving_a_rule(
     assert result["ok"] is True
     assert grants == []
     assert permission_checks == ["approve_external_publish"]
-    assert resolutions == [{"choice": "approve"}]
+    # The answered card carries the delivery result; no receipt message.
+    assert resolutions == [{"choice": "approve", "delivery_outcome": "sent"}]
 
 
 async def test_channel_approval_consumes_owner_quarantine_fallback(

@@ -159,7 +159,6 @@ async def test_task_comment_approval_resumes_once_without_rebinding_task(
     assert row.status == "consumed"
     assert task.status == "in_progress"
     assert task.conversation_id == original_conversation
-    assert not (task.details or {}).get("_runtime_tool_hitl_v1")
     workspace = await db_session.get(Workspace, envelope.workspace_id)
     assert workspace.status == ("paused" if paused else "active")
 
@@ -267,7 +266,6 @@ async def test_task_comment_rejection_does_not_fail_or_dispatch_task(db_session)
     assert not (resolution.runtime_metadata or {}).get("forced_tool_calls")
     await db_session.refresh(task)
     assert task.status == "in_progress"
-    assert not (task.details or {}).get("_runtime_tool_hitl_v1")
 
 
 @pytest.mark.asyncio
@@ -520,11 +518,7 @@ async def test_public_chat_approval_adapter_locks_lifecycle_before_task_and_conv
 
 
 @pytest.mark.asyncio
-async def test_foreground_cannot_claim_a_background_task_approval(db_session, monkeypatch):
-    from unittest.mock import AsyncMock
-
-    from packages.core.services import task_runtime_approvals
-
+async def test_foreground_cannot_claim_a_background_task_approval(db_session):
     task, _, foreground = await _scope(db_session, canonical_thread=True)
     background = replace(foreground, surface=ChatSurface.SCHEDULED_AGENT_RUN,
                          profile=RuntimeProfile.BACKGROUND_WORKER)
@@ -532,15 +526,12 @@ async def test_foreground_cannot_claim_a_background_task_approval(db_session, mo
     request = await db_session.get(HitlRequest, token)
     request.status = "granted"
     await db_session.commit()
-    # Even if the worker checkpoint were executable, a foreground call must
-    # reject the wrong execution plane before attempting that worker claim.
-    claim = AsyncMock(return_value=False)
-    monkeypatch.setattr(task_runtime_approvals, "claim_task_runtime_approval_execution", claim)
+    # A foreground call rejects the wrong execution plane before any Task
+    # origin check (which would expire the grant).
     result = json.loads(await _guard(
         foreground, arguments={**ARGUMENTS, "approval_token": token},
     ) or "{}")
     assert result.get("error"), result
-    claim.assert_not_awaited()
     await db_session.refresh(request)
     await db_session.refresh(task)
     assert request.status == "granted"

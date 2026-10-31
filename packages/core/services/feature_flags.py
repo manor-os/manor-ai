@@ -93,18 +93,18 @@ KNOWN_FLAGS: tuple[KnownFlag, ...] = (
     KnownFlag(
         key="strategist_review_v2",
         description=(
-            "On: strategist uses the decision-layer v2 review path — "
-            "frozen-snapshot reviews, consolidator briefing, typed proposal "
-            "items. Off (default): the legacy review path."
+            "On: the Strategist prompt reads the consolidator briefing instead "
+            "of the legacy context sections (default off). Review runs, "
+            "proposal items and approval are the same either way."
         ),
         default_enabled=False,
     ),
     KnownFlag(
-        key="task_agent_loop",
+        key="task_agent_durable_delegation",
         description=(
-            "On: new Workspace Task runs execute as one durable agent loop. "
-            "Read once when a run is created; in-flight runs keep their engine. "
-            "Off (default): Plan/Step DAG coordinator."
+            "On: a Task agent loop's delegated agents run as durable child runs; "
+            "frozen per run at its first delegating wake. Off (default): they run "
+            "nested in the loop's worker."
         ),
         default_enabled=False,
     ),

@@ -11,18 +11,23 @@ from celery.schedules import crontab
 from celery.signals import (
     after_setup_logger,
     after_setup_task_logger,
+    worker_init,
     worker_process_init,
     worker_process_shutdown,
+    worker_shutting_down,
 )
 from kombu import Queue
 
 from packages.core.queues import CeleryQueue, route_task
-from packages.core.services.step_deadline import (
-    CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
-)
+from packages.core.worker_drain import mark_worker_draining, register_worker_main_process
 from packages.core.observability.log_redaction import install_sensitive_log_filter
 
 logger = logging.getLogger(__name__)
+
+# How long Redis waits for an ack before redelivering a message. It must
+# stay above every task's hard time limit (the longest is about 3h), so
+# "visibility timeout > celery hard limit" cannot silently invert.
+CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS = 7 * 60 * 60
 
 
 @after_setup_logger.connect
@@ -67,11 +72,9 @@ celery_app.conf.update(
     # BROKER that decides how long it waits for that ack before handing the
     # message to somebody else. Redis has no server-side ack, so kombu emulates
     # one with ``visibility_timeout``, whose default is ONE HOUR: without this
-    # setting every step still running at the 60-minute mark was re-delivered
-    # to a second worker while the first was still executing it. The value is
-    # derived from the step-deadline ceiling so the ordering
-    # "visibility timeout > celery hard limit > step deadline" cannot silently
-    # invert — see packages/core/services/step_deadline.py.
+    # setting every task still running at the 60-minute mark was re-delivered
+    # to a second worker while the first was still executing it. See
+    # CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS.
     broker_transport_options={
         "visibility_timeout": CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
     },
@@ -86,7 +89,7 @@ celery_app.conf.update(
     # Child startup performs two best-effort 10s pricing-cache warmups.
     worker_proc_alive_timeout=30.0,
     # Queues — heavy work is separated from the control plane so concurrent long
-    # steps can no longer starve internal_worker_tick / cleanup_expired_leases /
+    # tasks can no longer starve cleanup_expired_leases /
     # scheduler.tick. Versioned recovery is separate so a rolling-deploy worker
     # cannot consume a settlement wire contract it does not understand. Every
     # task's queue comes from the explicit registry in
@@ -113,12 +116,13 @@ celery_app.conf.update(
 celery_app.conf.include = [
     "packages.core.tasks.ai_tasks",
     "packages.core.tasks.embedding_tasks",
+    "packages.core.tasks.media_analysis_tasks",
+    "packages.core.tasks.workspace_translation_tasks",
     "packages.core.tasks.monitor_tasks",
     "packages.core.tasks.scheduler_tasks",
     "packages.core.tasks.oauth_refresh",
     "packages.core.tasks.channel_tasks",
     "packages.core.tasks.metrics_tasks",
-    "packages.core.tasks.ops_tasks",
     "packages.core.tasks.deletion_tasks",
     "packages.core.tasks.event_tasks",
     "packages.core.tasks.maintenance_tasks",
@@ -130,6 +134,12 @@ celery_app.conf.include = [
 
 # Beat schedule — periodic jobs
 celery_app.conf.beat_schedule = {
+    # Uploaded media awaiting its description (lost dispatches, retries due,
+    # accounts that topped up credit). Bounded batch; the work runs on HEAVY.
+    "knowledge-media-analysis-sweep": {
+        "task": "knowledge.sweep_media_analysis",
+        "schedule": 300.0,
+    },
     "room-agent-pending-recovery": {
         "task": "room_agent.recover_pending",
         "schedule": 15.0,
@@ -145,13 +155,6 @@ celery_app.conf.beat_schedule = {
     "runtime-outbox-dispatch": {
         "task": "runtime.outbox_dispatch",
         "schedule": 1.0,
-    },
-    "runtime-plan-cycle-recovery": {
-        "task": "runtime.plan_cycle_recovery",
-        # This is only the lost-wake backstop. Normal state transitions stage
-        # an outbox row transactionally, so they retain one-second delivery
-        # without making every publisher tick scan all parked Plans.
-        "schedule": 10.0,
     },
     "runtime-task-coordinator-recovery": {
         "task": "runtime.task_coordinator_recovery",
@@ -185,6 +188,10 @@ celery_app.conf.beat_schedule = {
         "task": "workflow.recover_expired_claims",
         "schedule": 60.0,
     },
+    "workflow-unclaimed-dispatch-recovery": {
+        "task": "workflow.redispatch_unclaimed_runs",
+        "schedule": 60.0,
+    },
     "daily-health-briefing": {
         "task": "monitor.daily_health_briefing",
         "schedule": crontab(hour=8, minute=0),
@@ -199,6 +206,12 @@ celery_app.conf.beat_schedule = {
         # AI Edit sessions keep multi-turn context while their editor is open.
         # Explicit close deletes immediately; this sweep recovers crashed tabs.
         "task": "maintenance.cleanup_ai_edit_sessions",
+        "schedule": 3600.0,
+    },
+    "oauth-dynamic-client-cleanup": {
+        # Self-registered (RFC 7591) MCP clients that never finished a sign-in
+        # or whose every session ended. MANOR_OAUTH_DYNAMIC_CLIENT_TTL_HOURS.
+        "task": "maintenance.cleanup_oauth_dynamic_clients",
         "schedule": 3600.0,
     },
     "entity-chat-extraction-sweep": {
@@ -254,6 +267,22 @@ celery_app.conf.beat_schedule = {
         "task": "integrations.health_tick",
         "schedule": crontab(hour=4, minute=15),  # once daily at 04:15 UTC
     },
+    "integrations-deliver-incident-notices": {
+        "task": "integrations.deliver_incident_notices",
+        "schedule": 300.0,
+        # Set by hand (heavy queue, see ``_apply_beat_expiry``): a tick that
+        # waited behind long work is worthless once its successor is due,
+        # because every tick picks up all un-notified incidents. Dropping it
+        # keeps a backlog from replaying overlapping deliveries; the
+        # per-incident idempotency key covers any overlap that remains.
+        "options": {"expires": 240.0},
+    },
+    # Each tick sends the digest to people between 09:00 and noon local who have not had it today, so a dropped tick is caught up by the next.
+    "workspace-digest-sweep": {
+        "task": "workspace.digest_sweep",
+        "schedule": 900.0,
+        "options": {"expires": 600.0},
+    },
     "sync-openrouter-pricing": {
         # Keep runtime pricing aligned with OpenRouter changes.
         # Override cadence with OPENROUTER_PRICING_SYNC_SECONDS.
@@ -261,15 +290,6 @@ celery_app.conf.beat_schedule = {
         "schedule": float(os.getenv("OPENROUTER_PRICING_SYNC_SECONDS", "43200")),
     },
     # M3 Worker / Dispatcher layer
-    "internal-worker-tick": {
-        # Heartbeat for in-process internal workers — checks out leases
-        # and fans out per-lease execute_lease tasks. 5s trades a small
-        # amount of plan-step latency for ~60% fewer ticks/day vs the
-        # original 2s default; raise back to 2.0 if interactive plans
-        # feel laggy.
-        "task": "packages.core.tasks.ai_tasks.internal_worker_tick",
-        "schedule": 5.0,
-    },
     "cleanup-expired-leases": {
         "task": "packages.core.tasks.ai_tasks.cleanup_expired_leases",
         "schedule": 30.0,  # every 30s — leases default to 5min TTL
@@ -301,6 +321,12 @@ celery_app.conf.beat_schedule = {
         "task": "metrics.daily_rollup",
         "schedule": crontab(hour=0, minute=15),
     },
+    "metrics-workspace-health-refresh": {
+        # Hourly at :20 — after the 00:15 daily roll-up has finished on the
+        # midnight hour, and off the top of the hour where most jobs fire.
+        "task": "metrics.workspace_health_refresh",
+        "schedule": crontab(minute=20),
+    },
     "metrics-http-flush": {
         # Snapshot-sync the Redis HTTP traffic counters into
         # http_request_hourly (reads the last few hour buckets;
@@ -308,33 +334,6 @@ celery_app.conf.beat_schedule = {
         # double-counting).
         "task": "metrics.http_flush",
         "schedule": 300.0,  # every 5 minutes
-    },
-    # Ops monitoring — host + Docker container snapshot + alerting.
-    # Collector writes to Redis (ops:snapshot, TTL 2 min). Alerter
-    # reads it and runs the rule engine. Snapshot drives the
-    # /admin/ops dashboard too — endpoint reads Redis instead of
-    # blocking 1-2s on Docker stats per request.
-    "ops-collect-snapshot": {
-        "task": "ops.collect_snapshot",
-        "schedule": 30.0,
-    },
-    "ops-alert-tick": {
-        "task": "ops.alert_tick",
-        "schedule": 60.0,
-    },
-    "ops-log-scan": {
-        # Per-container error rate detection. Tails ~1m of docker logs
-        # per running container (~10 containers × small ms each). Updates
-        # rolling 1h baseline + publishes spike map for alert_tick to
-        # consume. Cheap when nothing is spiking.
-        "task": "ops.log_scan",
-        "schedule": 60.0,
-        },
-    "ops-send-digest": {
-        # Daily 08:00 UTC — drains the suppressed-warnings queue
-        # into one summary email. Cheap (no-op when queue empty).
-        "task": "ops.send_digest",
-        "schedule": crontab(hour=8, minute=0),
     },
     "ops-purge-soft-deleted-workspaces": {
         # Daily 02:00 UTC — hard-deletes workspaces past the soft-delete
@@ -414,6 +413,7 @@ def _apply_beat_expiry(schedule: dict) -> None:
     """
     from packages.core.queues import TASK_QUEUES, UNDECLARED_TASK_QUEUE, CeleryQueue
 
+    expiring_queues = {CeleryQueue.CONTROL}
     for entry in schedule.values():
         interval = beat_interval_seconds(entry.get("schedule"))
         if interval is None:
@@ -421,13 +421,46 @@ def _apply_beat_expiry(schedule: dict) -> None:
         if interval <= 0 or interval > BEAT_EXPIRE_MAX_INTERVAL_SECONDS:
             continue
         queue = TASK_QUEUES.get(str(entry.get("task") or ""), UNDECLARED_TASK_QUEUE)
-        if queue not in (CeleryQueue.CONTROL, CeleryQueue.OPS):
+        if queue not in expiring_queues:
             continue
         options = entry.setdefault("options", {})
         options.setdefault("expires", float(interval))
 
 
 _apply_beat_expiry(celery_app.conf.beat_schedule)
+
+
+# ── JWT secret gate — same policy as API startup ──────────────────────
+# Workers HMAC-sign Workflow approval continuations with JWT_SECRET_KEY and
+# the API verifies them; a worker on a placeholder secret strands every
+# approval. Runs once in the main worker process, before the pool forks.
+
+@worker_init.connect
+def _enforce_jwt_secret(**_kwargs: object) -> None:
+    from packages.core.config import enforce_jwt_secret_policy, get_settings
+
+    try:
+        enforce_jwt_secret_policy(get_settings(), logger)
+    except RuntimeError as exc:
+        # Celery logs and swallows Exception from signal receivers, so only
+        # SystemExit actually stops the worker from booting.
+        raise SystemExit(str(exc)) from exc
+
+
+# ── Shutdown drain ────────────────────────────────────────────────────
+# A warm shutdown lets the running task continue until the pod's grace runs
+# out. Long tasks (a Workflow run driving node after node) check this flag and
+# hand the remainder to another worker at their next safe boundary. The flag
+# is created before the pool forks so every child shares it.
+
+@worker_init.connect
+def _register_worker_drain(**_kwargs: object) -> None:
+    register_worker_main_process()
+
+
+@worker_shutting_down.connect
+def _mark_worker_draining(**_kwargs: object) -> None:
+    mark_worker_draining()
 
 
 # ── OTEL tracing — opt-in (OTEL_ENABLED=true) ─────────────────────────

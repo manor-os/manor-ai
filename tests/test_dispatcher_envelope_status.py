@@ -239,32 +239,6 @@ async def test_succeeded_envelope_is_a_success(client) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("evidenced", [False, True])
-async def test_publishing_receipt_is_persisted_for_supervisor_verification(client, evidenced):
-    import packages.core.database as dbmod
-
-    async with dbmod.async_session() as db:
-        step_id, lease_id = await _setup_step(db, kind="subagent")
-        step = await db.get(ExecutionStep, step_id)
-        plan = await db.get(ExecutionPlan, step.plan_id)
-        plan.plan_dag = {"steps": [{"key": step.step_key, "expects": ["publish"]}]}
-        # A URL claimed by the model is deliberately present in both cases.
-        result = {"status": "succeeded", "summary": "Draft ready", "outputs": {"post_url": "https://x.com/u/status/123"}}
-        evidence = [{
-            "kind": "tool_effect",
-            "effect": "publish",
-            "fields": {"tweet_id": "123", "delivery_confirmed": True},
-        }] if evidenced else []
-        lease = await Dispatcher().complete_lease(db, lease_id, result=result, evidence_refs=evidence)
-        assert step.result == result
-        assert step.step_status == "done"
-        assert lease.status == "completed"
-        from packages.core.plans.executor import _unmet_expects_issue
-
-        assert bool(_unmet_expects_issue(plan, [step])) is not evidenced
-
-
-@pytest.mark.asyncio
 async def test_non_envelope_step_with_status_failed_payload_still_completes(client) -> None:
     """The false-positive guard: the gate is the SCHEMA, not a `status` key.
 

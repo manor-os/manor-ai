@@ -99,7 +99,6 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
     "github": ("github", "git hub"),
     "notion": ("notion",),
     "replicate": ("replicate",),
-    "suno": ("suno", "suno music", "music generation", "AI music", "音乐生成"),
     "tavily": ("tavily",),
     "jimeng": ("jimeng", "即梦"),
     "claude_code": (

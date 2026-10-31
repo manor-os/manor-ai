@@ -7,8 +7,6 @@ the agent's create_goal tool all read/write the same shape.
 
 Measurement APIs (POST /goals/{id}/measurements,
 GET /goals/{id}/measurements) live on the same router for convenience.
-ExecutionPlan endpoints land on a separate /api/v1/plans router so
-the URL doesn't pretend a Plan is a Goal.
 """
 from __future__ import annotations
 
@@ -21,6 +19,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.collaborator_boundary import collaborator_scope
 from apps.api.deps import (
     get_current_user,
     require_workspace_readable,
@@ -231,13 +230,6 @@ async def _goal_link_summaries(
     for link, task in rows:
         if task is not None and task.entity_id != entity_id:
             continue
-        if task is not None:
-            try:
-                from packages.core.services.task_execution_reconcile import reconcile_task_from_latest_completed_plan
-
-                await reconcile_task_from_latest_completed_plan(db, task)
-            except Exception:
-                logger.debug("Goal task reconciliation skipped for task %s", task.id, exc_info=True)
         summary = summaries.setdefault(
             link.goal_id,
             {
@@ -281,6 +273,14 @@ async def _goal_link_summaries(
 
 
 # ── Routes ─────────────────────────────────────────────────────────────
+
+def _refuse_collaborator_external_measurement(user: User, source) -> None:
+    """A collaborator measures Goals from Workspace evidence, never the company's integrations."""
+    from packages.core.goals.scheduling import measurement_source_requires_external_provider
+
+    if collaborator_scope(user) is not None and measurement_source_requires_external_provider(source):
+        raise HTTPException(403, "External collaborators cannot measure Goals through company integrations")
+
 
 @router.get("")
 async def list_goals(
@@ -360,6 +360,7 @@ async def create_goal(
 
     if not req.title:
         raise HTTPException(422, "title is required")
+    _refuse_collaborator_external_measurement(user, req.measurement_source)
     linked_stat = None
     if req.stat_id:
         from packages.core.models.workspace_stat import WorkspaceStat
@@ -465,6 +466,7 @@ async def update_goal(
     await require_workspace_writable(db, user, existing.workspace_id)
 
     payload = req.model_dump(exclude_unset=True)
+    _refuse_collaborator_external_measurement(user, payload.get("measurement_source"))
     if payload.get("stat_id") is not None:
         from packages.core.models.workspace_stat import WorkspaceStat
         linked_stat = (await db.execute(select(WorkspaceStat).where(

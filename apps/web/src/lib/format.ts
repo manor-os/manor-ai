@@ -33,15 +33,25 @@ function browserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
+/** This device's IANA zone, or undefined when the runtime does not report one. */
+export function deviceTimeZone(): string | undefined {
+  return normalizeTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+}
+
 export function setPreferredTimeZone(timeZone?: string | null) {
   preferredTimeZone = normalizeTimeZone(timeZone) || browserTimeZone();
+}
+
+/** Show the account's zone when the user chose it; otherwise follow this device. */
+export function setPreferredTimeZoneForUser(user?: { timezone?: string | null; timezone_user_set?: boolean } | null) {
+  setPreferredTimeZone(user?.timezone_user_set ? user.timezone : deviceTimeZone() || user?.timezone);
 }
 
 export function getPreferredTimeZone(): string {
   return preferredTimeZone || browserTimeZone();
 }
 
-function withTimeZone(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormatOptions {
+function withTimeZone(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormatOptions & { timeZone: string } {
   return { ...options, timeZone: getPreferredTimeZone() };
 }
 
@@ -161,6 +171,19 @@ export function formatDateLong(dateStr?: string, fallback = "--"): string {
   }));
 }
 
+/** Compact date+time; retain the year for historical or cross-year context. */
+export function formatDateCompact(dateStr?: string, relatedDates: readonly string[] = [], fallback = "--"): string {
+  const parsed = parseDisplayDate(dateStr);
+  if (!parsed) return fallback;
+  const yearFormatter = new Intl.DateTimeFormat("en-US", withTimeZone({ year: "numeric" }));
+  const year = yearFormatter.format(parsed.date);
+  const includeYear = year !== yearFormatter.format(new Date()) || relatedDates.some((value) => {
+    const related = parseDisplayDate(value);
+    return related && yearFormatter.format(related.date) !== year;
+  });
+  return includeYear ? formatDateLong(dateStr, fallback) : formatDate(dateStr, fallback);
+}
+
 /** Weekday + short date+time  →  "Mon, Apr 21, 2:35 PM" */
 export function formatDateFull(dateStr?: string, fallback = "--"): string {
   const parsed = parseDisplayDate(dateStr);
@@ -210,6 +233,12 @@ export function formatTodayFull(now: Date = new Date()): string {
     day: "numeric",
     year: "numeric",
   }));
+}
+
+/** Calendar date of an instant in the preferred zone, for day-boundary comparisons. */
+export function zonedCalendarDate(date: Date): { year: number; month: number; day: number } {
+  const { year, month, day } = zonedPartsFor(date);
+  return { year, month, day };
 }
 
 export function currentZonedHour(now: Date = new Date()): number {

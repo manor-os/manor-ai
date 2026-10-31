@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
 from packages.core.models.workflow import WorkflowBinding
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.services.collaborator_scope import require_collaborator_references
 from packages.core.services.reusable_resource_locks import (
     is_reusable_resource_local_id,
     lock_reusable_resource_lifecycle,
@@ -27,6 +28,10 @@ from packages.core.services.reusable_resource_locks import (
     reusable_resource_ids_from_payload,
 )
 from packages.core.services.product_growth import persist_scheduled_job
+from packages.core.services.workspace_autonomy import (
+    scheduled_job_is_independent,
+    workspace_allows_configured_work,
+)
 from packages.core.revisions import (
     SCHEDULED_JOB_CONTENT_REVISION_FIELDS,
     SCHEDULED_JOB_SCHEDULE_REVISION_FIELDS,
@@ -390,8 +395,13 @@ async def finalize_scheduled_workflow_run(
     db: AsyncSession,
     workflow_run: object,
 ) -> bool:
-    """Settle the scheduler occurrence owned by a terminal Workflow run."""
-    if str(getattr(workflow_run, "trigger_source", "") or "") != "schedule":
+    """Settle the scheduler occurrence owned by a terminal Workflow run.
+
+    A person's Run now / Assess now is a manual occurrence of the same job; when
+    it pauses (for an approval) and finishes later, it must settle too, or the
+    occurrence stays running and blocks the Workspace's next upgrade or run.
+    """
+    if str(getattr(workflow_run, "trigger_source", "") or "") not in {"schedule", "manual"}:
         return False
     trigger_data = getattr(workflow_run, "trigger_data", None)
     if not isinstance(trigger_data, dict):
@@ -420,6 +430,10 @@ async def finalize_scheduled_workflow_run(
         or scheduled_run is None
         or scheduled_run.status != ScheduledRunStatus.RUNNING.value
     ):
+        return False
+    # Only the run this occurrence dispatched may settle it.
+    dispatched_child = (scheduled_run.result or {}).get("scheduled_child_id") if isinstance(scheduled_run.result, dict) else None
+    if dispatched_child and dispatched_child != str(getattr(workflow_run, "id", "") or ""):
         return False
 
     error = str(getattr(workflow_run, "error", "") or "").strip()
@@ -501,6 +515,33 @@ async def notify_scheduled_job_auto_paused(
     )
 
 
+def scheduled_job_references(
+    *,
+    agent_id: str | None,
+    execution_target: dict | None,
+    conversation_id: str | None,
+) -> dict[str, set]:
+    """Every resource a Job names, for a collaborator's Workspace check.
+
+    Any string counts, ULID-shaped or not: an unresolvable reference is
+    outside the Workspace, so a non-id value cannot route around it.
+    """
+    from packages.core.services.collaborator_scope import payload_references
+
+    target = execution_target or {}
+    refs = payload_references(target)
+    return {
+        "agent": {*refs["agent"], agent_id},
+        "skill": refs["skill"],
+        "workflow": refs["workflow"],
+        "agent_subscription": {target.get("agent_subscription_id"), target.get("subscription_id")},
+        "workflow_binding": {target.get("binding_id")},
+        "goal": {target.get("goal_id")},
+        "stat": {target.get("stat_id")},
+        "conversation": {conversation_id, target.get("conversation_id")},
+    }
+
+
 async def _lock_scheduled_job_resource_references(
     db: AsyncSession,
     *,
@@ -532,9 +573,16 @@ async def _lock_workspace_scheduling_admission(
     *,
     entity_id: str,
     workspace_id: str | None,
+    execution_type: str | None = None,
+    execution_target: dict | None = None,
     require_workspace: bool = False,
 ) -> bool:
-    """Lock the Workspace parent before admitting an enabled Job mutation."""
+    """Lock the Workspace parent before admitting an enabled Job mutation.
+
+    Independent Flows and stat collectors have their own durable ``enabled``
+    switch.  Workspace pause controls the Strategist/autonomous-agent runtime,
+    while these configured automations remain available in a paused Workspace.
+    """
 
     if not workspace_id:
         return True
@@ -560,7 +608,60 @@ async def _lock_workspace_scheduling_admission(
         # strict Agent Runtime callers opt out of this fallback. A real
         # foreign/deleted Workspace always fails closed.
         return True
+    if await scheduled_execution_is_workspace_independent(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        execution_type=execution_type,
+        execution_target=execution_target,
+    ):
+        return workspace_allows_configured_work(workspace)
     return workspace.status == "active"
+
+
+async def scheduled_execution_is_workspace_independent(
+    db: AsyncSession,
+    *,
+    entity_id: str | None,
+    workspace_id: str | None,
+    execution_type: str | None,
+    execution_target: dict | None,
+) -> bool:
+    """Classify an execution payload before a ScheduledJob row exists."""
+    if not scheduled_job_is_independent(execution_type):
+        return False
+    if execution_type != "workspace_stat_collection":
+        return True
+    stat_id = str((execution_target or {}).get("stat_id") or "").strip()
+    if not stat_id or not workspace_id or not entity_id:
+        return True
+    from packages.core.models.goal import Goal
+
+    goal_id = await db.scalar(select(Goal.id).where(
+        Goal.entity_id == entity_id,
+        Goal.workspace_id == workspace_id,
+        Goal.stat_id == stat_id,
+    ).limit(1))
+    return goal_id is None
+
+
+async def scheduled_job_is_workspace_independent(
+    db: AsyncSession,
+    job: ScheduledJob,
+) -> bool:
+    """Whether this job keeps its own enabled switch while Workspace is paused.
+
+    A Stats collector is normally independent, except when it backs a
+    Workspace Goal.  Goal-owned collectors remain part of the Goal runtime
+    so the pause/resume projection keeps its existing ownership contract.
+    """
+    return await scheduled_execution_is_workspace_independent(
+        db,
+        entity_id=job.entity_id,
+        workspace_id=job.workspace_id,
+        execution_type=job.execution_type,
+        execution_target=job.execution_target,
+    )
 
 
 async def create_scheduled_job(
@@ -588,8 +689,21 @@ async def create_scheduled_job(
     require_actor_workspace_write: bool = False,
     publish_realtime: bool = True,
     runtime_agent_request: RuntimeScheduledJobAgentRequest | None = None,
+    stop_after: datetime | str | None = None,
+    owner_project_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> ScheduledJob:
     scheduled_job_workspace_scope(workspace_id, execution_target)
+    if isinstance(stop_after, str):
+        stop_after = datetime.fromisoformat(stop_after)
+    if stop_after is not None:
+        if not isinstance(stop_after, datetime) or stop_after.tzinfo is None:
+            raise ValueError("stop_after must be a timezone-aware timestamp")
+        stop_after = stop_after.astimezone(timezone.utc)
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not workspace_id or not idempotency_key or len(idempotency_key) > 200:
+            raise ValueError("idempotency_key requires a Workspace and 1 to 200 characters")
     # Workspace deletion and reusable-resource purge both acquire this fence
     # before their Workspace/resource rows. Keep Workspace-scoped creation in
     # the same global order so a local resource reference cannot invert the
@@ -601,6 +715,8 @@ async def create_scheduled_job(
         db,
         entity_id=entity_id,
         workspace_id=workspace_id,
+        execution_type=execution_type,
+        execution_target=execution_target,
         require_workspace=require_workspace,
     )
     if workspace_id and require_actor_workspace_write:
@@ -610,6 +726,43 @@ async def create_scheduled_job(
             db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id,
         ):
             raise PermissionError("Workspace write access is required to manage automations")
+    if owner_project_id:
+        from packages.core.models.workflow import WorkflowProject
+
+        owner = await db.scalar(select(WorkflowProject).where(
+            WorkflowProject.id == owner_project_id, WorkflowProject.entity_id == entity_id,
+            WorkflowProject.workspace_id == workspace_id,
+        ).with_for_update())
+        if owner is None:
+            raise ValueError("owner_project_id must belong to this Workspace")
+    if idempotency_key:
+        # The Workspace admission lock serializes competing creators. Check
+        # replay only after lifecycle and actor authorization have succeeded.
+        existing = await db.scalar(select(ScheduledJob).where(
+            ScheduledJob.entity_id == entity_id,
+            ScheduledJob.workspace_id == workspace_id,
+            ScheduledJob.idempotency_key == idempotency_key,
+        ).with_for_update())
+        if existing is not None:
+            equivalent = all((
+                existing.owner_project_id == owner_project_id,
+                existing.stop_after == stop_after,
+                existing.execution_type == execution_type,
+                (existing.execution_target or {}) == (execution_target or {}),
+                existing.schedule_kind == schedule_kind,
+                existing.cron_expr == cron_expr,
+                existing.every_seconds == every_seconds,
+                existing.run_at == run_at,
+                existing.timezone == timezone_str,
+                existing.user_id == user_id,
+                existing.conversation_id == conversation_id,
+                existing.agent_id == agent_id,
+                existing.payload_message == payload_message,
+                existing.execution_script == execution_script,
+            ))
+            if not equivalent:
+                raise ValueError("idempotency_key already owns a different scheduled job")
+            return existing
     runtime_agent_selection = None
     if runtime_agent_request is not None:
         runtime_agent_selection = await resolve_runtime_scheduled_job_agent(
@@ -626,6 +779,16 @@ async def create_scheduled_job(
             execution_target["agent_subscription_id"] = (
                 runtime_agent_selection.agent_subscription_id
             )
+    # A collaborator schedules only inside a granted Workspace, naming its own resources.
+    await require_collaborator_references(
+        db,
+        user_id=user_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        refs=scheduled_job_references(
+            agent_id=agent_id, execution_target=execution_target, conversation_id=conversation_id,
+        ),
+    )
     await _lock_scheduled_job_resource_references(
         db,
         entity_id=entity_id,
@@ -649,6 +812,9 @@ async def create_scheduled_job(
         execution_target=execution_target or {},
         execution_script=execution_script,
         workspace_id=workspace_id,
+        owner_project_id=owner_project_id,
+        idempotency_key=idempotency_key,
+        stop_after=stop_after,
         conversation_id=conversation_id,
         default_delivery_mode=default_delivery_mode,
         user_id=user_id,
@@ -673,7 +839,7 @@ async def create_scheduled_job(
         summary = {
             "id": job.id, "job_id": job.job_id, "name": job.name,
             "schedule_kind": job.schedule_kind, "enabled": job.enabled,
-            "event": "created",
+            "workspace_id": job.workspace_id, "event": "created",
         }
         if user_id:
             await push_job_update(user_id, summary, entity_id=entity_id)
@@ -759,19 +925,21 @@ async def list_scheduled_jobs(
         include_managed=include_managed,
         readable_workspace_ids=readable_workspace_ids,
     )
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    if acting := collaborators_acting_now(entity_id):
+        # While a collaborator acts (their request or run), only Jobs of their
+        # live-granted Workspaces are listed; never entity-level Jobs.
+        from packages.core.services.runtime_authorization.collaborator import runtime_collaborator_scope
+
+        scope = await runtime_collaborator_scope(db, entity_id=entity_id, user_ids=acting) or frozenset()
+        filters.append(ScheduledJob.workspace_id.in_(sorted(scope)))
     q = select(ScheduledJob).where(*filters)
     count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
 
-    inactive_workspace = exists(
-        select(Workspace.id).where(
-            Workspace.id == ScheduledJob.workspace_id,
-            Workspace.entity_id == entity_id,
-            Workspace.status != "active",
-            Workspace.deleted_at.is_(None),
-        )
+    effective_enabled, effective_paused = _scheduled_job_effective_status_conditions(
+        entity_id,
     )
-    effective_enabled = ScheduledJob.enabled == True  # noqa: E712
-    effective_enabled = effective_enabled & ~inactive_workspace
 
     if enabled_only:
         q = q.where(effective_enabled)
@@ -793,10 +961,6 @@ async def list_scheduled_jobs(
             "statuses must contain only enabled, paused, attention, or all"
         )
     if status_values:
-        effective_paused = or_(
-            ScheduledJob.enabled.is_(False),
-            inactive_workspace,
-        )
         status_clauses = []
         if "enabled" in status_values:
             status_clauses.append(effective_enabled)
@@ -840,17 +1004,11 @@ async def summarize_scheduled_jobs(
         readable_workspace_ids=readable_workspace_ids,
     )
     count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
-    inactive_workspace = exists(
-        select(Workspace.id).where(
-            Workspace.id == ScheduledJob.workspace_id,
-            Workspace.entity_id == entity_id,
-            Workspace.status != "active",
-            Workspace.deleted_at.is_(None),
-        )
+    effective_enabled, _effective_paused = _scheduled_job_effective_status_conditions(
+        entity_id,
     )
     enabled_q = count_q.where(
-        ScheduledJob.enabled == True,  # noqa: E712
-        ~inactive_workspace,
+        effective_enabled,
     )
     attention_q = count_q.where(ScheduledJob.consecutive_errors > 0)
     total = (await db.execute(count_q)).scalar_one()
@@ -861,6 +1019,52 @@ async def summarize_scheduled_jobs(
         "enabled": int(enabled or 0),
         "attention": int(attention or 0),
     }
+
+
+def _scheduled_job_effective_status_conditions(entity_id: str):
+    """Build the SQL predicates used by both list and summary projections.
+
+    A paused Workspace blocks autonomous schedules, but a Workflow or
+    standalone Stat collector keeps the lifecycle expressed by its own
+    ``ScheduledJob.enabled``. A collector attached to a Workspace Goal remains
+    autonomy-owned. The Goal lookup is correlated to the job's entity and
+    Workspace as well as its configured stat id.
+    """
+    inactive_workspace = exists(
+        select(Workspace.id).where(
+            Workspace.id == ScheduledJob.workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.status != "active",
+            Workspace.deleted_at.is_(None),
+        )
+    )
+    from packages.core.models.goal import Goal
+
+    goal_owned_stat_collector = exists(select(Goal.id).where(
+        Goal.entity_id == ScheduledJob.entity_id,
+        Goal.workspace_id == ScheduledJob.workspace_id,
+        Goal.stat_id == ScheduledJob.execution_target["stat_id"].astext,
+    ))
+    independent_execution = or_(
+        ScheduledJob.execution_type == "workflow",
+        and_(
+            ScheduledJob.execution_type == "workspace_stat_collection",
+            ~goal_owned_stat_collector,
+        ),
+    )
+    paused_independent_workspace = exists(
+        select(Workspace.id).where(
+            Workspace.id == ScheduledJob.workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.status == "paused",
+            Workspace.deleted_at.is_(None),
+            independent_execution,
+        )
+    )
+    blocked_workspace = inactive_workspace & ~paused_independent_workspace
+    effective_enabled = ScheduledJob.enabled.is_(True) & ~blocked_workspace
+    effective_paused = ScheduledJob.enabled.is_(False) | blocked_workspace
+    return effective_enabled, effective_paused
 
 
 def _scheduled_job_filters(
@@ -1398,6 +1602,21 @@ async def mutate_scheduled_job(
     # schedule reconcilers call the factory directly when clearing a field is
     # the intended mutation.
     updates = {key: value for key, value in kwargs.items() if value is not None}
+    # An agent or system change acts for the Job's owner: a collaborator's Job
+    # stays inside their Workspace whoever edits it on their behalf.
+    acting_user_id = changed_by_id if changed_by_kind == TaskActor.USER.value else job.user_id
+    if acting_user_id:
+        await require_collaborator_references(
+            db,
+            user_id=acting_user_id,
+            entity_id=entity_id,
+            workspace_id=updates.get("workspace_id", job.workspace_id),
+            refs=scheduled_job_references(
+                agent_id=updates.get("agent_id"),
+                execution_target=updates.get("execution_target"),
+                conversation_id=updates.get("conversation_id"),
+            ),
+        )
     return await ScheduledJobMutationFactory.apply(
         db,
         job,
@@ -1450,7 +1669,7 @@ async def delete_scheduled_job(
     # Capture identity before delete so we can push afterwards
     summary = {
         "id": job.id, "job_id": job.job_id, "name": job.name,
-        "event": "deleted",
+        "workspace_id": job.workspace_id, "event": "deleted",
     }
     owner_id = job.user_id
     from packages.core.services.scheduled_run_lifecycle import (
@@ -1501,6 +1720,8 @@ async def toggle_scheduled_job(
             db,
             entity_id=entity_id,
             workspace_id=job.workspace_id,
+            execution_type=job.execution_type,
+            execution_target=job.execution_target,
             require_workspace=require_workspace or bool(scope_workspace_id),
         )
         if enabled and not workspace_active:
@@ -1538,7 +1759,7 @@ async def toggle_scheduled_job(
     )
     summary = {
         "id": job.id, "job_id": job.job_id, "name": job.name,
-        "enabled": job.enabled, "event": "updated",
+        "enabled": job.enabled, "workspace_id": job.workspace_id, "event": "updated",
     }
     if job.user_id:
         await push_job_update(job.user_id, summary, entity_id=entity_id)
@@ -1546,17 +1767,54 @@ async def toggle_scheduled_job(
     return job
 
 
+async def pause_workspace_autonomy_jobs(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+) -> dict[str, int]:
+    """Pause Workspace-autonomy schedules while retaining configured automation.
+
+    ``Workspace.status`` owns the Strategist and proactive Agent runtime.  A
+    configured Flow or standalone Stat collector has an independent lifecycle
+    and remains enabled while the Workspace is paused.  Bindings are retained:
+    a binding is a reusable Flow attachment, not evidence that its timer is
+    part of the Workspace-autonomy runtime.
+    """
+    return await _pause_workspace_automation_definitions(
+        db,
+        workspace_id,
+        entity_id,
+        include_configured=False,
+    )
+
+
 async def pause_workspace_automations(
     db: AsyncSession,
     workspace_id: str,
     entity_id: str,
 ) -> dict[str, int]:
-    """Pause every automation deployed into a workspace.
+    """Disable every deployed automation definition in a Workspace.
 
-    Manual and MCP workflow bindings are on-demand attachments, not automations, so
-    they remain available. Scheduled jobs and inbound/event workflow bindings
-    are the executable automation definitions shown in the Automations UI.
+    This is deliberately stronger than a normal Workspace pause. It is used by
+    flows such as private delivery installation, where the recipient must
+    explicitly activate any configured Flow or collector after setup.
     """
+    return await _pause_workspace_automation_definitions(
+        db,
+        workspace_id,
+        entity_id,
+        include_configured=True,
+    )
+
+
+async def _pause_workspace_automation_definitions(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+    *,
+    include_configured: bool,
+) -> dict[str, int]:
+    """Pause autonomous schedules and, when requested, deployed automation."""
     jobs = list((await db.execute(
         select(ScheduledJob)
         .where(
@@ -1566,18 +1824,15 @@ async def pause_workspace_automations(
         .order_by(ScheduledJob.id)
         .with_for_update()
     )).scalars().all())
-    bindings = list((await db.execute(
-        select(WorkflowBinding).where(
-            WorkflowBinding.entity_id == entity_id,
-            WorkflowBinding.workspace_id == workspace_id,
-            WorkflowBinding.trigger_type.not_in(("manual", "mcp")),
-        )
-    )).scalars().all())
-
-    now = datetime.now(timezone.utc)
     paused_jobs = 0
     for job in jobs:
-        if job.enabled:
+        if (
+            job.enabled
+            and (
+                include_configured
+                or not await scheduled_job_is_workspace_independent(db, job)
+            )
+        ):
             result = await ScheduledJobMutationFactory.apply_locked(
                 db,
                 job,
@@ -1588,12 +1843,21 @@ async def pause_workspace_automations(
                 paused_jobs += 1
 
     paused_bindings = 0
-    for binding in bindings:
-        if binding.enabled or binding.status == "active":
-            binding.enabled = False
-            binding.status = "paused"
-            binding.updated_at = now
-            paused_bindings += 1
+    if include_configured:
+        bindings = list((await db.execute(
+            select(WorkflowBinding).where(
+                WorkflowBinding.entity_id == entity_id,
+                WorkflowBinding.workspace_id == workspace_id,
+                WorkflowBinding.trigger_type.not_in(("manual", "mcp")),
+            )
+        )).scalars().all())
+        now = datetime.now(timezone.utc)
+        for binding in bindings:
+            if binding.enabled or binding.status == "active":
+                binding.enabled = False
+                binding.status = "paused"
+                binding.updated_at = now
+                paused_bindings += 1
 
     await db.flush()
     if paused_jobs:

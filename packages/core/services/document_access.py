@@ -30,6 +30,7 @@ from packages.core.services.actor_authorization import (
 from packages.core.services.workspace_access import (
     ENTITY_WORKSPACE_READ_ROLES,
     user_can_read_workspace_id,
+    user_readable_workspace_ids,
 )
 
 
@@ -112,6 +113,35 @@ def _id_batches(values: set[str] | list[str], size: int = _INTERNAL_QUERY_LIMIT)
     ordered = list(values)
     for offset in range(0, len(ordered), size):
         yield set(ordered[offset:offset + size])
+
+
+async def _collaborator_scope(
+    db: AsyncSession, *, user_id: str | None, entity_id: str, actor: object | None = None,
+) -> frozenset[str] | None:
+    """Live-granted Workspaces of an external collaborator, or None for anyone else.
+
+    A collaborator reads Knowledge only through those Workspaces (and their own
+    uploads): no company-wide visibility, no ResourceGrants, and never the
+    derived Workspace seat alone. A resolved actor answers from its membership
+    role, anyone else from the acting context, without a query; only a
+    collaborator's live grants are read.
+    """
+    from packages.core.services.collaborator_scope import actor_workspace_scope, collaborator_live_workspaces
+    from packages.core.services.external_collaboration_access import COLLABORATOR_MEMBERSHIP_ROLE
+
+    if not user_id:
+        return None
+    display_role = getattr(actor, "display_role", None)
+    if display_role is not None:
+        if display_role != COLLABORATOR_MEMBERSHIP_ROLE:
+            return None
+        return await collaborator_live_workspaces(db, user_id=user_id, entity_id=entity_id)
+    return await actor_workspace_scope(db, user_id=user_id, entity_id=entity_id)
+
+
+def _collaborator_admits(linked_workspace_ids: set[str], scope: frozenset[str], workspace_id: str | None) -> bool:
+    allowed = scope & {workspace_id} if workspace_id else scope
+    return bool(set(linked_workspace_ids) & allowed)
 
 
 def _with_file_integrity(metadata: dict | None, **fields: object) -> dict:
@@ -587,7 +617,7 @@ async def document_workspace_ids(db: AsyncSession, document: Document) -> set[st
 
 
 async def _workspace_roles_for_user(
-    db: AsyncSession, *, entity_id: str, user_id: str | None,
+    db: AsyncSession, *, entity_id: str, user_id: str | None, _actor: object | None = None,
 ) -> dict[str, str]:
     if not user_id:
         return {}
@@ -612,6 +642,10 @@ async def _workspace_roles_for_user(
     for workspace_id, role, expires_at in rows:
         if _expires_after_now(expires_at):
             roles.setdefault(str(workspace_id), str(role or "").strip().lower())
+    if roles and (
+        scope := await _collaborator_scope(db, user_id=user_id, entity_id=entity_id, actor=_actor)
+    ) is not None:
+        roles = {workspace_id: role for workspace_id, role in roles.items() if workspace_id in scope}
     return roles
 
 
@@ -633,7 +667,7 @@ async def workspace_document_capabilities_for_user(
     if actor is None or actor.user_id != str(user_id) or actor.entity_id != str(document.entity_id):
         return set()
     roles = await _workspace_roles_for_user(
-        db, entity_id=document.entity_id, user_id=user_id,
+        db, entity_id=document.entity_id, user_id=user_id, _actor=actor,
     )
     capabilities: set[str] = set()
     for workspace_id in workspace_ids:
@@ -669,7 +703,7 @@ async def workspace_folder_capabilities_for_user(
     if actor is None or actor.user_id != str(user_id) or actor.entity_id != str(folder.entity_id):
         return set()
     roles = await _workspace_roles_for_user(
-        db, entity_id=folder.entity_id, user_id=user_id,
+        db, entity_id=folder.entity_id, user_id=user_id, _actor=actor,
     )
     capabilities: set[str] = set()
     for workspace_id in scope.workspace_ids:
@@ -762,6 +796,25 @@ async def _folder_ancestor_ids(
         ids.append(row.id)
         current_id = row.parent_id
     return ids
+
+
+async def _folder_workspace_ids(db: AsyncSession, *, entity_id: str, folder_id: str | None) -> set[str]:
+    """Live Workspaces whose artifact folder contains this folder."""
+    from packages.core.models.workspace import Workspace
+
+    ancestor_ids = await _folder_ancestor_ids(db, entity_id=entity_id, folder_id=folder_id)
+    if not ancestor_ids:
+        return set()
+    return {
+        str(workspace_id)
+        for workspace_id in (await db.execute(
+            select(Workspace.id).where(
+                Workspace.entity_id == entity_id,
+                Workspace.artifact_folder_id.in_(ancestor_ids),
+                Workspace.deleted_at.is_(None),
+            )
+        )).scalars()
+    }
 
 
 async def resolve_folder_policy_lock_scope(
@@ -1022,6 +1075,8 @@ async def _grant_subject_ids_for_user(
         db, user_id=user_id, entity_id=entity_id,
     )
     if actor is None or actor.user_id != str(user_id) or actor.entity_id != str(entity_id):
+        return set()
+    if await _collaborator_scope(db, user_id=user_id, entity_id=entity_id, actor=actor) is not None:
         return set()
 
     ids = {user_id}
@@ -1431,6 +1486,14 @@ async def user_can_read_folder(
     )
     if actor is None:
         return False
+    if (
+        collaborator_scope := await _collaborator_scope(db, user_id=user_id, entity_id=entity_id, actor=actor)
+    ) is not None:
+        return getattr(folder, "owner_id", None) == user_id or _collaborator_admits(
+            await _folder_workspace_ids(db, entity_id=entity_id, folder_id=getattr(folder, "id", None)),
+            collaborator_scope,
+            None,
+        )
     (
         resolved_role,
         can_read_entity_documents,
@@ -1673,6 +1736,12 @@ async def user_can_read_document(
     )
     if effective_classification == "restricted" and actor_type != "user":
         return False
+    if (
+        collaborator_scope := await _collaborator_scope(db, user_id=user_id, entity_id=entity_id, actor=actor)
+    ) is not None:
+        return bool(document.owner_id and document.owner_id == user_id) or _collaborator_admits(
+            await document_workspace_ids(db, document), collaborator_scope, workspace_id,
+        )
 
     (
         resolved_role,
@@ -1900,6 +1969,8 @@ class DocumentAccessContext:
         self._workspace_by_artifact_folder_id: dict[str, str] = {}
         self._doc_group_links: dict[str, set[str]] = {}
         self.entity_available = True
+        # Live-granted Workspaces when the actor is an external collaborator.
+        self.collaborator_scope: frozenset[str] | None = None
 
     @classmethod
     async def load(
@@ -1965,8 +2036,18 @@ class DocumentAccessContext:
         # retained Knowledge. Unavailable identities need no grant state.
         if not identity_active:
             return ctx
+        if user_id:
+            ctx.collaborator_scope = await _collaborator_scope(
+                db, user_id=user_id, entity_id=entity_id, actor=actor,
+            )
+        if ctx.collaborator_scope is not None:
+            # No company-wide Knowledge reach, whatever the role grants: also
+            # closes the unprojected-file fallback in unreadable_document_paths.
+            ctx.can_read_all_documents = ctx.can_manage_all_documents = ctx.is_admin = False
+            ctx.can_read_all_workspaces = ctx.can_read_entity_workspaces = False
+            ctx.can_read_entity_documents = False
         ctx._workspace_roles = await _workspace_roles_for_user(
-            db, entity_id=entity_id, user_id=user_id,
+            db, entity_id=entity_id, user_id=user_id, _actor=actor,
         )
 
         subject_ids = (
@@ -2083,6 +2164,28 @@ class DocumentAccessContext:
 
     # ── folder rules ─────────────────────────────────────────────────────
 
+    async def preload_folder_workspace_access(self, db: AsyncSession) -> None:
+        """Resolve Workspace audiences for an immediate folder batch read.
+
+        Keep this out of ``load`` so unrelated callers still check Workspace
+        access at first use. The folder gate creates a fresh context for each
+        authorization round, including the final browse recheck.
+        """
+        for workspace_ids in _id_batches(set(self._workspace_by_artifact_folder_id.values())):
+            readable_ids = await user_readable_workspace_ids(
+                db,
+                entity_id=self.entity_id,
+                user_id=self.user_id,
+                role=self.role,
+                workspace_ids=workspace_ids,
+                can_read_entity_workspaces=self.can_read_entity_workspaces,
+                can_read_all_workspaces=self.can_read_all_workspaces,
+            )
+            self._ws_readable.update({
+                workspace_id: workspace_id in readable_ids
+                for workspace_id in workspace_ids
+            })
+
     def folder_chain_ids(self, folder_id: str | None) -> list[str]:
         """The folder and its ancestors, nearest first — `_folder_ancestor_ids`."""
         if not folder_id:
@@ -2127,6 +2230,10 @@ class DocumentAccessContext:
             return True
         if not self.identity_active:
             return False
+        if self.collaborator_scope is not None:
+            return getattr(folder, "owner_id", None) == self.user_id or _collaborator_admits(
+                self.folder_workspace_ids(getattr(folder, "id", None)), self.collaborator_scope, None,
+            )
         if self.can_read_all_documents:
             return True
         if getattr(folder, "owner_id", None) == self.user_id:
@@ -2338,6 +2445,8 @@ class DocumentAccessContext:
     async def _workspace_readable(self, db: AsyncSession, workspace_id: str) -> bool:
         if self.user_id and not self.identity_active:
             return False
+        if self.collaborator_scope is not None:
+            return workspace_id in self.collaborator_scope
         cached = self._ws_readable.get(workspace_id)
         if cached is None:
             cached = await user_can_read_workspace_id(
@@ -2384,6 +2493,10 @@ class DocumentAccessContext:
         )
         if effective_classification == "restricted" and actor_type != "user":
             return False
+        if self.collaborator_scope is not None:
+            return bool(document.owner_id and document.owner_id == self.user_id) or _collaborator_admits(
+                self._workspace_ids_for(document), self.collaborator_scope, workspace_id,
+            )
         if self.role == "client" and effective_classification in {
             "confidential",
             "restricted",
@@ -3251,6 +3364,8 @@ async def list_visible_documents(
     file_size_min: int | None = None,
     file_size_max: int | None = None,
     include_generated_assets: bool = True,
+    media_kinds: Sequence[str] | None = None,
+    exclude_work_artifacts: bool = False,
     limit: int | None = 100,
     offset: int = 0,
 ) -> tuple[list[Document], int]:
@@ -3286,6 +3401,8 @@ async def list_visible_documents(
             file_size_min=file_size_min,
             file_size_max=file_size_max,
             include_generated_assets=include_generated_assets,
+            media_kinds=media_kinds,
+            exclude_work_artifacts=exclude_work_artifacts,
             limit=_INTERNAL_FILTER_LIMIT,
             offset=raw_offset,
         )

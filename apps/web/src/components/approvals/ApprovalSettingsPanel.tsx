@@ -43,7 +43,8 @@ function ApprovalSettingsBody({ scope, presentation = "page", detailKey, showOve
   const [draft, setDraft] = useState<ApprovalDraft | null>(() => drafts.get(identity)?.draft || null);
   const [busy, setBusy] = useState<"save" | "preview" | null>(null);
   const [error, setError] = useState("");
-  const [forbidden, setForbidden] = useState(false);
+  // The data version a save/preview was refused against; a newer read decides again.
+  const [forbiddenAt, setForbiddenAt] = useState<number | null>(null);
   const [saved, setSaved] = useState(false);
   const [preview, setPreview] = useState<ApprovalPreview | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
@@ -56,7 +57,13 @@ function ApprovalSettingsBody({ scope, presentation = "page", detailKey, showOve
   const busyRef = useRef(busy); busyRef.current = busy;
   const current = query.data;
   const conflict = !!current && !!baseline && current.version !== baseline.version && dirty;
-  const canEdit = !!current && !forbidden && !query.isError && (scope.kind === "account" ? current.capabilities.can_edit_root : current.capabilities.can_edit_local);
+  const forbidden = forbiddenAt !== null && query.dataUpdatedAt <= forbiddenAt;
+  // Only the server's capabilities are a permission fact. A failed background
+  // refresh (backend restarting, connection dropped) keeps the last known
+  // snapshot and its capabilities; the save itself is still version-checked.
+  const allowedToEdit = !!current && (scope.kind === "account" ? current.capabilities.can_edit_root : current.capabilities.can_edit_local);
+  const canEdit = allowedToEdit && !forbidden;
+  const refreshFailed = !!current && query.isError && !query.isFetching;
 
   useEffect(() => {
     if (current && (!baseline || !dirty)) { setBaseline(current); setDraft(approvalDraft(current)); }
@@ -87,7 +94,7 @@ function ApprovalSettingsBody({ scope, presentation = "page", detailKey, showOve
       else void query.refetch();
       setError(t("approval_settings.conflict"));
     } else if (cause instanceof ApiError && [403, 404].includes(cause.status)) {
-      setForbidden(true); setError(t("approval_settings.unavailable")); void query.refetch();
+      setForbiddenAt(query.dataUpdatedAt); setError(t("approval_settings.unavailable")); void query.refetch();
     } else setError(`${t("approval_settings.save_error")} ${cause instanceof Error ? cause.message : ""}`);
   };
   const previewDraft = async (latest = false) => {
@@ -128,7 +135,8 @@ function ApprovalSettingsBody({ scope, presentation = "page", detailKey, showOve
   const catalog = current.action_catalog || [];
   return <div className={`approval-settings approval-settings--${presentation}`} aria-busy={!!busy}>
     {presentation === "page" && <p className="approval-scope">{t("approval_settings.scope_prefix", { scope: approvalScopeLabel(current.scope) })}</p>}
-    {!canEdit && <p role="status" className="approval-readonly">{t("approval_settings.readonly")}</p>}
+    {!allowedToEdit && <p role="status" className="approval-readonly">{t("approval_settings.readonly")}</p>}
+    {refreshFailed && <div role="alert" className="approval-status"><p>{t("approval_settings.refresh_failed")}</p><Button variant="outline" size="sm" onClick={() => void query.refetch()}>{t("approval_settings.retry")}</Button></div>}
     {current.approval_review?.required && <p role="status" className="approval-readonly">{t("approval_settings.review_required")}</p>}
     <div role="radiogroup" aria-label={t(local ? "approval_settings.local_mode" : "approval_settings.default_mode")} className="approval-mode-list" onKeyDown={event => {
       if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;

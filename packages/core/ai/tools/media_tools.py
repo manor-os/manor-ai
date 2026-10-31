@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -10,12 +12,14 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -35,7 +39,8 @@ from packages.core.models.base import generate_ulid
 from packages.core.services.audio_conversion import ffmpeg_audio_codec_args
 from packages.core.services.file_refs import file_ref
 from packages.core.services.generated_file_refs import entity_fs_open_url, parse_entity_fs_url
-from packages.core.services.workspace_layout import WorkspaceArtifactDir
+from packages.core.services.generated_artifact_service import mark_production_results
+from packages.core.services.workspace_layout import WorkspaceArtifactDir, project_production_root
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +228,17 @@ SEARCH_FREE_MUSIC_SCHEMA = {
     "type": "function",
     "function": {
         "name": "search_free_music",
-        "description": "Search Manor's commercially reusable Openverse music catalog. Returns track IDs and license/attribution details; it does not import a file.",
+        "description": "Search Manor's commercially reusable open music catalogs (Openverse, with Wikimedia Commons as fallback). Returns track IDs, license/attribution details, and the catalog that answered; it does not import a file.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Mood, genre, or instrument keywords."},
                 "page": {"type": "integer", "default": 1},
+                "catalog": {
+                    "type": "string",
+                    "enum": ["openverse", "wikimedia_commons"],
+                    "description": "Search only this catalog. Omit for Openverse with Commons fallback; use wikimedia_commons when an Openverse import is unavailable.",
+                },
             },
             "required": ["query"],
         },
@@ -245,9 +255,12 @@ IMPORT_FREE_MUSIC_SCHEMA = {
             "type": "object",
             "properties": {
                 "track_id": {"type": "string", "description": "ID returned by search_free_music."},
-                "source_document_id": {"type": "string", "description": "Knowledge Document ID of this project's CANVAS.md or video that the current user can edit."},
+                "source_path": {"type": "string", "description": "This project's CANVAS.md or video the current user can edit, by Knowledge path (e.g. the canvas_path a step returned) or open_url. Give this or source_document_id."},
+                "source_document_id": {"type": "string", "description": "Knowledge Document ID of that CANVAS.md or video, when known instead of its path."},
             },
-            "required": ["track_id", "source_document_id"],
+            # One of source_path / source_document_id is enforced by the handler
+            # (no top-level anyOf: Anthropic rejects it).
+            "required": ["track_id"],
         },
     },
 }
@@ -361,6 +374,16 @@ MERGE_VIDEOS_SCHEMA = {
                         "Preserve original audio from source clips. Keep false for clean picture "
                         "masters because video providers may include unwanted music/SFX even when "
                         "generate_audio=false."
+                    ),
+                },
+                "target_duration_seconds": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "description": (
+                        "Exact length of the master. The picture becomes exactly this many seconds of "
+                        "frames at fps (the last frame is held when the clips are shorter, the end is "
+                        "cut when longer) and the audio ends with it. Omit to keep the clips' own length."
                     ),
                 },
             },
@@ -505,6 +528,15 @@ class TimelineAudioTrack:
 
 
 @dataclass(frozen=True)
+class SubtitleWord:
+    """One word (or CJK character) of a cue, timed on the picture timeline."""
+
+    start: float
+    end: float
+    text: str
+
+
+@dataclass(frozen=True)
 class SubtitleCue:
     """Text cue resolved onto the final picture timeline."""
 
@@ -517,6 +549,21 @@ class SubtitleCue:
     estimated: bool = False
     measured: bool = False
     timing_source: str = ""
+    # Word timings and the words to set larger; only animated lyrics use them.
+    words: tuple[SubtitleWord, ...] = ()
+    emphasis: tuple[str, ...] = ()
+
+
+# Animated lyric motions; every look built from them is configuration.
+LYRIC_REVEALS = ("line", "word", "letter", "karaoke")
+# Word and letter reveals move each piece on its own; wipe, glitch and flicker play on a whole line.
+LYRIC_ENTRANCES = ("none", "fade", "ghost", "pop", "rise", "drop", "slide", "nudge", "zoom", "spin", "flip",
+                   "bounce", "blur", "slam", "highlight", "wipe", "glitch", "flicker")
+LYRIC_EXITS = ("none", "fade", "rise", "fall", "zoom", "blur", "scatter")
+LYRIC_LAYOUTS = ("line", "stack")
+# "follow": a camera reframes on the words sung so far, zooming out and tilting as the line grows.
+LYRIC_CAMERAS = ("none", "follow")
+LYRIC_POSITIONS = ("bottom", "middle", "top")
 
 
 ALIGN_SUBTITLES_SCHEMA = {
@@ -562,6 +609,76 @@ ALIGN_SUBTITLES_SCHEMA = {
                 "max_chars_per_line": {"type": "integer", "minimum": 16, "maximum": 56, "default": 34},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 2, "default": 2},
                 "style": {"type": "object", "description": "ASS/libass style: font_name, font_size, colors, alignment, outline, shadow, margin_v."},
+                "animation": {
+                    "type": "object",
+                    "description": (
+                        "Animated lyric or caption ASS (forces format ass): words appear on their timed "
+                        "start. A cue may list emphasis words (set larger in accent_color) and its own words "
+                        "[{start, end, text}]."
+                    ),
+                    "properties": {
+                        "font_name": {"type": "string"},
+                        "font_size": {"type": "number", "description": "Output pixels; default 7.5% of frame height."},
+                        "bold": {"type": "boolean"},
+                        "italic": {"type": "boolean"},
+                        "uppercase": {"type": "boolean"},
+                        "letter_spacing": {"type": "number"},
+                        "color": {"type": "string", "description": "#RRGGBB"},
+                        "accent_color": {"type": "string", "description": "Emphasis words, or the sung fill in karaoke."},
+                        "dim_color": {"type": "string", "description": "Karaoke words not sung yet."},
+                        "outline_color": {"type": "string"},
+                        "outline": {"type": "number"},
+                        "shadow": {"type": "number"},
+                        "glow_color": {"type": "string", "description": "Adds a soft glow layer in this colour."},
+                        "glow_size": {"type": "number"},
+                        "position": {"type": "string", "enum": list(LYRIC_POSITIONS)},
+                        "margin_v": {"type": "number"},
+                        "reveal": {"type": "string", "enum": list(LYRIC_REVEALS),
+                                   "description": (
+                                       "line: the whole line moves as one; word or letter: each piece is placed "
+                                       "and moves on its own sung time; karaoke: a fill sweeps the sung words."
+                                   )},
+                        "entrance": {"type": "string", "enum": list(LYRIC_ENTRANCES),
+                                     "description": "How each piece arrives. wipe, glitch and flicker are line motions."},
+                        "emphasis_entrance": {"type": "string", "enum": list(LYRIC_ENTRANCES),
+                                              "description": "How emphasis words arrive; defaults to entrance."},
+                        "entrance_ms": {"type": "integer"},
+                        "exit": {"type": "string", "enum": list(LYRIC_EXITS),
+                                 "description": "How word and letter pieces leave as the line ends."},
+                        "exit_ms": {"type": "integer"},
+                        "layout": {"type": "string", "enum": list(LYRIC_LAYOUTS),
+                                   "description": "stack puts each emphasis word on its own larger line."},
+                        "emphasis_scale": {"type": "number"},
+                        "camera": {"type": "string", "enum": list(LYRIC_CAMERAS),
+                                   "description": "follow: the first word fills the frame; the line zooms out "
+                                                  "and tilts as each word is sung (word reveal)."},
+                        "camera_max_zoom": {"type": "number"},
+                        "camera_ms": {"type": "integer", "description": "How long each reframing takes."},
+                        "camera_focus_y": {"type": "number", "description": "Where the words sit, as a share of "
+                                                                         "the frame height from the top (0.42)."},
+                        "camera_tilts": {"type": "array", "items": {"type": "number"},
+                                         "description": "Degrees the camera tilts to, one per sung word, repeating."},
+                        "max_chars_per_line": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+                "word_timing": {
+                    "type": "object",
+                    "description": (
+                        "Time each cue's words from this audio's speech-to-text words, matched in order; "
+                        "offset_seconds is where the picture's 0 sits in the audio."
+                    ),
+                    "properties": {
+                        "audio_path": {"type": "string"},
+                        "offset_seconds": {"type": "number", "minimum": 0},
+                    },
+                    "required": ["audio_path"],
+                    "additionalProperties": False,
+                },
+                "aspect_ratio": {
+                    "type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"],
+                    "description": "Picture shape when no timeline gives one, so ASS sizes match the video.",
+                },
             },
             "required": ["output_name"],
         },
@@ -808,8 +925,27 @@ NORMALIZE_AUDIO_LOUDNESS_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "input_path": {"type": "string", "description": "Knowledge audio path or /api/v1/fs URL."},
+                "input_path": {
+                    "type": "string",
+                    "description": (
+                        "Knowledge audio path or /api/v1/fs URL. A video file is accepted: "
+                        "its audio track is extracted (e.g. a presenter clip's own voice)."
+                    ),
+                },
                 "output_name": {"type": "string", "description": "Output audio path/filename."},
+                "start_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Optional: keep the source from this time (seconds).",
+                },
+                "end_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": (
+                        "Optional: keep the source up to this time (seconds), e.g. the last "
+                        "spoken word plus a short tail. Applied before tempo and loudness."
+                    ),
+                },
                 "target_lufs": {"type": "number", "default": -16},
                 "true_peak": {"type": "number", "default": -1.5},
                 "lra": {"type": "number", "default": 11},
@@ -837,17 +973,87 @@ PROBE_MEDIA_SCHEMA = {
         "name": "probe_media",
         "description": (
             "Inspect a Knowledge media file with ffprobe and return deterministic "
-            "container, stream, duration, video, and audio evidence."
+            "container, stream, duration, video, and audio evidence. Supply exactly one "
+            "input_path or document_id; prefer document_id for existing Workspace inputs."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "input_path": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "Knowledge-relative media path or /api/v1/fs URL.",
                 },
+                "document_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Native Knowledge Document ID in an active Workspace; preserves its canonical source path.",
+                },
             },
-            "required": ["input_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+VERIFY_MEDIA_SOURCES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "verify_media_sources",
+        "description": (
+            "Verify a final Workspace Knowledge video is decodable and that its decoded soundtrack "
+            "matches an exact declared source-audio span that covers the complete final video. Returns durable hash, stream, dimension, "
+            "and audio-alignment evidence; it does not publish or modify media."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "final_video_document_id": {"type": "string", "minLength": 1},
+                "expected_final_video_sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+                "source_audio_document_id": {"type": "string", "minLength": 1},
+                "expected_source_audio_sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+                "source_start_seconds": {"type": "number", "minimum": 0, "default": 0},
+                "duration_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 600},
+                "expected_width": {"type": "integer", "minimum": 1},
+                "expected_height": {"type": "integer", "minimum": 1},
+                "duration_tolerance_seconds": {
+                    "type": "number", "minimum": 0, "maximum": 1,
+                    "description": "Largest accepted difference between the final video and duration_seconds. Defaults to 0.25.",
+                },
+            },
+            "required": [
+                "final_video_document_id", "expected_final_video_sha256", "source_audio_document_id",
+                "expected_source_audio_sha256", "duration_seconds",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+MEASURE_MEDIA_AUDIO_ALIGNMENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "measure_media_audio_alignment",
+        "description": (
+            "Measure a bounded, local constant audio offset between two readable Workspace Knowledge "
+            "media documents for editing or subtitle timing. Returns measured evidence only: "
+            "target_time = reference_time + target_time_offset_seconds. It tolerates different "
+            "encodings, does not validate subtitles or certify either complete asset, does not "
+            "search an entire track, and has no publication side effect."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reference_document_id": {"type": "string", "minLength": 1},
+                "target_document_id": {"type": "string", "minLength": 1},
+                "reference_start_seconds": {"type": "number", "minimum": 0, "default": 0},
+                "target_start_seconds": {"type": "number", "minimum": 0, "default": 0},
+                "duration_seconds": {
+                    "type": "number", "minimum": 5, "maximum": 60, "default": 20,
+                },
+            },
+            "required": ["reference_document_id", "target_document_id"],
             "additionalProperties": False,
         },
     },
@@ -873,6 +1079,21 @@ VERIFY_STICKMAN_FINAL_MEDIA_SCHEMA = {
                     "exclusiveMinimum": 0,
                     "maximum": 3600,
                 },
+                "opening_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": "Length of an opening clip (a series intro) played before the planned video.",
+                },
+                "result_paths": {
+                    "type": "array",
+                    "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": (
+                        "Other files this production delivers with the video, such as its thumbnail. "
+                        "Inside a project folder they and the video are marked as its results."
+                    ),
+                },
             },
             "required": [
                 "final_video_path",
@@ -892,17 +1113,28 @@ RENDER_FRAME_SAMPLES_SCHEMA = {
         "name": "render_frame_samples",
         "description": (
             "Render bounded PNG evidence frames from a Knowledge video and register "
-            "each frame as a durable Workspace artifact."
+            "each frame as a durable Workspace artifact. Supply exactly one of "
+            "input_path or document_id; expected_source_sha256 may be used only with "
+            "document_id."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "input_path": {"type": "string"},
+                "input_path": {"type": "string", "minLength": 1},
+                "document_id": {"type": "string", "minLength": 1},
+                "expected_source_sha256": {
+                    "type": "string",
+                    "pattern": "^[A-Fa-f0-9]{64}$",
+                    "description": "Expected SHA-256; use only with document_id.",
+                },
                 "output_dir": {
                     "type": "string",
                     "description": (
                         "Knowledge-visible destination for generated PNG frames, for example "
-                        "Video-Analysis/frames. Never place output under uploads/chat; "
+                        "qa/frames. In a Workspace, use a relative directory: the runtime "
+                        "scopes it to the authorized artifact archive. Workflow retries keep "
+                        "the original lineage archive; do not construct a directory from the "
+                        "current run ID. Never place output under uploads/chat; "
                         "that directory contains private input attachments."
                     ),
                 },
@@ -927,7 +1159,7 @@ RENDER_FRAME_SAMPLES_SCHEMA = {
                     "default": 12,
                 },
             },
-            "required": ["input_path", "output_dir"],
+            "required": ["output_dir"],
             "additionalProperties": False,
         },
     },
@@ -943,6 +1175,8 @@ TRANSCRIBE_VIDEO_SCHEMA = {
             "and transcribe its speech. Return measured segment timestamps when the selected "
             "STT route supports them, otherwise return text with timestamps_available=false. "
             "Use a window of at most 30 minutes per call for long videos. "
+            "Pass reference_transcript (the scripted line) when the speech is known: "
+            "routes without native timestamps then return segments aligned to it. "
             "STT credit and BYOK checks use the normal Manor transcription path."
         ),
         "parameters": {
@@ -951,6 +1185,10 @@ TRANSCRIBE_VIDEO_SCHEMA = {
                 "input_path": {"type": "string"},
                 "start_seconds": {"type": "number", "minimum": 0, "default": 0},
                 "end_seconds": {"type": "number", "minimum": 0},
+                "reference_transcript": {
+                    "type": "string",
+                    "description": "Expected spoken text, e.g. the presenter's script line.",
+                },
             },
             "required": ["input_path"],
             "additionalProperties": False,
@@ -965,12 +1203,20 @@ ANALYZE_AUDIO_SCHEMA = {
         "name": "analyze_audio",
         "description": (
             "Measure integrated loudness, true peak, and silence intervals for a "
-            "Knowledge audio or video file with ffmpeg."
+            "Knowledge audio or video file with ffmpeg. Supply exactly one of "
+            "input_path or document_id; expected_source_sha256 may be used only with "
+            "document_id."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "input_path": {"type": "string"},
+                "input_path": {"type": "string", "minLength": 1},
+                "document_id": {"type": "string", "minLength": 1},
+                "expected_source_sha256": {
+                    "type": "string",
+                    "pattern": "^[A-Fa-f0-9]{64}$",
+                    "description": "Expected SHA-256; use only with document_id.",
+                },
                 "target_lufs_min": {"type": "number", "minimum": -40, "maximum": 0, "default": -20},
                 "target_lufs_max": {"type": "number", "minimum": -40, "maximum": 0, "default": -14},
                 "loudness_tolerance_lu": {
@@ -984,7 +1230,92 @@ ANALYZE_AUDIO_SCHEMA = {
                 "minimum_silence_seconds": {"type": "number", "minimum": 0.1, "maximum": 10, "default": 0.5},
                 "max_silence_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.35},
             },
-            "required": ["input_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+ANALYZE_MUSIC_STRUCTURE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "analyze_music_structure",
+        "description": (
+            "Measure a song's tempo, beat and downbeat times, per-second energy, "
+            "low/mid/high energy sections and the strongest excerpt windows of a "
+            "requested length (aligned to downbeats) for a Knowledge audio or video "
+            "file with ffmpeg. Use it to choose a hook or chorus excerpt and place cuts "
+            "on measured beats. Supply exactly one of input_path or document_id; "
+            "expected_source_sha256 may be used only with document_id."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string", "minLength": 1},
+                "document_id": {"type": "string", "minLength": 1},
+                "expected_source_sha256": {
+                    "type": "string",
+                    "pattern": "^[A-Fa-f0-9]{64}$",
+                    "description": "Expected SHA-256; use only with document_id.",
+                },
+                "window_seconds": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 180,
+                    "description": "Excerpt length for best_windows; omit to skip window ranking.",
+                },
+                "max_windows": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+LISTEN_TO_AUDIO_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "listen_to_audio",
+        "description": (
+            "Have an audio-capable model listen to a Knowledge audio or video file and answer instructions "
+            "about what it hears: voices (how many, gender, timbre, delivery, language), instruments, genre, "
+            "mood and emotion, sounds and setting. Its own timestamps are rough; to describe parts of the file, "
+            "pass measured times in context (for example sections from analyze_music_structure or a timed "
+            "transcript) to have them described. Use transcribe_audio for exact words and timings. Supply exactly "
+            "one of input_path or document_id; expected_source_sha256 may be used only with document_id."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string", "minLength": 1},
+                "document_id": {"type": "string", "minLength": 1},
+                "expected_source_sha256": {
+                    "type": "string",
+                    "pattern": "^[A-Fa-f0-9]{64}$",
+                    "description": "Expected SHA-256; use only with document_id.",
+                },
+                "instructions": {
+                    "type": "string", "minLength": 1, "maxLength": 8000,
+                    "description": "What to listen for and how to answer.",
+                },
+                "context": {
+                    "type": "string", "maxLength": 20000,
+                    "description": "Known facts to anchor the answer, such as measured sections or a transcript.",
+                },
+                "start_seconds": {
+                    "type": "number", "minimum": 0,
+                    "description": "Listen only from here (seconds into the file), e.g. the part chosen for a clip.",
+                },
+                "end_seconds": {
+                    "type": "number", "exclusiveMinimum": 0,
+                    "description": "Listen only up to here (seconds into the file); after start_seconds.",
+                },
+                "output_format": {
+                    "type": "string", "enum": ["text", "json"], "default": "text",
+                    "description": "json returns the answer as a parsed JSON object.",
+                },
+            },
+            "required": ["instructions"],
             "additionalProperties": False,
         },
     },
@@ -1021,7 +1352,8 @@ STILL_TO_VIDEO_SCHEMA = {
         "name": "still_to_video",
         "description": (
             "Convert one explicitly planned Knowledge still image into a bounded "
-            "H.264 MP4 scene and register it as a Workspace artifact."
+            "H.264 MP4 scene and register it as a Workspace artifact. Optionally "
+            "a slow push-in, fades and a title over the picture (e.g. a series intro)."
         ),
         "parameters": {
             "type": "object",
@@ -1051,6 +1383,18 @@ STILL_TO_VIDEO_SCHEMA = {
                     "enum": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
                     "default": "veryfast",
                 },
+                "motion": {
+                    "type": "string",
+                    "enum": ["none", "push_in"],
+                    "default": "none",
+                    "description": "push_in fills the frame and slowly moves in; none fits the whole picture.",
+                },
+                "title": {
+                    "type": "string",
+                    "maxLength": 120,
+                    "description": "Text shown large over the lower part of the picture, fading in.",
+                },
+                "fade_seconds": {"type": "number", "minimum": 0, "maximum": 2, "default": 0},
             },
             "required": ["input_path", "output_name"],
             "additionalProperties": False,
@@ -1165,6 +1509,7 @@ async def _merge_videos_handler(
     crf: int = 18,
     preset: str = "veryfast",
     include_source_audio: bool = False,
+    target_duration_seconds: float | None = None,
     workspace_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -1175,6 +1520,12 @@ async def _merge_videos_handler(
         return _json_error("entity_id is required")
     if not (output_name or "").strip():
         return _json_error("output_name is required")
+    if target_duration_seconds is not None and (
+        isinstance(target_duration_seconds, bool)
+        or not isinstance(target_duration_seconds, (int, float))
+        or not 1 <= float(target_duration_seconds) <= 3600
+    ):
+        return _json_error("target_duration_seconds must be a number from 1 through 3600")
 
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
@@ -1247,6 +1598,7 @@ async def _merge_videos_handler(
             conversation_id=conversation_id,
             resolution=resolution,
             aspect_ratio=aspect_ratio,
+            target_duration_seconds=float(target_duration_seconds) if target_duration_seconds is not None else None,
         )
 
         return _json(
@@ -1262,7 +1614,10 @@ async def _merge_videos_handler(
                     size=os.path.getsize(final_path), mime="video/mp4",
                 ),
                 "file_size": os.path.getsize(final_path),
-                "duration_seconds": round(total_duration, 2),
+                # Measured on the master itself: its picture and its audio end together here.
+                "duration_seconds": round(total_duration, 3),
+                **({"target_duration_seconds": float(target_duration_seconds)}
+                   if target_duration_seconds is not None else {}),
                 "resolution": resolution,
                 "aspect_ratio": aspect_ratio,
                 "fps": target_fps,
@@ -1304,24 +1659,26 @@ async def _compose_video_timeline_handler(
     **_: Any,
 ) -> str:
     if not entity_id:
-        return _json_error("entity_id is required")
+        return _not_applied(_json_error("entity_id is required"), "input_invalid")
     if not (timeline_path or "").strip():
-        return _json_error("timeline_path is required")
+        return _not_applied(_json_error("timeline_path is required"), "input_invalid")
     if not (output_name or "").strip():
-        return _json_error("output_name is required")
+        return _not_applied(_json_error("output_name is required"), "input_invalid")
 
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
-        return _json_error(
+        return _not_applied(_json_error(
             "ffmpeg/ffprobe is not installed in the API/worker runtime. "
             "Install ffmpeg in docker/Dockerfile.api before using compose_video_timeline.",
             code="ffmpeg_missing",
-        )
+        ), "runtime_unavailable")
 
     saved_video: dict[str, Any] | None = None
     editor_recipe: dict[str, Any] | None = None
     stage = "compose_video"
+    # Everything before the render reads and validates; nothing is written.
+    output_started = False
     try:
         from packages.core.services import entity_fs
 
@@ -1339,13 +1696,14 @@ async def _compose_video_timeline_handler(
         )
         clean_reference = _timeline_clean_video_path(timeline, clean_video_path)
         if not clean_reference:
-            return _json_error(
+            return _not_applied(_json_error(
                 "clean_video_path is required when timeline.delivery.clean_picture_master is missing",
                 code="clean_video_missing",
-            )
-        clean_rel = _workspace_media_reference(
+            ), "input_invalid")
+        clean_rel = await _existing_media_reference(
             clean_reference,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         clean_abs = await _resolve_entity_file(entity_root, clean_rel)
@@ -1355,9 +1713,10 @@ async def _compose_video_timeline_handler(
         subtitle_abs = ""
         subtitle_rel = ""
         if burn_subtitles and resolved_subtitle:
-            subtitle_rel = _workspace_media_reference(
+            subtitle_rel = await _existing_media_reference(
                 resolved_subtitle,
                 entity_id=entity_id,
+                entity_root=entity_root,
                 workspace_base_dir=workspace_base_dir,
             )
             subtitle_abs = await _resolve_entity_file(entity_root, subtitle_rel)
@@ -1386,16 +1745,16 @@ async def _compose_video_timeline_handler(
             )
         except ValueError as exc:
             if require_audio:
-                return _json_error(
+                return _not_applied(_json_error(
                     f"No usable timeline audio tracks were found: {exc}",
                     code="audio_track_missing",
-                )
+                ), "input_invalid")
             raise
         if require_audio and not audio_tracks:
-            return _json_error(
+            return _not_applied(_json_error(
                 "No usable timeline audio tracks were found.",
                 code="audio_track_missing",
-            )
+            ), "input_invalid")
         total_duration = _composition_duration(clean_video_duration, audio_tracks)
         ducking_config = _timeline_ducking_config(timeline, ducking)
         loudness_config = _timeline_loudness_config(timeline, loudness_normalization)
@@ -1405,6 +1764,7 @@ async def _compose_video_timeline_handler(
         target_crf = int(_clamp_float(crf, 14, 28, 18))
 
         # Burn a normalized copy of an ASS file; the Knowledge file is untouched.
+        output_started = True
         with tempfile.TemporaryDirectory(prefix="compose-subtitles-") as subtitles_dir:
             burn_subtitle_abs = (
                 _burnable_ass_copy(subtitle_abs, subtitles_dir)
@@ -1541,6 +1901,12 @@ async def _compose_video_timeline_handler(
             crf=target_crf,
             preset=target_preset,
             include_source_audio=bool(include_source_audio and media_info.get("has_audio")),
+            render_settings={
+                "burn_subtitles": bool(subtitle_abs),
+                "subtitle_style": resolved_subtitle_style,
+                "ducking": ducking_config,
+                "loudness_normalization": loudness_config,
+            },
         )
         if not editor_recipe.get("document_id"):
             raise RuntimeError("Video editor recipe Knowledge projection is unavailable")
@@ -1613,6 +1979,8 @@ async def _compose_video_timeline_handler(
                     "cause": {"type": type(exc).__name__, "message": str(exc)},
                 },
             ))
+        if not output_started:
+            return _not_applied(_json_error(str(exc), code="compose_failed"), "input_invalid")
         return _json_error(str(exc), code="compose_failed")
 
 
@@ -1632,6 +2000,9 @@ async def _align_subtitles_handler(
     max_chars_per_line: int = 34,
     max_lines: int = 2,
     style: dict[str, Any] | None = None,
+    animation: dict[str, Any] | None = None,
+    word_timing: dict[str, Any] | None = None,
+    aspect_ratio: str = "",
     workspace_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -1642,6 +2013,12 @@ async def _align_subtitles_handler(
         return _json_error("entity_id is required")
     if not (output_name or "").strip():
         return _json_error("output_name is required")
+    if animation is not None and not isinstance(animation, dict):
+        return _json_error("animation must be an object")
+    if word_timing is not None and (
+        not isinstance(word_timing, dict) or not str(word_timing.get("audio_path") or "").strip()
+    ):
+        return _json_error("word_timing needs audio_path")
     if not (timeline_path or cues_path or "").strip():
         return _json_error("timeline_path or cues_path is required")
     if (audio_path or "").strip() and not (transcript_path or "").strip():
@@ -1711,9 +2088,10 @@ async def _align_subtitles_handler(
         transcript_matches = None
         alignment_texts: list[str] = []
         if transcript_path:
-            transcript_rel = _workspace_media_reference(
+            transcript_rel = await _existing_media_reference(
                 transcript_path,
                 entity_id=entity_id,
+                entity_root=entity_root,
                 workspace_base_dir=workspace_base_dir,
             )
             transcript_abs = await _resolve_entity_file(entity_root, transcript_rel)
@@ -1829,9 +2207,10 @@ async def _align_subtitles_handler(
         if audio_path:
             if not ffprobe:
                 return _json_error("ffprobe is required to align subtitles to narration audio")
-            audio_rel = _workspace_media_reference(
+            audio_rel = await _existing_media_reference(
                 audio_path,
                 entity_id=entity_id,
+                entity_root=entity_root,
                 workspace_base_dir=workspace_base_dir,
             )
             audio_abs = await _resolve_entity_file(entity_root, audio_rel)
@@ -1990,9 +2369,39 @@ async def _align_subtitles_handler(
                         alignment_metrics=alignment_metrics,
                     )
 
+        word_timing_rel = ""
+        if word_timing:
+            from packages.core.services.voice.whisper import WhisperTimestampError, WhisperUploadTooLargeError
+
+            word_timing_rel = await _existing_media_reference(
+                str(word_timing["audio_path"]),
+                entity_id=entity_id,
+                entity_root=entity_root,
+                workspace_base_dir=workspace_base_dir,
+            )
+            word_audio_abs = await _resolve_entity_file(entity_root, word_timing_rel)
+            _assert_audio_path(word_audio_abs)
+            try:
+                heard = await _transcribe_narration_audio(
+                    audio_path=word_audio_abs,
+                    user_id=user_id,
+                    entity_id=entity_id,
+                    word_timestamps=True,
+                    workspace_id=workspace_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                )
+            except (WhisperTimestampError, WhisperUploadTooLargeError) as exc:
+                return _json_blocked(str(exc), code="subtitle_word_timestamps_required")
+            heard_words = getattr(heard, "words", None)
+            if isinstance(heard_words, list) and heard_words:
+                cues = _time_cue_words(cues, heard_words, _coerce_float(word_timing.get("offset_seconds"), 0.0))
+
         line_width = int(_clamp_float(max_chars_per_line, 16, 56, 34))
         line_limit = int(_clamp_float(max_lines, 1, 2, 2))
         spec = timeline.get("spec") if isinstance(timeline.get("spec"), dict) else timeline
+        if aspect_ratio and not (spec.get("width") or spec.get("aspect_ratio")):
+            spec = {**spec, "aspect_ratio": str(aspect_ratio), "resolution": spec.get("resolution") or "1080p"}
         canvas_width, canvas_height = _editor_canvas_size(spec, {})
         resolved_style = _subtitle_style(
             canvas_width,
@@ -2000,14 +2409,18 @@ async def _align_subtitles_handler(
             _timeline_subtitle_style(timeline, style),
         )
         resolved_style["max_lines"] = line_limit
-        cues = _fit_subtitle_cues_to_line_limit(
-            cues,
-            max_chars_per_line=line_width,
-            max_lines=line_limit,
-        )
+        if animation is None:
+            cues = _fit_subtitle_cues_to_line_limit(
+                cues,
+                max_chars_per_line=line_width,
+                max_lines=line_limit,
+            )
         subtitle_format = str(format or "srt").strip().lower()
         if subtitle_format not in {"srt", "vtt", "ass"}:
             subtitle_format = "srt"
+        if animation is not None:
+            # Motion exists only in ASS; each sung line stays one cue and lays out its own lines.
+            subtitle_format = "ass"
         target = await _build_media_target(
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -2021,13 +2434,17 @@ async def _align_subtitles_handler(
             raise ValueError("Could not resolve subtitle output path")
         os.makedirs(target.abs_dir, exist_ok=True)
 
-        text = _render_subtitles(
-            cues,
-            subtitle_format=subtitle_format,
-            max_chars_per_line=line_width,
-            style=resolved_style,
-            canvas_width=canvas_width,
-            canvas_height=canvas_height,
+        text = (
+            _render_animated_lyrics_ass(cues, animation, canvas_width=canvas_width, canvas_height=canvas_height)
+            if animation is not None
+            else _render_subtitles(
+                cues,
+                subtitle_format=subtitle_format,
+                max_chars_per_line=line_width,
+                style=resolved_style,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
         )
         data = text.encode("utf-8")
         target_abs_path = runtime_write_entity_file_atomic(
@@ -2071,6 +2488,9 @@ async def _align_subtitles_handler(
                 "max_chars_per_line": line_width,
                 "max_lines": line_limit,
                 "subtitle_style": resolved_style,
+                "animation": _lyric_animation(animation, canvas_width, canvas_height) if animation is not None else None,
+                "word_timing_audio_path": word_timing_rel or None,
+                "measured_word_cues": sum(1 for cue in cues if cue.words and cue.timing_source == "measured_stt_words"),
             },
         )
         await _bind_artifact_to_workspace(
@@ -2195,9 +2615,10 @@ async def _build_narration_timeline_handler(
             workspace_id=workspace_id,
             task_id=task_id,
         )
-        transcript_rel = _workspace_media_reference(
+        transcript_rel = await _existing_media_reference(
             transcript_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         transcript_abs = await _resolve_entity_file(entity_root, transcript_rel)
@@ -2757,9 +3178,10 @@ async def _inspect_narration_recovery_handler(
             entity_id=entity_id,
             workspace_base_dir=workspace_base_dir,
         )
-        source_dir_rel = _workspace_media_reference(
+        source_dir_rel = await _existing_media_reference(
             source_audio_directory,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         transcript = Path(await _resolve_entity_file(entity_root, transcript_rel)).read_text(
@@ -3111,9 +3533,10 @@ async def _prepare_narration_timeline_handler(
             entity_id=entity_id,
             workspace_base_dir=workspace_base_dir,
         )
-        source_dir_rel = _workspace_media_reference(
+        source_dir_rel = await _existing_media_reference(
             source_audio_directory,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         transcript = Path(await _resolve_entity_file(entity_root, transcript_rel)).read_text(
@@ -3583,6 +4006,8 @@ async def _normalize_audio_loudness_handler(
     lra: float = 11.0,
     target_duration_seconds: float | None = None,
     output_format: str = "wav",
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
     workspace_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -3590,20 +4015,29 @@ async def _normalize_audio_loudness_handler(
     **_: Any,
 ) -> str:
     if not entity_id:
-        return _json_error("entity_id is required")
+        return _not_applied(_json_error("entity_id is required"), "input_invalid")
     if not (input_path or "").strip():
-        return _json_error("input_path is required")
+        return _not_applied(_json_error("input_path is required"), "input_invalid")
     if not (output_name or "").strip():
-        return _json_error("output_name is required")
+        return _not_applied(_json_error("output_name is required"), "input_invalid")
+    trim_start = _coerce_float(start_seconds, 0.0)
+    trim_end = _coerce_float(end_seconds, 0.0)
+    if trim_start < 0 or trim_end < 0 or (trim_end and trim_end <= trim_start):
+        return _not_applied(
+            _json_error("end_seconds must be greater than start_seconds (both >= 0)"),
+            "input_invalid",
+        )
 
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
-        return _json_error(
+        return _not_applied(_json_error(
             "ffmpeg and ffprobe are required for loudness normalization",
             code="ffmpeg_missing",
-        )
+        ), "runtime_unavailable")
 
+    # Everything before the output directory is created reads and validates.
+    output_started = False
     try:
         from packages.core.services import entity_fs
 
@@ -3613,19 +4047,22 @@ async def _normalize_audio_loudness_handler(
             workspace_id=workspace_id,
             task_id=task_id,
         )
-        rel_input = _workspace_media_reference(
+        rel_input = await _existing_media_reference(
             input_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         input_abs = await _resolve_entity_file(entity_root, rel_input)
-        _assert_audio_path(input_abs)
-        narration_profile = await _audio_narrator_profile(
+        # A video source contributes its audio track (a presenter clip's voice).
+        if Path(input_abs).suffix.lower() not in AUDIO_EXTENSIONS | VIDEO_EXTENSIONS:
+            raise ValueError(f"Unsupported audio extension (audio or video file required): {input_abs}")
+        narration_profile, voice_reference = await _audio_narrator_provenance(
             entity_id=entity_id,
             audio_rel_path=_normalize_user_path(rel_input),
         )
-        from packages.core.services.generated_media_naming import workspace_artifact_default_dir
-        if narration_profile is not None and (
+        from packages.core.services.generated_media_naming import voice_folder_applies, workspace_artifact_default_dir
+        if narration_profile is not None and voice_folder_applies(voice_reference) and (
             "/" in output_name or workspace_artifact_default_dir(
                 workspace_base_dir, WorkspaceArtifactDir.AUDIO.value
             ) != workspace_base_dir
@@ -3648,6 +4085,7 @@ async def _normalize_audio_loudness_handler(
         )
         if not target.abs_dir or not target.abs_path:
             raise ValueError("Could not resolve audio output path")
+        output_started = True
         os.makedirs(target.abs_dir, exist_ok=True)
 
         config = {
@@ -3657,7 +4095,18 @@ async def _normalize_audio_loudness_handler(
             "lra": lra,
         }
         source_info = await _probe_media(ffprobe, input_abs)
+        if not source_info.get("has_audio", True):
+            raise ValueError(f"{_normalize_user_path(rel_input)} has no audio track")
         source_duration = float(source_info.get("duration_seconds") or 0.0)
+        if trim_start and source_duration and trim_start >= source_duration:
+            raise ValueError(
+                f"start_seconds {trim_start:g} is past the end of the source ({source_duration:.3f} s)"
+            )
+        if trim_end and source_duration:
+            trim_end = min(trim_end, source_duration)
+        if trim_start or trim_end:
+            # Tempo fitting and the recorded duration describe the kept window.
+            source_duration = (trim_end or source_duration) - trim_start
         requested_duration = _coerce_float(target_duration_seconds, 0.0)
         if requested_duration and not 0.25 <= requested_duration <= 3600:
             raise ValueError("target_duration_seconds must be between 0.25 and 3600")
@@ -3704,11 +4153,12 @@ async def _normalize_audio_loudness_handler(
         if abs(tempo_factor - 1.0) > 0.001:
             filters.append(_atempo_filter(tempo_factor))
         filters.append(_loudnorm_filter(config))
-        args = [
-            ffmpeg,
-            "-y",
-            "-i",
-            input_abs,
+        args = [ffmpeg, "-y", "-i", input_abs]
+        if trim_start:
+            args.extend(["-ss", f"{trim_start:.3f}"])
+        if trim_end:
+            args.extend(["-to", f"{trim_end:.3f}"])
+        args.extend([
             "-vn",
             "-af",
             ",".join(filters),
@@ -3716,7 +4166,7 @@ async def _normalize_audio_loudness_handler(
             "48000",
             "-ac",
             "2",
-        ]
+        ])
         args.extend(_audio_codec_args(fmt))
         with tempfile.TemporaryDirectory(prefix="normalize-audio-") as tmp_dir:
             rendered_path = os.path.join(tmp_dir, f"normalized.{fmt}")
@@ -3741,9 +4191,14 @@ async def _normalize_audio_loudness_handler(
             "target_duration_seconds": round(requested_duration, 3) if requested_duration else None,
             "tempo_factor": round(tempo_factor, 6),
         }
+        if trim_start or trim_end:
+            generation["start_seconds"] = round(trim_start, 3)
+            generation["end_seconds"] = round(trim_end, 3) if trim_end else None
         if narration_profile is not None:
             generation["voice"] = narration_profile["voice"]
             generation["narration_profile"] = narration_profile
+            if voice_reference is not None:
+                generation["voice_reference"] = voice_reference
         document_id = await _register_file_artifact(
             entity_id=entity_id,
             user_id=user_id,
@@ -3798,7 +4253,8 @@ async def _normalize_audio_loudness_handler(
         return _json(payload)
     except Exception as exc:  # noqa: BLE001
         logger.exception("normalize_audio_loudness failed")
-        return _json_error(str(exc), code="normalize_audio_loudness_failed")
+        result = _json_error(str(exc), code="normalize_audio_loudness_failed")
+        return result if output_started else _not_applied(result, "input_invalid")
 
 
 @_with_media_file_access
@@ -3806,19 +4262,46 @@ async def _probe_media_handler(
     *,
     entity_id: str = "",
     input_path: str = "",
+    document_id: str = "",
     workspace_id: str | None = None,
     **_: Any,
 ) -> str:
     if not entity_id:
         return _json_error("entity_id is required")
-    if not str(input_path or "").strip():
-        return _json_error("input_path is required")
+    input_path = str(input_path or "").strip()
+    document_id = str(document_id or "").strip()
+    if source_error := _media_source_error(input_path, document_id):
+        return source_error
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return _json_error("ffprobe is required for media inspection", code="ffprobe_missing")
     try:
         from packages.core.services import entity_fs
         from packages.core.services.ai_file_permissions import is_chat_upload_path
+
+        if document_id:
+            from packages.core.config import get_settings
+            from packages.core.services.workspace_document_media import inspect_workspace_document_media
+
+            access = _CURRENT_MEDIA_FILE_ACCESS.get()
+
+            async def inspect_snapshot(path: str) -> dict[str, Any]:
+                return {"report": await _probe_media_report(
+                    ffprobe, path, pass_fds=(int(Path(path).name),),
+                )}
+
+            source = await inspect_workspace_document_media(
+                {"source_kind": "workspace_document", "document_id": document_id},
+                entity_id=entity_id,
+                user_id=access.user_id if access else None,
+                conversation_id=access.conversation_id if access else None,
+                workspace_id=access.workspace_id if access else None,
+                tool_name="probe_media",
+                allowed_suffixes=AUDIO_EXTENSIONS | VIDEO_EXTENSIONS,
+                max_bytes=get_settings().MANOR_MAX_UPLOAD_MB * 1024 * 1024,
+                inspect_snapshot=inspect_snapshot,
+            )
+            return _json({"status": "completed", **source, "fs_path": source["rel_path"]})
 
         entity_root = entity_fs.get_entity_root(entity_id)
         upload_path = _entity_fs_url_path(input_path, entity_id) or unquote(
@@ -3845,9 +4328,10 @@ async def _probe_media_handler(
                 entity_id=entity_id,
                 workspace_id=workspace_id,
             )
-            rel_input = _workspace_media_reference(
+            rel_input = await _existing_media_reference(
                 input_path,
                 entity_id=entity_id,
+                entity_root=entity_root,
                 workspace_base_dir=workspace_base_dir,
             )
             input_abs = await _resolve_entity_file(entity_root, rel_input)
@@ -3865,6 +4349,89 @@ async def _probe_media_handler(
 
 
 @_with_media_file_access
+async def _verify_media_sources_handler(
+    *,
+    entity_id: str = "",
+    final_video_document_id: str = "",
+    expected_final_video_sha256: str = "",
+    source_audio_document_id: str = "",
+    expected_source_audio_sha256: str = "",
+    source_start_seconds: float = 0.0,
+    duration_seconds: float = 0.0,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+    duration_tolerance_seconds: float | None = None,
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    """Certify an existing Workspace video without creating or publishing anything."""
+    access = _CURRENT_MEDIA_FILE_ACCESS.get()
+    try:
+        from packages.core.services.workspace_media_source_verification import verify_media_sources
+        if not entity_id or not access or not access.user_id or not workspace_id:
+            raise ValueError("verify_media_sources requires an active Workspace and user.")
+        receipt = await verify_media_sources(
+            entity_id=entity_id,
+            user_id=access.user_id,
+            workspace_id=workspace_id,
+            conversation_id=access.conversation_id,
+            tool_name="verify_media_sources",
+            final_video_document_id=final_video_document_id,
+            expected_final_video_sha256=expected_final_video_sha256,
+            source_audio_document_id=source_audio_document_id,
+            expected_source_audio_sha256=expected_source_audio_sha256,
+            source_start_seconds=source_start_seconds,
+            duration_seconds=duration_seconds,
+            expected_width=expected_width,
+            expected_height=expected_height,
+            duration_tolerance_seconds=duration_tolerance_seconds,
+        )
+        return _json(receipt)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("verify_media_sources did not certify media: %s", exc)
+        return _json_error(str(exc), code="media_source_verification_failed")
+
+
+@_with_media_file_access
+async def _measure_media_audio_alignment_handler(
+    *,
+    entity_id: str = "",
+    reference_document_id: str = "",
+    target_document_id: str = "",
+    reference_start_seconds: float = 0.0,
+    target_start_seconds: float = 0.0,
+    duration_seconds: float = 20.0,
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    """Measure a local Workspace-media offset without certifying or publishing either asset."""
+    access = _CURRENT_MEDIA_FILE_ACCESS.get()
+    try:
+        from packages.core.services.workspace_media_source_verification import (
+            measure_media_audio_alignment,
+        )
+
+        if not entity_id or not access or not access.user_id or not workspace_id:
+            raise ValueError("measure_media_audio_alignment requires an active Workspace and user.")
+        receipt = await measure_media_audio_alignment(
+            entity_id=entity_id,
+            user_id=access.user_id,
+            workspace_id=workspace_id,
+            conversation_id=access.conversation_id,
+            tool_name="measure_media_audio_alignment",
+            reference_document_id=reference_document_id,
+            target_document_id=target_document_id,
+            reference_start_seconds=reference_start_seconds,
+            target_start_seconds=target_start_seconds,
+            duration_seconds=duration_seconds,
+        )
+        return _json(receipt)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("measure_media_audio_alignment did not measure media: %s", exc)
+        return _json_error(str(exc), code="media_audio_alignment_failed")
+
+
+@_with_media_file_access
 async def _verify_stickman_final_media_handler(
     *,
     entity_id: str = "",
@@ -3872,8 +4439,11 @@ async def _verify_stickman_final_media_handler(
     subtitle_path: str = "",
     narration_timeline_path: str = "",
     target_duration_seconds: float = 0.0,
+    opening_seconds: float = 0.0,
+    result_paths: list[str] | None = None,
     workspace_id: str | None = None,
     workflow_lineage_root_run_id: str = "",
+    _workflow_project_root_from_context: str = "",
     **_: Any,
 ) -> str:
     """Return one deterministic publication receipt for a Stickman Workflow run."""
@@ -3906,6 +4476,8 @@ async def _verify_stickman_final_media_handler(
         target_duration = float(target_duration_seconds)
         if not math.isfinite(target_duration) or target_duration <= 0:
             raise ValueError("target_duration_seconds must be a positive finite number")
+        # A series intro plays before the planned video, which keeps its own target.
+        target_duration += _clamp_float(opening_seconds, 0.0, 10.0, 0.0)
 
         entity_root = entity_fs.get_entity_root(entity_id)
         workspace_base_dir = await _workspace_media_base_dir(
@@ -3928,10 +4500,13 @@ async def _verify_stickman_final_media_handler(
             workspace_base_dir=workspace_base_dir,
         )
         lineage_root = str(workflow_lineage_root_run_id or "").strip()
-        if lineage_root:
+        # Inside a project folder (a series episode) the production is kept there.
+        project_root = project_production_root(_workflow_project_root_from_context)
+        production_root = project_root or (f"runs/{lineage_root}" if lineage_root else "")
+        if production_root:
             expected_prefix = (
                 _workspace_media_reference(
-                    f"runs/{lineage_root}",
+                    production_root,
                     entity_id=entity_id,
                     workspace_base_dir=workspace_base_dir,
                 ).rstrip("/")
@@ -4091,6 +4666,13 @@ async def _verify_stickman_final_media_handler(
         base_result["findings"] = findings
         base_result["publication_ready"] = not findings
         base_result["blocker"] = str(findings[0]["code"]) if findings else ""
+        if project_root and not findings:
+            # The verified video (and its thumbnail) are the project's results;
+            # frames, clips and timelines are how they were made.
+            await mark_production_results(entity_id, expected_prefix.rstrip("/"), {final_rel, *(
+                _workspace_media_reference(path, entity_id=entity_id, workspace_base_dir=workspace_base_dir)
+                for path in result_paths or [] if str(path or "").strip()
+            )})
         return _json(base_result)
     except Exception as exc:  # noqa: BLE001
         logger.exception("verify_stickman_final_media failed")
@@ -4115,6 +4697,9 @@ async def _still_to_video_handler(
     fps: int = 30,
     crf: int = 18,
     preset: str = "veryfast",
+    motion: str = "none",
+    title: str = "",
+    fade_seconds: float = 0.0,
     workspace_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -4140,9 +4725,10 @@ async def _still_to_video_handler(
             workspace_id=workspace_id,
             task_id=task_id,
         )
-        rel_input = _workspace_media_reference(
+        rel_input = await _existing_media_reference(
             input_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         input_abs = await _resolve_entity_file(entity_root, rel_input)
@@ -4174,19 +4760,38 @@ async def _still_to_video_handler(
         if not target.abs_dir or not target.abs_path:
             raise ValueError("Could not resolve still-scene output path")
         os.makedirs(target.abs_dir, exist_ok=True)
-        video_filter = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,fps={selected_fps},format=yuv420p"
-        )
+        selected_motion = "push_in" if str(motion or "").strip().lower() == "push_in" else "none"
+        title_text = " ".join(str(title or "").split())[:120]
+        fade = _clamp_float(fade_seconds, 0.0, min(2.0, duration / 3), 0.0)
+        frames = max(1, round(duration * selected_fps))
+        if selected_motion == "push_in":
+            # Fill the frame and move in slowly; zoompan makes every frame from the one picture.
+            video_filter = (
+                f"scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,crop={width * 2}:{height * 2},"
+                f"zoompan=z='min(1+0.08*on/{frames},1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f":d={frames}:s={width}x{height}:fps={selected_fps},setsar=1,format=yuv420p"
+            )
+        else:
+            video_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+                f"setsar=1,fps={selected_fps},format=yuv420p"
+            )
         with tempfile.TemporaryDirectory(prefix="still-to-video-") as tmp_dir:
+            if title_text:
+                title_path = os.path.join(tmp_dir, "title.ass")
+                Path(title_path).write_text(
+                    _still_title_ass(title_text, duration, width=width, height=height), encoding="utf-8",
+                )
+                video_filter += f",subtitles={_subtitles_filter_value(title_path)}"
+            if fade:
+                video_filter += f",fade=t=in:st=0:d={fade:.3f},fade=t=out:st={duration - fade:.3f}:d={fade:.3f}"
             rendered_path = os.path.join(tmp_dir, "still-scene.mp4")
             await _run_process(
                 [
                     ffmpeg,
                     "-y",
-                    "-loop",
-                    "1",
+                    *([] if selected_motion == "push_in" else ["-loop", "1"]),
                     "-i",
                     input_abs,
                     "-t",
@@ -4229,6 +4834,9 @@ async def _still_to_video_handler(
             "fps": selected_fps,
             "crf": selected_crf,
             "preset": selected_preset,
+            **({"motion": selected_motion} if selected_motion != "none" else {}),
+            **({"title": title_text} if title_text else {}),
+            **({"fade_seconds": round(fade, 3)} if fade else {}),
         }
         document_id = await _register_file_artifact(
             entity_id=entity_id,
@@ -4278,12 +4886,179 @@ async def _still_to_video_handler(
         return _json_error(str(exc), code="still_to_video_failed")
 
 
+DERIVE_IMAGE_ASPECT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "derive_image_aspect",
+        "description": (
+            "Derive an image at another aspect ratio by a centred crop: no padding, stretching or generation, "
+            "at the source's native resolution. An image that already has the requested aspect ratio is returned as "
+            "its own Document unchanged. Otherwise the crop is saved as a new Knowledge image. Returns a poster receipt "
+            "(document_id, fs_path, filename, sha256) with ready=true, or ready=false with a blocker."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {
+                    "type": "string",
+                    "description": "Source image: a /viewer/<document_id> address or its Knowledge path.",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["16:9", "9:16", "4:5", "5:4", "1:1", "4:3", "3:4"],
+                    "description": "Requested width:height.",
+                },
+                "output_name": {"type": "string", "description": "Filename for a derived image, without a path."},
+            },
+            "required": ["input_path", "aspect_ratio"],
+        },
+    },
+}
+
+
+def _center_crop_size(width: int, height: int, aspect_w: int, aspect_h: int) -> tuple[int, int]:
+    """The largest centred crop of width x height that has the requested aspect ratio."""
+    if width * aspect_h > height * aspect_w:
+        return height * aspect_w // aspect_h, height
+    return width, width * aspect_h // aspect_w
+
+
+@_with_media_file_access
+async def _derive_image_aspect_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    input_path: str = "",
+    aspect_ratio: str = "",
+    output_name: str = "",
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    def blocked(message: str) -> str:
+        return _json({"ready": False, "blocker": message, "poster": None})
+
+    if not entity_id:
+        return blocked("entity_id is required")
+    if not str(input_path or "").strip():
+        return blocked("input_path is required")
+    try:
+        aspect_w, aspect_h = (int(part) for part in str(aspect_ratio or "").split(":", 1))
+    except ValueError:
+        return blocked("aspect_ratio must look like 16:9")
+    if aspect_w <= 0 or aspect_h <= 0:
+        return blocked("aspect_ratio must be positive")
+
+    try:
+        from PIL import Image
+
+        from packages.core.ai.tools.file_tools import _file_reference_arg
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id, workspace_id=workspace_id, task_id=task_id,
+        )
+        _path, source_document_id, _foreign = _file_reference_arg(entity_id, entity_root, str(input_path).strip())
+        rel_input = await _existing_media_reference(
+            input_path, entity_id=entity_id, entity_root=entity_root, workspace_base_dir=workspace_base_dir,
+        )
+        input_abs = await _resolve_entity_file(entity_root, rel_input)
+        _assert_image_path(input_abs)
+        with Image.open(input_abs) as source:
+            source.load()
+            width, height = source.size
+            crop_w, crop_h = _center_crop_size(width, height, aspect_w, aspect_h)
+            if (crop_w, crop_h) == (width, height):
+                if not source_document_id:
+                    return blocked("the source image must be addressed by its Document (/viewer/<document_id>)")
+                return _json({
+                    "ready": True, "derived": False,
+                    "poster": {
+                        "document_id": source_document_id, "fs_path": _normalize_user_path(rel_input),
+                        "filename": os.path.basename(rel_input), "sha256": _sha256_file(input_abs),
+                    },
+                    "width": width, "height": height,
+                })
+            left = (width - crop_w) // 2
+            top = (height - crop_h) // 2
+            cropped = source.crop((left, top, left + crop_w, top + crop_h))
+            target = await _build_media_target(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                output_name=output_name or f"{Path(rel_input).stem}-{aspect_w}x{aspect_h}.png",
+                ext=".png",
+                fallback="derived-image",
+                default_dir="images",
+            )
+            if not target.abs_dir or not target.abs_path:
+                raise ValueError("Could not resolve the derived image output path")
+            os.makedirs(target.abs_dir, exist_ok=True)
+            cropped.save(target.abs_path, format="PNG")
+
+        if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
+            raise RuntimeError("the derived image was not written")
+        digest = _sha256_file(target.abs_path)
+        document_id = await _register_file_artifact(
+            entity_id=entity_id,
+            user_id=user_id,
+            filename=target.filename,
+            rel_path=target.rel_path,
+            file_size=os.path.getsize(target.abs_path),
+            file_type="png",
+            mime_type="image/png",
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            tool_name="derive_image_aspect",
+            artifact_role="poster",
+            generation={
+                "operation": "derive_image_aspect",
+                "input_path": _normalize_user_path(rel_input),
+                "source_document_id": source_document_id,
+                "aspect_ratio": f"{aspect_w}:{aspect_h}",
+                "crop_box": [left, top, left + crop_w, top + crop_h],
+                "width": crop_w,
+                "height": crop_h,
+                "sha256": digest,
+            },
+        )
+        await _bind_artifact_to_workspace(
+            entity_id=entity_id,
+            document_id=document_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            tool_name="derive_image_aspect",
+        )
+        return _json({
+            "ready": True, "derived": True,
+            "poster": {
+                "document_id": document_id, "fs_path": target.rel_path,
+                "filename": target.filename, "sha256": digest,
+            },
+            "width": crop_w, "height": crop_h,
+            "source_document_id": source_document_id,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("derive_image_aspect failed")
+        return blocked(str(exc))
+
+
 @_with_media_file_access
 async def _render_frame_samples_handler(
     *,
     entity_id: str = "",
     user_id: str = "",
     input_path: str = "",
+    document_id: str = "",
+    expected_source_sha256: str = "",
     output_dir: str = "",
     timestamps: list[float] | None = None,
     scene_boundaries: list[float] | None = None,
@@ -4297,8 +5072,15 @@ async def _render_frame_samples_handler(
 ) -> str:
     if not entity_id:
         return _json_error("entity_id is required")
-    if not str(input_path or "").strip():
-        return _json_error("input_path is required")
+    input_path = str(input_path or "").strip()
+    document_id = str(document_id or "").strip()
+    if source_error := _media_source_error(input_path, document_id):
+        return source_error
+    expected_source_sha256 = str(expected_source_sha256 or "").strip()
+    if expected_source_sha256 and not document_id:
+        return _json_error("expected_source_sha256 requires document_id")
+    if expected_source_sha256 and not re.fullmatch(r"[A-Fa-f0-9]{64}", expected_source_sha256):
+        return _json_error("expected_source_sha256 must be a 64-character hexadecimal SHA-256")
     if not str(output_dir or "").strip():
         return _json_error("output_dir is required")
     ffmpeg = shutil.which("ffmpeg")
@@ -4310,139 +5092,174 @@ async def _render_frame_samples_handler(
 
     completed_frames: list[dict[str, Any]] = []
     try:
-        rel_input, input_abs, is_upload = await _resolve_video_analysis_source(
-            entity_id=entity_id,
-            input_path=input_path,
-            workspace_id=workspace_id,
-            task_id=task_id,
-        )
-        _assert_video_path(input_abs)
-        report = await _probe_media_report(ffprobe, input_abs)
-        if not report.get("has_video"):
-            raise ValueError("Frame sampling requires a video stream")
-        media_duration = float(_probe_number(report.get("duration_seconds")))
-        video_stream = report.get("video_stream")
-        video_duration = float(_probe_number(
-            video_stream.get("duration_seconds")
-            if isinstance(video_stream, dict)
-            else 0
-        ))
-        duration = video_duration if video_duration > 0 else media_duration
-        if duration <= 0:
-            raise ValueError("Frame sampling requires a positive media duration")
-        try:
-            output_base = _normalize_user_path(output_dir).rstrip("/")
-        except ValueError:
-            # Models sometimes mirror the uploaded source directory for their
-            # output. Keep the input ACL intact and store evidence in a visible
-            # generated-artifact directory instead. Other unsafe paths fail.
-            if not is_upload or not re.fullmatch(
-                r"uploads/chat/[A-Za-z0-9_/-]{1,100}", output_dir.strip()
-            ):
-                raise
-            output_base = f"Video-Analysis/{Path(rel_input).stem}/frames"
-        sample_times = _frame_sample_times(
-            duration_seconds=duration,
-            timestamps=timestamps,
-            scene_boundaries=scene_boundaries,
-            interval_seconds=interval_seconds,
-            max_samples=max_samples,
-        )
-        for index, timestamp in enumerate(sample_times, start=1):
-            timestamp_ms = int(round(timestamp * 1000))
-            output_name = f"{output_base}/frame-{index:03d}-{timestamp_ms:09d}ms.png"
-            target = await _build_media_target(
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                output_name=output_name,
-                ext=".png",
-                fallback=f"frame-{index:03d}",
-                default_dir="qa/frames",
-            )
-            if not target.abs_dir or not target.abs_path:
-                raise ValueError("Could not resolve frame sample output path")
-            os.makedirs(target.abs_dir, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="frame-sample-") as tmp_dir:
-                rendered_path = os.path.join(tmp_dir, "frame.png")
-                await _run_process(
-                    [
-                        ffmpeg,
-                        "-y",
-                        "-ss",
-                        f"{timestamp:.3f}",
-                        "-i",
-                        input_abs,
-                        "-frames:v",
-                        "1",
-                        "-an",
+        with tempfile.TemporaryDirectory(prefix="frame-sample-") as temp_dir:
+            source: dict[str, Any] = {}
+            rel_input = ""
+            is_upload = False
+
+            async def render_frames(
+                source_path: str, *, pass_fds: tuple[int, ...] = (),
+            ) -> dict[str, Any]:
+                try:
+                    output_base = _normalize_user_path(output_dir).rstrip("/")
+                except ValueError:
+                    if not is_upload or not re.fullmatch(
+                        r"uploads/chat/[A-Za-z0-9_/-]{1,100}", output_dir.strip(),
+                    ):
+                        raise
+                    output_base = f"Video-Analysis/{Path(rel_input).stem}/frames"
+                report = await _probe_media_report(
+                    ffprobe, source_path, **({"pass_fds": pass_fds} if pass_fds else {}),
+                )
+                if not report.get("has_video"):
+                    raise ValueError("Frame sampling requires a video stream")
+                media_duration = float(_probe_number(report.get("duration_seconds")))
+                video_stream = report.get("video_stream")
+                video_duration = float(_probe_number(
+                    video_stream.get("duration_seconds") if isinstance(video_stream, dict) else 0
+                ))
+                duration = video_duration if video_duration > 0 else media_duration
+                if duration <= 0:
+                    raise ValueError("Frame sampling requires a positive media duration")
+                sample_times = _frame_sample_times(
+                    duration_seconds=duration,
+                    timestamps=timestamps,
+                    scene_boundaries=scene_boundaries,
+                    interval_seconds=interval_seconds,
+                    max_samples=max_samples,
+                    frame_rate=float(_probe_number(video_stream.get("frame_rate")))
+                    if isinstance(video_stream, dict) else 0.0,
+                )
+                for index, timestamp in enumerate(sample_times, start=1):
+                    rendered_path = os.path.join(temp_dir, f"frame-{index:03d}.png")
+                    await _run_process(
+                        [
+                            ffmpeg, "-y", "-ss", f"{timestamp:.6f}",
+                            *(["-protocol_whitelist", "file,pipe"] if pass_fds else []),
+                            "-i", source_path, "-frames:v", "1", "-an", rendered_path,
+                        ],
+                        timeout_seconds=120.0,
+                        **({"pass_fds": pass_fds} if pass_fds else {}),
+                    )
+                    timestamp_ms = int(round(timestamp * 1000))
+                    output_name = f"{output_base}/frame-{index:03d}-{timestamp_ms:09d}ms.png"
+                    target = await _build_media_target(
+                        entity_id=entity_id,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        output_name=output_name,
+                        ext=".png",
+                        fallback=f"frame-{index:03d}",
+                        default_dir="qa/frames",
+                    )
+                    if not target.abs_dir or not target.abs_path:
+                        raise ValueError("Could not resolve frame sample output path")
+                    os.makedirs(target.abs_dir, exist_ok=True)
+                    runtime_copy_entity_file_atomic(
+                        entity_id,
+                        target.rel_path,
                         rendered_path,
-                    ],
-                    timeout_seconds=120.0,
+                        expected_size=os.path.getsize(rendered_path),
+                        allow_empty=False,
+                    )
+                    if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
+                        raise RuntimeError(f"ffmpeg did not produce frame sample {index}")
+                    generation = {
+                        "operation": "render_frame_samples",
+                        "input_path": rel_input if is_upload else _normalize_user_path(rel_input),
+                        "timestamp_seconds": timestamp,
+                        "sample_index": index,
+                        "media_duration_seconds": round(duration, 3),
+                        **({"source_document_id": source["document_id"], "source_sha256": source["source_sha256"]}
+                           if source else {}),
+                    }
+                    artifact_document_id = await _register_file_artifact(
+                        entity_id=entity_id,
+                        user_id=user_id,
+                        filename=target.filename,
+                        rel_path=target.rel_path,
+                        file_size=os.path.getsize(target.abs_path),
+                        file_type="png",
+                        mime_type="image/png",
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                        tool_name="render_frame_samples",
+                        artifact_role="qa_evidence",
+                        generation=generation,
+                    )
+                    await _bind_artifact_to_workspace(
+                        entity_id=entity_id,
+                        document_id=artifact_document_id,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        tool_name="render_frame_samples",
+                    )
+                    completed_frames.append({
+                        "index": index,
+                        "timestamp_seconds": timestamp,
+                        "document_id": artifact_document_id,
+                        "name": target.filename,
+                        "fs_path": target.rel_path,
+                        "result_url": _fs_url(entity_id, target.rel_path),
+                        "file_size": os.path.getsize(target.abs_path),
+                        "file": _produced_file(
+                            entity_id, target.rel_path, document_id=artifact_document_id, name=target.filename,
+                            size=os.path.getsize(target.abs_path),
+                        ),
+                    })
+                return {"report": report, "duration": duration, "sample_times": sample_times}
+
+            if document_id:
+                from packages.core.services.workspace_document_media import inspect_workspace_document_media
+
+                access = _CURRENT_MEDIA_FILE_ACCESS.get()
+                staged_source = os.path.join(temp_dir, "workspace-document-source")
+
+                async def inspect_snapshot(path: str) -> dict[str, Any]:
+                    await _stage_media_snapshot(path, staged_source, max_bytes=4 * 1024 * 1024 * 1024)
+                    return {}
+
+                source = await inspect_workspace_document_media(
+                    {"source_kind": "workspace_document", "document_id": document_id},
+                    entity_id=entity_id,
+                    user_id=access.user_id if access else None,
+                    conversation_id=access.conversation_id if access else None,
+                    workspace_id=access.workspace_id if access else None,
+                    tool_name="render_frame_samples",
+                    allowed_suffixes=VIDEO_EXTENSIONS,
+                    max_bytes=4 * 1024 * 1024 * 1024,
+                    expected_source_sha256=expected_source_sha256.lower() or None,
+                    inspect_snapshot=inspect_snapshot,
                 )
-                runtime_copy_entity_file_atomic(
-                    entity_id,
-                    target.rel_path,
-                    rendered_path,
-                    expected_size=os.path.getsize(rendered_path),
-                    allow_empty=False,
+                rel_input, is_upload = source["rel_path"], False
+                with open(staged_source, "rb") as staged:
+                    descriptor = staged.fileno()
+                    inspection = await render_frames(
+                        f"/dev/fd/{descriptor}", pass_fds=(descriptor,),
+                    )
+            else:
+                rel_input, input_abs, is_upload = await _resolve_video_analysis_source(
+                    entity_id=entity_id, input_path=input_path, workspace_id=workspace_id, task_id=task_id,
                 )
-            if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
-                raise RuntimeError(f"ffmpeg did not produce frame sample {index}")
-            generation = {
-                "operation": "render_frame_samples",
+                _assert_video_path(input_abs)
+                inspection = await render_frames(input_abs)
+
+            duration = float(inspection["duration"])
+            return _json({
+                "status": "completed",
                 "input_path": rel_input if is_upload else _normalize_user_path(rel_input),
-                "timestamp_seconds": timestamp,
-                "sample_index": index,
-                "media_duration_seconds": round(duration, 3),
-            }
-            document_id = await _register_file_artifact(
-                entity_id=entity_id,
-                user_id=user_id,
-                filename=target.filename,
-                rel_path=target.rel_path,
-                file_size=os.path.getsize(target.abs_path),
-                file_type="png",
-                mime_type="image/png",
-                workspace_id=workspace_id,
-                task_id=task_id,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                tool_name="render_frame_samples",
-                artifact_role="qa_evidence",
-                generation=generation,
-            )
-            await _bind_artifact_to_workspace(
-                entity_id=entity_id,
-                document_id=document_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                tool_name="render_frame_samples",
-            )
-            completed_frames.append({
-                "index": index,
-                "timestamp_seconds": timestamp,
-                "document_id": document_id,
-                "name": target.filename,
-                "fs_path": target.rel_path,
-                "result_url": _fs_url(entity_id, target.rel_path),
-                "file_size": os.path.getsize(target.abs_path),
-                "file": _produced_file(
-                    entity_id, target.rel_path, document_id=document_id, name=target.filename,
-                    size=os.path.getsize(target.abs_path),
-                ),
+                "duration_seconds": round(duration, 3),
+                "sample_count": len(completed_frames),
+                "frames": completed_frames,
+                "files": [frame["file"] for frame in completed_frames],
+                **({"source_document_id": source["document_id"], "source_sha256": source["source_sha256"]}
+                   if source else {}),
             })
-        return _json({
-            "status": "completed",
-            "input_path": rel_input if is_upload else _normalize_user_path(rel_input),
-            "duration_seconds": round(duration, 3),
-            "sample_count": len(completed_frames),
-            "frames": completed_frames,
-            "files": [frame["file"] for frame in completed_frames],
-        })
     except Exception as exc:  # noqa: BLE001
         logger.exception("render_frame_samples failed")
         return _json({
@@ -4461,6 +5278,7 @@ async def _transcribe_video_handler(
     input_path: str = "",
     start_seconds: float = 0,
     end_seconds: float | None = None,
+    reference_transcript: str = "",
     workspace_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -4469,6 +5287,8 @@ async def _transcribe_video_handler(
 ) -> str:
     if not entity_id or not str(input_path or "").strip():
         return _json_error("entity_id and input_path are required")
+    from packages.core.services.voice.whisper import WhisperTimestampError
+
     ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
         return _json_error("ffmpeg and ffprobe are required", code="ffmpeg_missing")
@@ -4518,15 +5338,26 @@ async def _transcribe_video_handler(
                 timeout_seconds=max(180.0, end - start),
             )
             access = _CURRENT_MEDIA_FILE_ACCESS.get()
-            transcript = await _transcribe_narration_audio(
+            stt_kwargs = dict(
                 audio_path=audio_path,
                 entity_id=entity_id,
                 user_id=(access.user_id if access else None) or user_id,
                 workspace_id=workspace_id,
                 agent_id=agent_id,
                 conversation_id=conversation_id,
-                require_timestamps=False,
             )
+            try:
+                # Timestamps first: a text-only route cannot place subtitles.
+                transcript = await _transcribe_narration_audio(
+                    **stt_kwargs,
+                    require_timestamps=True,
+                    reference_transcript=str(reference_transcript or "").strip(),
+                )
+            except WhisperTimestampError:
+                transcript = await _transcribe_narration_audio(
+                    **stt_kwargs,
+                    require_timestamps=False,
+                )
         segments = [
             {**segment, "start": round(start + float(segment["start"]), 3),
              "end": round(start + float(segment["end"]), 3)}
@@ -4551,6 +5382,8 @@ async def _analyze_audio_handler(
     *,
     entity_id: str = "",
     input_path: str = "",
+    document_id: str = "",
+    expected_source_sha256: str = "",
     target_lufs_min: float = -20.0,
     target_lufs_max: float = -14.0,
     loudness_tolerance_lu: float = 0.0,
@@ -4563,8 +5396,15 @@ async def _analyze_audio_handler(
 ) -> str:
     if not entity_id:
         return _json_error("entity_id is required")
-    if not str(input_path or "").strip():
-        return _json_error("input_path is required")
+    input_path = str(input_path or "").strip()
+    document_id = str(document_id or "").strip()
+    if source_error := _media_source_error(input_path, document_id):
+        return source_error
+    expected_source_sha256 = str(expected_source_sha256 or "").strip()
+    if expected_source_sha256 and not document_id:
+        return _json_error("expected_source_sha256 requires document_id")
+    if expected_source_sha256 and not re.fullmatch(r"[A-Fa-f0-9]{64}", expected_source_sha256):
+        return _json_error("expected_source_sha256 must be a 64-character hexadecimal SHA-256")
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg:
@@ -4573,26 +5413,6 @@ async def _analyze_audio_handler(
         return _json_error("ffprobe is required for audio analysis", code="ffprobe_missing")
 
     try:
-        from packages.core.services import entity_fs
-
-        entity_root = entity_fs.get_entity_root(entity_id)
-        workspace_base_dir = await _workspace_media_base_dir(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-        )
-        rel_input = _workspace_media_reference(
-            input_path,
-            entity_id=entity_id,
-            workspace_base_dir=workspace_base_dir,
-        )
-        input_abs = await _resolve_entity_file(entity_root, rel_input)
-        report = await _probe_media_report(ffprobe, input_abs)
-        if not report.get("has_audio"):
-            raise ValueError("Media has no audio stream")
-        duration = float(_probe_number(report.get("duration_seconds")))
-        if duration <= 0:
-            raise ValueError("Audio analysis requires a positive media duration")
-
         lufs_min = _clamp_float(target_lufs_min, -40.0, 0.0, -20.0)
         lufs_max = _clamp_float(target_lufs_max, -40.0, 0.0, -14.0)
         if lufs_min > lufs_max:
@@ -4605,40 +5425,48 @@ async def _analyze_audio_handler(
         silence_minimum = _clamp_float(minimum_silence_seconds, 0.1, 10.0, 0.5)
         silence_ratio_limit = _clamp_float(max_silence_ratio, 0.0, 1.0, 0.35)
 
-        _loudness_stdout, loudness_stderr = await _run_process(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-nostats",
-                "-i",
-                input_abs,
-                "-map",
-                "0:a:0",
-                "-af",
-                "ebur128=peak=true:framelog=verbose",
-                "-f",
-                "null",
-                "-",
-            ],
-            timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+        async def analyze_source(
+            source_path: str, *, pass_fds: tuple[int, ...] = (),
+        ) -> dict[str, Any]:
+            report = await _probe_media_report(
+                ffprobe, source_path, **({"pass_fds": pass_fds} if pass_fds else {}),
+            )
+            if not report.get("has_audio"):
+                raise ValueError("Media has no audio stream")
+            duration = float(_probe_number(report.get("duration_seconds")))
+            if duration <= 0:
+                raise ValueError("Audio analysis requires a positive media duration")
+            command_prefix = ["-protocol_whitelist", "file,pipe"] if pass_fds else []
+            _loudness_stdout, loudness_stderr = await _run_process(
+                [
+                    ffmpeg, "-hide_banner", "-nostats", *command_prefix, "-i", source_path,
+                    "-map", "0:a:0", "-af", "ebur128=peak=true:framelog=verbose", "-f", "null", "-",
+                ],
+                timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+                **({"pass_fds": pass_fds} if pass_fds else {}),
+            )
+            _silence_stdout, silence_stderr = await _run_process(
+                [
+                    ffmpeg, "-hide_banner", "-nostats", *command_prefix, "-i", source_path,
+                    "-map", "0:a:0", "-af", f"silencedetect=noise={noise:.1f}dB:d={silence_minimum:.3f}",
+                    "-f", "null", "-",
+                ],
+                timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+                **({"pass_fds": pass_fds} if pass_fds else {}),
+            )
+            return {
+                "report": report, "duration": duration,
+                "loudness_stderr": loudness_stderr, "silence_stderr": silence_stderr,
+            }
+
+        rel_input, inspection, source = await _analyze_media_source(
+            entity_id=entity_id, input_path=input_path, document_id=document_id,
+            expected_source_sha256=expected_source_sha256, workspace_id=workspace_id,
+            tool_name="analyze_audio", analyze=analyze_source,
         )
-        _silence_stdout, silence_stderr = await _run_process(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-nostats",
-                "-i",
-                input_abs,
-                "-map",
-                "0:a:0",
-                "-af",
-                f"silencedetect=noise={noise:.1f}dB:d={silence_minimum:.3f}",
-                "-f",
-                "null",
-                "-",
-            ],
-            timeout_seconds=max(120.0, duration * 2.0 + 30.0),
-        )
+        duration = float(inspection["duration"])
+        loudness_stderr = inspection["loudness_stderr"]
+        silence_stderr = inspection["silence_stderr"]
         loudness = _parse_ebur128(loudness_stderr)
         silence = _parse_silence_intervals(silence_stderr, duration_seconds=duration)
         integrated_lufs = loudness["integrated_lufs"]
@@ -4683,6 +5511,8 @@ async def _analyze_audio_handler(
             "status": "completed",
             "verdict": "pass" if not findings else "fail",
             "fs_path": _normalize_user_path(rel_input),
+            **({"source_document_id": source["document_id"], "source_sha256": source["source_sha256"]}
+               if source else {}),
             "duration_seconds": round(duration, 3),
             "non_empty": non_empty,
             "integrated_lufs": integrated_lufs,
@@ -4704,6 +5534,506 @@ async def _analyze_audio_handler(
     except Exception as exc:  # noqa: BLE001
         logger.exception("analyze_audio failed")
         return _json_error(str(exc), code="analyze_audio_failed")
+
+
+async def _analyze_media_source(
+    *,
+    entity_id: str,
+    input_path: str,
+    document_id: str,
+    expected_source_sha256: str,
+    workspace_id: str | None,
+    tool_name: str,
+    analyze: Callable[..., Awaitable[dict[str, Any]]],
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Run ``analyze(path, pass_fds=...)`` on a Knowledge document snapshot or an entity file.
+
+    Returns the user-relative input path, the analysis result and, for a
+    document, its verified source identity.
+    """
+    source: dict[str, Any] = {}
+    if document_id:
+        from packages.core.services.workspace_document_media import inspect_workspace_document_media
+
+        access = _CURRENT_MEDIA_FILE_ACCESS.get()
+        with tempfile.TemporaryDirectory(prefix="workspace-media-source-") as temp_dir:
+            staged_source = os.path.join(temp_dir, "workspace-document-source")
+
+            async def inspect_snapshot(path: str) -> dict[str, Any]:
+                await _stage_media_snapshot(path, staged_source, max_bytes=2 * 1024 * 1024 * 1024)
+                return {}
+
+            source = await inspect_workspace_document_media(
+                {"source_kind": "workspace_document", "document_id": document_id},
+                entity_id=entity_id,
+                user_id=access.user_id if access else None,
+                conversation_id=access.conversation_id if access else None,
+                workspace_id=access.workspace_id if access else None,
+                tool_name=tool_name,
+                allowed_suffixes=AUDIO_EXTENSIONS | VIDEO_EXTENSIONS,
+                max_bytes=2 * 1024 * 1024 * 1024,
+                expected_source_sha256=expected_source_sha256.lower() or None,
+                inspect_snapshot=inspect_snapshot,
+            )
+            with open(staged_source, "rb") as staged:
+                descriptor = staged.fileno()
+                inspection = await analyze(f"/dev/fd/{descriptor}", pass_fds=(descriptor,))
+            return source["rel_path"], inspection, source
+    from packages.core.services import entity_fs
+
+    entity_root = entity_fs.get_entity_root(entity_id)
+    workspace_base_dir = await _workspace_media_base_dir(
+        entity_id=entity_id, workspace_id=workspace_id,
+    )
+    rel_input = await _existing_media_reference(
+        input_path, entity_id=entity_id, entity_root=entity_root,
+        workspace_base_dir=workspace_base_dir,
+    )
+    inspection = await analyze(await _resolve_entity_file(entity_root, rel_input))
+    return rel_input, inspection, source
+
+
+_MUSIC_SAMPLE_RATE = 22050
+_MUSIC_HOP_SAMPLES = 256
+_MUSIC_MAX_SECONDS = 1800.0
+_MUSIC_SILENT_DB = -120.0
+
+
+def _parse_astats_rms_levels(text: str) -> list[float]:
+    """RMS level (dBFS) per frame from ``astats`` metadata printed by ``ametadata``."""
+    levels: list[float] = []
+    for match in re.finditer(r"lavfi\.astats\.Overall\.RMS_level=(\S+)", text):
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            value = _MUSIC_SILENT_DB
+        levels.append(max(_MUSIC_SILENT_DB, value if math.isfinite(value) else _MUSIC_SILENT_DB))
+    return levels
+
+
+def _moving_average(values: list[float], radius: int) -> list[float]:
+    prefix = [0.0]
+    for value in values:
+        prefix.append(prefix[-1] + value)
+    result = []
+    for index in range(len(values)):
+        low, high = max(0, index - radius), min(len(values), index + radius + 1)
+        result.append((prefix[high] - prefix[low]) / (high - low))
+    return result
+
+
+def _music_structure_from_levels(
+    full_db: list[float],
+    high_db: list[float],
+    *,
+    frames_per_second: float,
+    window_seconds: float | None = None,
+    max_windows: int = 3,
+) -> dict[str, Any]:
+    """Tempo, beats, downbeats, energy sections and best excerpt windows.
+
+    ``full_db`` is the full-band and ``high_db`` the high-passed RMS level per
+    frame. Onsets are positive level changes in both bands; the tempo is the
+    strongest onset autocorrelation lag (60-200 BPM, centred prior at 120 BPM),
+    beats follow that grid snapped to local onsets, and the downbeat is the bar
+    phase with the strongest beats. Energy is mean power per bar normalized to
+    the song's own 10th-90th percentile range.
+    """
+    fps = float(frames_per_second)
+    n = min(len(full_db), len(high_db))
+    if n < int(fps * 4):
+        raise ValueError("Music structure analysis needs at least four seconds of audio")
+    full_db, high_db = full_db[:n], high_db[:n]
+    duration = n / fps
+
+    raw = [0.0] + [
+        max(0.0, full_db[i] - full_db[i - 1]) + max(0.0, high_db[i] - high_db[i - 1])
+        for i in range(1, n)
+    ]
+    onset = [max(0.0, value - base) for value, base in zip(raw, _moving_average(raw, int(fps * 0.25)))]
+
+    scores: dict[int, float] = {}
+    for lag in range(int(fps * 60 / 200), math.ceil(fps * 60 / 60) + 1):
+        total = sum(onset[i] * onset[i + lag] for i in range(n - lag))
+        prior = math.exp(-0.5 * (math.log2((60 * fps / lag) / 120.0) / 0.9) ** 2)
+        scores[lag] = total / max(1, n - lag) * prior
+    best = max(scores, key=scores.get)
+    left, middle, right = scores.get(best - 1, 0.0), scores[best], scores.get(best + 1, 0.0)
+    curvature = left - 2 * middle + right
+    period = best + (0.5 * (left - right) / curvature if curvature else 0.0)
+    mean_score = sum(scores.values()) / len(scores)
+    confidence = min(1.0, max(0.0, (middle / mean_score - 1.0) / 3.0)) if mean_score else 0.0
+
+    def phase_score(phase: int) -> float:
+        total, position = 0.0, float(phase)
+        while position < n - 0.5:
+            total += onset[round(position)]
+            position += period
+        return total
+
+    beat_frames: list[int] = []
+    position = float(max(range(max(1, int(period))), key=phase_score))
+    while position < n - 0.5:
+        center = round(position)
+        candidates = range(max(0, center - 2), min(n, center + 3))
+        beat_frames.append(max(candidates, key=lambda index: onset[index]))
+        position += period
+    if len(beat_frames) < 4:
+        raise ValueError("Music structure analysis found fewer than four beats")
+
+    def bar_score(offset: int) -> float:
+        return sum(onset[frame] + max(0.0, full_db[frame] + 60.0) * 0.02 for frame in beat_frames[offset::4])
+
+    downbeat_frames = beat_frames[max(range(4), key=bar_score)::4]
+
+    prefix = [0.0]
+    for value in full_db:
+        prefix.append(prefix[-1] + 10 ** (value / 10.0))
+
+    def span_db(start: int, end: int) -> float:
+        mean = (prefix[end] - prefix[start]) / max(1, end - start)
+        return 10 * math.log10(mean) if mean > 0 else _MUSIC_SILENT_DB
+
+    raw_bars = []
+    for index, start in enumerate(downbeat_frames):
+        end = downbeat_frames[index + 1] if index + 1 < len(downbeat_frames) else n
+        if end > start:
+            raw_bars.append((start, end, span_db(start, end), sum(onset[start:end]) / (end - start)))
+    bar_levels = sorted(level for _, _, level, _ in raw_bars)
+    low_db = bar_levels[int(0.1 * (len(bar_levels) - 1))]
+    span = max(3.0, bar_levels[int(0.9 * (len(bar_levels) - 1))] - low_db)
+
+    def normalized(level: float) -> float:
+        return min(1.0, max(0.0, (level - low_db) / span))
+
+    bars = [
+        {"start": start / fps, "end": end / fps, "energy": normalized(level), "onset": density}
+        for start, end, level, density in raw_bars
+    ]
+
+    def energy_level(energy: float) -> str:
+        return "high" if energy >= 0.66 else "mid" if energy >= 0.4 else "low"
+
+    # Label bars on energy smoothed over neighbours; runs shorter than four
+    # bars join the adjacent section so a single quiet bar is not a section.
+    runs: list[dict[str, Any]] = []
+    for bar, energy in zip(bars, _moving_average([bar["energy"] for bar in bars], 1)):
+        level = energy_level(energy)
+        if runs and runs[-1]["level"] == level:
+            runs[-1]["bars"].append((bar, energy))
+        else:
+            runs.append({"level": level, "bars": [(bar, energy)]})
+    merged: list[dict[str, Any]] = []
+    for run in runs:
+        if merged and (len(run["bars"]) < 4 or len(merged[-1]["bars"]) < 4):
+            merged[-1]["bars"].extend(run["bars"])
+        else:
+            merged.append(run)
+    sections: list[dict[str, Any]] = []
+    for run in merged:
+        energies = [energy for _, energy in run["bars"]]
+        mean = sum(energies) / len(energies)
+        level = energy_level(mean)
+        if sections and sections[-1]["energy_level"] == level:
+            previous = sections[-1]
+            weight = previous["_bars"]
+            previous["mean_energy"] = (previous["mean_energy"] * weight + mean * len(energies)) / (weight + len(energies))
+            previous["end_seconds"] = run["bars"][-1][0]["end"]
+            previous["_bars"] = weight + len(energies)
+            continue
+        sections.append({
+            "start_seconds": run["bars"][0][0]["start"], "end_seconds": run["bars"][-1][0]["end"],
+            "energy_level": level, "mean_energy": mean, "_bars": len(energies),
+        })
+    for section in sections:
+        section.pop("_bars")
+        for key in ("start_seconds", "end_seconds", "mean_energy"):
+            section[key] = round(section[key], 3)
+
+    downbeats = [frame / fps for frame in downbeat_frames]
+    windows: list[dict[str, Any]] = []
+    if window_seconds:
+        max_onset = max((bar["onset"] for bar in bars), default=0.0) or 1.0
+        candidates = []
+        for start in downbeats:
+            end = start + window_seconds
+            if end > duration + 1e-6:
+                break
+            inside = [bar for bar in bars if start - 1e-6 <= bar["start"] < end]
+            if not inside:
+                continue
+            energy = sum(bar["energy"] for bar in inside) / len(inside)
+            density = sum(bar["onset"] for bar in inside) / len(inside) / max_onset
+            candidates.append({
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "score": round(0.7 * energy + 0.3 * density, 3),
+                "mean_energy": round(energy, 3),
+                "peak_bar_seconds": round(max(inside, key=lambda bar: bar["energy"])["start"], 3),
+                "downbeats_in_window": [round(time - start, 3) for time in downbeats if start <= time < end],
+            })
+        for candidate in sorted(candidates, key=lambda item: -item["score"]):
+            if all(abs(candidate["start_seconds"] - kept["start_seconds"]) >= window_seconds / 2 for kept in windows):
+                windows.append(candidate)
+            if len(windows) >= max_windows:
+                break
+
+    second_bounds = [
+        (round(second * fps), min(n, round((second + 1) * fps)))
+        for second in range(math.ceil(duration - 1e-6))
+    ]
+    return {
+        "duration_seconds": round(duration, 3),
+        "tempo_bpm": round(60 * fps / period, 2),
+        "tempo_confidence": round(confidence, 3),
+        "beat_seconds": [round(frame / fps, 3) for frame in beat_frames],
+        "downbeat_seconds": [round(time, 3) for time in downbeats],
+        "sections": sections,
+        "best_windows": windows,
+        "energy_per_second": [
+            round(normalized(span_db(start, end)), 3) for start, end in second_bounds if end > start
+        ],
+    }
+
+
+@_with_media_file_access
+async def _analyze_music_structure_handler(
+    *,
+    entity_id: str = "",
+    input_path: str = "",
+    document_id: str = "",
+    expected_source_sha256: str = "",
+    window_seconds: float | None = None,
+    max_windows: int = 3,
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    input_path = str(input_path or "").strip()
+    document_id = str(document_id or "").strip()
+    if source_error := _media_source_error(input_path, document_id):
+        return source_error
+    expected_source_sha256 = str(expected_source_sha256 or "").strip()
+    if expected_source_sha256 and not document_id:
+        return _json_error("expected_source_sha256 requires document_id")
+    if expected_source_sha256 and not re.fullmatch(r"[A-Fa-f0-9]{64}", expected_source_sha256):
+        return _json_error("expected_source_sha256 must be a 64-character hexadecimal SHA-256")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg:
+        return _json_error("ffmpeg is required for music analysis", code="ffmpeg_missing")
+    if not ffprobe:
+        return _json_error("ffprobe is required for music analysis", code="ffprobe_missing")
+
+    try:
+        window = _clamp_float(window_seconds, 5.0, 180.0, 0.0) if window_seconds not in (None, "") else None
+        windows_limit = max(1, min(5, int(max_windows or 3)))
+
+        async def analyze_source(source_path: str, *, pass_fds: tuple[int, ...] = ()) -> dict[str, Any]:
+            report = await _probe_media_report(
+                ffprobe, source_path, **({"pass_fds": pass_fds} if pass_fds else {}),
+            )
+            if not report.get("has_audio"):
+                raise ValueError("Media has no audio stream")
+            duration = float(_probe_number(report.get("duration_seconds")))
+            if not 0 < duration <= _MUSIC_MAX_SECONDS:
+                raise ValueError("Music analysis supports audio up to 30 minutes")
+            command_prefix = ["-protocol_whitelist", "file,pipe"] if pass_fds else []
+            levels = []
+            # Full band for loudness and a high-passed band for percussive onsets.
+            for band in ("", "highpass=f=1500,"):
+                stdout, _stderr = await _run_process(
+                    [
+                        ffmpeg, "-hide_banner", "-nostats", *command_prefix, "-i", source_path,
+                        "-map", "0:a:0", "-af",
+                        (
+                            f"aresample={_MUSIC_SAMPLE_RATE},aformat=channel_layouts=mono,{band}"
+                            f"asetnsamples=n={_MUSIC_HOP_SAMPLES}:p=0,astats=metadata=1:reset=1,"
+                            "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-"
+                        ),
+                        "-f", "null", "-",
+                    ],
+                    timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+                    **({"pass_fds": pass_fds} if pass_fds else {}),
+                )
+                levels.append(_parse_astats_rms_levels(stdout))
+            return {"levels": levels}
+
+        rel_input, inspection, source = await _analyze_media_source(
+            entity_id=entity_id, input_path=input_path, document_id=document_id,
+            expected_source_sha256=expected_source_sha256, workspace_id=workspace_id,
+            tool_name="analyze_music_structure", analyze=analyze_source,
+        )
+        full_db, high_db = inspection["levels"]
+        structure = _music_structure_from_levels(
+            full_db, high_db,
+            frames_per_second=_MUSIC_SAMPLE_RATE / _MUSIC_HOP_SAMPLES,
+            window_seconds=window, max_windows=windows_limit,
+        )
+        return _json({
+            "status": "completed",
+            "fs_path": _normalize_user_path(rel_input),
+            **({"source_document_id": source["document_id"], "source_sha256": source["source_sha256"]}
+               if source else {}),
+            **structure,
+            "method": (
+                "ffmpeg frame RMS (full band and high-passed) at "
+                f"{_MUSIC_SAMPLE_RATE / _MUSIC_HOP_SAMPLES:.2f} frames/s; onset autocorrelation tempo; "
+                "energy normalized per song. Measured estimates, not a musical score."
+            ),
+        })
+    except Exception as exc:
+        logger.exception("analyze_music_structure failed")
+        return _json_error(str(exc), code="analyze_music_structure_failed")
+
+
+# The model that listens. Chosen on a full-song comparison (2026-10-29): Gemini 2.5 Pro and
+# Flash both named the singer, lineup and instruments correctly, Pro with steadier JSON and a
+# richer emotional arc for about $0.05 per 3-minute song; neither kept its own timestamps
+# inside the song, hence measured times go in through ``context``.
+LISTEN_TO_AUDIO_MODEL = os.getenv("LISTEN_TO_AUDIO_MODEL", "google/gemini-2.5-pro")
+# Gemini hears at 16 kHz; mono 32 kbps keeps a 30-minute file under 10 MB of base64.
+_LISTEN_SAMPLE_RATE = 16000
+_LISTEN_BITRATE = "32k"
+
+
+@_with_media_file_access
+async def _listen_to_audio_handler(
+    *,
+    entity_id: str = "",
+    input_path: str = "",
+    document_id: str = "",
+    expected_source_sha256: str = "",
+    instructions: str = "",
+    context: str = "",
+    output_format: str = "text",
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    workspace_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    instructions = str(instructions or "").strip()
+    if not instructions:
+        return _json_error("instructions are required")
+    try:
+        part_start = max(0.0, float(start_seconds)) if start_seconds not in (None, "") else 0.0
+        part_end = float(end_seconds) if end_seconds not in (None, "") else None
+    except (TypeError, ValueError):
+        return _json_error("start_seconds and end_seconds must be numbers")
+    if part_end is not None and part_end <= part_start:
+        return _json_error("end_seconds must be after start_seconds")
+    input_path = str(input_path or "").strip()
+    document_id = str(document_id or "").strip()
+    if source_error := _media_source_error(input_path, document_id):
+        return source_error
+    expected_source_sha256 = str(expected_source_sha256 or "").strip()
+    if expected_source_sha256 and not document_id:
+        return _json_error("expected_source_sha256 requires document_id")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return _json_error("ffmpeg and ffprobe are required to listen to audio", code="ffmpeg_missing")
+    as_json = str(output_format or "text").strip().lower() == "json"
+
+    try:
+        async def read_audio(source_path: str, *, pass_fds: tuple[int, ...] = ()) -> dict[str, Any]:
+            report = await _probe_media_report(
+                ffprobe, source_path, **({"pass_fds": pass_fds} if pass_fds else {}),
+            )
+            if not report.get("has_audio"):
+                raise ValueError("Media has no audio stream")
+            duration = float(_probe_number(report.get("duration_seconds")))
+            if not 0 < duration <= _MUSIC_MAX_SECONDS:
+                raise ValueError("Listening supports audio up to 30 minutes")
+            if part_start >= duration:
+                raise ValueError(f"start_seconds is past the end of the audio ({duration:.1f} s)")
+            # Only the asked-for part is sent, so the model hears exactly that part.
+            heard_end = min(duration, part_end) if part_end is not None else duration
+            part = ["-ss", f"{part_start:.3f}", "-t", f"{heard_end - part_start:.3f}"] if (part_start or heard_end < duration) else []
+            command_prefix = ["-protocol_whitelist", "file,pipe"] if pass_fds else []
+            with tempfile.TemporaryDirectory(prefix="listen-to-audio-") as temp_dir:
+                heard_path = os.path.join(temp_dir, "heard.mp3")
+                await _run_process(
+                    [
+                        ffmpeg, "-hide_banner", "-nostats", "-v", "error", *command_prefix, *part, "-i", source_path,
+                        "-map", "0:a:0", "-ac", "1", "-ar", str(_LISTEN_SAMPLE_RATE), "-b:a", _LISTEN_BITRATE,
+                        heard_path,
+                    ],
+                    timeout_seconds=max(120.0, duration + 30.0),
+                    **({"pass_fds": pass_fds} if pass_fds else {}),
+                )
+                audio = Path(heard_path).read_bytes()
+            if not audio:
+                raise ValueError("The audio could not be decoded")
+            return {"audio": audio, "duration": heard_end - part_start, "track_duration": duration,
+                    "start": part_start, "end": heard_end}
+
+        rel_input, heard, source = await _analyze_media_source(
+            entity_id=entity_id, input_path=input_path, document_id=document_id,
+            expected_source_sha256=expected_source_sha256, workspace_id=workspace_id,
+            tool_name="listen_to_audio", analyze=read_audio,
+        )
+        duration = heard["duration"]
+        partial = heard["start"] > 0 or heard["end"] < heard["track_duration"]
+        prompt = (
+            f"Listen to the attached audio, all {duration:.1f} seconds of it, and describe only what you "
+            "actually hear. Say when you are unsure instead of guessing. Any time you give must lie within "
+            f"0-{duration:.1f} s"
+            + (f", counted from the start of this part (the part runs {heard['start']:.1f}-{heard['end']:.1f} s "
+               f"of a {heard['track_duration']:.1f} s track)" if partial else "")
+            + ".\n\n"
+            + (f"Known facts about this audio (measured; trust them over your own estimates):\n{context.strip()}\n\n"
+               if str(context or "").strip() else "")
+            + instructions
+            + ("\n\nReturn one JSON object only." if as_json else "")
+        )
+        from packages.core.ai.runtime import RUNTIME_LISTEN_TO_AUDIO_TOOL_SOURCE
+        from packages.core.ai.runtime.completions import runtime_execute_text_completion
+
+        result = await runtime_execute_text_completion(
+            [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "input_audio", "input_audio": {
+                    "data": base64.b64encode(heard["audio"]).decode("ascii"), "format": "mp3",
+                }},
+            ]}],
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            source=RUNTIME_LISTEN_TO_AUDIO_TOOL_SOURCE,
+            model=LISTEN_TO_AUDIO_MODEL,
+            temperature=0.2,
+            max_tokens=8000,
+            response_format={"type": "json_object"} if as_json else None,
+        )
+        usage = dict(result.usage or {})
+        if not result.content:
+            raise RuntimeError(f"The listening model returned nothing: {str(usage.get('error') or '')[:300]}")
+        answer: Any = result.content.strip()
+        if as_json:
+            from packages.core.services.skill_bundle import extract_json_object
+
+            answer = extract_json_object(answer)
+        return _json({
+            "status": "completed",
+            "fs_path": _normalize_user_path(rel_input),
+            **({"source_document_id": source["document_id"], "source_sha256": source["source_sha256"]}
+               if source else {}),
+            "duration_seconds": round(duration, 3),
+            **({"start_seconds": round(heard["start"], 3), "end_seconds": round(heard["end"], 3),
+                "track_duration_seconds": round(heard["track_duration"], 3)} if partial else {}),
+            "model": usage.get("model") or LISTEN_TO_AUDIO_MODEL,
+            "answer": answer,
+        })
+    except Exception as exc:
+        logger.exception("listen_to_audio failed")
+        return _json_error(str(exc), code="listen_to_audio_failed")
 
 
 def _validate_subtitle_content(
@@ -4840,9 +6170,10 @@ async def _validate_subtitles_handler(
             entity_id=entity_id,
             workspace_id=workspace_id,
         )
-        subtitle_rel = _workspace_media_reference(
+        subtitle_rel = await _existing_media_reference(
             subtitle_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         subtitle_abs = await _resolve_entity_file(entity_root, subtitle_rel)
@@ -4858,9 +6189,10 @@ async def _validate_subtitles_handler(
             ffprobe = shutil.which("ffprobe")
             if not ffprobe:
                 raise ValueError("ffprobe is required to resolve media duration")
-            media_rel = _workspace_media_reference(
+            media_rel = await _existing_media_reference(
                 media_path,
                 entity_id=entity_id,
+                entity_root=entity_root,
                 workspace_base_dir=workspace_base_dir,
             )
             media_abs = await _resolve_entity_file(entity_root, media_rel)
@@ -5064,9 +6396,10 @@ async def _resolve_video_inputs(
                     )
 
     for path in paths:
-        rel_path = _workspace_media_reference(
+        rel_path = await _existing_media_reference(
             path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         abs_path = await _resolve_entity_file(entity_root, rel_path)
@@ -5081,9 +6414,10 @@ async def _resolve_video_inputs(
         )
 
     if folder_path:
-        folder_rel_path = _workspace_media_reference(
+        folder_rel_path = await _existing_media_reference(
             folder_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         folder_abs_path = _resolve_entity_dir(entity_root, folder_rel_path)
@@ -5251,6 +6585,7 @@ async def _merge_video_files(
     conversation_id: str | None,
     resolution: str,
     aspect_ratio: str,
+    target_duration_seconds: float | None = None,
 ) -> tuple[str, str, str, list[dict[str, Any]], float, str]:
     from packages.core.ai.runtime.media_outputs import runtime_generated_media_target
     from packages.core.services import entity_fs
@@ -5278,6 +6613,10 @@ async def _merge_video_files(
 
     total_duration = 0.0
     input_payloads: list[dict[str, Any]] = []
+    # Each clip gets the frames its planned end reaches, rounded cumulatively, so the frames add up
+    # to the planned total instead of losing a frame to flooring in every shot.
+    planned_seconds = 0.0
+    emitted_frames = 0
 
     with tempfile.TemporaryDirectory(prefix="merge-videos-") as tmp_dir:
         normalized_paths: list[str] = []
@@ -5290,6 +6629,9 @@ async def _merge_video_files(
                 end_seconds=item.end_seconds,
                 speed=item.speed,
             )
+            planned_seconds += planned_duration
+            clip_frames = max(1, round(planned_seconds * fps) - emitted_frames)
+            emitted_frames += clip_frames
             normalized_path = os.path.join(tmp_dir, f"clip-{index:03d}.mp4")
             await _normalize_clip(
                 ffmpeg=ffmpeg,
@@ -5302,7 +6644,8 @@ async def _merge_video_files(
                 preset=preset,
                 start_seconds=trim_start,
                 source_duration_seconds=trim_end - trim_start,
-                output_duration_seconds=planned_duration,
+                output_duration_seconds=clip_frames / fps,
+                output_frames=clip_frames,
                 speed=item.speed,
                 has_audio=bool(media_info.get("has_audio")),
                 include_source_audio=include_source_audio,
@@ -5335,7 +6678,7 @@ async def _merge_video_files(
             for normalized_path in normalized_paths:
                 handle.write(f"file '{_concat_escape(normalized_path)}'\n")
 
-        tmp_output = os.path.join(tmp_dir, "merged.mp4")
+        joined_output = os.path.join(tmp_dir, "joined.mp4")
         await _run_process(
             [
                 ffmpeg,
@@ -5350,9 +6693,22 @@ async def _merge_video_files(
                 "copy",
                 "-movflags",
                 "+faststart",
-                tmp_output,
+                joined_output,
             ],
             timeout_seconds=max(120.0, total_duration * 4.0 + 60.0),
+        )
+        tmp_output = os.path.join(tmp_dir, "merged.mp4")
+        total_duration = await _conform_merged_video(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            source=joined_output,
+            output=tmp_output,
+            fps=fps,
+            crf=crf,
+            preset=preset,
+            target_seconds=target_duration_seconds,
+            has_audio=bool((await _probe_media(ffprobe, joined_output)).get("has_audio")),
+            timeout_seconds=max(120.0, max(total_duration, target_duration_seconds or 0) * 4.0 + 60.0),
         )
         document_id = await _commit_merged_video_output(
             entity_id=entity_id,
@@ -5373,10 +6729,90 @@ async def _merge_video_files(
                 "crf": crf,
                 "preset": preset,
                 "include_source_audio": include_source_audio,
+                **({"target_duration_seconds": target_duration_seconds} if target_duration_seconds else {}),
             },
         )
 
     return target.abs_path, target.rel_path, target.filename, input_payloads, total_duration, document_id
+
+
+async def _count_video_frames(ffprobe: str, path: str) -> int:
+    stdout, _stderr = await _run_process(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+        timeout_seconds=120,
+    )
+    try:
+        return int(str(stdout or "").strip().split(",")[0])
+    except ValueError as exc:
+        raise RuntimeError(f"ffprobe could not count the frames of {path}") from exc
+
+
+async def _conform_merged_video(
+    *,
+    ffmpeg: str,
+    ffprobe: str,
+    source: str,
+    output: str,
+    fps: int,
+    crf: int,
+    preset: str,
+    target_seconds: float | None,
+    has_audio: bool,
+    timeout_seconds: float,
+) -> float:
+    """Make the master one length and return it, in seconds.
+
+    Joined clips each carry an audio track a little longer than their picture,
+    so the file ran past its picture. Here the audio ends exactly where the
+    picture does, and with a target the picture is exactly that many frames:
+    the last frame is held when the clips fall short, the end cut when long.
+    """
+    frames = await _count_video_frames(ffprobe, source)
+    wanted = max(1, round(target_seconds * fps)) if target_seconds else frames
+    # Re-encoded, not copied: joined clips start their picture a few
+    # milliseconds late, which a stream copy keeps.
+    picture = ["setpts=PTS-STARTPTS", *([f"tpad=stop_mode=clone:stop={wanted - frames}"] if wanted > frames else [])]
+    seconds = wanted / fps
+    video_args = [
+        ffmpeg, "-y", "-i", source, "-map", "0:v:0", "-vf", ",".join(picture),
+        "-frames:v", str(wanted), "-r", str(fps), "-c:v", "libx264", "-crf", str(crf),
+        "-preset", preset, "-pix_fmt", "yuv420p",
+    ]
+    if not has_audio:
+        await _run_process([*video_args, "-movflags", "+faststart", output], timeout_seconds=timeout_seconds)
+        return seconds
+
+    # Encoding audio in the same ffmpeg output as the frame-capped picture can
+    # drop the final partial AAC packet. Prepare exact audio separately, then
+    # mux it with the independently frame-capped video.
+    video_output = f"{output}.video.mp4"
+    audio_output = f"{output}.audio.m4a"
+    deadline = time.monotonic() + timeout_seconds
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Command timed out after {timeout_seconds:.0f}s: {ffmpeg}")
+        return remaining
+
+    try:
+        await _run_process(
+            [ffmpeg, "-y", "-i", source, "-map", "0:a:0", "-vn",
+             "-af", f"apad,atrim=0:{seconds:.6f}", "-c:a", "aac", "-b:a", "192k", audio_output],
+            timeout_seconds=remaining_timeout(),
+        )
+        await _run_process([*video_args, video_output], timeout_seconds=remaining_timeout())
+        await _run_process(
+            [ffmpeg, "-y", "-i", video_output, "-i", audio_output, "-map", "0:v:0", "-map", "1:a:0",
+             "-c", "copy", "-movflags", "+faststart", output],
+            timeout_seconds=remaining_timeout(),
+        )
+    finally:
+        for temporary_output in (video_output, audio_output):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temporary_output)
+    return seconds
 
 
 async def _commit_merged_video_output(
@@ -5572,6 +7008,7 @@ async def _create_video_editor_recipe_sidecar(
     crf: int,
     preset: str,
     include_source_audio: bool,
+    render_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist the editor recipe that lets a final render reopen as layers."""
     recipe_rel_path = _video_editor_recipe_rel_path(final_rel_path)
@@ -5601,6 +7038,7 @@ async def _create_video_editor_recipe_sidecar(
         crf=crf,
         preset=preset,
         include_source_audio=include_source_audio,
+        render_settings=render_settings,
     )
     recipe_abs_path, recipe_file_size = _write_video_editor_recipe_file(
         entity_id=entity_id,
@@ -5741,6 +7179,7 @@ def _build_video_editor_recipe_payload(
     crf: int,
     preset: str,
     include_source_audio: bool,
+    render_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     duration = _timeline_recipe_duration(timeline, total_duration)
     clips = _editor_recipe_clips(
@@ -5764,6 +7203,7 @@ def _build_video_editor_recipe_payload(
         audio_tracks=audio_tracks,
         documents_by_path=documents_by_path,
         duration=duration,
+        ducking_config=_timeline_ducking_config(timeline, (render_settings or {}).get("ducking")),
     )
     markers = _editor_recipe_markers(timeline, duration, clips, shots)
     spec = timeline.get("spec") if isinstance(timeline.get("spec"), dict) else {}
@@ -5841,6 +7281,10 @@ def _build_video_editor_recipe_payload(
             "crf": crf,
             "preset": preset,
             "include_source_audio": include_source_audio,
+            # Call-time overrides need not be present in source_timeline.
+            # Retain the actual compose settings for native reconstruction;
+            # the browser caption renderer is not a libass rasterizer.
+            "render_settings": dict(render_settings or {}),
         },
     }
 
@@ -6094,9 +7538,10 @@ async def _load_timeline_json(
     entity_id: str,
     workspace_base_dir: str = "",
 ) -> dict[str, Any]:
-    rel_path = _workspace_media_reference(
+    rel_path = await _existing_media_reference(
         timeline_path,
         entity_id=entity_id,
+        entity_root=entity_root,
         workspace_base_dir=workspace_base_dir,
     )
     abs_path = await _resolve_entity_file(entity_root, rel_path)
@@ -6115,9 +7560,10 @@ async def _load_entity_json(
     entity_id: str,
     workspace_base_dir: str = "",
 ) -> Any:
-    rel_path = _workspace_media_reference(
+    rel_path = await _existing_media_reference(
         path,
         entity_id=entity_id,
+        entity_root=entity_root,
         workspace_base_dir=workspace_base_dir,
     )
     abs_path = await _resolve_entity_file(entity_root, rel_path)
@@ -6281,13 +7727,14 @@ async def _resolve_timeline_audio_tracks(
                 f"audio_tracks[{index}].path or fs_path is required; "
                 "source is not a supported audio path field"
             )
-        rel_path = _workspace_media_reference(
+        rel_path = await _existing_media_reference(
             raw_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         abs_path = await _resolve_entity_file(entity_root, rel_path)
-        _assert_audio_path(abs_path)
+        _assert_timeline_audio_source_path(abs_path)
         start = _coerce_required_time(item.get("start"), f"audio_tracks[{index}].start")
         media_info = await _probe_media(ffprobe, abs_path)
         if not media_info.get("has_audio"):
@@ -6637,7 +8084,9 @@ def _editor_recipe_audio_cues(
     audio_tracks: list[TimelineAudioTrack],
     documents_by_path: dict[str, dict[str, Any]],
     duration: float,
+    ducking_config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    effective_ducking = _timeline_ducking_config(timeline, ducking_config)
     raw_tracks, _source_key = _timeline_audio_track_items(timeline)
     if isinstance(raw_tracks, dict):
         raw_tracks = raw_tracks.get("tracks") or []
@@ -6673,7 +8122,8 @@ def _editor_recipe_audio_cues(
                 "sourceStart": track.source_start,
                 "sourceEnd": round(track.source_start + track.duration, 3),
                 "assetDuration": track.source_duration,
-                "duckUnderDialogue": cue_type in {"music", "ambience"} or bool(raw.get("duckUnderDialogue") or raw.get("duck_under_dialogue")),
+                "duckUnderDialogue": bool(effective_ducking["enabled"])
+                and track.track_type in effective_ducking["target_types"],
                 "muted": False,
                 "assetDocumentId": _string_or_none(
                     raw.get("document_id") or doc.get("document_id")
@@ -7263,7 +8713,28 @@ async def _audio_prompt_matches_transcript(
     if provenance is None:
         return None
     prompt, _source_path = provenance
-    return _canonical_subtitle_text(prompt) == _canonical_subtitle_text(transcript)
+    expected = _canonical_subtitle_text(transcript)
+    return any(
+        _canonical_subtitle_text(spoken) == expected
+        for spoken in _tts_prompt_spoken_texts(prompt)
+    )
+
+
+_TTS_QUOTED_SPEECH_RE = re.compile(r"「([^」]+)」|“([^”]+)”|\"([^\"]+)\"")
+
+
+def _tts_prompt_spoken_texts(prompt: str) -> list[str]:
+    """The prompt itself plus any quoted line a TTS direction wraps.
+
+    Directable TTS models take prompts like ``Speak exactly this narration: 「…」``;
+    only the quoted text is spoken, so that is what the transcript must match.
+    A prompt quoting several fragments is ambiguous and is compared whole.
+    """
+    quoted = [
+        next(group for group in match.groups() if group is not None)
+        for match in _TTS_QUOTED_SPEECH_RE.finditer(prompt)
+    ]
+    return [prompt, *quoted] if len(quoted) == 1 else [prompt]
 
 
 async def _audio_prompt_provenance(
@@ -7367,6 +8838,16 @@ async def _audio_narrator_profile(
     audio_rel_path: str,
 ) -> dict[str, str | int] | None:
     """Follow normalized-audio provenance to recover its task narrator profile."""
+    profile, _reference = await _audio_narrator_provenance(entity_id=entity_id, audio_rel_path=audio_rel_path)
+    return profile
+
+
+async def _audio_narrator_provenance(
+    *,
+    entity_id: str,
+    audio_rel_path: str,
+) -> tuple[dict[str, str | int] | None, dict[str, Any] | None]:
+    """The narrator profile of an audio file's source, and where its voice is pinned."""
     from sqlalchemy import select
 
     from packages.core.database import async_session
@@ -7378,7 +8859,7 @@ async def _audio_narrator_profile(
         for _depth in range(3):
             current_path = str(current_path or "").strip()
             if not current_path or current_path in seen:
-                return None
+                return None, None
             seen.add(current_path)
             document = (
                 await db.execute(
@@ -7392,17 +8873,18 @@ async def _audio_narrator_profile(
                 )
             ).scalar_one_or_none()
             if document is None:
-                return None
+                return None, None
             generation = (document.metadata_ or {}).get("generation")
             generation = generation if isinstance(generation, dict) else {}
             profile = generation.get("narration_profile")
             if profile is not None:
-                return _validate_narrator_profile(profile)
+                reference = generation.get("voice_reference")
+                return _validate_narrator_profile(profile), reference if isinstance(reference, dict) else None
             source_path = generation.get("input_path") or generation.get("source_path")
             if not isinstance(source_path, str) or not source_path.strip():
-                return None
+                return None, None
             current_path = _rel_path_from_reference(source_path, entity_id) or source_path
-    return None
+    return None, None
 
 
 async def _transcribe_narration_audio(
@@ -7412,6 +8894,7 @@ async def _transcribe_narration_audio(
     entity_id: str,
     reference_transcript: str = "",
     require_timestamps: bool = True,
+    word_timestamps: bool = False,
     workspace_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
@@ -7435,11 +8918,18 @@ async def _transcribe_narration_audio(
         "stt",
         user_id=user_id or None,
         entity_id=entity_id or None,
+        workspace_id=workspace_id,
     )
+    if require_timestamps and not str(reference_transcript or "").strip():
+        # Timings cannot come from a model that only transcribes text.
+        from packages.core.constants.models import timestamped_stt_model
+
+        stt_model = timestamped_stt_model(stt_model)
     metadata = await resolve_llm_metadata_for_user(
         "stt",
         user_id=user_id or None,
         entity_id=entity_id or None,
+        workspace_id=workspace_id,
     )
     user_key = (metadata or {}).get("llm_api_key")
     user_base_url = (metadata or {}).get("llm_base_url")
@@ -7455,6 +8945,7 @@ async def _transcribe_narration_audio(
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+            workspace_id=workspace_id,
         )
     transcribe_kwargs: dict[str, Any] = {
         "mime": _audio_mime_from_path(audio_path),
@@ -7464,6 +8955,8 @@ async def _transcribe_narration_audio(
         "require_timestamps": require_timestamps,
         "reference_transcript": reference_transcript,
     }
+    if word_timestamps:
+        transcribe_kwargs["word_timestamps"] = True
     if user_base_url:
         transcribe_kwargs["user_base_url"] = user_base_url
     result = await transcribe_blob(
@@ -7851,23 +9344,33 @@ async def _collect_subtitle_cues(
                 estimated=estimated,
                 measured=measured,
                 timing_source=timing_source,
+                words=_subtitle_item_words(item.get("words"), start, end),
+                emphasis=tuple(
+                    str(word).strip() for word in (item.get("emphasis") or []) if str(word).strip()
+                ) if isinstance(item.get("emphasis"), list) else (),
             )
         )
     cues.sort(key=lambda cue: (cue.start, cue.end))
-    return [
-        SubtitleCue(
-            index=index,
-            start=cue.start,
-            end=cue.end,
-            text=cue.text,
-            cue_type=cue.cue_type,
-            source_path=cue.source_path,
-            estimated=cue.estimated,
-            measured=cue.measured,
-            timing_source=cue.timing_source,
-        )
-        for index, cue in enumerate(cues, start=1)
-    ]
+    return [replace(cue, index=index) for index, cue in enumerate(cues, start=1)]
+
+
+def _subtitle_item_words(raw: Any, start: float, end: float) -> tuple[SubtitleWord, ...]:
+    """A cue's own word timings, kept inside the cue and in order; anything malformed drops them all."""
+    if not isinstance(raw, list) or not raw:
+        return ()
+    words: list[SubtitleWord] = []
+    for item in raw:
+        if not isinstance(item, dict) or not str(item.get("text") or item.get("word") or "").strip():
+            return ()
+        try:
+            word_start = min(max(float(item["start"]), start), end)
+            word_end = min(max(float(item["end"]), word_start), end)
+        except (KeyError, TypeError, ValueError):
+            return ()
+        if words and word_start < words[-1].start:
+            return ()
+        words.append(SubtitleWord(word_start, word_end, str(item.get("text") or item.get("word")).strip()))
+    return tuple(words)
 
 
 def _subtitle_items_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -7925,9 +9428,10 @@ async def _subtitle_cue_end(
     if raw_path:
         if not ffprobe:
             raise ValueError("ffprobe is required to derive subtitle end from audio duration")
-        rel_path = _workspace_media_reference(
+        rel_path = await _existing_media_reference(
             raw_path,
             entity_id=entity_id,
+            entity_root=entity_root,
             workspace_base_dir=workspace_base_dir,
         )
         abs_path = await _resolve_entity_file(entity_root, rel_path)
@@ -8032,6 +9536,651 @@ def _render_ass_subtitles(
             f"Default,,0,0,0,,{text}"
         )
     return "\n".join(header) + "\n"
+
+
+# A lyric token is one CJK character or one run of other non-space characters, with the space after it.
+_LYRIC_TOKEN_RE = re.compile(r"([぀-ヿ㐀-鿿豈-﫿가-힯]|[^\s぀-ヿ㐀-鿿豈-﫿가-힯]+)(\s*)")
+
+
+def _lyric_tokens(text: str) -> list[tuple[str, str]]:
+    """(token, the space after it) pairs; CJK text has no spaces, so each character is a token."""
+    return [(match.group(1), match.group(2)) for match in _LYRIC_TOKEN_RE.finditer(text)]
+
+
+def _lyric_key(token: str) -> str:
+    return re.sub(r"[^\w]", "", unicodedata.normalize("NFKC", token).casefold())
+
+
+def _spread_cue_words(cue: SubtitleCue) -> tuple[SubtitleWord, ...]:
+    """Word times estimated across the cue in proportion to each word's length."""
+    tokens = [token for token, _space in _lyric_tokens(cue.text)]
+    if not tokens:
+        return ()
+    weights = [max(1, len(_lyric_key(token)) or 1) + 1 for token in tokens]
+    total, span, at, words = float(sum(weights)), cue.end - cue.start, cue.start, []
+    for token, weight in zip(tokens, weights):
+        length = span * weight / total
+        words.append(SubtitleWord(round(at, 3), round(at + length, 3), token))
+        at += length
+    return tuple(words)
+
+
+def _time_cue_words(cues: list[SubtitleCue], heard: list[dict[str, Any]], offset_seconds: float) -> list[SubtitleCue]:
+    """Each cue's words timed from the words heard in its span, matched in order.
+
+    ``heard`` are speech-to-text words on the audio's clock; ``offset_seconds`` is where the
+    picture's 0 sits in that audio. Words the recognizer missed or misheard are placed between
+    their matched neighbours by length, so every cue keeps all of its own words.
+    """
+    timed = []
+    for item in heard:
+        try:
+            start, end = float(item["start"]) - offset_seconds, float(item["end"]) - offset_seconds
+        except (KeyError, TypeError, ValueError):
+            continue
+        # A recognizer hears CJK in multi-character words; lyrics are timed per character.
+        pieces = [token for token, _space in _lyric_tokens(str(item.get("word") or item.get("text") or ""))]
+        for index, piece in enumerate(pieces):
+            share = (end - start) / len(pieces)
+            timed.append((start + share * index, start + share * (index + 1), _lyric_key(piece)))
+    result = []
+    for cue in cues:
+        if cue.words:
+            result.append(cue)
+            continue
+        estimate = _spread_cue_words(cue)
+        window = [word for word in timed if word[1] > cue.start - 0.25 and word[0] < cue.end + 0.25 and word[2]]
+        keys = [_lyric_key(word.text) for word in estimate]
+        anchors: dict[int, tuple[float, float]] = {}
+        matcher = SequenceMatcher(a=keys, b=[word[2] for word in window], autojunk=False)
+        for block in matcher.get_matching_blocks():
+            for step in range(block.size):
+                start, end, _key = window[block.b + step]
+                anchors[block.a + step] = (start, end)
+        if not anchors:
+            result.append(replace(cue, words=estimate))
+            continue
+        words: list[SubtitleWord] = []
+        previous_end = cue.start
+        for index, word in enumerate(estimate):
+            if index in anchors:
+                start, end = anchors[index]
+            else:
+                # Between the last placed word and the next anchor (or the cue's end), by length.
+                next_index = next((later for later in range(index + 1, len(estimate)) if later in anchors), None)
+                gap_end = anchors[next_index][0] if next_index is not None else cue.end
+                share = estimate[index:next_index]
+                weight = sum(max(0.001, item.end - item.start) for item in share)
+                start = previous_end
+                end = start + (gap_end - previous_end) * max(0.001, word.end - word.start) / weight
+            start = min(max(start, previous_end), cue.end)
+            end = min(max(end, start + 0.05), cue.end)
+            words.append(SubtitleWord(round(start, 3), round(end, 3), word.text))
+            previous_end = end
+        result.append(replace(cue, words=tuple(words), measured=True, timing_source="measured_stt_words"))
+    return result
+
+
+def _ass_tag_color(value: Any, fallback: str) -> str:
+    """``&HBBGGRR&`` for an override tag."""
+    raw = _ass_color(value or fallback)
+    return f"&H{raw[-6:]}&" if raw.startswith("&H") and len(raw) >= 8 else f"&H{_ass_color(fallback)[-6:]}&"
+
+
+def _lyric_animation(spec: dict[str, Any] | None, canvas_width: int, canvas_height: int) -> dict[str, Any]:
+    """The animation settings with defaults; sizes are output pixels."""
+    spec = dict(spec or {})
+
+    def choice(key: str, options: tuple[str, ...], default: str) -> str:
+        value = str(spec.get(key) or default).strip().lower()
+        return value if value in options else default
+
+    font_size = int(_clamp_float(spec.get("font_size"), 12, 400, round(canvas_height * 0.075)))
+    emphasis_scale = _clamp_float(spec.get("emphasis_scale"), 1.0, 3.0, 1.5)
+    return {
+        "font_name": str(spec.get("font_name") or "Noto Sans").replace(",", " ").strip(),
+        "font_size": font_size,
+        "bold": bool(spec.get("bold", True)),
+        "italic": bool(spec.get("italic", False)),
+        "uppercase": bool(spec.get("uppercase", False)),
+        "letter_spacing": _clamp_float(spec.get("letter_spacing"), -10, 40, 0),
+        "color": spec.get("color") or "#FFFFFF",
+        "accent_color": spec.get("accent_color") or spec.get("color") or "#FFD54A",
+        "dim_color": spec.get("dim_color") or "#9A9A9A",
+        "outline_color": spec.get("outline_color") or "#000000",
+        "outline": _clamp_float(spec.get("outline"), 0, 20, 3),
+        "shadow": _clamp_float(spec.get("shadow"), 0, 20, 0),
+        "glow_color": spec.get("glow_color") or "",
+        "glow_size": _clamp_float(spec.get("glow_size"), 0, 40, 12),
+        "position": choice("position", LYRIC_POSITIONS, "bottom"),
+        "margin_v": int(_clamp_float(spec.get("margin_v"), 0, canvas_height / 2, round(canvas_height * 0.08))),
+        "reveal": choice("reveal", LYRIC_REVEALS, "line"),
+        # A camera that follows the words brings each one in as a ghost unless told otherwise.
+        "entrance": choice("entrance", LYRIC_ENTRANCES, entrance_default := (
+            "ghost" if choice("camera", LYRIC_CAMERAS, "none") == "follow" else "fade")),
+        "emphasis_entrance": choice("emphasis_entrance", LYRIC_ENTRANCES,
+                                    choice("entrance", LYRIC_ENTRANCES, entrance_default)),
+        "entrance_ms": int(_clamp_float(spec.get("entrance_ms"), 0, 2000, 220)),
+        "exit": choice("exit", LYRIC_EXITS, "blur" if entrance_default == "ghost" else "fade"),
+        "exit_ms": int(_clamp_float(spec.get("exit_ms"), 0, 2000, 180)),
+        "layout": choice("layout", LYRIC_LAYOUTS, "line"),
+        "camera": choice("camera", LYRIC_CAMERAS, "none"),
+        "camera_max_zoom": _clamp_float(spec.get("camera_max_zoom"), 1.0, 8.0, 5.0),
+        "camera_ms": int(_clamp_float(spec.get("camera_ms"), 1, 1000, 220)),
+        "camera_focus_y": _clamp_float(spec.get("camera_focus_y"), 0.2, 0.8, 0.42),
+        "camera_tilts": [_clamp_float(tilt, -30, 30, 0) for tilt in (spec.get("camera_tilts") or [-6, -2, -8, -4])
+                         if isinstance(tilt, (int, float))][:12],
+        "emphasis_scale": emphasis_scale,
+        "max_chars_per_line": int(_clamp_float(
+            spec.get("max_chars_per_line"), 8, 80, max(10, round(canvas_width * 0.85 / (font_size * 0.55)))
+        )),
+    }
+
+
+def _lyric_lines(words: tuple[SubtitleWord, ...], spaces: list[str], emphasized: list[bool],
+                 settings: dict[str, Any]) -> list[list[int]]:
+    """Word indexes per line, balanced so no word is left alone; a stack layout gives each emphasized
+    word its own line and balances the words between them separately."""
+    sizes = [len(word.text) * (settings["emphasis_scale"] if emphasized[index] else 1.0) + (1 if spaces[index] else 0)
+             for index, word in enumerate(words)]
+    limit = settings["max_chars_per_line"]
+    segments: list[list[int]] = [[]]
+    for index in range(len(words)):
+        if settings["layout"] == "stack" and emphasized[index]:
+            segments += [[index], []]
+        else:
+            segments[-1].append(index)
+    lines: list[list[int]] = []
+    for segment in (segment for segment in segments if segment):
+        total = sum(sizes[index] for index in segment)
+        # The fewest lines that fit, split evenly rather than filling the first line to the limit.
+        target = total / math.ceil(total / limit) if total > limit else limit
+        line: list[int] = []
+        width = 0.0
+        for index in segment:
+            if line and (width + sizes[index] > limit or width + sizes[index] / 2 > target):
+                lines.append(line)
+                line, width = [], 0.0
+            line.append(index)
+            width += sizes[index]
+        lines.append(line)
+    return lines
+
+
+def _font_ass_height_em(path: str) -> float | None:
+    """The line height libass sizes a face by, in ems: OS/2 usWinAscent + usWinDescent over unitsPerEm."""
+    import struct
+
+    with open(path, "rb") as handle:
+        data = handle.read()
+    start = struct.unpack(">I", data[12:16])[0] if data[:4] == b"ttcf" else 0  # first face of a collection
+    tables = {}
+    for index in range(struct.unpack(">H", data[start + 4:start + 6])[0]):
+        tag, _checksum, offset, _length = struct.unpack(">4sIII", data[start + 12 + index * 16:start + 28 + index * 16])
+        tables[tag] = offset
+    if b"OS/2" not in tables or b"head" not in tables:
+        return None
+    units = struct.unpack(">H", data[tables[b"head"] + 18:tables[b"head"] + 20])[0]
+    ascent, descent = struct.unpack(">HH", data[tables[b"OS/2"] + 74:tables[b"OS/2"] + 78])
+    return (ascent + descent) / units if units and ascent + descent else None
+
+
+@lru_cache(maxsize=32)
+def _lyric_font_measure(font_name: str, bold: bool, italic: bool) -> Callable[[str, float], float] | None:
+    """Text width in output pixels for an ASS font size, from the face libass will pick; None if unknown.
+
+    libass sizes a face by its Windows line height (OS/2 win ascent + descent), not its em, so widths
+    are scaled by that; faces without it fall back to the hhea height.
+    """
+    try:
+        from PIL import ImageFont
+
+        pattern = f"{font_name}:weight={'bold' if bold else 'regular'}{':slant=italic' if italic else ''}"
+        path = subprocess.run(["fc-match", "-f", "%{file}", pattern], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+        face = ImageFont.truetype(path, 200)
+        ascent, descent = face.getmetrics()
+        height = 200 * (_font_ass_height_em(path) or (ascent + descent) / 200)
+    except Exception:  # noqa: BLE001 - no fontconfig or face: widths are estimated instead
+        return None
+    return lambda text, size: face.getlength(text) * size / height
+
+
+def _camera_follow_events(
+    cue: SubtitleCue,
+    pieces: list[tuple[str, int, float, float, float, bool]],
+    width: Callable[[str, float], float],
+    settings: dict[str, Any],
+    *,
+    canvas_width: int,
+    canvas_height: int,
+) -> list[str]:
+    """Lyrics shot by a camera that follows the singing.
+
+    The line is laid out once; each time a word is sung the camera reframes on the words sung so
+    far, so the first word fills the frame and the block zooms out and tilts as the line grows. A
+    new word slides in from the right. Every word is drawn in its own events, one per framing,
+    moving from the previous framing to the next.
+    """
+    order = sorted(range(len(pieces)), key=lambda index: pieces[index][4])
+    starts = [min(max(pieces[index][4], cue.start), cue.end) for index in order]
+    out_ms = settings["exit_ms"] if settings["exit"] != "none" else 0
+    exit_at = max(cue.start, cue.end - out_ms / 1000)
+    boxes = []
+    for index in order:
+        text, size, x, y, _start, _key = pieces[index]
+        half = width(text, size) / 2
+        boxes.append((x - half, y - size, x + half, y))
+    # The camera frames the words a little above the middle, clear of the lower picture.
+    centre_x, centre_y = canvas_width / 2, canvas_height * settings["camera_focus_y"]
+    tilts = settings["camera_tilts"]
+    framings = []
+    for step in range(len(order)):
+        left = min(box[0] for box in boxes[:step + 1])
+        top = min(box[1] for box in boxes[:step + 1])
+        right = max(box[2] for box in boxes[:step + 1])
+        bottom = max(box[3] for box in boxes[:step + 1])
+        zoom = min(settings["camera_max_zoom"], canvas_width * 0.84 / max(1.0, right - left),
+                   canvas_height * 0.62 / max(1.0, bottom - top))
+        # A line holds one tilt, so the words read as one block; lines alternate through the tilts.
+        framings.append((zoom, (left + right) / 2, (top + bottom) / 2, tilts[cue.index % len(tilts)] if tilts else 0))
+
+    def place(x: float, y: float, framing: tuple[float, float, float, float]) -> tuple[int, int]:
+        zoom, focus_x, focus_y, _tilt = framing
+        return round(centre_x + (x - focus_x) * zoom), round(centre_y + (y - focus_y) * zoom)
+
+    color = _ass_tag_color(settings["color"], "#FFFFFF")
+    accent = _ass_tag_color(settings["accent_color"], "#FFD54A")
+    glow = settings["glow_size"] if settings["glow_color"] else 0
+    reframe_ms = max(1, settings["camera_ms"])
+    in_ms = max(1, settings["entrance_ms"])
+    pivot = f"\\org({round(centre_x)},{round(centre_y)})"
+    events = []
+    def scale(value: float) -> str:
+        return f"\\fscx{value * 100:.0f}\\fscy{value * 100:.0f}"
+
+    def arrive(entrance: str, number: int, size: int, last: tuple, now: tuple, start_at: tuple[int, int],
+               end_at: tuple[int, int], *, fx: bool) -> str:
+        """A newly sung word arriving while the camera reframes from ``last`` to ``now``.
+
+        The word travels with the line (the camera's move), plus its own entrance on top: an offset
+        added to where it starts, and transforms relative to the camera's zoom and tilt.
+        """
+        (from_x, from_y), (to_x, to_y) = start_at, end_at
+        last_zoom, _lx, _ly, last_tilt = last
+        zoom, _x, _y, tilt = now
+        side = -1 if number % 2 == 0 else 1
+        lift = round(size * zoom * 0.6)
+        reframe = f"\\t(0,{reframe_ms},{scale(zoom)}\\frz{tilt:g})"
+        settle = in_ms * 6 // 10
+        soft = "" if fx else "\\blur6"
+        sharpen = "" if fx else "\\blur0"
+        # Where the word starts relative to its place in the line, and what it does on the way.
+        offset, extra = {
+            # Lands with a squash, then springs back to shape.
+            "drop": ((0, -lift * 2), f"\\t({in_ms},{in_ms + 90},\\fscx{zoom * 110:.0f}\\fscy{zoom * 86:.0f})"
+                                     f"\\t({in_ms + 90},{in_ms + 200},{scale(zoom)})"),
+            "rise": ((0, lift), ""),
+            "slide": ((side * canvas_width // 4, 0), f"{soft}\\t(0,{in_ms},{sharpen})" if soft else ""),
+            "nudge": ((-round(size * zoom * 0.7), 0), ""),
+            "bounce": ((0, -lift), f"\\t({settle},{in_ms * 8 // 10},\\fscx{zoom * 114:.0f}\\fscy{zoom * 82:.0f})"
+                                   f"\\t({in_ms * 8 // 10},{in_ms},{scale(zoom)})"),
+        }.get(entrance, ((0, 0), ""))
+        move = (f"\\move({from_x + offset[0]},{from_y + offset[1]},{to_x},{to_y},0,"
+                f"{max(reframe_ms, in_ms) if offset != (0, 0) else reframe_ms})")
+        fade = f"\\alpha&HFF&\\t(0,{in_ms // 2},\\alpha&H00&)"
+        body = {
+            "ghost": f"\\alpha&HB0&{soft}{scale(last_zoom)}\\frz{last_tilt:g}{reframe}"
+                     f"\\t(0,{in_ms},\\alpha&H00&{sharpen})",
+            "fade": f"{scale(last_zoom)}\\frz{last_tilt:g}{reframe}\\fad({in_ms},0)",
+            "pop": f"{fade}{scale(zoom * 1.45)}\\frz{tilt:g}\\t(0,{settle},{scale(zoom * 0.92)})"
+                   f"\\t({settle},{in_ms},{scale(zoom)})",
+            "zoom": f"{scale(0)}\\frz{tilt:g}\\t(0,{in_ms * 7 // 10},{scale(zoom * 1.18)})"
+                    f"\\t({in_ms * 7 // 10},{in_ms},{scale(zoom)})",
+            "slam": f"{fade}{scale(zoom * 1.8)}\\frz{tilt + side * 5:g}\\fax-0.15"
+                    f"\\t(0,{settle},{scale(zoom * 0.94)}\\frz{tilt:g}\\fax0)\\t({settle},{in_ms},{scale(zoom)})",
+            "spin": f"{fade}{scale(zoom * 0.4)}\\frz{tilt - side * 40:g}\\t(0,{in_ms},{scale(zoom)}\\frz{tilt:g})",
+            "flip": f"{scale(last_zoom)}\\frz{last_tilt:g}\\fry{side * 90}{reframe}\\t(0,{in_ms},\\fry0)",
+            "blur": f"{fade}{'' if fx else chr(92) + 'blur14'}{scale(last_zoom)}\\frz{last_tilt:g}{reframe}"
+                    f"\\t(0,{in_ms},{sharpen})",
+            "flicker": f"{scale(last_zoom)}\\frz{last_tilt:g}{reframe}\\alpha&HC0&\\t(0,60,\\alpha&H00&)"
+                       f"\\t(60,110,\\alpha&HA0&)\\t(110,170,\\alpha&H00&)\\t(170,210,\\alpha&H70&)"
+                       f"\\t(210,260,\\alpha&H00&)",
+        }.get(entrance, f"{fade}{scale(last_zoom)}\\frz{last_tilt:g}{reframe}")
+        return move + body + extra
+
+    def leave(exit_name: str, number: int, size: int, framing: tuple, at: tuple[int, int]) -> str:
+        """How a word leaves as its line ends."""
+        zoom, _fx, _fy, tilt = framing
+        at_x, at_y = at
+        side = -1 if number % 2 == 0 else 1
+        lift = round(size * zoom * 0.7)
+        hold = f"{scale(zoom)}\\frz{tilt:g}"
+        if exit_name == "fall":
+            return f"\\move({at_x},{at_y},{at_x},{at_y + lift},0,{out_ms}){hold}\\fad(0,{out_ms})"
+        if exit_name == "rise":
+            return f"\\move({at_x},{at_y},{at_x},{at_y - lift},0,{out_ms}){hold}\\fad(0,{out_ms})"
+        if exit_name == "zoom":
+            # The line pushes past the camera.
+            return (f"\\move({at_x},{at_y},{round(centre_x + (at_x - centre_x) * 1.4)},"
+                    f"{round(centre_y + (at_y - centre_y) * 1.4)},0,{out_ms}){hold}"
+                    f"\\t(0,{out_ms},{scale(zoom * 1.5)}\\alpha&HFF&)")
+        if exit_name == "scatter":
+            dx, dy = ((number * 73) % 9 - 4) * size * zoom / 5, -((number * 37) % 5 + 2) * size * zoom / 4
+            return (f"\\move({at_x},{at_y},{round(at_x + dx)},{round(at_y + dy)},0,{out_ms}){hold}"
+                    f"\\t(0,{out_ms},\\frz{tilt + side * 25:g}\\alpha&HFF&)")
+        if exit_name == "fade":
+            return f"\\pos({at_x},{at_y}){hold}\\fad(0,{out_ms})"
+        # blur: the line blurs away, leaving the picture clear before the next one.
+        return f"\\pos({at_x},{at_y}){hold}\\t(0,{out_ms},\\blur10\\alpha&HFF&)"
+
+    for rank, index in enumerate(order):
+        text, size, x, y, _start, key = pieces[index]
+        safe = text.replace("{", r"\{").replace("}", r"\}")
+        look = f"\\an2\\fs{size}\\1c{accent if key else color}{pivot}"
+        entrance = settings["emphasis_entrance"] if key else settings["entrance"]
+        spans = []
+        for step in range(rank, len(order)):
+            begin = starts[step]
+            end = starts[step + 1] if step + 1 < len(order) else exit_at
+            begin, end = min(begin, exit_at), min(max(end, begin), exit_at)
+            if end <= begin:
+                continue
+            zoom, _fx, _fy, tilt = framings[step]
+            to_x, to_y = place(x, y, framings[step])
+            last = framings[step - 1] if step else framings[step]
+            from_x, from_y = place(x, y, last)
+            if step == rank:
+                spans.append((begin, end, lambda fx, a=(from_x, from_y), b=(to_x, to_y), l=last, n=framings[step]:
+                              arrive(entrance, rank, size, l, n, a, b, fx=fx)))
+            else:
+                motion = (f"\\move({from_x},{from_y},{to_x},{to_y},0,{reframe_ms}){scale(last[0])}\\frz{last[3]:g}"
+                          f"\\t(0,{reframe_ms},{scale(zoom)}\\frz{tilt:g})")
+                spans.append((begin, end, lambda fx, m=motion: m))
+        if out_ms and exit_at < cue.end and framings:
+            gone = leave(settings["exit"], rank, size, framings[-1], place(x, y, framings[-1]))
+            spans.append((exit_at, cue.end, lambda fx, m=gone: m))
+        for begin, end, motion in spans:
+            when = f"{_format_ass_time(begin)},{_format_ass_time(end)}"
+            if glow:
+                events.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{{{look}{motion(True)}"
+                              f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&}}{safe}")
+            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion(False)}}}{safe}")
+    return events
+
+
+def _placed_lyric_events(
+    cue: SubtitleCue,
+    words: tuple[SubtitleWord, ...],
+    spaces: list[str],
+    emphasized: list[bool],
+    settings: dict[str, Any],
+    *,
+    canvas_width: int,
+    canvas_height: int,
+) -> list[str]:
+    """One event per word (or letter), each placed by measured width and moving on its own sung time.
+
+    A piece enters with the entrance motion when it is sung, holds, and leaves with the exit motion
+    as the line ends; a glow layer follows every piece.
+    """
+    base = settings["font_size"]
+    big = round(base * settings["emphasis_scale"])
+    measure = _lyric_font_measure(settings["font_name"], settings["bold"], settings["italic"])
+    spacing = settings["letter_spacing"]
+
+    def width(text: str, size: float) -> float:
+        raw = measure(text, size) if measure else len(text) * size * 0.5
+        return raw + spacing * len(text)
+
+    texts = [word.text.upper() if settings["uppercase"] else word.text for word in words]
+    sizes = [big if emphasized[index] else base for index in range(len(words))]
+    rows = _lyric_lines(words, spaces, emphasized, settings)
+    row_heights = [max(sizes[index] for index in row) for row in rows]
+    gap = round(base * 0.12)
+    block = sum(row_heights) + gap * (len(rows) - 1)
+    top = {"bottom": canvas_height - settings["margin_v"] - block, "middle": (canvas_height - block) // 2,
+           "top": settings["margin_v"]}[settings["position"]]
+
+    # Each piece: its text, size, bottom-centre point, start time and index for alternating motions.
+    pieces: list[tuple[str, int, float, float, float, bool]] = []
+    for row, row_height in zip(rows, row_heights):
+        bottom = top + row_height
+        row_width = sum(width(texts[index], sizes[index]) for index in row) + sum(
+            width(spaces[index], sizes[index]) for index in row[:-1]
+        )
+        left = (canvas_width - row_width) / 2
+        for position, index in enumerate(row):
+            word, size = words[index], sizes[index]
+            if settings["reveal"] == "letter":
+                # Letters cascade through the word's sung time, at most 70 ms apart.
+                letters = list(texts[index])
+                step = min(0.07, max(0.0, word.end - word.start) / max(1, len(letters)))
+                for offset, letter in enumerate(letters):
+                    letter_width = width(letter, size)
+                    pieces.append((letter, size, left + letter_width / 2, bottom, word.start + step * offset,
+                                   emphasized[index]))
+                    left += letter_width
+            else:
+                word_width = width(texts[index], size)
+                pieces.append((texts[index], size, left + word_width / 2, bottom, word.start, emphasized[index]))
+                left += word_width
+            if position < len(row) - 1:
+                left += width(spaces[index], size)
+        top = bottom + gap
+
+    if settings["camera"] == "follow":
+        return _camera_follow_events(cue, pieces, width, settings, canvas_width=canvas_width,
+                                     canvas_height=canvas_height)
+    in_ms, out_ms = max(1, settings["entrance_ms"]), settings["exit_ms"] if settings["exit"] != "none" else 0
+    exit_at = max(cue.start, cue.end - out_ms / 1000)
+    color = _ass_tag_color(settings["color"], "#FFFFFF")
+    accent = _ass_tag_color(settings["accent_color"], "#FFD54A")
+    glow = settings["glow_size"] if settings["glow_color"] else 0
+    events = []
+    for number, (text, size, x, y, start, key) in enumerate(pieces):
+        x, y = round(x), round(y)
+        start = min(max(start, cue.start), exit_at)
+        entrance = settings["emphasis_entrance"] if key else settings["entrance"]
+        # A highlighted line is all there, dim, from its start; each word lights up when it is sung.
+        sung_ms = round((start - cue.start) * 1000)
+        if entrance == "highlight":
+            start = cue.start
+        side = -1 if number % 2 == 0 else 1
+        lift = round(size * 0.55)
+        centre = f"\\org({x},{y - size // 2})"
+        fade_in = f"\\alpha&HFF&\\t(0,{in_ms // 2},\\alpha&H00&)"
+        enter = {
+            "none": f"\\pos({x},{y})",
+            "fade": f"\\pos({x},{y})\\fad({in_ms},0)",
+            "pop": f"\\pos({x},{y}){fade_in}\\fscx140\\fscy140\\t(0,{in_ms * 6 // 10},\\fscx92\\fscy92)"
+                   f"\\t({in_ms * 6 // 10},{in_ms},\\fscx100\\fscy100)",
+            "rise": f"\\move({x},{y + lift},{x},{y},0,{in_ms}){fade_in}",
+            "drop": f"\\move({x},{y - lift * 2},{x},{y},0,{in_ms}){fade_in}\\t({in_ms},{in_ms + 90},\\fscx110\\fscy86)"
+                    f"\\t({in_ms + 90},{in_ms + 200},\\fscx100\\fscy100)",
+            "slide": f"\\move({x + side * canvas_width // 5},{y},{x},{y},0,{in_ms}){fade_in}\\blur6"
+                     f"\\t(0,{in_ms},\\blur0)",
+            "zoom": f"\\pos({x},{y}){centre}\\fscx0\\fscy0\\t(0,{in_ms * 7 // 10},\\fscx118\\fscy118)"
+                    f"\\t({in_ms * 7 // 10},{in_ms},\\fscx100\\fscy100)",
+            "spin": f"\\pos({x},{y}){centre}{fade_in}\\frz{side * -35}\\fscx50\\fscy50"
+                    f"\\t(0,{in_ms},\\frz0\\fscx100\\fscy100)",
+            "flip": f"\\pos({x},{y}){centre}\\fry{side * 90}\\t(0,{in_ms},\\fry0)",
+            "bounce": f"\\move({x},{y - lift},{x},{y},0,{in_ms * 6 // 10}){fade_in}"
+                      f"\\t({in_ms * 6 // 10},{in_ms * 8 // 10},\\fscx114\\fscy82)"
+                      f"\\t({in_ms * 8 // 10},{in_ms},\\fscx100\\fscy100)",
+            "blur": f"\\pos({x},{y}){fade_in}\\blur14\\t(0,{in_ms},\\blur0)",
+            # Arrives a short way from the left, briefly over its neighbour.
+            "nudge": f"\\move({x - round(size * 0.7)},{y},{x},{y},0,{in_ms}){fade_in}",
+            # Punches in huge and skewed, then settles at a slight tilt.
+            "slam": f"\\pos({x},{y}){centre}\\frz{side * 4}\\fax-0.18\\fscx170\\fscy170{fade_in}"
+                    f"\\t(0,{in_ms * 6 // 10},\\fscx94\\fscy94\\fax-0.08)"
+                    f"\\t({in_ms * 6 // 10},{in_ms},\\fscx100\\fscy100)",
+            "highlight": f"\\pos({x},{y})\\1c{_ass_tag_color(settings['dim_color'], '#9A9A9A')}\\alpha&H50&"
+                         f"\\t({sung_ms},{sung_ms + in_ms},\\1c{accent if key else color}\\alpha&H00&)",
+            # Line motions do not apply to a single word; it flickers or fades on instead.
+            "flicker": f"\\pos({x},{y})\\alpha&HC0&\\t(0,60,\\alpha&H00&)\\t(60,110,\\alpha&HA0&)"
+                       f"\\t(110,170,\\alpha&H00&)",
+        }.get(entrance, f"\\pos({x},{y})\\fad({in_ms},0)")
+        # A deterministic scatter direction per piece.
+        dx, dy = ((number * 73) % 9 - 4) * size // 6, -((number * 37) % 5 + 2) * size // 5
+        leave = {
+            "fade": f"\\pos({x},{y})\\fad(0,{out_ms})",
+            "rise": f"\\move({x},{y},{x},{y - lift},0,{out_ms})\\fad(0,{out_ms})",
+            "fall": f"\\move({x},{y},{x},{y + lift},0,{out_ms})\\fad(0,{out_ms})",
+            "zoom": f"\\pos({x},{y}){centre}\\t(0,{out_ms},\\fscx150\\fscy150\\alpha&HFF&)",
+            "blur": f"\\pos({x},{y})\\t(0,{out_ms},\\blur14\\alpha&HFF&)",
+            "scatter": f"\\move({x},{y},{x + dx},{y + dy},0,{out_ms}){centre}"
+                       f"\\t(0,{out_ms},\\frz{side * 25}\\alpha&HFF&)",
+        }.get(settings["exit"], "")
+        if leave and entrance == "slam":
+            # It leaves from the tilt it settled at.
+            leave += f"{centre}\\frz{side * 4}\\fax-0.08"
+        look = f"\\an2\\fs{size}\\1c{accent if key else color}"
+        safe = text.replace("{", r"\{").replace("}", r"\}")
+        spans = [(start, exit_at, enter)] + ([(exit_at, cue.end, leave)] if leave and exit_at < cue.end else [])
+        for begin, end, motion in spans:
+            if end <= begin:
+                continue
+            when = f"{_format_ass_time(begin)},{_format_ass_time(end)}"
+            if glow:
+                events.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{{{look}{motion}"
+                              f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&}}{safe}")
+            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion}}}{safe}")
+    return events
+
+
+def _render_animated_lyrics_ass(
+    cues: list[SubtitleCue],
+    animation: dict[str, Any] | None,
+    *,
+    canvas_width: int,
+    canvas_height: int,
+) -> str:
+    """ASS lyrics that move: words revealed on their sung times, key words set larger.
+
+    Every look is configuration (font, colours, reveal, entrance, layout, glow); the code only
+    supplies the motions. Two styles are always written so a burn-in never forces one style
+    over the file.
+    """
+    settings = _lyric_animation(animation, canvas_width, canvas_height)
+    color = _ass_color(settings["color"])
+    accent = _ass_color(settings["accent_color"])
+    karaoke = settings["reveal"] == "karaoke"
+    # Karaoke shows SecondaryColour before a word is sung and PrimaryColour after.
+    primary, secondary = (accent, _ass_color(settings["dim_color"])) if karaoke else (color, accent)
+    alignment = {"bottom": 2, "middle": 5, "top": 8}[settings["position"]]
+    x = canvas_width // 2
+    y = {"bottom": canvas_height - settings["margin_v"], "middle": canvas_height // 2,
+         "top": settings["margin_v"]}[settings["position"]]
+    style_tail = (
+        f"{-1 if settings['bold'] else 0},{-1 if settings['italic'] else 0},0,0,100,100,"
+        f"{settings['letter_spacing']:g},0,1,{settings['outline']:g},{settings['shadow']:g},{alignment},40,40,"
+        f"{settings['margin_v']},1"
+    )
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {canvas_width}",
+        f"PlayResY: {canvas_height}",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+        "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding",
+        f"Style: Lyric,{settings['font_name']},{settings['font_size']},{primary},{secondary},"
+        f"{_ass_color(settings['outline_color'])},&H80000000,{style_tail}",
+        f"Style: LyricFx,{settings['font_name']},{settings['font_size']},{primary},{secondary},"
+        f"{_ass_color(settings['glow_color'] or settings['outline_color'])},&H00000000,{style_tail}",
+        "",
+        "[Events]",
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+    ]
+    entrance, in_ms, out_ms = settings["entrance"], settings["entrance_ms"], settings["exit_ms"]
+    big = round(settings["font_size"] * settings["emphasis_scale"])
+    for cue in cues:
+        words = cue.words or _spread_cue_words(cue)
+        if not words:
+            continue
+        tokens = _lyric_tokens(cue.text)
+        # The cue's own spacing (none between CJK characters) when its words are its tokens.
+        spaces = ([space for _token, space in tokens] if len(tokens) == len(words)
+                  else ["" if _LYRIC_TOKEN_RE.fullmatch(word.text) and len(word.text) == 1 and not word.text.isascii()
+                        else " " for word in words])
+        emphasis_keys = {_lyric_key(word) for word in cue.emphasis}
+        emphasized = [_lyric_key(word.text) in emphasis_keys for word in words]
+        if settings["reveal"] in {"word", "letter"}:
+            lines.extend(_placed_lyric_events(cue, words, spaces, emphasized, settings,
+                                              canvas_width=canvas_width, canvas_height=canvas_height))
+            continue
+        start_ms = round(cue.start * 1000)
+        duration_ms = max(1, round(cue.end * 1000) - start_ms)
+
+        def word_text(index: int, *, fx: bool) -> str:
+            word = words[index]
+            text = word.text.upper() if settings["uppercase"] else word.text
+            text = text.replace("{", r"\{").replace("}", r"\}")
+            at = max(0, round(word.start * 1000) - start_ms)
+            tags = []
+            if emphasized[index]:
+                tags.append(f"\\fs{big}" + ("" if karaoke or fx else f"\\1c{_ass_tag_color(settings['accent_color'], '#FFD54A')}"))
+            if karaoke:
+                previous_end = round(words[index - 1].end * 1000) - start_ms if index else 0
+                gap = max(0, at - max(0, previous_end))
+                sung = max(1, round((word.end - word.start) * 100))
+                tags.insert(0, (f"\\k{round(gap / 10)}" if gap >= 10 else "") + f"\\kf{sung}")
+            reset = ("{" + f"\\fs{settings['font_size']}"
+                     + ("" if karaoke or fx else f"\\1c{_ass_tag_color(settings['color'], '#FFFFFF')}") + "}"
+                     if emphasized[index] else "")
+            return ("{" + "".join(tags) + "}" if tags else "") + text + reset
+
+        def line_text(*, fx: bool) -> str:
+            parts = []
+            for line in _lyric_lines(words, spaces, emphasized, settings):
+                parts.append("".join(word_text(index, fx=fx) + (spaces[index] if position < len(line) - 1 else "")
+                                     for position, index in enumerate(line)))
+            return r"\N".join(parts)
+
+        line_tags = [f"\\an{alignment}"]
+        if entrance == "rise":
+            line_tags.append(f"\\move({x},{y + round(settings['font_size'] * 0.6)},{x},{y},0,{max(1, in_ms)})")
+        else:
+            line_tags.append(f"\\pos({x},{y})")
+        if settings["reveal"] == "line" or entrance in {"fade", "rise"}:
+            line_tags.append(f"\\fad({in_ms if settings['reveal'] == 'line' or entrance == 'rise' else 0},{out_ms})")
+        elif out_ms:
+            line_tags.append(f"\\fad(0,{out_ms})")
+        if settings["reveal"] == "line" and entrance == "pop":
+            line_tags.append(f"\\fscx120\\fscy120\\t(0,{max(1, in_ms)},\\fscx100\\fscy100)")
+        if settings["reveal"] == "line" and entrance == "blur":
+            line_tags.append(f"\\blur12\\t(0,{max(1, in_ms)},\\blur0)")
+        if entrance == "wipe":
+            # The text box grows from the left edge of the line's estimated width.
+            half = min(canvas_width // 2, round(settings["max_chars_per_line"] * settings["font_size"] * 0.3))
+            wipe_ms = max(in_ms, min(duration_ms - out_ms, round(words[-1].start * 1000) - start_ms + in_ms))
+            line_tags.append(f"\\clip({x - half},0,{x - half},{canvas_height})"
+                             f"\\t(0,{max(1, wipe_ms)},\\clip({x - half},0,{x + half},{canvas_height}))")
+        if entrance == "flicker":
+            line_tags.append("\\alpha&HC0&\\t(0,60,\\alpha&H00&)\\t(60,110,\\alpha&HA0&)\\t(110,170,\\alpha&H00&)"
+                             "\\t(170,210,\\alpha&H60&)\\t(210,260,\\alpha&H00&)")
+        head = "{" + "".join(line_tags) + "}"
+        when = f"{_format_ass_time(cue.start)},{_format_ass_time(cue.end)}"
+        if settings["glow_color"]:
+            glow = settings["glow_size"]
+            glow_head = head[:-1] + f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&" + "}"
+            lines.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{glow_head}{line_text(fx=True)}")
+        if entrance == "glitch":
+            # Red and cyan copies shake off the words, then the clean line holds.
+            end_fx = _format_ass_time(cue.start + min(0.35, duration_ms / 1000))
+            for color_tag, dx in (("&H3B3BFF&", -8), ("&HFFFF3B&", 8)):
+                lines.append(
+                    f"Dialogue: 0,{_format_ass_time(cue.start)},{end_fx},LyricFx,,0,0,0,,"
+                    f"{{\\an{alignment}\\move({x + dx},{y},{x - dx // 2},{y + 3},0,120)\\1c{color_tag}\\3c{color_tag}"
+                    f"\\alpha&H50&\\bord0\\shad0}}{line_text(fx=True)}"
+                )
+        lines.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{head}{line_text(fx=False)}")
+    return "\n".join(lines) + "\n"
 
 
 def _wrap_subtitle_text(text: str, max_chars_per_line: int) -> str:
@@ -8173,8 +10322,20 @@ async def _apply_two_pass_loudnorm(
     config: dict[str, Any],
     total_duration: float,
 ) -> None:
-    """Normalize a composed MP4 deterministically without re-encoding video."""
+    """Normalize a composed MP4 deterministically without re-encoding video.
+
+    Without normalization the final mix is still never left clipping: tracks
+    are summed at full level, so its true peak is capped at
+    ``FINAL_MIX_TRUE_PEAK_DBTP`` (the smallest change that does it).
+    """
     if not config.get("enabled"):
+        if await _has_audio_stream(ffmpeg, input_path):
+            await _enforce_encoded_true_peak(
+                ffmpeg=ffmpeg,
+                input_path=input_path,
+                target_true_peak=FINAL_MIX_TRUE_PEAK_DBTP,
+                total_duration=total_duration,
+            )
         return
     target_i = _loudness_target_lufs(config.get("target_lufs"))
     target_tp = _loudness_true_peak(config.get("true_peak"))
@@ -8368,12 +10529,61 @@ def _loudness_target_lufs(value: Any) -> float:
     return _clamp_float(value, -24.0, -6.0, -16.0)
 
 
+# Every rendered mix stays below clipping, normalized or not.
+FINAL_MIX_TRUE_PEAK_DBTP = -1.0
+
+
+async def _has_audio_stream(ffmpeg: str, path: str) -> bool:
+    ffprobe = shutil.which("ffprobe") or os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    stdout, _stderr = await _run_process(
+        [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        timeout_seconds=60,
+    )
+    return bool(str(stdout or "").strip())
+
+
 def _loudness_true_peak(value: Any) -> float:
     return _clamp_float(value, -6.0, 0.0, -1.5)
 
 
 def _loudness_lra(value: Any) -> float:
     return _clamp_float(value, 1.0, 20.0, 11.0)
+
+
+# The composed mix never exceeds this sample ceiling, leaving headroom for inter-sample overs.
+COMPOSE_TRUE_PEAK_CEILING_DB = -3.0
+
+
+async def _video_frame_timing(path: str) -> tuple[float, int]:
+    """The frame rate and frame count of a video's first stream, read from its container."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0, 0
+    stdout, _stderr = await _run_process(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate,avg_frame_rate,nb_frames",
+            "-of",
+            "json",
+            path,
+        ],
+        timeout_seconds=60,
+    )
+    streams = (json.loads(stdout or "{}").get("streams") or [{}])
+    stream = streams[0] if streams else {}
+    # r_frame_rate is the stable rate of a constant-rate master; a timebase value (for example 1000/1)
+    # in it would make the frame target absurd, so only a plausible rate is used.
+    for field in ("r_frame_rate", "avg_frame_rate"):
+        numerator, _, denominator = str(stream.get(field) or "0/1").partition("/")
+        rate = float(numerator or 0) / float(denominator or 1) if float(denominator or 1) else 0.0
+        if 1.0 <= rate <= 120.0:
+            return rate, int(stream.get("nb_frames") or 0)
+    return 0.0, 0
 
 
 async def _compose_video_file(
@@ -8437,10 +10647,19 @@ async def _compose_video_file(
     filter_parts: list[str] = []
     video_map = "0:v:0"
     video_filters: list[str] = []
-    source_duration = total_duration if clean_video_duration is None else clean_video_duration
-    extension_seconds = max(0.0, total_duration - source_duration)
-    if extension_seconds > 0.001:
-        video_filters.append(f"tpad=stop_mode=clone:stop_duration={extension_seconds:.3f}")
+    # The picture is cut to the frames its timeline needs. A master can be shorter than its container
+    # (its audio runs longer), so the missing frames come from its own frame count, not its duration.
+    frame_rate, clean_frames = await _video_frame_timing(clean_video_abs)
+    target_frames = round(total_duration * frame_rate) if frame_rate > 0 else 0
+    if target_frames > 0:
+        missing_frames = target_frames - clean_frames
+        if missing_frames > 0:
+            video_filters.append(f"tpad=stop_mode=clone:stop_duration={(missing_frames + 2) / frame_rate:.3f}")
+    else:
+        source_duration = total_duration if clean_video_duration is None else clean_video_duration
+        extension_seconds = max(0.0, total_duration - source_duration)
+        if extension_seconds > 0.001:
+            video_filters.append(f"tpad=stop_mode=clone:stop_duration={extension_seconds:.3f}")
     if subtitle_abs:
         video_filters.append(
             f"subtitles={_subtitles_filter_value(subtitle_abs, subtitle_style, canvas_height=canvas_height)}"
@@ -8490,6 +10709,12 @@ async def _compose_video_file(
         )
         if total_duration > 0:
             mix_chain += f",atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS"
+        # A limiter is transparent below its ceiling; it only stops a hot source or a boosted track
+        # from clipping in the composed mix.
+        mix_chain += (
+            f",alimiter=limit={10 ** (COMPOSE_TRUE_PEAK_CEILING_DB / 20):.4f}"
+            ":attack=5:release=50:level=disabled"
+        )
         filter_parts.append(mix_chain + "[aout]")
     else:
         output_audio_label = "aout"
@@ -8537,6 +10762,8 @@ async def _compose_video_file(
                 rendered_path,
             ]
         )
+        if target_frames > 0:
+            args = [*args[:-1], "-frames:v", str(target_frames), args[-1]]
         await _run_process(
             args,
             timeout_seconds=max(180.0, (total_duration or 60.0) * 8.0 + 120.0),
@@ -8650,16 +10877,23 @@ def _frame_sample_times(
     scene_boundaries: list[float] | None,
     interval_seconds: float,
     max_samples: int,
+    frame_rate: float = 0.0,
 ) -> list[float]:
     duration = max(0.001, float(_probe_number(duration_seconds)))
     end_margin = min(0.1, duration / 2)
     end_time = round(max(0.0, duration - end_margin), 3)
+    # Keep the conservative automatic ending sample, but allow an explicit
+    # request inside the last 100 ms when the stream has a known frame rate.
+    # Floor seek precision so rounding cannot step past the last frame's PTS.
+    fps = float(_probe_number(frame_rate))
+    request_end = max(0.0, duration - 1 / fps) if fps > 0 else end_time
     candidates = {0.0, end_time}
     requested: set[float] = set()
     for value in [*(timestamps or []), *(scene_boundaries or [])]:
         number = float(_probe_number(value))
         if 0 <= number < duration:
-            requested.add(round(min(number, end_time), 3))
+            bounded = min(number, request_end)
+            requested.add(math.floor(bounded * 1_000_000) / 1_000_000 if fps > 0 else round(bounded, 3))
     candidates |= requested
 
     interval = max(0.25, float(_probe_number(interval_seconds)) or 10.0)
@@ -8911,12 +11145,36 @@ def _parse_subtitle_content(content: str, subtitle_format: str) -> dict[str, Any
     raise ValueError(f"Unsupported subtitle format: {subtitle_format}")
 
 
-async def _probe_media_report(ffprobe: str, path: str) -> dict[str, Any]:
+async def _stage_media_snapshot(descriptor_path: str, destination: str, *, max_bytes: int) -> None:
+    """Copy a pinned Workspace source while its read lock is held, then release it."""
+    def copy_snapshot() -> None:
+        copied = 0
+        with open(descriptor_path, "rb") as source, open(destination, "xb") as target:
+            while chunk := source.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > max_bytes:
+                    raise ValueError("Workspace Knowledge media exceeds the allowed size")
+                target.write(chunk)
+
+    copy_task = asyncio.create_task(asyncio.to_thread(copy_snapshot))
+    try:
+        await asyncio.shield(copy_task)
+    except asyncio.CancelledError:
+        # The descriptor belongs to the inspector's snapshot. Do not let its
+        # context close and potentially reuse the FD while the copy thread runs.
+        await asyncio.shield(copy_task)
+        raise
+
+
+async def _probe_media_report(
+    ffprobe: str, path: str, *, pass_fds: tuple[int, ...] = (),
+) -> dict[str, Any]:
     stdout, _stderr = await _run_process(
         [
             ffprobe,
             "-v",
             "error",
+            *(["-protocol_whitelist", "file,pipe"] if pass_fds else []),
             "-show_entries",
             "format=duration,format_name,bit_rate,size",
             "-show_entries",
@@ -8929,6 +11187,7 @@ async def _probe_media_report(ffprobe: str, path: str) -> dict[str, Any]:
             path,
         ],
         timeout_seconds=60,
+        **({"pass_fds": pass_fds} if pass_fds else {}),
     )
     try:
         data = json.loads(stdout or "{}")
@@ -9013,6 +11272,7 @@ async def _normalize_clip(
     speed: float = 1.0,
     has_audio: bool = False,
     include_source_audio: bool = False,
+    output_frames: int | None = None,
 ) -> None:
     source_span = max(
         0.1,
@@ -9022,12 +11282,20 @@ async def _normalize_clip(
         0.1,
         float(output_duration_seconds if output_duration_seconds is not None else source_span / speed),
     )
+    # A frame budget must not round its end down (145/30 is longer than 4.833s).
+    output_seconds = (
+        f"{math.ceil(output_span * 1_000_000) / 1_000_000:.6f}"
+        if output_frames is not None else f"{output_span:.3f}"
+    )
     speed_filter = f",setpts=PTS/{speed:.6f}" if abs(speed - 1.0) > 0.000001 else ""
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        f"setsar=1{speed_filter},fps={fps},format=yuv420p"
+        f"setsar=1,setpts=PTS-STARTPTS{speed_filter},fps={fps},format=yuv420p"
     )
+    if output_frames is not None:
+        # Hold the last frame so the clip always has the frames -frames:v cuts it to.
+        vf += f",tpad=stop_mode=clone:stop_duration={2 / fps:.6f}"
     base = [
         ffmpeg,
         "-y",
@@ -9059,23 +11327,22 @@ async def _normalize_clip(
             # AAC packet rounding must not truncate the last video frame or
             # accumulate drift across chapters. Pad only the missing audio tail;
             # the explicit output -t remains the authoritative cut duration.
-            _atempo_filter(speed) + f",apad=whole_dur={output_span:.3f}",
+            _atempo_filter(speed) + f",apad=whole_dur={output_seconds}",
             "-ar",
             "48000",
             "-ac",
             "2",
             "-t",
-            f"{output_span:.3f}",
+            output_seconds,
             output_path,
         ]
     else:
-        silent_duration = output_span
         args = [
             *base,
             "-f",
             "lavfi",
             "-t",
-            f"{silent_duration:.3f}",
+            output_seconds,
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-map",
@@ -9097,10 +11364,12 @@ async def _normalize_clip(
             "-ac",
             "2",
             "-t",
-            f"{output_span:.3f}",
+            output_seconds,
             "-shortest",
             output_path,
         ]
+    if output_frames is not None:
+        args = [*args[:-1], "-frames:v", str(output_frames), args[-1]]
     await _run_process(
         args,
         timeout_seconds=max(
@@ -9124,6 +11393,12 @@ def _resolve_clip_window(
     start = max(0.0, float(start_seconds or 0.0))
     if start >= source_duration:
         raise ValueError("Clip starts after the source ends")
+    if end_seconds is not None and float(end_seconds) > source_duration + 0.02:
+        # A clamped end would silently shorten the clip and the picture it contributes to.
+        raise ValueError(
+            f"Clip end {float(end_seconds):.3f}s is beyond its source, which lasts {source_duration:.3f}s; "
+            "window each clip within its own source (start and end are source times, not timeline times)"
+        )
     end = source_duration if end_seconds is None else min(float(end_seconds), source_duration)
     if end <= start:
         raise ValueError("Clip end must be greater than its start")
@@ -9143,11 +11418,14 @@ def _atempo_filter(speed: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
-async def _run_process(args: list[str], *, timeout_seconds: float) -> tuple[str, str]:
+async def _run_process(
+    args: list[str], *, timeout_seconds: float, pass_fds: tuple[int, ...] = (),
+) -> tuple[str, str]:
     process = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        pass_fds=pass_fds,
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
@@ -9297,6 +11575,43 @@ def _workspace_media_reference(
     return _normalize_user_path(rel_path)
 
 
+async def _existing_media_reference(
+    value: str | None,
+    *,
+    entity_id: str,
+    entity_root: str,
+    workspace_base_dir: str = "",
+) -> str:
+    """The entity path of an existing media source, found the way ``read_file`` finds it.
+
+    A logical name means the active Workspace's file first. When no such file
+    exists, the literal Knowledge path is used, so a source kept outside the
+    Workspace folder (an entity-level upload) stays readable instead of being
+    relocated to a path that does not exist. A ``/viewer/<id>`` address is its
+    Document's path. Read access is still decided by ``_resolve_entity_file``.
+    """
+    from packages.core.ai.tools.file_tools import _file_reference_arg, _file_reference_path
+
+    raw = str(value or "").strip()
+    path, document_id, foreign = _file_reference_arg(entity_id, entity_root, raw)
+    if foreign:
+        raise ValueError(f"Media file not found or access denied: {raw}")
+    if document_id:
+        fs_path, error = await _file_reference_path(entity_id, entity_root, raw)
+        if error:
+            raise ValueError(f"Media file not found or access denied: {raw}")
+        return _normalize_user_path(fs_path)
+    scoped = _workspace_media_reference(
+        raw, entity_id=entity_id, workspace_base_dir=workspace_base_dir,
+    )
+    if not scoped or os.path.exists(os.path.join(entity_root, scoped)):
+        return scoped
+    literal = _normalize_user_path(_rel_path_from_reference(raw, entity_id) or path)
+    if literal != scoped and os.path.exists(os.path.join(entity_root, literal)):
+        return literal
+    return scoped
+
+
 async def _resolve_video_analysis_source(
     *,
     entity_id: str,
@@ -9333,10 +11648,52 @@ async def _resolve_video_analysis_source(
     workspace_base_dir = await _workspace_media_base_dir(
         entity_id=entity_id, workspace_id=workspace_id, task_id=task_id,
     )
-    rel_input = _workspace_media_reference(
-        input_path, entity_id=entity_id, workspace_base_dir=workspace_base_dir,
+    rel_input = await _existing_media_reference(
+        input_path, entity_id=entity_id, entity_root=entity_root,
+        workspace_base_dir=workspace_base_dir,
     )
     return rel_input, await _resolve_entity_file(entity_root, rel_input), False
+
+
+async def _resolve_source_document_id(
+    *,
+    entity_id: str,
+    source: str,
+    workspace_id: str | None,
+    task_id: str | None = None,
+) -> str:
+    """The Knowledge Document an existing file reference names, for tools that bind to one.
+
+    A step hands the next one a file as a path or ``open_url`` (``canvas_path``,
+    a ``/viewer/<id>`` link), not always its Document ID. The path resolves
+    exactly like every other media source (Workspace scoping, chat uploads, the
+    caller's read ACL); the caller keeps its own capability check on the Document.
+    """
+    from packages.core.ai.tools.file_tools import _file_reference_arg
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+    from packages.core.services.entity_fs import get_entity_root
+
+    # The file tools' reading of an address: open_url, /viewer/<id>, sandbox mount, Knowledge/ prefix.
+    path, document_id, foreign = _file_reference_arg(entity_id, get_entity_root(entity_id), source)
+    if foreign or not (path or document_id):
+        raise ValueError(f"Source document not found: {source}")
+    if document_id:
+        return document_id
+    rel_path, _abs_path, _is_upload = await _resolve_video_analysis_source(
+        entity_id=entity_id, input_path=path, workspace_id=workspace_id, task_id=task_id,
+    )
+    async with async_session() as db:
+        document_id = await db.scalar(
+            select(Document.id).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == rel_path,
+                Document.is_trashed.is_(False),
+            ).limit(1)
+        )
+    if not document_id:
+        raise ValueError(f"Source is not a Knowledge Document: {rel_path}")
+    return str(document_id)
 
 
 async def _workspace_media_base_dir(
@@ -9416,6 +11773,12 @@ def _assert_audio_path(abs_path: str) -> None:
         raise ValueError(f"Unsupported audio extension: {abs_path}")
 
 
+def _assert_timeline_audio_source_path(abs_path: str) -> None:
+    """Accept a media container only when it is a known audio or video source."""
+    if Path(abs_path).suffix.lower() not in AUDIO_EXTENSIONS | VIDEO_EXTENSIONS:
+        raise ValueError(f"Unsupported timeline audio source extension: {abs_path}")
+
+
 def _assert_subtitle_path(abs_path: str) -> None:
     if Path(abs_path).suffix.lower() not in {".srt", ".vtt", ".ass"}:
         raise ValueError(f"Unsupported subtitle extension: {abs_path}")
@@ -9467,6 +11830,26 @@ def _ass_style_count(abs_path: str) -> int:
             return sum(1 for line in handle if line.lstrip().lower().startswith("style:"))
     except OSError:
         return 0
+
+
+def _still_title_ass(title: str, duration: float, *, width: int, height: int) -> str:
+    """A large title over the lower part of the picture that fades in, readable on any still."""
+    size = round(min(width, height) * (0.11 if height > width else 0.1))
+    text = title.replace("\\", "").replace("{", r"\{").replace("}", r"\}")
+    start = min(0.35, duration / 4)
+    return "\n".join([
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 0", "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,"
+        "Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,"
+        "MarginV,Encoding",
+        # Noto Sans CJK ships with the service image; fontconfig falls back elsewhere.
+        f"Style: Title,Noto Sans CJK SC,{size},&H00FFFFFF,&H000000FF,&H00141414,&H96000000,1,0,0,0,100,100,0,0,1,"
+        f"{max(2, round(size * 0.06))},{max(1, round(size * 0.04))},2,{round(width * 0.08)},{round(width * 0.08)},"
+        f"{round(height * 0.14)},1",
+        "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+        f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(duration)},Title,,0,0,0,,{{\\fad(450,0)}}{text}",
+    ]) + "\n"
 
 
 def _subtitles_filter_value(
@@ -9645,6 +12028,30 @@ def _json_error(message: str, *, code: str = "invalid_request") -> str:
     return _json({"status": "error", "code": code, "error": message})
 
 
+def _media_source_error(input_path: str, document_id: str) -> str | None:
+    """Say which source rule a call broke, so the caller can correct it."""
+    if input_path and document_id:
+        return _json_error(
+            f"Both input_path ({input_path!r}) and document_id ({document_id!r}) were supplied; "
+            "send only one of them, e.g. just document_id."
+        )
+    if not input_path and not document_id:
+        return _json_error("Neither input_path nor document_id was supplied; send exactly one of them.")
+    return None
+
+
+def _not_applied(result: str, reason: str) -> str:
+    """A failure before the handler's first write: host proof that nothing changed.
+
+    Minted only by handlers that track their own write boundary (see
+    compose_video_timeline and normalize_audio_loudness); any failure after it
+    stays an unconfirmed effect.
+    """
+    from packages.core.ai.runtime.tool_results import RuntimeSettledToolResult
+
+    return RuntimeSettledToolResult.not_applied(result, reason)
+
+
 def _json_blocked(message: str, *, code: str, **details: Any) -> str:
     return _json({"status": "blocked", "code": code, "error": message, **details})
 
@@ -9681,10 +12088,11 @@ async def _search_free_music_handler(
     user_id: str = "",
     query: str = "",
     page: int = 1,
+    catalog: str = "",
     **_: Any,
 ) -> str:
     from packages.core.database import async_session
-    from packages.core.services.open_music_catalog import search_open_music
+    from packages.core.services.open_music_catalog import OpenMusicSearchUnavailable, search_open_music
 
     access = _CURRENT_MEDIA_FILE_ACCESS.get()
     actor_id = str((access.user_id if access else user_id) or "").strip()
@@ -9693,8 +12101,14 @@ async def _search_free_music_handler(
     try:
         async with async_session() as db:
             await _free_music_actor(db, entity_id=entity_id, user_id=actor_id)
-        result = await search_open_music(query.strip(), page=max(1, int(page)), page_size=18)
+        catalog_filter = {"catalog": str(catalog).strip()} if str(catalog or "").strip() else {}
+        result = await search_open_music(query.strip(), page=max(1, int(page)), page_size=18, **catalog_filter)
         return _json({"status": "ok", **result})
+    except OpenMusicSearchUnavailable as exc:
+        return _json({
+            "status": "error", "code": "free_music_search_failed",
+            "error": str(exc), "catalog_failures": exc.failures,
+        })
     except Exception as exc:
         return _json_error(str(exc), code="free_music_search_failed")
 
@@ -9706,6 +12120,9 @@ async def _import_free_music_handler(
     user_id: str = "",
     track_id: str = "",
     source_document_id: str = "",
+    source_path: str = "",
+    workspace_id: str | None = None,
+    task_id: str | None = None,
     **_: Any,
 ) -> str:
     from fastapi import HTTPException
@@ -9716,11 +12133,28 @@ async def _import_free_music_handler(
 
     access = _CURRENT_MEDIA_FILE_ACCESS.get()
     actor_id = str((access.user_id if access else user_id) or "").strip()
-    if not entity_id or not actor_id or not track_id.strip() or not source_document_id.strip():
+    source_document_id = str(source_document_id or "").strip()
+    source_path = str(source_path or "").strip()
+    if not entity_id or not actor_id or not track_id.strip() or not (source_document_id or source_path):
         return _json_error(
-            "Entity, current user, track_id, and source_document_id are required",
+            "Entity, current user, track_id, and source_path or source_document_id are required",
             code="invalid_request",
         )
+    if source_path:
+        try:
+            path_document_id = await _resolve_source_document_id(
+                entity_id=entity_id, source=source_path,
+                workspace_id=(access.workspace_id if access else None) or workspace_id,
+                task_id=task_id,
+            )
+        except ValueError as exc:
+            return _json_error(str(exc), code="source_not_found")
+        if source_document_id and source_document_id != path_document_id:
+            return _json_error(
+                "source_path and source_document_id name different Documents; pass only one",
+                code="identity_conflict",
+            )
+        source_document_id = path_document_id
     try:
         async with async_session() as db:
             user = await _free_music_actor(db, entity_id=entity_id, user_id=actor_id)
@@ -9746,6 +12180,17 @@ async def _import_free_music_handler(
             plan=exc.plan, limit=exc.limit, current=exc.current,
         )
     except HTTPException as exc:
+        if exc.status_code == 503 and "Retry-After" in (exc.headers or {}):
+            # The catalog or file host is temporarily unavailable: nothing was
+            # refused, and the same import can succeed later.
+            return _json({
+                "status": "error",
+                "code": "free_music_import_unavailable",
+                "error": str(exc.detail),
+                "retryable": True,
+            })
+        if exc.status_code >= 500:
+            return _json_error(str(exc.detail), code="free_music_import_failed")
         return _json_error(str(exc.detail), code="free_music_import_denied")
     except Exception as exc:
         return _json_error(str(exc), code="free_music_import_failed")
@@ -9764,10 +12209,15 @@ def get_tools():
         (NORMALIZE_AUDIO_LOUDNESS_SCHEMA, _normalize_audio_loudness_handler),
         (COMPOSE_VIDEO_TIMELINE_SCHEMA, _compose_video_timeline_handler),
         (PROBE_MEDIA_SCHEMA, _probe_media_handler),
+        (VERIFY_MEDIA_SOURCES_SCHEMA, _verify_media_sources_handler),
+        (MEASURE_MEDIA_AUDIO_ALIGNMENT_SCHEMA, _measure_media_audio_alignment_handler),
         (VERIFY_STICKMAN_FINAL_MEDIA_SCHEMA, _verify_stickman_final_media_handler),
         (RENDER_FRAME_SAMPLES_SCHEMA, _render_frame_samples_handler),
         (TRANSCRIBE_VIDEO_SCHEMA, _transcribe_video_handler),
         (ANALYZE_AUDIO_SCHEMA, _analyze_audio_handler),
+        (ANALYZE_MUSIC_STRUCTURE_SCHEMA, _analyze_music_structure_handler),
+        (LISTEN_TO_AUDIO_SCHEMA, _listen_to_audio_handler),
         (VALIDATE_SUBTITLES_SCHEMA, _validate_subtitles_handler),
         (STILL_TO_VIDEO_SCHEMA, _still_to_video_handler),
+        (DERIVE_IMAGE_ASPECT_SCHEMA, _derive_image_aspect_handler),
     ]

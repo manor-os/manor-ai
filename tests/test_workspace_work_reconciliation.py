@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from packages.core.ai.runtime.strategist import _format_work_batch_reconciliation
 from packages.core.services.workspace_work_reconciliation import (
     build_work_batch_reconciliation,
     stale_reconciliation_results,
@@ -128,3 +129,52 @@ def test_in_progress_with_live_plan_is_not_immediately_stale() -> None:
     assert result["status"] == "active"
     assert result["stale"] is False
     assert result["stale_task_ids"] == []
+
+
+def test_stale_tasks_waiting_on_a_person_are_not_rendered_as_agent_recovery_work() -> None:
+    result = build_work_batch_reconciliation(
+        _batch("review_wait", "approval_wait", "stuck"),
+        [
+            _task("review_wait", "waiting_on_customer", age_hours=30),
+            _task("approval_wait", "blocked", age_hours=7),
+            _task("stuck", "blocked", age_hours=7),
+        ],
+        now=NOW,
+        human_request_task_ids={"approval_wait"},
+    )
+
+    waiting = {row["task_id"]: row["waiting_on_human"] for row in result["stale_tasks"]}
+    assert waiting == {"review_wait": True, "approval_wait": True, "stuck": False}
+    rendered = _format_work_batch_reconciliation(SimpleNamespace(work_batch_reconciliation=[result]))
+    assert "Task review_wait task_id=review_wait owner=content age_hours=30.0 waiting_on=person" in rendered
+    assert "task_id=stuck owner=content age_hours=7.0\n" in rendered + "\n"
+
+
+async def test_an_in_progress_task_whose_agent_loop_ended_is_stale_at_once(db_session) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Task
+    from packages.core.models.task_coordinator import TaskCoordinatorRun
+    from packages.core.models.workspace import WorkspaceWorkBatch
+    from packages.core.services.workspace_work_reconciliation import reconcile_active_work_batches
+
+    workspace = SimpleNamespace(id=generate_ulid(), entity_id=generate_ulid())
+    now = datetime.now(timezone.utc)
+    tasks = {}
+    for name, phase in (("ended", "failed"), ("running", "running"), ("unstarted", None)):
+        task = Task(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+                    title=name, status="in_progress")
+        db_session.add(task)
+        if phase:
+            db_session.add(TaskCoordinatorRun(
+                task_id=task.id, entity_id=workspace.entity_id, workspace_id=workspace.id,
+                root_subscription_id="sub", root_agent_id="agent", selection_fingerprint="f",
+                lifecycle_generation="g", engine="agent_loop", phase=phase,
+            ))
+        tasks[name] = task.id
+    db_session.add(WorkspaceWorkBatch(workspace_id=workspace.id, entity_id=workspace.entity_id,
+                                      task_ids=list(tasks.values())))
+    await db_session.flush()
+
+    (snapshot,) = await reconcile_active_work_batches(db_session, workspace, now=now)
+
+    assert [item["task_id"] for item in snapshot["stale_tasks"]] == [tasks["ended"]]

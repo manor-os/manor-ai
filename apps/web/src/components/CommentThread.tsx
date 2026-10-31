@@ -7,6 +7,8 @@ import { useAuthStore } from "../stores/auth";
 import ConfirmDialog from "./ui/ConfirmDialog";
 import ContextMenu from "./ui/ContextMenu";
 import { IconComment, IconEdit, IconMoreHorizontal, IconThumbUp, IconTrash } from "./icons";
+import { userAvatarImage } from "../lib/userAvatar";
+import { getPreferredTimeZone } from "../lib/format";
 
 interface CommentThreadProps {
   resourceType: string;
@@ -54,10 +56,11 @@ function anchorLabel(anchor?: CommentAnchor | null) {
 
 function Avatar({ comment }: { comment: Comment }) {
   const name = getAuthorName(comment);
-  if (comment.user_avatar_url) {
+  const avatarSrc = userAvatarImage(comment.user_avatar_url);
+  if (avatarSrc) {
     return (
       <img
-        src={comment.user_avatar_url}
+        src={avatarSrc}
         alt=""
         className="comment-thread-avatar-img"
       />
@@ -156,8 +159,8 @@ function CommentItem({
         <Avatar comment={comment} />
         <div className="comment-thread-identity">
           <span className="comment-thread-author" title={author}>{author}</span>
-          <span className="comment-thread-time" title={comment.created_at ? new Date(comment.created_at).toLocaleString() : undefined}>
-            {comment.created_at ? new Date(comment.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}
+          <span className="comment-thread-time" title={comment.created_at ? new Date(comment.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : undefined}>
+            {comment.created_at ? new Date(comment.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() }) : ""}
             {comment.is_edited && !isDeleted && ` · ${t("component.comment_thread.edited")}`}
           </span>
         </div>

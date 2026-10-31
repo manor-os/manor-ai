@@ -14,6 +14,8 @@ async function prepareChat(page: Page) {
   await page.route(`**${apiBase}`, (route) => route.fulfill({ json: {
     channel_name: "Recovery chat", agent_name: "Support", language: "en", login_required: false,
   } }));
+  // Not a resident-private chat; history and the composer depend on this check.
+  await page.route(`**${apiBase}/resident?**`, (route) => route.fulfill({ json: { verified: false, expires_at: null } }));
 }
 
 async function openChat(page: Page) {
@@ -330,6 +332,29 @@ for (const terminal of ["completed", "interrupted-placeholder", "interrupted-emp
     }
   });
 }
+
+test("a remembered session whose conversation is gone starts a fresh chat", async ({ page }) => {
+  await prepareChat(page);
+  const sessionBodies: Array<Record<string, unknown>> = [];
+  await page.route(`**${apiBase}/resident?**`, (route) => {
+    const checked = new URL(route.request().url()).searchParams.get("session_id");
+    return route.fulfill(checked === sessionId
+      ? { status: 404, json: { detail: { code: "chat_session_not_found", message: "Chat session not found" } } }
+      : { json: { verified: false, expires_at: null } });
+  });
+  await page.route(`**${apiBase}/session`, (route) => {
+    sessionBodies.push(route.request().postDataJSON());
+    return route.fulfill({ json: { session_id: "fresh-session", conversation_id: "conversation-2", channel_config_id: "channel" } });
+  });
+  await page.route(`**${apiBase}/messages?**`, (route) => route.fulfill({ json: { messages: [], updates: [] } }));
+  await page.goto(`/chat/public/${token}`);
+
+  await expect(page.locator("textarea")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  expect(sessionBodies).toHaveLength(1);
+  expect(sessionBodies[0].session_id).toBeUndefined();
+  expect(await page.evaluate((key) => localStorage.getItem(key), `manor_public_chat_session:${token}`)).toBe("fresh-session");
+});
 
 test("an interrupted reply with saved text keeps that text", async ({ page }) => {
   await page.route(`**${apiBase}/messages?**`, (route) => route.fulfill({ json: { messages: [{

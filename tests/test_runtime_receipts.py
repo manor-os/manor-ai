@@ -60,6 +60,15 @@ def _p(tool, args, payload):
     return runtime_project_receipts(tool, args, payload)
 
 
+def test_derived_poster_is_the_file_receipt_only_when_ready():
+    poster = {"document_id": "poster-doc", "fs_path": "images/cover.png", "filename": "cover.png", "sha256": "c" * 64}
+    assert _p("derive_image_aspect", {}, {"ready": True, "derived": True, "poster": poster}) == [{
+        "kind": "file", "operation": "derive", "document_id": "poster-doc", "fs_path": "images/cover.png",
+        "name": "cover.png", "sha256": "c" * 64,
+    }]
+    assert _p("derive_image_aspect", {}, {"ready": False, "blocker": "no source", "poster": None}) == []
+
+
 def test_generate_file_document_projection():
     payload = {"created": True, "document": {
         "document_id": "doc1", "fs_path": "Workspaces/a/report.docx",
@@ -555,7 +564,8 @@ def test_render_recording_projects_every_output_and_the_delivery_receipt():
 
 
 @pytest.mark.parametrize(("tool", "operation"), [
-    ("compose_creative_publication", "publication"), ("compose_creative_dub", "dub"),
+    ("compose_creative_publication", "publication"), ("compose_creative_deck", "deck"), ("compose_creative_dub", "dub"),
+    ("compose_creative_video", "video"),
 ])
 def test_creative_compose_tools_project_their_returned_paths(tool, operation):
     payload = {"status": "completed", "files": ["w/o/publication.pptx", "w/o/publication.pdf", " ", 3, "w/o/notes.md"]}

@@ -13,6 +13,7 @@ from enum import StrEnum
 import logging
 import math
 import time
+import weakref
 
 from sqlalchemy import event
 from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
@@ -94,12 +95,35 @@ class DatabaseAdmission:
     peak_active: int = 0
     peak_waiting: int = 0
     max_wait_seconds: float = 0
+    # Sessions admitted on behalf of a task that already holds a permit.
+    nested_active: int = 0
+    nested_admissions: int = 0
     semaphore: asyncio.Semaphore = field(init=False)
+    holders: dict[object, int] = field(init=False)
 
     def __post_init__(self):
         self.semaphore = asyncio.Semaphore(self.policy.limit)
+        self.holders = {}
 
-    async def acquire(self) -> None:
+    def holds(self, owner: object | None) -> bool:
+        return owner is not None and self.holders.get(owner, 0) > 0
+
+    def enter_nested(self) -> None:
+        """Admit a Session whose caller already holds one of this gate's permits.
+
+        Waiting would be hold-and-wait on the caller's own permit: the caller
+        cannot finish its transaction until this Session returns. With limit 1
+        that is a guaranteed timeout; with N permits, N such callers deadlock.
+        The caller still counts once; extra connections are bounded by its own
+        nesting/fan-out, and the client pool and PgBouncer remain hard caps.
+        """
+        self.nested_active += 1
+        self.nested_admissions += 1
+
+    def exit_nested(self) -> None:
+        self.nested_active -= 1
+
+    async def acquire(self, owner: object | None = None) -> None:
         if self.semaphore.locked() and self.waiting >= self.policy.max_waiters:
             self.rejected += 1
             self.queue_full += 1
@@ -120,10 +144,31 @@ class DatabaseAdmission:
             self.max_wait_seconds = max(self.max_wait_seconds, time.monotonic() - start)
         self.active += 1
         self.peak_active = max(self.peak_active, self.active)
+        if owner is not None:
+            self.holders[owner] = self.holders.get(owner, 0) + 1
 
-    def release(self) -> None:
+    def release(self, owner: object | None = None) -> None:
+        if owner is not None:
+            remaining = self.holders.get(owner, 0) - 1
+            if remaining > 0:
+                self.holders[owner] = remaining
+            else:
+                self.holders.pop(owner, None)
         self.active -= 1
         self.semaphore.release()
+
+
+@dataclass(frozen=True)
+class _AdmissionLease:
+    gate: DatabaseAdmission
+    owner: object | None
+    nested: bool = False
+
+    def release(self) -> None:
+        if self.nested:
+            self.gate.exit_nested()
+        else:
+            self.gate.release(self.owner)
 
 
 class DatabaseAdmissionGroup:
@@ -163,7 +208,7 @@ class DatabaseAdmissionGroup:
         self.holders.discard(owner)
         self.semaphore.release()
 
-    async def wait_for_gate(self, gate: "DatabaseAdmission") -> None:
+    async def wait_for_gate(self, gate: "DatabaseAdmission", owner: object | None = None) -> None:
         """Enter the process gate behind every other caller already waiting.
 
         The group yields: it queues only when nobody else is waiting, so other
@@ -173,7 +218,7 @@ class DatabaseAdmissionGroup:
         while True:
             if gate.waiting == 0:
                 try:
-                    await gate.acquire()
+                    await gate.acquire(owner)
                     return
                 except DatabaseBusyError:
                     pass
@@ -184,6 +229,12 @@ class DatabaseAdmissionGroup:
 
 database_admission_group: ContextVar[DatabaseAdmissionGroup | None] = ContextVar(
     "database_admission_group", default=None,
+)
+# Tasks of this caller that took a permit: the current task and the tasks that
+# were holding one when they started it (asyncio copies context at creation).
+# Siblings started before or by another task are not included.
+_admission_lineage: ContextVar[tuple[weakref.ref, ...]] = ContextVar(
+    "database_admission_lineage", default=(),
 )
 
 
@@ -201,8 +252,31 @@ def _loop_admission(policy: AdmissionPolicy, *, scope: str = "business") -> Data
     return gates[key]
 
 
+def _extend_admission_lineage(*tasks: object | None) -> None:
+    lineage = _admission_lineage.get()
+    added = tuple(
+        weakref.ref(task) for task in dict.fromkeys(tasks)
+        if task is not None and not any(ref() is task for ref in lineage)
+    )
+    if added:
+        _admission_lineage.set((*lineage, *added))
+
+
 class DatabaseSession(Session):
     """Sync half of AsyncSession; get_bind runs before SQL/pool checkout."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # AsyncSession builds this synchronously in the caller's task and
+        # context: remember the caller that owns this Session's permits, and
+        # let tasks it starts from now on (tool calls) count as that caller.
+        try:
+            caller = asyncio.current_task()
+        except RuntimeError:  # no running loop (sync tooling)
+            caller = None
+        if caller is not None:
+            self.info["database_admission_caller"] = weakref.ref(caller)
+            _extend_admission_lineage(caller)
 
     def get_bind(self, mapper=None, *, clause=None, bind=None, **kwargs):
         resolved = super().get_bind(mapper, clause=clause, bind=bind, **kwargs)
@@ -210,6 +284,12 @@ class DatabaseSession(Session):
         # Workers behind PgBouncer can bypass both business gates. Retain the
         # managed Session's transaction tracking and the independent probe cap.
         if runtime is not None and not runtime.admission_enabled and not self.info.get("database_probe"):
+            return resolved
+        # Execution-lease statements (one short UPDATE per claim every 30s)
+        # fence the business work that holds this loop's permits. Waiting for
+        # those permits made renewals fail under load and owners give up
+        # leases nobody else could take; they run outside the business gate.
+        if runtime is not None and self.info.get("database_lease_control"):
             return resolved
         # Public AsyncSession.get_bind() is also used outside the bridge just
         # to inspect dialects. That must never acquire a connection/permit.
@@ -231,16 +311,45 @@ class DatabaseSession(Session):
                     await_only(group.acquire(owner))
                     self.info["database_admission_group"] = (group, owner)
                 gate = _loop_admission(policy, scope=scope)
+                # A business permit belongs to the caller that created this
+                # Session, not to whichever task runs a statement on it:
+                # agentic_loop runs tools in child tasks, and a tool that
+                # commits and re-locks the caller's Session must not leave the
+                # permit owned by a finished child (the caller's next credit
+                # preflight would then wait on it).
+                caller = owner
+                if scope == "business":
+                    created_by = self.info.get("database_admission_caller")
+                    caller = (created_by() if created_by is not None else None) or owner
+                # Only the business gate is reentrant; the probe cap stays strict.
+                lineage = _admission_lineage.get() if scope == "business" else ()
+                if gate.holds(owner if scope == "business" else None) or any(
+                    gate.holds(ref()) for ref in lineage
+                ):
+                    # This task, or the task that started it and is (usually)
+                    # awaiting it, holds a permit of this gate: e.g. the credit
+                    # preflight inside a Workspace draft turn's transaction.
+                    gate.enter_nested()
+                    gates[key] = _AdmissionLease(gate, None, nested=True)
+                    logger.debug(
+                        "database_admission_nested scope=%s request_id=%s nested_active=%s",
+                        scope, database_request_id.get(), gate.nested_active,
+                    )
+                    return resolved
                 held = self.info.get("database_admission_group") if scope == "business" else None
                 if held is None:
-                    await_only(gate.acquire())
+                    await_only(gate.acquire(caller))
                 else:
                     # The group's one waiter keeps its place until the group
                     # deadline rather than failing behind another request's
                     # long transaction. A final timeout leaves the permit in
                     # info: close() releases it with the session's admission.
-                    await_only(held[0].wait_for_gate(gate))
-                gates[key] = gate
+                    await_only(held[0].wait_for_gate(gate, caller))
+                gates[key] = _AdmissionLease(gate, caller)
+                if scope == "business":
+                    # The greenlet shares the task's context, so later Sessions
+                    # of this task and tasks it starts from now on see it.
+                    _extend_admission_lineage(owner, caller)
         return resolved
 
     def connection(self, bind_arguments=None, execution_options=None):
@@ -291,8 +400,8 @@ def _track_flush(session, flush_context, instances):
 @event.listens_for(DatabaseSession, "after_transaction_end")
 def _release_admission(session, transaction):
     if transaction is None or transaction.parent is None:
-        for gate in session.info.pop("database_admission", {}).values():
-            gate.release()
+        for lease in session.info.pop("database_admission", {}).values():
+            lease.release()
         _release_admission_group(session)
         session.info.pop("database_non_read_transaction", None)
 
@@ -365,6 +474,8 @@ class DatabaseRuntime:
             "peak_active_transactions": gate.peak_active if gate is not None else None,
             "peak_waiters": gate.peak_waiting if gate is not None else None,
             "max_wait_seconds": round(gate.max_wait_seconds, 3) if gate is not None else None,
+            "active_nested_transactions": gate.nested_active if gate is not None else None,
+            "nested_admissions": gate.nested_admissions if gate is not None else None,
         }
 
     def checkout(self, connection, record, proxy):

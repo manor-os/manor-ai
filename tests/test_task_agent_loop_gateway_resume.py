@@ -447,6 +447,70 @@ async def test_a_continuation_resumes_with_the_runs_web_sources_and_loaded_tools
     assert len(gateway.chart_runs) == 1 and len(seen) == 6
 
 
+# ── A required Skill's declared tools load with the run ──────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config", [{}, {"execution_mode": "instructions_only"}], ids=["prompt_skill", "instructions_only_guide"],
+)
+async def test_a_required_skills_declared_tools_are_callable_without_searching(db_session, monkeypatch, config):
+    """The Task carries out its Skill: the Skill's work tools load at the first wake.
+
+    Exact discovery under the run's own envelope decides what loads (a name
+    it refuses is not loaded or remembered), orchestration tools are not
+    requested, and the tool list (the cached prefix) does not change.
+    """
+    from packages.core.models.skill import Skill
+
+    host, wake = await hitl._start(db_session, monkeypatch)
+    refused = "mcp__shop__refund"
+    db_session.add(Skill(
+        entity_id=host.envelope.entity_id, name="Launch notes", slug="launch-notes",
+        system_prompt="Write the launch note.", tools=[CHART, "invoke_skill", "search_tools", refused],
+        config=config, status="active",
+    ))
+    task = await base._fresh(db_session, Task, host.task_id)
+    task.required_skills = ["launch-notes"]
+    await db_session.commit()
+    gateway = _install_gateway_run(monkeypatch, host)
+    seen = base._model(monkeypatch, [_CALL_CHART, _chart_called])
+
+    outcome = await hitl._run(db_session, host.task_id, wake)
+
+    assert outcome == {"status": "completed", "task_id": host.task_id}, outcome
+    assert len(gateway.chart_runs) == 1
+    assert gateway.chart_runs[0]["envelope"].discovered_tool_grants is gateway.envelopes[0].discovered_tool_grants
+    [preload] = gateway.discoveries
+    assert preload["mode"] == "exact" and sorted(preload["exact_names"]) == sorted([CHART, refused])
+    loop_call = gateway.loop_calls[0]
+    assert CHART not in {tool["function"]["name"] for tool in loop_call["tools"]}
+    assert "`launch-notes`" in loop_call["system_prompt"]
+    assert all("is not loaded for this request" not in str(m.get("content")) for m in seen[-1])
+    row = await base._fresh(db_session, TaskCoordinatorRun, host.run_id)
+    assert row.checkpoint["loaded_gateway_tools"] == [CHART]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("slug", "expected"), [
+    ("video-edit", {"video_edit", "probe_media", "render_frame_samples", "generate_file"}),
+    ("content-ledger", {"read_content_ledger", "record_content_ledger", "query_ledger", "visualize_workspace_ledgers"}),
+])
+async def test_builtin_skill_refs_resolve_to_their_declared_work_tools(db_session, slug, expected):
+    from packages.core.ai.runtime.skills import runtime_skill_refs_instruction_tool_names
+    from packages.core.models.base import generate_ulid
+    from packages.core.services.builtin_skill_loader import seed_builtin_skills
+
+    await seed_builtin_skills(db_session)
+
+    names = await runtime_skill_refs_instruction_tool_names(
+        db_session, [slug, "no-such-skill"], entity_id=generate_ulid(),
+    )
+
+    assert expected <= set(names)
+    assert not {"invoke_skill", "list_skills", "search_tools"} & set(names)
+
+
 # ── Restore never trusts a name the model could have planted ──────────
 
 

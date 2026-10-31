@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any
 
 from packages.core.ai.runtime.control import RuntimeTurnAborted
@@ -118,6 +119,80 @@ def runtime_apply_capability_refresh(
     applied = _AppliedCapabilityRefreshResult(str(result))
     applied._refresh = _CapabilityRefresh(envelope, frozenset(allowed), tuple(schemas.values()))
     return envelope, allowed, applied
+
+
+class RuntimeToolBindingReach(StrEnum):
+    """Where binding one first-party tool to an Agent would leave it."""
+
+    IN_SCOPE = "in_scope"  # already callable in this run: nothing to bind
+    BINDABLE = "bindable"  # a binding puts it into the Agent's runtime scope
+    POLICY_DENIED = "policy_denied"  # governance or this run's surface/profile forbids it
+    NOT_EXPOSED = "not_exposed"  # the runtime never exposes it to a bound Agent
+    NOT_REGISTERED = "not_registered"  # this deployment does not run it
+
+
+_REACH_MESSAGES = {
+    RuntimeToolBindingReach.POLICY_DENIED: (
+        "{name} is blocked for this Agent by the Workspace's governance or by this run's surface; "
+        "binding it cannot make it callable. Only the user can change that policy."
+    ),
+    RuntimeToolBindingReach.NOT_EXPOSED: (
+        "{name} is never exposed to a Workspace Agent's runtime scope, even when bound; "
+        "binding it cannot make it callable. Use the tool that covers it or another route."
+    ),
+    RuntimeToolBindingReach.NOT_REGISTERED: (
+        "{name} is not available on this deployment; binding it cannot make it callable."
+    ),
+}
+
+
+def runtime_tool_binding_reach(
+    name: str,
+    *,
+    envelope: RuntimeEnvelope,
+    registered_tool_schemas: Iterable[tuple[str, dict]] | None = None,
+) -> RuntimeToolBindingReach:
+    """Predict, with the runtime's own resolution, what binding ``name`` achieves.
+
+    Capability acquisition must agree with the scope the run will actually
+    get: a tool already in ``envelope`` needs no binding, and a tool the
+    surface/profile/governance resolution would still withhold after binding
+    is a precise refusal, never a "ready" request that applies as a no-op.
+    """
+    from packages.core.ai.runtime.policies import filter_runtime_tools
+    from packages.core.ai.runtime.tool_registry import runtime_registered_tool_surface_from_schemas
+
+    name = str(name or "").strip()
+    if name in envelope.effective_allowed_tool_names():
+        return RuntimeToolBindingReach.IN_SCOPE
+    if registered_tool_schemas is None:
+        from packages.core.ai.runtime.tool_registry import runtime_registered_tool_schemas
+
+        registered_tool_schemas = runtime_registered_tool_schemas()
+    schemas = tuple(registered_tool_schemas)
+    if name not in {schema_name for schema_name, _ in schemas}:
+        return RuntimeToolBindingReach.NOT_REGISTERED
+    if name in set(envelope.blocked_tool_names):
+        return RuntimeToolBindingReach.POLICY_DENIED
+    # The same surface resolution a turn runs, for this Agent's current scope
+    # plus the binding: co-bound tools can change what a binding exposes.
+    surface = runtime_registered_tool_surface_from_schemas(
+        schemas, bound_tool_names={*envelope.allowed_tool_names, name}, is_master=False,
+        mcp_allowed_names=set(), tool_profile=envelope.tool_profile,
+    )
+    if name not in surface.visible_tool_names:
+        return RuntimeToolBindingReach.NOT_EXPOSED
+    _, allowed, blocked = filter_runtime_tools(
+        surface=envelope.surface, profile=envelope.profile, tools=(), allowed_tool_names={name},
+    )
+    if name not in allowed or name in blocked:
+        return RuntimeToolBindingReach.POLICY_DENIED
+    return RuntimeToolBindingReach.BINDABLE
+
+
+def runtime_tool_binding_reach_message(name: str, reach: RuntimeToolBindingReach) -> str | None:
+    template = _REACH_MESSAGES.get(reach)
+    return template.format(name=name) if template else None
 
 
 def runtime_applied_capability_schemas(result: Any) -> list[dict[str, Any]] | None:

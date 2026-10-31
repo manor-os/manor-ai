@@ -57,6 +57,26 @@ class CreditUsageSummary:
     week_credits: int
     all_time_credits: int
     timezone: str
+    paid_by_provider: bool = False
+    """A client delivery trial's provider pays this Workspace's AI usage, so
+    the viewer's own ledger shows none of it."""
+
+
+async def _paid_by_provider(
+    db: AsyncSession, *, viewer_entity_id: str, owner_entity_id: str, workspace_id: str
+) -> bool:
+    from packages.core.services.billing_payer import (
+        TrialSponsorUnavailable,
+        resolve_billing_payer,
+    )
+
+    try:
+        payer = await resolve_billing_payer(db, entity_id=owner_entity_id, workspace_id=workspace_id)
+    except TrialSponsorUnavailable:
+        # Still a trial: the customer is not charged, new spend just fails.
+        return owner_entity_id == viewer_entity_id
+    # The provider reading its own spend here sees its numbers instead.
+    return payer.sponsored and payer.entity_id != viewer_entity_id
 
 
 async def get_workspace_credit_usage_summary(
@@ -66,7 +86,13 @@ async def get_workspace_credit_usage_summary(
     workspace_id: str,
     workspace_created_at: datetime,
     timezone_name: str | None,
+    owner_entity_id: str | None = None,
 ) -> CreditUsageSummary:
+    """Credits ``entity_id`` was charged in ``workspace_id``.
+
+    ``owner_entity_id`` is the Workspace's company (defaults to ``entity_id``);
+    it decides whether a trial provider pays instead.
+    """
     timezone_label = user_timezone_name(timezone_name)
     now = utc_now()
     today = user_current_date(timezone_label, now)
@@ -114,6 +140,12 @@ async def get_workspace_credit_usage_summary(
         week_credits=int(row.week_credits),
         all_time_credits=int(row.all_time_credits),
         timezone=timezone_label,
+        paid_by_provider=await _paid_by_provider(
+            db,
+            viewer_entity_id=entity_id,
+            owner_entity_id=owner_entity_id or entity_id,
+            workspace_id=workspace_id,
+        ),
     )
 
 

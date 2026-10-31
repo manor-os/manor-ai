@@ -196,6 +196,58 @@ class CredentialService:
         cc.credential_scheme = self._kp.backend
         cc.credentials = {}
 
+    # ── ChannelConfig inbound secret ──
+    #
+    # A Manor-generated secret that an external sender uses to sign
+    # callbacks for one ChannelConfig. It is separate from the provider
+    # credentials: source-linked configs keep no credential copy of their
+    # own, and editing the source connection must not rotate the secret
+    # already configured in the sender. Only the encrypted ref is stored,
+    # under ChannelConfig.config, so the routing row never holds plaintext.
+
+    @staticmethod
+    def _channel_inbound_secret_context(cc: "ChannelConfig") -> dict[str, str]:
+        return {
+            "kind": "channel_inbound_secret_v1",
+            "entity_id": str(cc.entity_id or ""),
+            "channel_config_id": str(cc.id or ""),
+        }
+
+    def store_channel_inbound_secret(self, cc: "ChannelConfig", secret: str) -> None:
+        if not secret:
+            raise ValueError("inbound secret is required")
+        ref = self._kp.encrypt(
+            json.dumps({"secret": secret}).encode("utf-8"),
+            self._channel_inbound_secret_context(cc),
+        )
+        cc.config = {
+            **(cc.config or {}),
+            "inbound_secret_ref": ref,
+            "inbound_secret_scheme": self._kp.backend,
+        }
+
+    def lease_channel_inbound_secret(
+        self,
+        cc: "ChannelConfig",
+        *,
+        requester: Requester,
+        reason: str,
+    ) -> Optional[str]:
+        """Return the inbound secret, or None when none was ever stored."""
+        config = cc.config or {}
+        ref = config.get("inbound_secret_ref")
+        if not ref:
+            return None
+        plaintext = self._lease(
+            scheme=str(config.get("inbound_secret_scheme") or self._kp.backend).lower(),
+            ref=ref,
+            legacy_plaintext=None,
+            context=self._channel_inbound_secret_context(cc),
+            requester=requester,
+            reason=reason,
+        )
+        return str(plaintext.get("secret") or "") or None
+
     # ── Resident Webchat (never a management credential) ──
 
     @staticmethod
@@ -233,6 +285,7 @@ class CredentialService:
             legacy_plaintext=None, context=self._webchat_resident_context(row),
             requester=requester, reason=reason,
         )
+
 
     # ── IntegrationSession (browser cookies / storage_state) ──
 

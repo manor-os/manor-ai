@@ -932,6 +932,8 @@ def _tool_display_metadata(
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.web.fetch",
             "display_params": {"target": _tool_target(args, fallback=target or "web page")},
         }
+    # list_sandbox_files / save_sandbox_file are retired tools; their names
+    # stay here only so persisted transcripts keep rendering.
     if lower_name.startswith("sandbox_") or lower_name in {"list_sandbox_files", "save_sandbox_file"}:
         if lower_name == "sandbox_exec":
             key = "sandbox.exec"

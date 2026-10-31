@@ -10,6 +10,12 @@ import re
 from pathlib import Path
 
 from packages.core.ai.runtime.tool_registry import runtime_tool_schema
+from packages.core.ai.runtime.skills import (
+    runtime_prepare_prompt_skill_tool_surface,
+    runtime_skill_tools_withheld_from_surface,
+)
+from packages.core.ai.runtime.tool_visibility import resolve_runtime_tool_surface
+from packages.core.services.builtin_skill_loader import packaged_builtin_skill_declaration
 from packages.core.services.builtin_skill_loader import _builtin_skill_dirs, _read_builtin_skill_extra_files
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "packages/core/ai/skills"
@@ -140,6 +146,25 @@ def test_motion_design_names_only_tools_video_edit_can_call():
 
 def test_video_production_requires_normalized_narration_segments():
     assert {"normalize_audio_loudness", "build_narration_timeline"} <= set(_config("video-production")["tools"])
+
+
+def test_video_production_uses_tools_reachable_from_its_bound_agent():
+    # The Agent's public generation gateway shadows low-level image/video tools.
+    # A nested production Skill must still have every declared dependency.
+    skill = packaged_builtin_skill_declaration("video-production")
+    registered = tuple(skill.tools)
+    parent = resolve_runtime_tool_surface(
+        registered, bound_tool_names=set(registered), is_master=False,
+        mcp_allowed_names=set(),
+    )
+    child = runtime_prepare_prompt_skill_tool_surface(
+        skill, allowed_tool_names=parent.visible_tool_names,
+        get_registered_tool_names=lambda: registered,
+    )
+    assert runtime_skill_tools_withheld_from_surface(
+        skill, child, registered_tool_names=registered,
+    ) == ()
+    assert "generate_file" in child.skill_tool_names
 
 
 _INVOKE_SKILL_CALL = re.compile(r"invoke_skill\(([^)]*)\)")

@@ -10,6 +10,18 @@ from urllib.parse import quote
 logger = logging.getLogger(__name__)
 
 
+def _collaborator_steered(entity_id: str) -> bool:
+    """Whether the runtime gate found an external collaborator behind this call."""
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    return bool(collaborators_acting_now(entity_id))
+
+
+def runtime_rag_collaborator_scope(entity_id: str, trusted_workspace_id: str | None) -> dict[str, Any]:
+    """The trusted run Workspace for a collaborator-steered search, else nothing to pass."""
+    return {"trusted_workspace_id": trusted_workspace_id} if _collaborator_steered(entity_id) else {}
+
+
 async def runtime_rag_action(
     *,
     entity_id: str,
@@ -18,8 +30,16 @@ async def runtime_rag_action(
     client_visible_only: bool = False,
     public_agent_visible_only: bool = False,
     params: dict[str, Any] | None = None,
+    trusted_workspace_id: str | None = None,
 ) -> str:
-    """Semantic search across entity, workspace, or Knowledge Net documents."""
+    """Semantic search across entity, workspace, or Knowledge Net documents.
+
+    A search with no User behind it in a run an external collaborator steered
+    (their Task, or a run they started) reads only the run's own Workspace:
+    the trusted run Workspace replaces any model-chosen Workspace, and
+    model-chosen Knowledge Nets can only narrow it. Other user-less searches
+    are not narrowed.
+    """
 
     raw_params = dict(params or {})
     question = (raw_params.get("question") or "").strip()
@@ -28,6 +48,15 @@ async def runtime_rag_action(
 
     limit = min(max(int(raw_params.get("limit") or 5), 1), 20)
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
+    steered_user_less = not user_id and not client_visible_only and _collaborator_steered(entity_id)
+    if steered_user_less:
+        workspace_scope = str(trusted_workspace_id or "").strip() or None
+        if workspace_scope is None:
+            return json.dumps({
+                "context": "", "sources": [], "source_count": 0, "scope": "workspace",
+                "evidence_mode": "none", "content_evidence_available": False,
+                "message": "Knowledge search without a user is limited to the run's Workspace.",
+            })
     net_ids = _runtime_rag_id_list(raw_params.get("net_ids") or raw_params.get("group_ids"))
 
     from packages.core.database import async_session
@@ -62,6 +91,10 @@ async def runtime_rag_action(
         except Exception:
             logger.warning("hybrid_search failed", exc_info=True)
 
+        if results and steered_user_less:
+            results = await _runtime_rag_filter_to_system_workspace(
+                db, results, entity_id=entity_id, workspace_id=workspace_scope,
+            )
         if results and client_visible_only:
             results = await _runtime_rag_filter_to_client_visible_documents(
                 db,
@@ -239,6 +272,32 @@ async def _runtime_rag_filter_to_workspace(
     )).scalars().all()
     allowed = set(rows)
     return [result for result in results if result["document_id"] in allowed]
+
+
+async def _runtime_rag_filter_to_system_workspace(
+    db: Any,
+    results: list[dict[str, Any]],
+    *,
+    entity_id: str,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """User-less turns: documents filed in the run Workspace, never private or restricted."""
+    from packages.core.services.document_access import _QUARANTINED_STATUSES
+    from packages.core.services.document_service import get_document
+
+    in_workspace = await _runtime_rag_filter_to_workspace(db, results, workspace_id)
+    visible: list[dict[str, Any]] = []
+    for result in in_workspace:
+        document = await get_document(db, result["document_id"], entity_id)
+        if (
+            document is None
+            or getattr(document, "visibility", None) == "private"
+            or getattr(document, "classification", None) == "restricted"
+            or getattr(document, "quarantine_status", None) in _QUARANTINED_STATUSES
+        ):
+            continue
+        visible.append(result)
+    return visible
 
 
 async def _runtime_rag_filter_to_visible_documents(

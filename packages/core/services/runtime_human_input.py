@@ -85,7 +85,7 @@ def _hitl_payload(question: dict[str, Any], *, conversation_id: str | None) -> d
         ),
         "action_to_take": "Reply in the chat; the assistant continues with your answer.",
     }
-    for key in ("options", "fields", "context", "justification"):
+    for key in ("options", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
         if question.get(key):
             payload[key] = question[key]
     if conversation_id:
@@ -111,6 +111,13 @@ async def mint_runtime_human_input_request(
     question = _question_payload(control)
     if not str(question.get("question") or "").strip():
         raise ValueError("human-input suspension carries no question")
+    justification = question.get("justification") if isinstance(question.get("justification"), dict) else {}
+    if justification.get("kind") == "file_review":
+        # The person reviews the files themselves, not their paths.
+        from packages.core.services.workflow_review_files import review_files_from_refs
+
+        question["review_files"] = await review_files_from_refs(
+            db, entity_id=run.entity_id, refs=justification.get("file_refs") or [])
     tool_call_id = _pending_call_id(control)
     request = await mint_approval_request(
         db,
@@ -162,7 +169,7 @@ async def human_input_projection(
         "question": str(question.get("question") or request.reason or ""),
         "deadline_at": context.get("deadline_at"),
     }
-    for key in ("options", "fields", "context", "justification"):
+    for key in ("options", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
         if question.get(key):
             projection[key] = question[key]
     answer = context.get("answer")
@@ -424,13 +431,17 @@ async def record_human_input_question_message(
     text = human_input_question_text(question) or str(request.reason or "").strip()
     if not text:
         return None
+    from packages.core.models.task import Message
     from packages.core.services.conversation_messages import add_message
 
+    # The question is the asking agent's, as is the turn it interrupts.
+    turn = await db.get(Message, run.assistant_message_id) if run.assistant_message_id else None
     message = await add_message(
         db,
         run.conversation_id,
         role="assistant",
         content=text,
+        author_subscription_id=getattr(turn, "author_subscription_id", None),
         meta={
             "runtime_input_request_id": request.id,
             "runtime_run_id": run.id,
@@ -446,9 +457,10 @@ async def record_human_input_answer_message(
     *,
     run: RuntimeRun,
     answer_text: str,
+    user_id: str | None = None,
 ) -> Any:
-    """Persist the answer as a user message and place the assistant's reply
-    after it.
+    """Persist the answer as the answering person's message and place the
+    assistant's reply after it.
 
     The assistant placeholder was created when the turn started, before the
     question; ordered by ``created_at`` it would render above the answer.
@@ -481,6 +493,8 @@ async def record_human_input_answer_message(
             "runtime_input_request_id": run.human_input_request_id,
             "runtime_run_id": run.id,
             "runtime_input_role": "answer",
+            # Messages have no author column; chat reads the person from here.
+            **({"author_user_id": user_id} if user_id else {}),
         },
     )
     message.created_at = now

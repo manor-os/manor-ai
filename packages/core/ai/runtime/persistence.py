@@ -218,22 +218,6 @@ async def runtime_persist_channel_hold_runtime_events(
     )
 
 
-async def runtime_persist_internal_worker_runtime_events(
-    envelope: RuntimeEnvelope | None,
-    *,
-    message_id: str | None = None,
-    trace_id: str | None = None,
-) -> int:
-    """Persist InternalWorker Runtime events with Runtime-owned source."""
-
-    return await _runtime_persist_events_best_effort(
-        envelope,
-        source=RUNTIME_INTERNAL_WORKER_EVENT_SOURCE,
-        message_id=message_id,
-        trace_id=trace_id,
-    )
-
-
 def attach_runtime_meta(
     payload: dict[str, Any],
     envelope: RuntimeEnvelope | None,

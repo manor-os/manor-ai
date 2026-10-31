@@ -49,7 +49,6 @@ from packages.core.models.workspace import (
     ToolDefinition,
     Workspace,
 )
-from packages.core.models.worker import SubscriptionWorker
 from packages.core.services.workspace_readiness import (
     evaluate_workspace_blocking_setup,
 )
@@ -150,6 +149,7 @@ async def test_live_install_does_not_persist_simulation_only_settings(
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == result.workspace_id))).scalar_one()
     assert "sandbox" not in workspace.settings
     assert "simulation_experience" not in workspace.settings
+    assert workspace.status == "paused"
 
 
 async def test_installed_usage_guide_remains_available_and_reexports(
@@ -545,7 +545,7 @@ async def test_embedded_agent_creates_with_tool_bindings(
     assert bindings[0].tool_id == td.id
 
 
-async def test_existing_agent_reconciles_all_bindings_and_subscription_worker(
+async def test_existing_agent_reconciles_all_bindings(
     db_session: AsyncSession,
     entity_id: str,
 ):
@@ -707,14 +707,6 @@ async def test_existing_agent_reconciles_all_bindings_and_subscription_worker(
         .scalars()
         .all()
     )
-    worker_binding = (
-        await db_session.execute(
-            select(SubscriptionWorker).where(
-                SubscriptionWorker.subscription_id == subscription.id,
-            )
-        )
-    ).scalar_one_or_none()
-    assert worker_binding is not None
 
 
 async def test_embedded_agent_missing_tool_raises_install_error(
@@ -798,7 +790,11 @@ async def test_optional_missing_mcp_does_not_block_workspace(
             "contract.requires": {
                 "manor_min_version": None,
                 "tools": [],
-                "mcp_servers": [{"slug": server_slug, "required": False}],
+                "mcp_servers": [{
+                    "slug": server_slug,
+                    "required": False,
+                    "install_blocking": False,
+                }],
                 "skills": [],
                 "agents": [],
             },
@@ -825,7 +821,78 @@ async def test_optional_missing_mcp_does_not_block_workspace(
     assert [todo for todo in result.todos if todo.kind == "mcp_server"]
     assert all(todo.blocking is False for todo in result.todos)
     assert workspace.settings["_blueprint"]["blocking_todo_count"] == 0
+    reexported = await export_workspace(
+        db_session, workspace.id, title="Optional MCP roundtrip"
+    )
+    assert reexported["contract"]["requires"]["mcp_servers"] == [{
+        "slug": server_slug,
+        "purpose": None,
+        "config_fields_to_set": [],
+        "required": False,
+        "install_blocking": False,
+    }]
     assert await evaluate_workspace_blocking_setup(db_session, workspace) is None
+
+
+async def test_internal_mcp_binding_does_not_create_setup_work(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    server = (await db_session.execute(
+        select(MCPServer).where(MCPServer.server_key == "chrome_knowledge_local")
+    )).scalar_one_or_none()
+    if server is None:
+        server = MCPServer(
+            id=generate_ulid(),
+            server_key="chrome_knowledge_local",
+            name="Chrome Knowledge Upload Prep",
+            transport="builtin",
+            auth_type="none",
+            status="active",
+        )
+        db_session.add(server)
+        await db_session.flush()
+    payload = _base_payload(
+        **{
+            "contract.requires": {
+                "manor_min_version": None,
+                "tools": [],
+                "mcp_servers": [{"slug": "chrome_knowledge_local"}],
+                "skills": [],
+                "agents": [],
+            },
+            "embedded.agents": [{
+                "slug": f"internal-mcp-agent-{entity_id}",
+                "name": "Internal MCP Agent",
+                "system_prompt": "Use the internal bridge.",
+                "config": {},
+                "tool_bindings": [],
+                "mcp_bindings": [{
+                    "server_slug": "chrome_knowledge_local",
+                    "allowed_tools": ["prepare_upload"],
+                    "config_override_allowlist": [],
+                }],
+                "skill_bindings": [],
+                "starter_memory": [],
+            }],
+        }
+    )
+
+    result = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    workspace = await db_session.get(Workspace, result.workspace_id)
+    assert workspace is not None
+    assert result.todos == []
+    assert workspace.settings["_blueprint"]["live_setup_requirements"] == []
+    assert (await db_session.execute(
+        select(AgentMCPBinding).where(AgentMCPBinding.mcp_server_id == server.id)
+    )).scalar_one_or_none() is not None
+
+    rebuilt = await sync_workspace_live_setup_requirements(
+        db_session,
+        workspace=workspace,
+        payload=payload,
+    )
+    assert rebuilt == []
 
 
 async def test_mcp_contract_config_fields_remain_a_live_blocker(
@@ -1978,6 +2045,62 @@ async def test_identical_duplicate_knowledge_groups_export_as_one_pack(
     assert installed.workspace_id != source.workspace_id
 
 
+async def test_same_title_knowledge_packs_keep_distinct_blueprint_slugs_on_install(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(**{
+        "embedded.knowledge_packs": [
+            {
+                "slug": "workspace-knowledge-2",
+                "title": "Workspace Knowledge",
+                "purpose": "General background",
+                "mode": "skeleton",
+                "folder_structure": [],
+                "starter_documents": [],
+                "external_source": None,
+            },
+            {
+                "slug": "workspace-knowledge-3",
+                "title": "Workspace Knowledge",
+                "purpose": "General background",
+                "mode": "skeleton",
+                "folder_structure": [],
+                "starter_documents": [],
+                "external_source": None,
+            },
+        ],
+    })
+
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    groups = list((await db_session.execute(select(DocumentGroup).where(
+        DocumentGroup.workspace_id == installed.workspace_id,
+    ))).scalars().all())
+    assert {
+        group.settings["installed_from_blueprint_slug"] for group in groups
+    } == {"workspace-knowledge-2", "workspace-knowledge-3"}
+
+    reexported = await export_workspace(db_session, installed.workspace_id, title="Copy")
+    assert [pack["slug"] for pack in reexported["embedded"]["knowledge_packs"]] == [
+        "workspace-knowledge-2", "workspace-knowledge-3",
+    ]
+
+    from packages.core.blueprints.installer import _install_knowledge_pack
+
+    original = next(
+        group for group in groups
+        if group.settings["installed_from_blueprint_slug"] == "workspace-knowledge-2"
+    )
+    renamed = {**payload["embedded"]["knowledge_packs"][0], "title": "Renamed Knowledge"}
+    assert await _install_knowledge_pack(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=installed.workspace_id,
+        kp=renamed,
+        todos=[],
+    ) == original.id
+
+
 async def test_conflicting_duplicate_knowledge_groups_fail_export(
     db_session: AsyncSession,
     entity_id: str,
@@ -1990,9 +2113,15 @@ async def test_conflicting_duplicate_knowledge_groups_fail_export(
         }],
     })
     source = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    original = (await db_session.execute(select(DocumentGroup).where(
+        DocumentGroup.workspace_id == source.workspace_id,
+    ))).scalar_one()
     db_session.add(DocumentGroup(
         id=generate_ulid(), entity_id=entity_id, workspace_id=source.workspace_id,
-        name="Workspace Knowledge", settings={"purpose": "Different"},
+        name="Workspace Knowledge", settings={
+            **dict(original.settings or {}),
+            "purpose": "Different",
+        },
     ))
     await db_session.flush()
 

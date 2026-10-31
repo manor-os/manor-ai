@@ -34,12 +34,10 @@ from packages.core.constants.approvals import (
 from packages.core.constants.blueprints import BlueprintStatus
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.constants.execution import (
-    ExecutionPlanStatus,
     ExecutionStepStatus,
     WorkerStatus,
     WorkLeaseStatus,
 )
-from packages.core.constants.supervisor import SupervisorVerdict
 from packages.core.models.media_job import MediaJobStatus
 from packages.core.constants.task import TASK_TYPES, TaskLogType, TaskStatus, TaskType
 
@@ -64,23 +62,10 @@ EXEMPT_PATHS = (
 #: files that own the vocabulary, and the scan looks only at those.
 VOCABULARIES: tuple[tuple[str, tuple[str, ...], type, tuple[str, ...]], ...] = (
     ("execution step status", ("step_status",), ExecutionStepStatus, ()),
-    (
-        "execution plan status",
-        # ``status`` bare is the executor's local for the plan's terminal
-        # status. It is scoped to that file because the name is too common to
-        # scan repo-wide — and it is here because the sweep's first pass missed
-        # it: `if status == "completed"` was still deciding whether to post
-        # "## Task Completed" long after every attribute-qualified site was
-        # converted.
-        ("ExecutionPlan.status", "plan.status", "plan_row.status", "status"),
-        ExecutionPlanStatus,
-        ("packages/core/plans/executor.py",),
-    ),
     ("work lease status", ("WorkLease.status", "lease.status"), WorkLeaseStatus, ()),
     ("worker status", ("Worker.status", "worker.status", "w.status"), WorkerStatus, ()),
     ("task status", ("Task.status", "task.status", "task_row.status"), TaskStatus, ()),
     ("task log type", ("log_type", "TaskLog.log_type"), TaskLogType, ()),
-    ("supervisor verdict", ("verdict", "decision.verdict"), SupervisorVerdict, ()),
     (
         "approval status",
         ("HitlRequest.status", "req.status", "request.status"),
@@ -253,29 +238,6 @@ def test_task_logs_are_written_with_the_log_type_enum() -> None:
     )
 
 
-def test_supervisor_verdict_log_type_is_the_enum_value() -> None:
-    """The writer and the reader of the verdict log share one spelling."""
-    from packages.core.constants.supervisor import SUPERVISOR_VERDICT_LOG_TYPE
-
-    assert SUPERVISOR_VERDICT_LOG_TYPE == TaskLogType.AI_SUPERVISOR_VERDICT.value
-
-
-def test_plan_terminal_log_types_exist_for_every_terminal_plan_status() -> None:
-    """``plan_terminal_log_type`` replaced an f-string that could build a
-    type nothing knew about. Every terminal plan status must map to a real
-    log type, or the call raises in production instead of at import.
-    """
-    from packages.core.constants.task import plan_terminal_log_type
-
-    for status in (
-        ExecutionPlanStatus.COMPLETED,
-        ExecutionPlanStatus.FAILED,
-        ExecutionPlanStatus.CANCELLED,
-        ExecutionPlanStatus.REPLANNED,
-    ):
-        assert plan_terminal_log_type(status.value) in TaskLogType.values()
-
-
 def test_task_status_enum_matches_the_status_catalog() -> None:
     """The enum and the label/colour catalog the UI reads describe the same
     set of states — neither may grow a state the other has never heard of.
@@ -301,22 +263,6 @@ def test_open_and_terminal_step_statuses_partition_the_vocabulary() -> None:
 
     assert STEP_OPEN_STATUSES | STEP_TERMINAL_STATUSES == set(ExecutionStepStatus)
     assert not (STEP_OPEN_STATUSES & STEP_TERMINAL_STATUSES)
-
-
-def test_step_status_enum_covers_what_the_timeline_offers_to_retry() -> None:
-    """The execution timeline offers a retry per step status. A status it
-    knows and the backend doesn't is a button wired to nothing.
-    """
-    source = (
-        REPO_ROOT / "apps/web/src/components/task/TaskExecutionTimeline.tsx"
-    ).read_text()
-    block = re.search(
-        r"const RETRYABLE_STEP_STATUSES = new Set\(\[(.*?)\]\);", source, re.S
-    )
-    assert block, "RETRYABLE_STEP_STATUSES moved — update this check, don't delete it"
-    claimed = set(re.findall(r'"([a-z_]+)"', block.group(1)))
-    unknown = sorted(claimed - set(ExecutionStepStatus.values()))
-    assert not unknown, f"timeline offers retry for unknown step statuses: {unknown}"
 
 
 def test_worker_reported_step_status_aliases_resolve_to_members() -> None:

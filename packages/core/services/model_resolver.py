@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.sql import or_
@@ -176,15 +176,66 @@ def default_llm_model() -> str:
 
 # ── DB-loading variant — most callers use this ──────────────────────────────
 
+_PAYER_UNAVAILABLE = object()
+
+
+async def _payer_scope(
+    entity_id: Optional[str],
+    *,
+    workspace_id: Optional[str],
+    db: Optional[AsyncSession],
+) -> Any:
+    """Return the entity whose models and keys serve this call: the payer.
+
+    During a client delivery trial that is the provider, not the Workspace's
+    data owner. Without ``workspace_id`` the bound billing context decides
+    when it is for the same entity and names a Workspace. Returns
+    ``_PAYER_UNAVAILABLE`` when the trial's provider is gone.
+    """
+    if not entity_id:
+        return entity_id
+    from packages.core.services.billing_payer import (
+        TrialSponsorUnavailable,
+        payer_entity_id,
+        trial_provider_pays_enabled,
+    )
+
+    if not trial_provider_pays_enabled():
+        return entity_id
+    if workspace_id:
+        try:
+            if db is not None:
+                return await payer_entity_id(db, entity_id, workspace_id)
+            from packages.core.database import async_session
+
+            async with async_session() as fresh:
+                return await payer_entity_id(fresh, entity_id, workspace_id)
+        except TrialSponsorUnavailable:
+            return _PAYER_UNAVAILABLE
+    from packages.core.ai.llm_client import CreditExhaustedError, _billing_ctx_var, billing_context_payer
+
+    bound = _billing_ctx_var.get()
+    if bound is None or bound.entity_id != entity_id or not bound.workspace_id:
+        return entity_id
+    try:
+        return await billing_context_payer(bound, db=db)
+    except CreditExhaustedError:
+        return _PAYER_UNAVAILABLE
+
+
 async def resolve_model_for_user(
     role: str,
     *,
     user_id: Optional[str] = None,
     entity_id: Optional[str] = None,
     db: Optional[AsyncSession] = None,
+    workspace_id: Optional[str] = None,
 ) -> str:
     """Resolve the model id for a role, loading user prefs + entity
     settings as needed.
+
+    ``workspace_id`` names the Workspace the call runs in: its payer's model
+    settings apply (the provider during a client delivery trial).
 
     ``db`` is optional — when omitted, this opens its own short-lived
     session. Pass ``db`` when you're already inside a transaction so
@@ -196,6 +247,13 @@ async def resolve_model_for_user(
     user_prefs = None
     entity_settings = None
     owner_prefs = None
+    try:
+        payer = await _payer_scope(entity_id, workspace_id=workspace_id, db=db)
+    except Exception:
+        logger.debug("model_resolver: payer lookup failed", exc_info=True)
+        payer = entity_id
+    if payer is not _PAYER_UNAVAILABLE:
+        entity_id = payer
 
     if user_id or entity_id:
         try:
@@ -305,7 +363,7 @@ def _configured_model(
     disabled = set(
         ((platform_settings or {}).get("disabled_models") or {}).get(role) or []
     )
-    if model_preference_is_available(role, model_id, disabled_models=disabled):
+    if model_preference_is_available(role, model_id, disabled_models=disabled, settings=settings):
         return model_id
     return None
 
@@ -360,16 +418,44 @@ async def resolve_llm_metadata_for_user(
     user_id: Optional[str] = None,
     entity_id: Optional[str] = None,
     db: Optional[AsyncSession] = None,
+    workspace_id: Optional[str] = None,
 ) -> dict | None:
     """Resolve BYOK metadata for a role, loading preferences as needed.
 
     Applies the BYOK plan gate (``byok_allowed_for_plan``) so a user on
     the public Free plan has their stored API key silently ignored —
     Manor's gateway stays in the loop and the credit meter keeps
-    counting."""
+    counting.
+
+    ``workspace_id`` (or the bound billing context) selects the payer's
+    keys. Metadata resolved for a payer other than ``entity_id`` carries
+    ``_byok_entity_id`` so the LLM client can refuse a key whose owner is
+    not the payer of the call it serves."""
 
     if not user_id and not entity_id:
         return None
+    requested_entity_id = entity_id
+    try:
+        payer = await _payer_scope(entity_id, workspace_id=workspace_id, db=db)
+    except Exception:
+        logger.debug("model_resolver: payer lookup failed for BYOK", exc_info=True)
+        return None
+    if payer is _PAYER_UNAVAILABLE:
+        return None
+    entity_id = payer
+    metadata = await _resolve_llm_metadata(role, user_id=user_id, entity_id=entity_id, db=db)
+    if metadata and entity_id and entity_id != requested_entity_id:
+        metadata = {**metadata, "_byok_entity_id": entity_id}
+    return metadata
+
+
+async def _resolve_llm_metadata(
+    role: str,
+    *,
+    user_id: Optional[str],
+    entity_id: Optional[str],
+    db: Optional[AsyncSession],
+) -> dict | None:
     try:
         if db is not None:
             user_prefs, entity_settings, entity_plan_id, owner_prefs = await _load_prefs(
@@ -562,7 +648,31 @@ def resolve_llm_metadata_from_settings(
     )
     if base_url and str(base_url).strip():
         meta["llm_base_url"] = str(base_url).strip()
+    limits = model_limits_from_settings(settings, key_role, bound_model or str(selected_model or "").strip())
+    if limits:
+        from packages.core.services.model_context_window import MODEL_LIMITS_METADATA_KEY
+
+        meta[MODEL_LIMITS_METADATA_KEY] = limits
     return meta
+
+
+def model_limits_from_settings(settings: dict | None, role: str, model: str) -> dict | None:
+    """Limits declared with ``role``'s BYOK credential, when bound to ``model``.
+
+    Stored as ``settings.llm_model_limits[role] = {"model", "context_window_tokens",
+    "max_output_tokens"}``; an entry saved for another model is stale.
+    """
+    from packages.core.services.model_context_window import normalize_model_limits
+
+    entry = ((settings or {}).get("llm_model_limits") or {}).get(role)
+    if not isinstance(entry, dict) or not model or str(entry.get("model") or "").strip() != model:
+        return None
+    try:
+        limits = normalize_model_limits(entry.get("context_window_tokens"), entry.get("max_output_tokens"))
+    except ValueError:
+        logger.warning("model_resolver: ignoring invalid llm_model_limits for role=%s", role)
+        return None
+    return {"model": model, **limits} if limits else None
 
 
 def resolve_llm_metadata_from_objects(

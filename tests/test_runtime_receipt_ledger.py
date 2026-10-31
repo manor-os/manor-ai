@@ -1148,3 +1148,193 @@ def test_effect_seen_set_outlives_the_observation_window():
     from packages.core.ai.runtime import tool_evidence
 
     assert tool_evidence._MAX_EFFECT_CALL_IDS > tool_evidence._OBSERVATION_WINDOW
+
+
+# --- A Skill call's effect state is its child ledger's --------------------
+
+
+def _skill_result(child: RuntimeToolEvidence, **reply) -> RuntimeStructuredToolResult:
+    from packages.core.ai.runtime.skills import runtime_format_invoke_skill_result
+
+    result = runtime_format_invoke_skill_result("video", {
+        "content": "done", "stop_reason": "completed", "tool_evidence": child.checkpoint_state(), **reply,
+    })
+    assert isinstance(result, RuntimeStructuredToolResult)
+    return result
+
+
+@pytest.mark.parametrize("reply", [
+    {},
+    # The Skill reports its own verdict as not fully done (disclosed exceptions).
+    {"content": json.dumps({"status": "PARTIAL", "notes": "one stem 0.1 LU low"})},
+    {"stop_reason": "max_rounds"},
+    {"error": "provider error after the render", "stop_reason": "error"},
+], ids=["completed", "partial-verdict", "max-rounds", "error"])
+def test_a_skill_that_committed_a_file_is_confirmed_whatever_its_reply_says(reply):
+    child = RuntimeToolEvidence()
+    child.observe_tool_result("generate_file", "c-1", _doc("render"), {"kind": "video"})
+    parent = RuntimeToolEvidence()
+    parent.observe_tool_result("invoke_skill", "p-1", _skill_result(child, **reply), {"skill": "video"})
+
+    state = parent.checkpoint_state()
+    assert parent.observations["p-1"]["effect_state"] == "confirmed"
+    assert state["unconfirmed_calls"] == [] and state["effect_state"] == "confirmed"
+    assert [r["document_id"] for r in state["receipts"]] == ["render"]
+
+
+def test_a_skill_that_wrote_nothing_is_none_and_an_uncertain_child_call_stays_unconfirmed():
+    reads = RuntimeToolEvidence()
+    reads.observe_tool_result("read_file", "c-1", json.dumps({"content": "x"}), {"path": "a.md"})
+    nothing = RuntimeToolEvidence()  # the child loop ran and made no call
+    failed = RuntimeToolEvidence()
+    failed.observe_tool_result("generate_file", "c-1", json.dumps({"error": "timeout after upload"}), {"kind": "md"})
+
+    for child, expected in ((reads, "none"), (nothing, "none"), (failed, "unconfirmed")):
+        parent = RuntimeToolEvidence()
+        parent.observe_tool_result("invoke_skill", "p-1", _skill_result(child), {"skill": "video"})
+        assert parent.observations["p-1"]["effect_state"] == expected
+        assert parent.effect_state == expected
+    # Listed once, as the child call that may have had the effect.
+    assert [c["call_id"] for c in parent.unconfirmed_calls] == ["p-1/c-1"]
+
+
+def test_a_nested_skill_that_reported_failure_over_its_render_leaves_the_run_confirmed():
+    """The production case: Skill A invokes Skill B, which renders the MP4 and
+    reports a partial verdict. Neither call may stay unconfirmed."""
+    grandchild = RuntimeToolEvidence()
+    grandchild.observe_tool_result("generate_file", "g-1", _doc("final-mp4"), {"kind": "video"})
+    child = RuntimeToolEvidence()
+    child.observe_tool_result("invoke_skill", "c-1", _skill_result(
+        grandchild, content=json.dumps({"status": "PARTIAL"}),
+    ), {"skill": "topic-explainer"})
+    for i in range(140):  # more child calls than the observation window
+        child.observe_tool_result("read_file", f"c-read-{i}", json.dumps({"content": "x"}), {"path": "a"})
+    parent = RuntimeToolEvidence()
+    parent.observe_tool_result("invoke_skill", "p-1", _skill_result(child), {"skill": "video-production"})
+
+    state = parent.checkpoint_state()
+    assert state["effect_state"] == "confirmed" and state["unconfirmed_calls"] == []
+    assert [(r["call_id"], r["document_id"]) for r in state["receipts"]] == [("p-1/c-1/g-1", "final-mp4")]
+    # The caller outlives its own children in the bounded window (the journal
+    # reads its effect state there).
+    assert list(parent.observations)[-1] == "p-1"
+    assert parent.observations["p-1"]["effect_state"] == "confirmed"
+
+
+# --- Reconciliation: a host read of the reported file confirms the call ----
+
+
+def _uncertain_doc(document_id: str, sha256: str) -> str:
+    # The file was registered, then a later step failed: unconfirmed.
+    return json.dumps({"error": "thumbnail step failed", "document": {
+        "document_id": document_id, "fs_path": f"out/{document_id}.md", "source_sha256": sha256,
+    }})
+
+
+def _host_read(document_id: str, sha256: str) -> str:
+    return json.dumps({
+        "path": f"out/{document_id}.md", "resolved_path": f"out/{document_id}.md",
+        "document_id": document_id, "source_sha256": sha256, "size": 10,
+    })
+
+
+def test_a_host_read_with_the_reported_hash_confirms_an_unconfirmed_call():
+    from packages.core.ai.runtime.tool_evidence import runtime_model_view_of_observation
+
+    ledger = RuntimeToolEvidence()
+    ledger.observe_tool_result("generate_file", "g-1", _uncertain_doc("d1", "aa11"), {"kind": "md"})
+    assert ledger.effect_state == "unconfirmed"
+    assert ledger.unconfirmed_calls[0]["targets"] == [{"document_id": "d1", "fs_path": "out/d1.md", "sha256": "aa11"}]
+    assert "effect_targets" not in runtime_model_view_of_observation(ledger.observations["g-1"])
+
+    # Different bytes, or a read that measured no hash, confirm nothing.
+    ledger.observe_tool_result("read_file", "r-1", _host_read("d1", "bb22"), {"document_id": "d1"})
+    ledger.observe_tool_result("read_file", "r-2", json.dumps({"path": "out/d1.md", "content": "x"}), {"path": "out/d1.md"})
+    assert ledger.effect_state == "unconfirmed"
+
+    # Survives a restage; then the matching read (here through the gateway) confirms it.
+    restored = RuntimeToolEvidence()
+    restored.restore_checkpoint_state(ledger.checkpoint_state())
+    restored.observe_tool_result(
+        "call_tool", "r-3", _host_read("d1", "AA11"), {"name": "read_file", "arguments": {"document_id": "d1"}},
+    )
+    state = restored.checkpoint_state()
+    assert state["unconfirmed_calls"] == [] and state["effect_state"] == "confirmed"
+    assert restored.observations["g-1"]["effect_state"] == "confirmed"
+    assert state["reconciled_calls"] == [
+        {"call_id": "g-1", "tool": "generate_file", "operation": "generate_file", "reconciled_by": "r-3"},
+    ]
+
+
+def test_a_call_without_a_reported_hash_or_with_an_unobserved_target_stays_unconfirmed():
+    ledger = RuntimeToolEvidence()
+    # Reported nothing the host can check.
+    ledger.observe_tool_result("generate_file", "g-1", json.dumps({"error": "x"}), {"kind": "md"})
+    # Reported two files; each must be read back.
+    two = json.dumps({"status": "partial", "files": [
+        {"document_id": "d1", "fs_path": "out/d1.md", "sha256": "aa11"},
+        {"document_id": "d2", "fs_path": "out/d2.md", "sha256": "bb22"},
+    ]})
+    ledger.observe_tool_result("generate_file", "g-2", two, {"kind": "md"})
+    ledger.observe_tool_result("read_file", "r-1", _host_read("d1", "aa11"), {"document_id": "d1"})
+    assert [c["call_id"] for c in ledger.unconfirmed_calls] == ["g-1", "g-2"]
+
+    ledger.observe_tool_result("read_file", "r-2", _host_read("d2", "bb22"), {"document_id": "d2"})
+    assert [c["call_id"] for c in ledger.unconfirmed_calls] == ["g-1"]
+    assert ledger.effect_state == "unconfirmed"
+
+
+def test_a_skill_s_unconfirmed_child_call_is_reconciled_by_a_later_parent_read():
+    child = RuntimeToolEvidence()
+    child.observe_tool_result("generate_file", "c-1", _uncertain_doc("d1", "aa11"), {"kind": "md"})
+    parent = RuntimeToolEvidence()
+    parent.observe_tool_result("invoke_skill", "p-1", _skill_result(child), {"skill": "x"})
+    assert parent.effect_state == "unconfirmed"
+    assert [c["call_id"] for c in parent.unconfirmed_calls] == ["p-1/c-1"]
+
+    parent.observe_tool_result("read_file", "r-1", _host_read("d1", "aa11"), {"document_id": "d1"})
+    assert parent.unconfirmed_calls == [] and parent.effect_state == "confirmed"
+    assert parent.observations["p-1"]["effect_state"] == "confirmed"
+
+
+def test_a_later_confirmed_write_of_the_same_file_supersedes_an_uncertain_one():
+    """Strict rule: an earlier uncertain write is settled when a later call
+    replaced every file it reported with a host-confirmed artifact. Other
+    bytes seen by a read, or an in-place edit on top, settle nothing."""
+    ledger = RuntimeToolEvidence()
+    ledger.observe_tool_result("generate_file", "g-1", _uncertain_doc("d1", "aa11"), {"kind": "md"})
+    # A read showing other bytes may be g-1's own partial output.
+    ledger.observe_tool_result("read_file", "r-1", _host_read("d1", "ffff"), {"document_id": "d1"})
+    # An in-place patch builds on whatever g-1 left.
+    ledger.observe_tool_result("patch_file", "p-1", json.dumps({
+        "patched": True, "document_id": "d1", "path": "out/d1.md", "source_sha256": "eeee",
+    }), {"path": "out/d1.md"})
+    assert [c["call_id"] for c in ledger.unconfirmed_calls] == ["g-1"]
+
+    # A later full write of the same file with a confirmed receipt replaces it.
+    ledger.observe_tool_result("generate_file", "g-2", json.dumps({"created": True, "document": {
+        "document_id": "d1", "fs_path": "out/d1.md", "source_sha256": "bb22",
+    }}), {"kind": "md"})
+    state = ledger.checkpoint_state()
+    assert state["unconfirmed_calls"] == [] and state["effect_state"] == "confirmed"
+    assert state["reconciled_calls"] == [{
+        "call_id": "g-1", "tool": "generate_file", "operation": "generate_file",
+        "reconciled_by": "g-2", "superseded": True,
+    }]
+
+
+def test_a_handler_settled_failure_is_none_or_confirmed_and_never_from_json():
+    from packages.core.ai.runtime.tool_results import RuntimeSettledToolResult
+
+    refused = json.dumps({"error": "Command 'python' not in allowed list", "command_executed": False})
+    stopped = json.dumps({"contract": "tool_error", "status": "error", "error": "render_failed"})
+    ledger = RuntimeToolEvidence()
+    ledger.observe_tool_result("bash", "b-1", RuntimeSettledToolResult.not_applied(refused, "command_policy"),
+                               {"command": "python -c 1"})
+    assert ledger.effect_state == "none" and ledger.unconfirmed_calls == []
+    ledger.observe_tool_result("video_edit", "v-1", RuntimeSettledToolResult.completed_steps_only(
+        stopped, "render_failed"), {"operation": "render"})
+    assert ledger.effect_state == "confirmed" and ledger.unconfirmed_calls == []
+    # The same text as plain JSON (a provider, a checkpoint) is an uncertain failure.
+    ledger.observe_tool_result("bash", "b-2", refused, {"command": "python -c 1"})
+    assert [c["call_id"] for c in ledger.unconfirmed_calls] == ["b-2"]

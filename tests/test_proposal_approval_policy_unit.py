@@ -102,7 +102,7 @@ async def test_cohort_uses_real_approval_core(
 @pytest.mark.parametrize(
     "auto_approved,policy_denied,task_ids,expected",
     [(True, False, ["task"], "auto_approved"), (False, False, ["task"], "pending"),
-     (False, True, ["task"], "rejected"), (False, False, [], "not_required")],
+     (False, True, ["task"], "rejected"), (False, False, [], None)],
 )
 async def test_card_has_typed_approval_metadata(monkeypatch, auto_approved, policy_denied, task_ids, expected):
     monkeypatch.setattr(service, "_proposal_impact_goals", AsyncMock(return_value={}))
@@ -116,7 +116,9 @@ async def test_card_has_typed_approval_metadata(monkeypatch, auto_approved, poli
         auto_approved_action_key=TASK_ACTION_KEY if auto_approved else None,
     )
     payload = post.await_args.kwargs
-    assert payload["meta"]["proposal"]["approval"]["status"] == expected
+    approval = payload["meta"]["proposal"]["approval"]
+    # Nothing to decide: a plain reply with no approval chip.
+    assert (approval or {}).get("status") == expected
     assert bool(payload["pending_action"]) is (expected == "pending")
 
 

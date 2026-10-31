@@ -250,6 +250,28 @@ def approved_external_reply_outcome_message(result: dict[str, Any]) -> str:
     return f"Approved — the external reply was not sent: {reason}."
 
 
+def approved_external_reply_resolution_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Record one terminal delivery projection on the approval's resolution.
+
+    The answered card shows this on its own "you chose" line, so no separate
+    Workspace chat message is written for the delivery result.
+    """
+
+    disposition = approved_external_reply_delivery_disposition(result)
+    if disposition is ApprovedExternalReplyDeliveryDisposition.ACCEPTED:
+        return {"delivery_outcome": "sent"}
+    if disposition is ApprovedExternalReplyDeliveryDisposition.OUTCOME_UNKNOWN:
+        return {
+            "delivery_outcome": "unknown",
+            "message_log_id": result.get("message_log_id"),
+            "delivery_error": result.get("error"),
+        }
+    return {
+        "delivery_outcome": "not_sent",
+        "delivery_error": str(result.get("reason") or result.get("error") or "unknown"),
+    }
+
+
 class ChannelReplyRouteVersion(IntEnum):
     """Schema versions for durable, exact channel reply routes."""
 

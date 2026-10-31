@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from packages.core.credentials import CredentialDecryptError, Requester
 from packages.core.credentials.vault_provider import VaultKeyProvider
 
 
@@ -76,3 +79,35 @@ def test_health_ensures_transit_key_before_encrypt_probe() -> None:
     assert client.secrets.transit.read_calls == 1
     assert client.secrets.transit.encrypt_calls == 1
     assert client.sys.enable_calls == 0
+
+
+@pytest.mark.parametrize("response", [{"data": {"plaintext": "%%%"}}, {"data": {"plaintext": None}}, {"data": {}}, None])
+def test_decrypt_rejects_malformed_vault_response(monkeypatch, response) -> None:
+    client = _FakeClient(authenticated=True)
+    monkeypatch.setattr(client.secrets.transit, "decrypt_data", lambda **_kwargs: response, raising=False)
+    provider = _provider_with_client(client)
+    with pytest.raises(CredentialDecryptError, match="invalid decryption response"):
+        provider.decrypt("vault:v1:test-only", {"entity_id": "fixture"}, reason="test", requester=Requester(kind="test", id="test"))
+
+
+def test_decrypt_does_not_expose_vault_error_material(monkeypatch) -> None:
+    from hvac.exceptions import InvalidRequest
+
+    client = _FakeClient(authenticated=True)
+    def fail(**_kwargs):
+        raise InvalidRequest("submitted ciphertext TEST_ONLY_PROVIDER_MATERIAL")
+    monkeypatch.setattr(client.secrets.transit, "decrypt_data", fail, raising=False)
+    provider = _provider_with_client(client)
+    with pytest.raises(CredentialDecryptError) as raised:
+        provider.decrypt("vault:v1:test-only", {"entity_id": "fixture"}, reason="test", requester=Requester(kind="test", id="test"))
+    assert str(raised.value) == "vault transit decryption failed"
+    assert "TEST_ONLY_PROVIDER_MATERIAL" not in str(raised.value)
+
+
+def test_decrypt_decodes_valid_vault_response(monkeypatch) -> None:
+    client = _FakeClient(authenticated=True)
+    monkeypatch.setattr(client.secrets.transit, "decrypt_data", lambda **_kwargs: {"data": {"plaintext": "Zml4dHVyZQ=="}}, raising=False)
+    provider = _provider_with_client(client)
+    assert provider.decrypt(
+        "vault:v1:test-only", {"entity_id": "fixture"}, reason="test", requester=Requester(kind="test", id="test")
+    ) == b"fixture"

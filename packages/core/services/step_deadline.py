@@ -1,30 +1,19 @@
-"""Explicit per-step runtime deadline.
+"""Explicit per-step runtime deadline of a worker job.
 
-A plan step may legitimately run for a long time (video generation, large
-batch work). Liveness is already proven by the in-process lease heartbeat
-(``packages/core/workers/internal.py``), so the question a worker must answer
-is not "has this run longer than the process timeout?" but "has this run
-longer than the budget somebody actually configured for it?".
+A worker job (a local CLI action, a remote coding run) may legitimately run
+for a long time. The Dispatcher hands its budget to the worker with the lease
+(``max_runtime_seconds``), so a genuinely hung job ends with a diagnosable
+``StepDeadlineExceeded`` failure instead of an unbounded wait.
 
-That budget is ``max_runtime_seconds``. Configuration is JSONB-backed — same
-shape as ``retry_policy`` — so operators can tune it without a migration:
+Configuration is JSONB-backed — same shape as ``retry_policy`` — so operators
+can tune it without a migration:
 
 1. ``workspace.settings.execution_policy.max_runtime_seconds``
 2. ``plan.plan_dag.metadata.max_runtime_seconds``
 3. ``step.params.max_runtime_seconds``
 
-Later sources override earlier ones (i.e. step beats plan beats workspace
-beats the built-in default), matching ``retry_policy`` resolution exactly.
-
-The built-in default is deliberately generous: **6 hours**. Steps are not
-expected to hit it; it exists so a genuinely hung step eventually produces a
-clean, diagnosable ``StepDeadlineExceeded`` failure that flows through the
-normal retry policy — instead of the process-level SIGKILL that used to end
-any step running past 30 minutes.
-
-The Celery limits on ``execute_lease`` live here too, so the invariant
-"celery limit > step deadline" is visible in one place and cannot silently
-invert. Celery's limit is only a last-resort backstop for a wedged process.
+Later sources override earlier ones, matching ``retry_policy`` resolution.
+The built-in default is deliberately generous: **6 hours**.
 """
 from __future__ import annotations
 
@@ -37,44 +26,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 
 
-# Built-in default budget for one step attempt. Generous on purpose — the
-# planner is NOT constrained to short steps.
+# Built-in default budget for one step attempt.
 DEFAULT_MAX_RUNTIME_SECONDS = 6 * 60 * 60  # 21600 (6h)
 
-# Configured values are clamped into this range. The upper clamp is what keeps
-# the Celery ceiling strictly above every possible deadline; if you raise it,
-# raise the two Celery constants below by the same amount. Sub-second budgets
-# are legal (tests use them) but useless in production.
+# Configured values are clamped into this range. Sub-second budgets are legal
+# (tests use them) but useless in production.
 MIN_MAX_RUNTIME_SECONDS = 0.001
 MAX_MAX_RUNTIME_SECONDS = 6 * 60 * 60  # 21600 (6h)
-
-# Celery limits for the ``execute_lease`` task. These are a BACKSTOP for a
-# hung worker process, NOT the execution policy: the step deadline above is
-# the policy, and it must always expire first so failures are structured
-# (StepDeadlineExceeded → fail_lease → retry policy) rather than a
-# SoftTimeLimitExceeded / SIGKILL that kills the heartbeat with the process.
-CELERY_LEASE_SOFT_TIME_LIMIT_SECONDS = MAX_MAX_RUNTIME_SECONDS + 15 * 60  # 6h15m
-CELERY_LEASE_HARD_TIME_LIMIT_SECONDS = MAX_MAX_RUNTIME_SECONDS + 30 * 60  # 6h30m
-
-# Redis broker visibility timeout — the last link in the same chain.
-#
-# The Redis transport has no server-side ack: kombu re-delivers any message
-# whose consumer has not acked it within ``visibility_timeout`` (default: ONE
-# HOUR). With ``task_acks_late=True`` the ack happens when the task *finishes*,
-# so before this constant existed every step still running at 60 minutes was
-# handed to a second worker while the first was still executing it — duplicated
-# external publishes, duplicated media generation, duplicated paid API calls,
-# and a late ``complete_lease`` against an already-terminal lease.
-#
-# It must therefore sit ABOVE the hard time limit: a task that Celery itself
-# would kill must be dead before the broker considers re-delivering it. The
-# full invariant, all derived from ``MAX_MAX_RUNTIME_SECONDS``:
-#
-#     visibility timeout > celery hard limit > celery soft limit
-#                        > MAX_MAX_RUNTIME_SECONDS >= any step deadline
-#
-# tests/test_orchestration_hardening.py guards the ordering.
-CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS = MAX_MAX_RUNTIME_SECONDS + 60 * 60  # 7h
 
 STEP_DEADLINE_ERROR_TYPE = "StepDeadlineExceeded"
 STEP_DEADLINE_HINT = (
@@ -178,22 +136,3 @@ async def resolve_step_deadline(
         ("step", step_max_runtime_config(step)),
     )
 
-
-def step_deadline_error(
-    *,
-    max_runtime_seconds: float,
-    elapsed_seconds: float,
-    source: str = "default",
-) -> dict[str, Any]:
-    """The structured failure a blown deadline reports to ``fail_lease``."""
-    budget: float | int = float(max_runtime_seconds)
-    if float(budget).is_integer():
-        budget = int(budget)
-    return {
-        "type": STEP_DEADLINE_ERROR_TYPE,
-        "message": f"step exceeded its {budget}-second runtime budget",
-        "max_runtime_seconds": budget,
-        "elapsed_seconds": round(float(elapsed_seconds), 3),
-        "max_runtime_source": source,
-        "hint": STEP_DEADLINE_HINT,
-    }

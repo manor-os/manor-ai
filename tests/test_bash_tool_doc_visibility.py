@@ -1,9 +1,8 @@
 """Regression: the bash tool must not read private Knowledge documents.
 
-Local filesystem commands (`cat`, `grep`, `head`, …) run in the entity FS root,
-so an agent acting for a member could `cat another-members-private.md`. The bash
-tool now resolves the file paths a read command touches and blocks the command
-when any maps to a document the caller cannot view.
+Commands run in the caller's sandbox on a working copy of the entity files.
+A document the caller cannot view is never copied into it, and a command that
+names one is refused before it runs.
 """
 
 from __future__ import annotations
@@ -30,8 +29,11 @@ def fs_enabled(tmp_path, monkeypatch):
     old_enabled, old_root = settings.MANOR_FS_ENABLED, settings.MANOR_FS_ROOT
     settings.MANOR_FS_ENABLED = True
     settings.MANOR_FS_ROOT = str(tmp_path)
-    # Force local execution (no sandbox) so `cat` runs against the entity FS.
-    monkeypatch.delenv("SANDBOX_SERVICE_URL", raising=False)
+    # bash runs in a sandbox: a local stand-in that really executes, with the
+    # entity files staged in by the bash tool.
+    from tests.bash_sandbox_fakes import install
+
+    install(monkeypatch, tmp_path)
     try:
         yield settings
     finally:

@@ -23,6 +23,11 @@ from packages.core.blueprints.exporter import (
     _RUNTIME_SETTINGS_KEYS,
     _without_nonportable_references,
 )
+from packages.core.blueprints.knowledge_templates import (
+    INITIAL_BODY_KEY,
+    initial_file_body,
+    normalize_knowledge_template,
+)
 from packages.core.models.base import generate_ulid
 from packages.core.models.custom_field import CustomFieldDefinition
 from packages.core.models.document import Document, DocumentChunk, DocumentGroup, DocumentGroupMember
@@ -595,8 +600,28 @@ async def _row(db: AsyncSession, workspace: Any, target: dict, *, lock: bool = F
         query = query.where(model.target == field_target, model.name == name)
     elif kind == "knowledge_pack":
         source = target.get("source_content") or target.get("installed_content") or {}
+        slug_query = query.where(
+            model.settings["installed_from_blueprint_slug"].astext == identity
+        )
+        if lock:
+            slug_query = slug_query.with_for_update()
+        slug_rows = list((await db.execute(
+            slug_query.execution_options(populate_existing=True)
+        )).scalars().all())
+        if len(slug_rows) > 1:
+            raise ConfigurationUpgradeError(
+                f"Configuration identity {target['key']} is ambiguous"
+            )
+        if slug_rows:
+            return slug_rows[0]
+        # A pre-Blueprint local group has no portable slug yet. Retain the
+        # legacy title lookup only when the installed identity is absent.
         query = query.where(
-            or_(model.settings["installed_from_blueprint_slug"].astext == identity, model.name == source.get("title"))
+            model.name == source.get("title"),
+            or_(
+                model.settings["installed_from_blueprint_slug"].astext.is_(None),
+                model.settings["installed_from_blueprint_slug"].astext == "",
+            ),
         )
     elif kind == "knowledge_document":
         source = target.get("source_content") or target.get("installed_content") or {}
@@ -709,7 +734,10 @@ async def _read(db: AsyncSession, workspace: Any, target: dict, *, lock: bool = 
         target["shared_document"] = True
     if row.fs_path or row.file_url:
         target["body_read_only"] = True
-    return _document_content(row), row
+    content = _document_content(row)
+    if _is_initial_file_content(content):
+        target["initial_file_template"] = True
+    return content, row
 
 
 def _document_content(row: Document) -> dict:
@@ -722,13 +750,37 @@ def _document_content(row: Document) -> dict:
     # their portable, pack-relative path lives in Blueprint provenance.
     if row.name not in (path, path.rsplit("/", 1)[-1]):
         path = row.name
+    template = metadata.get("blueprint_template")
+    body = (
+        initial_file_body(metadata)
+        if isinstance(template, dict) and template.get("mode") == "initial_file"
+        else _metadata_text_content(row)
+    )
     return _safe(
         {
             "path": path,
-            "body_md": _metadata_text_content(row) or "",
+            "body_md": body or "",
             "key": metadata.get("blueprint_document_key"),
-            "template": metadata.get("blueprint_template"),
+            "template": template,
         }
+    )
+
+
+def _is_initial_file_content(content: dict | None) -> bool:
+    if not isinstance(content, dict):
+        return False
+    try:
+        template = normalize_knowledge_template(content.get("template"))
+    except ValueError:
+        return False
+    return bool(template and template["mode"] == "initial_file")
+
+
+def _initial_file_configuration_change(current: dict | None, intended: dict | None) -> bool:
+    return bool(
+        _is_initial_file_content(intended)
+        and current is not None
+        and current.get("path") == intended.get("path")
     )
 
 
@@ -810,9 +862,15 @@ async def plan_configuration(
             else ["reconcile Workspace configuration"],
             "customized": action == "unchanged" and current != target["source_content"],
         }
-        if target.get("body_read_only") and action != "unchanged" and target["source_content"] is not None:
+        if (
+            (target.get("body_read_only") or target.get("initial_file_template"))
+            and action != "unchanged"
+            and target["source_content"] is not None
+            and not _initial_file_configuration_change(current, target["source_content"])
+        ):
             item["blocked_reason"] = (
-                "This starter document is now a stored file; keep it or reconcile it through the document editor"
+                "This starter document's current content is preserved; keep its template mode and path "
+                "or reconcile it through the document editor"
             )
         if target.get("shared_document") and action != "unchanged" and target["source_content"] is not None:
             item["blocked_reason"] = (
@@ -1122,7 +1180,11 @@ def _is_retired(kind: str, content: Any) -> bool:
 
 
 async def _sync_collection(db: AsyncSession, workspace: Any, kind: str, row: Any) -> None:
-    from packages.core.services.scheduler_service import ScheduledJobMutationFactory
+    from packages.core.services.scheduler_service import (
+        ScheduledJobMutationFactory,
+        scheduled_execution_is_workspace_independent,
+    )
+    from packages.core.services.workspace_autonomy import workspace_allows_configured_work
 
     await db.flush()
     if kind == "goal":
@@ -1135,7 +1197,18 @@ async def _sync_collection(db: AsyncSession, workspace: Any, kind: str, row: Any
 
         should_run = should_schedule(row)
         job_id = f"wsstat:{row.id}"
-    if workspace.status != "active" or not workspace.heartbeat_enabled:
+    independent = kind == "stat" and await scheduled_execution_is_workspace_independent(
+        db,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        execution_type="workspace_stat_collection",
+        execution_target={"stat_id": row.id},
+    )
+    runtime_available = (
+        workspace_allows_configured_work(workspace)
+        if independent else workspace.status == "active" and workspace.heartbeat_enabled
+    )
+    if not runtime_available:
         should_run = False
     if should_run:
         if kind == "goal":
@@ -1388,18 +1461,25 @@ async def _sync_heartbeat(
         )
         for row in rows:
             await ScheduledJobMutationFactory.apply(db, row, {"enabled": False})
-    for kind, model in (("goal", Goal), ("stat", WorkspaceStat)):
-        rows = list(
-            (
-                await db.execute(
-                    select(model).where(model.workspace_id == workspace.id, model.entity_id == workspace.entity_id)
-                )
-            )
-            .scalars()
-            .all()
+    goals = list((await db.execute(
+        select(Goal).where(
+            Goal.workspace_id == workspace.id,
+            Goal.entity_id == workspace.entity_id,
         )
-        for row in rows:
-            await _sync_collection(db, workspace, kind, row)
+    )).scalars().all())
+    for goal in goals:
+        await _sync_collection(db, workspace, "goal", goal)
+    goal_stat_ids = sorted({goal.stat_id for goal in goals if goal.stat_id})
+    if goal_stat_ids:
+        stats = list((await db.execute(
+            select(WorkspaceStat).where(
+                WorkspaceStat.workspace_id == workspace.id,
+                WorkspaceStat.entity_id == workspace.entity_id,
+                WorkspaceStat.id.in_(goal_stat_ids),
+            )
+        )).scalars().all())
+        for stat in stats:
+            await _sync_collection(db, workspace, "stat", stat)
 
 
 async def _write(
@@ -1489,10 +1569,6 @@ async def _write(
             value = _merge_portable_dict(row.config, content[key]) if key == "config" else copy.deepcopy(content[key])
             setattr(row, key, value)
         await db.flush()
-        if row.status == "active":
-            from packages.core.workers.registry import ensure_internal_worker
-
-            await ensure_internal_worker(db, workspace.entity_id)
     elif kind == "scheduled_job":
         from packages.core.constants.blueprints import installed_blueprint_job_id
         from packages.core.services.product_growth import persist_scheduled_job
@@ -1665,7 +1741,8 @@ async def _write(
             row.owner_id = by_user_id
             row.created_by = by_user_id
         else:
-            if _document_content(row) == content:
+            current_content = _document_content(row)
+            if current_content == content:
                 # Undoing a detach changes only this Workspace's membership;
                 # stored files and shared documents need no body overwrite.
                 await _require_document_access(db, row=row, actor=actor, capability=Capability.MANAGE_METADATA)
@@ -1675,6 +1752,27 @@ async def _write(
                 return
             await _require_blueprint_document_owned_by_workspace(db, row, workspace.id)
             await _require_document_access(db, row=row, actor=actor, capability=Capability.EDIT)
+            if _is_initial_file_content(content):
+                if not _initial_file_configuration_change(current_content, content):
+                    raise ConfigurationUpgradeError("Initial-file template changes must preserve the current file path")
+                metadata = dict(row.metadata_ or {})
+                metadata.update({
+                    "blueprint_starter_path": content["path"],
+                    "blueprint_knowledge_pack_slug": target["pack_slug"],
+                    "blueprint_template": normalize_knowledge_template(content["template"]),
+                    INITIAL_BODY_KEY: content["body_md"],
+                })
+                if content.get("key") is None:
+                    metadata.pop("blueprint_document_key", None)
+                else:
+                    metadata["blueprint_document_key"] = content["key"]
+                row.metadata_ = metadata
+                await add_document_to_group(db, row.id, pack.id, entity_id=workspace.entity_id)
+                await db.flush()
+                target["row_id"] = row.id
+                return
+            if _is_initial_file_content(current_content):
+                raise ConfigurationUpgradeError("Changing an initial-file template mode must not overwrite current content")
             if row.fs_path or row.file_url:
                 raise ConfigurationUpgradeError(
                     "Stored-file starter content must be reconciled through the document editor"
@@ -1833,6 +1931,7 @@ async def apply_configuration(
     schedules_before = await _schedule_snapshots(db, workspace)
     selected_governance = _selected_governance_content(workspace, plan, choices)
     restore, updated, kept = [], [], []
+    goal_stat_ids_to_reconcile: set[str] = set()
     ordered = sorted(
         targets.values(),
         key=lambda value: (
@@ -1858,6 +1957,8 @@ async def apply_configuration(
                 kept.append(item)
             continue
         before, row = await _read(db, workspace, target, lock=True)
+        if target["kind"] == "goal" and row is not None and row.stat_id:
+            goal_stat_ids_to_reconcile.add(row.stat_id)
         references_before = (
             {"agent_id": row.agent_id, "execution_target": copy.deepcopy(row.execution_target)}
             if row is not None and target["kind"] == "scheduled_job"
@@ -1869,6 +1970,8 @@ async def apply_configuration(
             db, workspace, target, target["source_content"], payload=payload, actor=actor, by_user_id=by_user_id
         )
         after, row = await _read(db, workspace, target, lock=True)
+        if target["kind"] == "goal" and row is not None and row.stat_id:
+            goal_stat_ids_to_reconcile.add(row.stat_id)
         if target["source_content"] is not None and after != target["source_content"]:
             raise ConfigurationUpgradeError(f"Configuration verification failed for {target['key']}")
         if target["source_content"] is None and not _is_retired(target["kind"], after):
@@ -1890,8 +1993,66 @@ async def apply_configuration(
         await _reconcile_component_references(db, workspace, reference_remaps, restore)
     if any(entry["target"].get("path", [None])[0] in {"operating_context", "primary_work"} for entry in restore):
         await _refresh_subscription_framings(db, workspace, restore)
+    from packages.core.workspaces import is_sandbox_workspace
+
+    heartbeat_entry = next(
+        (
+            entry
+            for entry in restore
+            if entry["target"]["kind"] == "workspace_configuration"
+            and entry["target"].get("path") == ["heartbeat_enabled"]
+        ),
+        None,
+    )
+    if (
+        heartbeat_entry is not None
+        and heartbeat_entry["before"] == {"value": True}
+        and heartbeat_entry["after"] == {"value": False}
+        and workspace.status == "active"
+        and not is_sandbox_workspace(workspace)
+    ):
+        status_target = {
+            "key": "workspace_configuration:autonomy_status",
+            "kind": "workspace_configuration",
+            "identity": "autonomy_status",
+            "path": ["status"],
+            "source_content": {"value": "paused"},
+        }
+        before_status, _ = await _read(db, workspace, status_target, lock=True)
+        await _write(
+            db,
+            workspace,
+            status_target,
+            status_target["source_content"],
+            payload=payload,
+            actor=actor,
+            by_user_id=by_user_id,
+        )
+        after_status, _ = await _read(db, workspace, status_target, lock=True)
+        restore.append(
+            {
+                "target": status_target,
+                "before": before_status,
+                "after": after_status,
+                "references_before": None,
+                "expected_fingerprint": _current_fingerprint(after_status, None),
+            }
+        )
     if any(entry["target"].get("path", [None])[0] in {"heartbeat_enabled", "heartbeat_cadence"} for entry in restore):
         await _sync_heartbeat(db, workspace, user_id=by_user_id)
+    if goal_stat_ids_to_reconcile:
+        # Goals are applied after Stats. Reconcile only the old and new
+        # collectors they affect, so an unrelated deployment's enabled state
+        # remains authoritative while bindings converge in this upgrade.
+        stats = list((await db.execute(
+            select(WorkspaceStat).where(
+                WorkspaceStat.entity_id == workspace.entity_id,
+                WorkspaceStat.workspace_id == workspace.id,
+                WorkspaceStat.id.in_(sorted(goal_stat_ids_to_reconcile)),
+            ).order_by(WorkspaceStat.id)
+        )).scalars().all())
+        for stat in stats:
+            await _sync_collection(db, workspace, "stat", stat)
     schedules_after = await _schedule_snapshots(db, workspace)
     for row_id, state in schedules_after.items():
         existing = next(
@@ -1967,6 +2128,12 @@ async def validate_configuration_restore(
                 from packages.core.services.document_service import _require_text_content_save
 
                 await _require_blueprint_document_owned_by_workspace(db, row, workspace.id)
+                if _initial_file_configuration_change(_document_content(row), entry["before"]):
+                    continue
+                if _is_initial_file_content(_document_content(row)):
+                    raise ConfigurationUpgradeError(
+                        "Changing an initial-file template mode must not overwrite current content"
+                    )
                 _require_text_content_save(row)
                 if row.fs_path or row.file_url:
                     raise ConfigurationUpgradeError(

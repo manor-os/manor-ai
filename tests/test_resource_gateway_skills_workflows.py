@@ -402,7 +402,7 @@ async def test_private_entity_binding_cannot_be_run_by_non_member(client: AsyncC
         headers=outsider["headers"],
     )
 
-    assert response.status_code == 404, response.text
+    assert response.status_code == 403, response.text
     assert binding["id"] not in {item["id"] for item in listed.json()}
 
 

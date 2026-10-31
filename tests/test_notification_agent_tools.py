@@ -110,10 +110,12 @@ async def _link_telegram(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_mode", ["entity", "paused_workflow"])
 async def test_notify_user_writes_in_app_row(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_telegram: _RecordingAdapter,
+    workspace_mode,
 ):
     """Basic happy path — agent calls notify_user, recipient gets in-app
     row + telegram push (when they opted into telegram)."""
@@ -126,6 +128,30 @@ async def test_notify_user_writes_in_app_row(
     target_user = (await db_session.execute(select(User).where(User.id == target["user_id"]))).scalar_one()
     target_user.entity_id = sender["entity_id"]
     await db_session.commit()
+
+    runtime_context = {}
+    if workspace_mode == "paused_workflow":
+        from packages.core.models.workspace import Workspace, WorkspaceStaff
+        from packages.core.models.workflow import WorkflowRun
+
+        workspace = Workspace(entity_id=sender["entity_id"], name="Invoice reports", status="paused")
+        db_session.add(workspace)
+        await db_session.flush()
+        db_session.add_all([
+            WorkspaceStaff(workspace_id=workspace.id, user_id=target["user_id"], role="viewer", status="active"),
+            WorkspaceStaff(workspace_id=workspace.id, user_id=sender["user_id"], role="owner", status="active"),
+        ])
+        run = WorkflowRun(
+            workflow_id="invoice-report", entity_id=sender["entity_id"], workspace_id=workspace.id,
+            started_by=sender["user_id"], trigger_source="manual", status="running",
+        )
+        db_session.add(run)
+        await db_session.commit()
+        runtime_context = {
+            "workspace_id": workspace.id,
+            "_workflow_run_id_from_context": run.id,
+            "_user_id_from_context": sender["user_id"],
+        }
 
     cc, contact = await _link_telegram(
         db_session,
@@ -148,10 +174,30 @@ async def test_notify_user_writes_in_app_row(
         severity="info",
         kind="task_succeeded",
         _agent_id_from_context="agent-123",
+        idempotency_key="weekly-report:2026-10-12",
+        **runtime_context,
     )
     result = json.loads(raw)
     assert result["ok"] is True, result
     assert result["user_id"] == target["user_id"]
+    assert result["dispatch_status"] == "dispatched"
+    assert result["delivery_status"] == "delivered"
+    if runtime_context:
+        next_run = WorkflowRun(
+            workflow_id=run.workflow_id, entity_id=run.entity_id, workspace_id=run.workspace_id,
+            started_by=run.started_by, trigger_source="manual", status="running",
+        )
+        db_session.add(next_run)
+        await db_session.commit()
+        runtime_context["_workflow_run_id_from_context"] = next_run.id
+    replay = json.loads(await _notify_user(
+        entity_id=sender["entity_id"], user_id=target["user_id"],
+        title="Your report is ready", body="Open the dashboard to see the numbers.",
+        link="/dashboards/weekly", severity="info", kind="task_succeeded",
+        _agent_id_from_context="agent-123", idempotency_key="weekly-report:2026-10-12",
+        **runtime_context,
+    ))
+    assert replay["notification_id"] == result["notification_id"]
 
     # In-app row
     rows = (
@@ -166,10 +212,18 @@ async def test_notify_user_writes_in_app_row(
         .all()
     )
     assert len(rows) == 1
+    assert rows[0].id == result["notification_id"]
     assert rows[0].title == "Your report is ready"
     assert rows[0].type == "task_succeeded"
     # agent_id surfaced into meta for audit
     assert (rows[0].meta or {}).get("sent_by_agent") == "agent-123"
+    if runtime_context:
+        assert rows[0].meta["workflow_origin"]["run_id"] == run.id
+        denied = json.loads(await _notify_user(
+            entity_id=sender["entity_id"], user_id=target["user_id"], title="Invalid origin",
+            **{**runtime_context, "_user_id_from_context": target["user_id"]},
+        ))
+        assert denied["ok"] is False
 
     # Telegram push reached the target's bound contact
     assert [s["to"] for s in fake_telegram.sent] == [contact.source_id]
@@ -207,6 +261,14 @@ async def test_notify_user_refuses_cross_entity_recipient(
     )
     assert rows == []
     assert fake_telegram.sent == []
+    # notify() silently drops an inaccessible Workspace target. The tool must
+    # report that no notification was created instead of claiming success.
+    dropped = json.loads(await _notify_user(
+        entity_id=sender["entity_id"], user_id=sender["user_id"],
+        workspace_id="missing-workspace", title="Unavailable report",
+    ))
+    assert dropped["ok"] is False
+    assert dropped["error"] == "notification_not_created_or_recipient_unavailable"
 
 
 @pytest.mark.asyncio

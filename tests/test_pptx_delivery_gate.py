@@ -8,6 +8,17 @@ import pytest
 import packages.core.ai.tools.sandbox_tools as sandbox_tools
 
 
+@pytest.fixture(autouse=True)
+def _bound_sandbox(monkeypatch):
+    """The delivery gate is under test, not the binding check (covered in
+    tests/test_sandbox_binding_scope.py): every sandbox here is the caller's."""
+
+    async def allow_access(**_kwargs):
+        return None
+
+    monkeypatch.setattr(sandbox_tools, "_sandbox_instance_access_error", allow_access)
+
+
 def _passing_report(content: bytes, *, path: str) -> bytes:
     return json.dumps(
         {
@@ -155,13 +166,13 @@ async def test_save_result_blocks_failed_pptx_before_filesystem_mutation(monkeyp
     calls: list[tuple[str, str]] = []
 
     class FakeSandboxClient:
-        async def exec(self, *, sandbox_id, command, timeout):
+        async def exec(self, *, sandbox_id, command, timeout, execution_id=None, **_queue_and_view):
             calls.append(("exec", command))
             assert sandbox_id == "sb_1"
             assert timeout == 240
             return SimpleNamespace(exit_code=1, stdout="", stderr="quality failed")
 
-        async def read_file_base64(self, *, sandbox_id, path):
+        async def read_file_base64(self, *, sandbox_id, path, **_view):
             calls.append(("read", path))
             payload = failed_report if path == report_path else content
             return SimpleNamespace(content_base64=base64.b64encode(payload).decode("ascii"))

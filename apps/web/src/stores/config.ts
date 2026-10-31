@@ -8,7 +8,6 @@ interface AppConfig {
   flows_available: boolean;
   flows_released: boolean;
   ai_credits_unlimited: boolean;
-  support_tickets_enabled: boolean;
   loaded: boolean;
   loading: boolean;
   load_error: boolean;
@@ -23,7 +22,6 @@ export const useConfigStore = create<AppConfig>((set, get) => ({
   flows_available: import.meta.env.DEV,
   flows_released: import.meta.env.DEV,
   ai_credits_unlimited: true,
-  support_tickets_enabled: false,
   loaded: false,
   loading: false,
   load_error: false,

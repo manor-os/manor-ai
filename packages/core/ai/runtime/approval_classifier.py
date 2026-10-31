@@ -10,6 +10,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+from packages.core.governance.action_effects import (
+    EffectGate,
+    declared_action_effect,
+    mcp_action_effect,
+    provider_policy_effect,
+)
 from packages.core.ai.runtime.bash_command_specs import BashCommandSpecFactory
 from packages.core.ai.runtime.chrome_tool_catalog import (
     CHROME_MCP_TOOLS,
@@ -43,6 +49,7 @@ from packages.core.services.official_remote_mcp import (
 
 
 __all__ = [
+    "runtime_action_key_is_gateable",
     "bash_write_targets",
     "ChromeConfirmationDecision",
     "classify_chrome_confirmation",
@@ -55,6 +62,8 @@ __all__ = [
     "RuntimeToolClassifier",
     "RuntimeToolClassifierFactory",
     "RuntimeToolEffect",
+    "RUNTIME_NO_EFFECT_CONTROL_TOOL_NAMES",
+    "runtime_call_executes_nothing",
     "split_mcp_tool",
 ]
 
@@ -580,8 +589,8 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     }),
     "claude_code": frozenset({"check_path"}),
     "codex_cli": frozenset({"check_path"}),
+    "discord": frozenset({"get_connection_info", "list_channels"}),
     "elevenlabs": frozenset({"list_voices"}),
-    "suno": frozenset({"get_generation", "get_usage"}),
     "email": frozenset({
         "download_attachment",
         "get_draft",
@@ -594,7 +603,7 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
         "list_threads",
     }),
     "facebook": frozenset({
-        "get_instagram_account", "get_instagram_insights", "get_instagram_media", "get_live_video",
+        "get_instagram_account", "get_instagram_container_status", "get_instagram_insights", "get_instagram_media", "get_live_video",
         "get_page", "get_page_insights", "get_post", "get_post_insights", "list_comments",
         "list_conversation_messages", "list_conversations", "list_instagram_accounts",
         "list_instagram_comments", "list_instagram_media", "list_live_videos", "list_page_albums",
@@ -671,7 +680,7 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     "quickbooks": frozenset({
         "custom_query", "get_company_info", "get_customer", "get_invoice", "get_payment",
         "query_accounts", "query_bills", "query_customers", "query_invoices", "query_items",
-        "query_payments", "query_vendors",
+        "query_payments", "query_vendors", "run_report",
     }),
     "shopify": frozenset({
         "get_order", "get_product", "get_shop", "list_customers", "list_orders", "list_products",
@@ -732,8 +741,11 @@ _READ_ONLY_TOOLS = {
     "resident_maintenance_status",
     "website_content",
     "analyze_audio",
+    "analyze_music_structure",
+    "listen_to_audio",
     "browse_web",
     "check_youtube_publication_setup",
+    "resolve_platform_routes",
     "draft_skill",
     "extract_data",
     "find_team_members",
@@ -745,9 +757,6 @@ _READ_ONLY_TOOLS = {
     "inspect_file_engine",
     "inspect_narration_recovery",
     "search_tools",
-    # Only an unwrappable or rejected call_tool is classified as itself; it
-    # executes nothing. A valid one is classified as the tool it calls.
-    "call_tool",
     "web_search",
     "web_event_search",
     "web_fetch",
@@ -773,7 +782,6 @@ _READ_ONLY_TOOLS = {
     "list_agent_initiative_runs",
     "list_agent_files",
     "list_documents",
-    "list_sandbox_files",
     "list_scheduled_jobs",
     "list_workspace_flows",
     "plan_video_segments",
@@ -794,17 +802,22 @@ _READ_ONLY_TOOLS = {
     "visualize_workspace_ledgers",
     "render_response_surface",
     "read_youtube_public_metrics",
+    "expand_schedule_occurrences",
+    "query_workspace_stat_observations",
+    "query_workflow_projects",
     "search_documents",
     "search_tasks",
     "take_screenshot",
     "transcribe_audio",
     "transcribe_video",
     "validate_subtitles",
+    "measure_media_audio_alignment",
+    "verify_media_sources",
     "verify_stickman_final_media",
     "wait_media_jobs",
-    # Task agent loop only: parks the loop until a time; executes nothing.
-    "wait_until",
     "weather_search",
+    "app_pattern_project_tree",
+    "app_read_context",
     "ws_get_draft",
     "ws_lint_draft",
     "ws_read_source",
@@ -839,7 +852,9 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "prepare_creative_studio": _fixed_action("workspace.file.create", "medium", "freeze creative production inputs", "file", "create"),
     "verify_creative_studio": _fixed_action("workspace.file.create", "medium", "verify creative files and render previews", "file", "create"),
     "compose_creative_publication": _fixed_action("workspace.file.create", "medium", "compose native illustrated publication", "file", "create"),
+    "compose_creative_deck": _fixed_action("workspace.file.create", "medium", "compose a styled editable deck", "file", "create"),
     "compose_creative_dub": _fixed_action("workspace.file.create", "medium", "compose translated video with actual narration", "file", "create"),
+    "compose_creative_video": _fixed_action("workspace.file.create", "medium", "compose a narrated video from scene pictures", "file", "create"),
     "render_recording": _fixed_action("workspace.file.create", "medium", "render recording deliverables", "file", "create"),
     "align_subtitles": _fixed_action("workspace.file.create", "medium", "create subtitle files", "file", "create"),
     "answer_task_blocker": _fixed_action("workspace.task.update", "medium", "answer task blocker", "workspace_task", "modify"),
@@ -849,6 +864,7 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "compose_video_timeline": _fixed_action("workspace.file.create", "medium", "render video timeline", "file", "create"),
     "create_goal": _fixed_action("workspace.goal.create", "medium", "create goal", "goal", "create"),
     "dashboard_submit_module": _fixed_action("workspace.dashboard.module.update", "medium", "submit dashboard module", "workspace", "modify"),
+    "derive_image_aspect": _fixed_action("workspace.file.create", "medium", "derive image in another aspect ratio", "file", "create"),
     "generate_image": _fixed_action("workspace.file.create", "medium", "generate image", "file", "create"),
     "generate_video": _fixed_action("workspace.file.create", "medium", "generate video", "file", "create"),
     "import_free_music": _fixed_action("workspace.file.create", "medium", "import licensed music", "file", "create"),
@@ -866,6 +882,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "record_stickman_topic_ledger": _fixed_action("workspace.knowledge.update", "medium", "update Stickman Topic Ledger", "knowledge", "modify"),
     "record_youtube_publication": _fixed_action("workspace.knowledge.update", "medium", "record YouTube publication", "knowledge", "modify"),
     "record_youtube_workspace_metrics": _fixed_action("workspace.knowledge.update", "medium", "record YouTube metrics", "knowledge", "modify"),
+    "configure_workspace_stat": _fixed_action("workspace.stat.create", "medium", "configure Workspace statistic", "workspace_stat", "create"),
+    "collect_workspace_stats": _fixed_action("workspace.stat.update", "medium", "collect Workspace statistics", "workspace_stat", "modify"),
     "render_frame_samples": _fixed_action("workspace.file.create", "medium", "render frame samples", "file", "create"),
     "sandbox_cancel": _fixed_action("sandbox.cancel", "medium", "cancel sandbox command", "sandbox", "cancel"),
     "sandbox_respond": _fixed_action("sandbox.respond", "low", "respond to sandbox command", "sandbox", "execute"),
@@ -881,14 +899,13 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "update_goal_value": _fixed_action("workspace.goal.update", "medium", "update goal", "goal", "modify"),
     "update_task": _fixed_action("workspace.task.update", "medium", "update task", "workspace_task", "modify"),
     "video_edit": _fixed_action("workspace.file.modify", "medium", "edit video", "file", "modify"),
-    "coding_based_video": _fixed_action(
-        "workspace.file.create", "medium", "create coding-based video", "file", "create"
-    ),
     "workspace_resolve_hitl": _fixed_action("workspace.hitl.resolve", "medium", "resolve Workspace request", "workspace", "modify"),
     "ws_assign_staff": _fixed_action("workspace.operation.draft", "medium", "assign Workspace staff", "workspace_operation", "modify"),
     "ws_attach_knowledge": _fixed_action("workspace.operation.draft", "medium", "attach Workspace knowledge", "workspace_operation", "modify"),
     "ws_commit_basics": _fixed_action("workspace.operation.draft", "medium", "update Workspace draft", "workspace_operation", "modify"),
-    "ws_configure_app_view": _fixed_action("workspace.operation.draft", "medium", "configure Workspace app view", "workspace_operation", "modify"),
+    "ws_design_app_view": _fixed_action("workspace.operation.draft", "medium", "design Workspace app view", "workspace_operation", "modify"),
+    "ws_accept_app_view": _fixed_action("workspace.operation.draft", "medium", "accept Workspace app view", "workspace_operation", "modify"),
+    "app_submit_candidate": _fixed_action("workspace.operation.draft", "medium", "submit Workspace app design", "workspace_operation", "modify"),
     "ws_flag_missing_integration": _fixed_action("workspace.operation.draft", "medium", "update Workspace integration requirement", "workspace_operation", "modify"),
     "ws_mark_ready": _fixed_action("workspace.operation.draft", "medium", "mark Workspace draft ready", "workspace_operation", "modify"),
     "ws_propose_agent_mapping": _fixed_action("workspace.operation.draft", "medium", "update Workspace agent mapping", "workspace_operation", "modify"),
@@ -897,6 +914,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "ws_propose_goal": _fixed_action("workspace.operation.draft", "medium", "update Workspace goal", "workspace_operation", "modify"),
     "ws_propose_rule": _fixed_action("workspace.operation.draft", "medium", "update Workspace rule", "workspace_operation", "modify"),
     "ws_propose_service": _fixed_action("workspace.operation.draft", "medium", "update Workspace service", "workspace_operation", "modify"),
+    "ws_propose_stat": _fixed_action("workspace.operation.draft", "medium", "update Workspace statistic", "workspace_operation", "modify"),
+    "ws_propose_workflow": _fixed_action("workspace.operation.draft", "medium", "update Workspace workflow", "workspace_operation", "modify"),
     "ws_remove": _fixed_action("workspace.operation.draft", "medium", "remove Workspace draft item", "workspace_operation", "modify"),
     "ws_request_custom_agent": _fixed_action("workspace.operation.draft", "medium", "request custom Workspace agent", "workspace_operation", "modify"),
     "ws_confirm_creation_preferences": _fixed_action("workspace.operation.draft", "medium", "confirm Workspace creation preferences", "workspace_operation", "modify"),
@@ -919,6 +938,9 @@ _FILE_DELETE_BASE_CMDS = {"rm"}
 _CLI_WRITE_HINTS = ("tee ", "sed -i", " rm ", " mv ", " cp ", " mkdir ", " touch ", "chmod ")
 _SHELL_SEGMENT_SEPARATOR_RE = re.compile(r"(?:^|\s)(?:&&|\|\||;|\|)(?:\s|$)")
 _MANOR_ACTION_MAP = {
+    # Creates stats plus an assessment Workflow and schedule: a configuration
+    # change, never a reversible goal measurement.
+    "add_assessed_metrics": ("workspace.operation.apply", "high", "add assessed metrics", "workspace_operation", "modify"),
     "create_task": ("workspace.task.create", "medium", "create task", "workspace_task", "create"),
     "assign_task": ("workspace.task.update", "medium", "assign task", "workspace_task", "modify"),
     "start_workspace_draft": ("workspace.draft.start", "low", "start workspace setup", "workspace", "create"),
@@ -1010,8 +1032,10 @@ _AGENT_INITIATIVE_ACTION_MAP = {
     ),
 }
 _WORKSPACE_AGENT_ACTION_MAP = {
+    "add_assessed_metrics": ("workspace.operation.apply", "high", "add assessed metrics", "workspace_operation", "modify"),
     "create_task": ("workspace.task.create", "medium", "create workspace task", "workspace_task", "create"),
     "update_task_runtime": ("workspace.task.update", "medium", "update task runtime requirements", "workspace_task", "modify"),
+    "start_task": ("workspace.task.update", "medium", "start a pending task", "workspace_task", "modify"),
     "create_knowledge_folder": ("workspace.knowledge.update", "medium", "create workspace Knowledge Net", "knowledge", "create"),
     "add_knowledge_documents": ("workspace.knowledge.update", "medium", "attach workspace knowledge documents", "knowledge", "modify"),
     "remove_knowledge_document": ("workspace.knowledge.update", "medium", "detach workspace knowledge document", "knowledge", "modify"),
@@ -1040,6 +1064,7 @@ _WORKSPACE_OPERATION_READ_ACTIONS = {
 }
 _WORKSPACE_OPERATION_ACTION_MAP = {
     "create_draft": ("workspace.operation.draft", "medium", "create workspace operation draft", "workspace_operation", "create"),
+    "design_app": ("workspace.operation.draft", "medium", "design workspace app page draft", "workspace_operation", "create"),
     "patch_draft": ("workspace.operation.draft", "medium", "patch workspace operation draft", "workspace_operation", "modify"),
     "apply_draft": ("workspace.operation.apply", "high", "apply workspace operation draft", "workspace_operation", "modify"),
     "discard_draft": ("workspace.operation.discard", "medium", "discard workspace operation draft", "workspace_operation", "modify"),
@@ -1242,8 +1267,6 @@ def _classify_known_runtime_tool_action(
         if _command_has_write_hint(command):
             return RuntimeApprovalAction("action", "sandbox.exec.write_unknown", "medium", "run sandbox command with possible writes", "sandbox", "execute")
         return RuntimeApprovalAction("action", "sandbox.exec", "low", "run sandbox command", "sandbox", "execute")
-    if name == "sandbox_create":
-        return RuntimeApprovalAction("action", "sandbox.create", "low", "create sandbox", "sandbox", "create")
     if name == "manor":
         from packages.core.ai.runtime.manor_read_policy import (
             ManorReadCapabilityFactory,
@@ -1268,7 +1291,8 @@ def _classify_known_runtime_tool_action(
         raw_params = args.get("params") or {}
         params = raw_params if isinstance(raw_params, dict) else {}
         action_name = str(args.get("action") or "").strip()
-        if action_name in {"search", "list_knowledge", "read_delegation_result"}:
+        # hold_for_approval only adds approvals to this conversation.
+        if action_name in {"search", "list_knowledge", "read_delegation_result", "hold_for_approval"}:
             return None
         if action_name == "operation":
             return _classify_workspace_operation_action(params)
@@ -1369,17 +1393,22 @@ _ORCHESTRATOR_REASONS = {
     "invoke_skill": (
         "Every nested skill tool call re-enters the runtime authorization boundary."
     ),
-    "execute_planned_action": (
-        "Execute only the immutable action bound to the current Dispatcher lease. "
-        "Dispatcher owns its approval; the handler revalidates that lease before I/O."
-    ),
 }
 _CONTROL_REASONS = {
     "resident_maintenance_draft": (
         "Save a private draft for the verified resident in this conversation. "
         "The handler validates resident scope; only a separate browser confirmation writes to PMS."
     ),
-    "submit_result": "Return a result to the current Runtime-owned orchestration loop.",
+    # A valid call_tool is classified as the tool it calls; only an
+    # unwrappable or gateway-rejected one is classified as itself.
+    "call_tool": (
+        "A gateway-rejected or malformed call executes nothing; the handler "
+        "only echoes the rejection."
+    ),
+    "wait_until": (
+        "Park the Task agent loop until a time. It is loop control and "
+        "executes nothing."
+    ),
     "update_task_plan": (
         "Record the Task agent loop's own plan and acceptance criteria. "
         "It is bookkeeping for this loop and executes nothing."
@@ -1387,6 +1416,11 @@ _CONTROL_REASONS = {
     "complete_task": (
         "Submit the Task agent loop's final outcome to its host, which decides "
         "and writes the Task's terminal state."
+    ),
+    "sandbox_create": (
+        "Open an ephemeral Runtime-owned sandbox, not a user file or resource. "
+        "Product decision (2026-10-06): creating a sandbox never needs approval, "
+        "in any mode; the commands later run in it are classified on their own."
     ),
     "sandbox_destroy": (
         "Release an ephemeral Runtime-owned sandbox, not a user file or resource. "
@@ -1402,10 +1436,28 @@ _CONTROL_REASONS = {
 # handlers. They have no durable catalog binding: the loop that armed them is
 # their only binding, and without a handler the call fails as unknown.
 RUNTIME_LOOP_CONTROL_TOOL_NAMES = frozenset({
-    "submit_result",
     "update_task_plan",
     "complete_task",
+    "wait_until",
 })
+
+# CONTROL calls that execute nothing at all: a gateway-rejected or
+# unwrappable call_tool (a valid one is classified as the tool it calls) and
+# wait_until (it only computes a park time). They were READ_ONLY before the
+# effect contract made them CONTROL so they never cross the consent gate.
+# Every "did this call do anything?" judgement (the receipt ledger,
+# interrupted-call recovery, serial batching, effect durability, Step effect
+# limits) asks runtime_call_executes_nothing, never READ_ONLY alone.
+RUNTIME_NO_EFFECT_CONTROL_TOOL_NAMES = frozenset({"call_tool", "wait_until"})
+
+
+def runtime_call_executes_nothing(tool_name: str, classification: Any) -> bool:
+    """True when this classified call cannot have had any effect."""
+    effect = getattr(classification, "effect", None)
+    if effect is RuntimeToolEffect.READ_ONLY:
+        return True
+    return effect is RuntimeToolEffect.CONTROL and str(tool_name or "").strip() in RUNTIME_NO_EFFECT_CONTROL_TOOL_NAMES
+
 
 _NON_ACTION_CAPABILITY_BY_TOOL = {
     "invoke_skill": "skill.invoke",
@@ -1425,6 +1477,7 @@ _NON_ACTION_CAPABILITY_BY_TOOL = {
     "web_fetch": "web.safe_search",
     "browse_web": "web.safe_search",
     "sandbox_read_file": "sandbox.execute",
+    "sandbox_create": "sandbox.execute",
     "sandbox_destroy": "sandbox.execute",
 }
 
@@ -1440,20 +1493,102 @@ def runtime_policy_action_for_classification(
 
     action = classification.action
     if action is not None:
-        # A classified action that only reads (asking the user a question)
-        # is a read for the policy. Without this its impact was unknown, and
-        # unknown impact always asks: every question needed an approval.
-        return action, ("read" if action.operation == "read" else None)
+        return action, action.impact
     authorization = classification.authorization
-    impact = "read" if classification.effect is RuntimeToolEffect.READ_ONLY else "reversible"
-    return RuntimeApprovalAction(
+    read_only = classification.effect is RuntimeToolEffect.READ_ONLY
+    gate = runtime_effect_gate(classification)
+    action = RuntimeApprovalAction(
         kind="action", action_key=authorization.action_key,
         capability_id=authorization.capability_id,
         risk_level="low", title=authorization.action_key,
         resource_kind=authorization.resource_kind,
         resource_id=authorization.resource_id,
-        operation="read" if impact == "read" else "modify",
-    ), impact
+        operation="read" if read_only else "modify",
+        # READ_ONLY is a typed authorization decision: its facts are read/read
+        # (a basic Chrome read, or Chrome-only discovery, read/browser).
+        # CONTROL/ORCHESTRATOR keep their declared family effect.
+        impact="read" if read_only else None,
+        category=(
+            ("browser" if _is_chrome_browser_discovery(authorization) else "read")
+            if read_only else None
+        ),
+        gate=gate.value,
+    )
+    return action, action.impact
+
+
+# Step providers that name Manor's own tool surface (anything else is an MCP
+# server whose raw action names must never resolve to a native Manor tool).
+_PLAN_NATIVE_STEP_PROVIDERS = frozenset({"", "platform", "manor"})
+
+
+def runtime_step_policy_action(
+    action_key: str | None,
+    *,
+    provider: str | None = None,
+    arguments: dict[str, Any] | None = None,
+) -> RuntimeApprovalAction | None:
+    """The classified action a plan step whose key may be a raw tool name performs.
+
+    A declared action key keeps its declaration (``None``). A step on an MCP
+    provider is classified as ``mcp__<provider>__<action>`` through the MCP
+    factory; a native step as that Manor tool with the step's own arguments.
+    The result carries the canonical action key, the classifier's risk and the
+    resource. Only a concrete ACTION or READ_ONLY classification counts and a
+    plan step is never leaf_only: control/orchestration names and
+    unclassifiable steps stay undeclared (``None``), so they ask.
+    """
+
+    key = str(action_key or "").strip()
+    if not key or declared_action_effect(key) is not None:
+        return None
+    source = str(provider or "").strip()
+    tool_name = key if source in _PLAN_NATIVE_STEP_PROVIDERS else f"mcp__{source}__{key}"
+    try:
+        classification = classify_runtime_tool(tool_name, dict(arguments or {}))
+    except Exception:
+        return None
+    if classification.authorization is None or classification.effect not in {
+        RuntimeToolEffect.ACTION, RuntimeToolEffect.READ_ONLY,
+    }:
+        return None
+    action, _impact = runtime_policy_action_for_classification(classification)
+    if action.impact in {None, "unknown"}:
+        return None
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(action, gate=EffectGate.POLICY.value)
+
+
+def _is_chrome_browser_discovery(authorization: Any) -> bool:
+    """A verified Chrome-only ``search_tools`` call (see ``_resolve_non_action_authorization``)."""
+    return (
+        getattr(authorization, "action_key", None) == "tool.search_tools.read"
+        and getattr(authorization, "resource_kind", None) == "browser"
+        and getattr(authorization, "resource_id", None) == "chrome"
+    )
+
+
+def runtime_effect_gate(classification: RuntimeToolClassification) -> EffectGate:
+    """Whether this call itself crosses the consent gate.
+
+    CONTROL and ORCHESTRATOR calls never do (their leaf calls do), nor do the
+    agent's own discovery reads. An ACTION follows its declared gate.
+    """
+    if classification.effect in {RuntimeToolEffect.CONTROL, RuntimeToolEffect.ORCHESTRATOR}:
+        return EffectGate.LEAF_ONLY
+    if classification.effect is RuntimeToolEffect.READ_ONLY:
+        # Discovery reads are declared leaf_only (action_effects, Q3), except
+        # verified Chrome-only discovery: it arms the user's browser and is
+        # basic browsing, judged like any basic Chrome read (browser rules).
+        if _is_chrome_browser_discovery(classification.authorization):
+            return EffectGate.POLICY
+        declared = declared_action_effect(getattr(classification.authorization, "action_key", None))
+        return declared.gate if declared is not None else EffectGate.POLICY
+    action = classification.action
+    if action is not None and action.gate == EffectGate.LEAF_ONLY.value:
+        return EffectGate.LEAF_ONLY
+    return EffectGate.POLICY
 
 
 def runtime_is_orchestration_tool(tool_name: str) -> bool:
@@ -1467,7 +1602,6 @@ def runtime_is_orchestration_tool(tool_name: str) -> bool:
 
     from packages.core.ai.runtime.human_input import REQUEST_INPUT_TOOL_NAME
     from packages.core.ai.runtime.workspace_delegation_actions import DELEGATE_TO_AGENT_TOOL_NAME
-    from packages.core.constants.execution import DELEGATE_TO_SERVICE_TOOL_NAME
 
     name = str(tool_name or "").strip()
     if not name:
@@ -1475,7 +1609,7 @@ def runtime_is_orchestration_tool(tool_name: str) -> bool:
     if (
         name in RUNTIME_LOOP_CONTROL_TOOL_NAMES
         or _NON_ACTION_CAPABILITY_BY_TOOL.get(name) == "runtime.discovery"
-        or name in {REQUEST_INPUT_TOOL_NAME, DELEGATE_TO_AGENT_TOOL_NAME, DELEGATE_TO_SERVICE_TOOL_NAME}
+        or name in {REQUEST_INPUT_TOOL_NAME, DELEGATE_TO_AGENT_TOOL_NAME}
     ):
         return True
     try:
@@ -1598,6 +1732,62 @@ def _canonical_composite_tool_call(
     return call.tool_name, call.arguments
 
 
+def _unsupported_gateway_action(
+    canonical_name: str,
+    canonical_arguments: dict[str, Any],
+) -> str | None:
+    """The refusal for a ``manor`` action with no handler, else ``None``.
+
+    ``manor`` takes its action as free text, and an unmapped name otherwise
+    falls back to a generic ``workspace.<action>`` mutation that asks first.
+    """
+    if canonical_name != "manor":
+        return None
+    action = str(canonical_arguments.get("action") or "").strip()
+    if not action:
+        return None
+    from packages.core.ai.tools.manor_tool import manor_action_is_callable
+
+    if manor_action_is_callable(action):
+        return None
+    return (
+        f"Manor has no action named {action!r}; nothing ran. "
+        "Find a current action with action='search' or search_tools."
+    )
+
+
+# Generic fallbacks minted without an effect declaration (they evaluate as
+# unknown); a rule naming one still matches those calls.
+_UNDECLARED_MINTED_ACTION_KEYS = frozenset({
+    "workspace.agent.action", "workspace.hitl.resolve", "chrome.action",
+})
+
+
+def runtime_action_key_is_gateable(action_key: str | None) -> bool:
+    """Whether a policy rule naming ``action_key`` can ever match a runtime call.
+
+    Declared keys and the ``workspace.<action>`` keys minted for callable Manor
+    actions are known here. A dotted key outside Manor's own namespaces is a
+    dynamic ``<mcp server>.<action>`` key and cannot be checked offline. A bare
+    word (``promote``, ``discount``) matches nothing.
+    """
+    from packages.core.governance.action_effects import internal_action_namespaces
+
+    key = str(action_key or "").strip()
+    if not key:
+        return False
+    if declared_action_effect(key) is not None or key in _UNDECLARED_MINTED_ACTION_KEYS:
+        return True
+    namespace, _, name = key.partition(".")
+    if not name:
+        return False
+    if namespace == "workspace":
+        from packages.core.ai.tools.manor_tool import manor_action_is_callable
+
+        return manor_action_is_callable(name)
+    return namespace not in internal_action_namespaces()
+
+
 def _is_update_goal_value_call(
     canonical_name: str,
     canonical_arguments: dict[str, Any],
@@ -1640,6 +1830,10 @@ def classify_runtime_tool(
         task_id=task_id,
         workspace_file_scope=workspace_file_scope,
     )
+    if unsupported := _unsupported_gateway_action(canonical_name, canonical_arguments):
+        # Checked before any approval: a card for an operation that cannot run
+        # would ask the user to approve nothing.
+        return RuntimeToolClassification.unsupported(unsupported)
     if _is_update_goal_value_call(canonical_name, canonical_arguments):
         return RuntimeToolClassification.action_call(_FIXED_TOOL_ACTIONS["update_goal_value"])
     if declared_effect is not None:
@@ -1686,6 +1880,7 @@ class RuntimeMCPApprovalActionFactory:
             "external_account",
             policy.operation,
             capability_id=_MCP_AUTHORIZATION_CAPABILITY,
+            **_mcp_effect_fields(server, MCPActionEffect(effect), action),
         )
 
 
@@ -1743,6 +1938,7 @@ def _runtime_tool_is_explicitly_read_only(
             "get_stat_status",
             "visualize_ledgers",
             "read_delegation_result",
+            "hold_for_approval",
         }
     if tool_name == "workspace_operation":
         from packages.core.ai.runtime.workspace_operation_actions import (
@@ -1798,6 +1994,12 @@ def _classify_workspace_operation_action(args: dict[str, Any]) -> RuntimeApprova
     return None
 
 
+def _mcp_effect_fields(server: str | None, effect: MCPActionEffect, action: str | None = None) -> dict[str, str]:
+    """Impact/category of a dynamic ``<server>.<action>`` key from the shared MCP enum."""
+    declared = mcp_action_effect(server, effect.value, action)
+    return {"impact": declared.impact, "category": declared.category}
+
+
 def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeApprovalAction | None:
     server, action = split_mcp_tool(tool_name)
     if not server or not action:
@@ -1835,16 +2037,23 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             # contract.  It is not an ordinary browser action, but its risk
             # level must not be upgraded solely by this basic-action policy.
             if action in {"upload", "set_files", "upload_ref"}:
+                # Selecting a file hands it to the page: an outside effect,
+                # still in the browser category the user's browser rules reach.
                 return RuntimeApprovalAction(
                     "action", "chrome.browser.interact", "low", "interact with Chrome",
                     "browser", "execute", capability_id="manor.composite",
+                    impact="external", category="browser",
                 )
             decision = classify_chrome_call(tool_name, args)
             if decision.kind in {"read", "ordinary"}:
+                # An ordinary call takes the key's declared effect; a read is
+                # a browser read.
+                read = decision.kind == "read"
                 return RuntimeApprovalAction(
                     "action", "chrome.browser.interact", "low", "interact with Chrome",
-                    "browser", "read" if decision.kind == "read" else "modify",
+                    "browser", "read" if read else "modify",
                     capability_id="manor.composite",
+                    **({"impact": "read", "category": "browser"} if read else {}),
                 )
             if decision.kind in {"unsupported", "observation_required"}:
                 return None
@@ -1856,6 +2065,9 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
                 "confirm Chrome action", "external_account",
                 "execute",
                 capability_id="manor.composite",
+                # Chrome's own confirmation category is the fact, as for
+                # confirm_action below; an unmapped category stays unknown.
+                **provider_policy_effect("chrome", confirmation.policy_category),
             )
         mode = str(args.get("confirmation_mode") or "").strip()
         category = re.sub(r"[^a-z0-9_]+", "_", str(args.get("policy_category") or "browser_action").strip().lower()).strip("_") or "browser_action"
@@ -1868,6 +2080,9 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
                 "external_account",
                 "execute",
                 capability_id="manor.composite",
+                # Chrome's own confirmation category is the fact (same table as
+                # the provider plane); an unmapped category stays unknown.
+                **provider_policy_effect("chrome", category),
             )
         return RuntimeApprovalAction(
             "action",
@@ -1878,6 +2093,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             "execute",
             str(args.get("approvalId") or args.get("approval_id") or "").strip() or None,
             "manor.composite",
+            **provider_policy_effect("chrome", category),
         )
 
     if (
@@ -1982,6 +2198,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             "external_account",
             "modify",
             capability_id=_MCP_AUTHORIZATION_CAPABILITY,
+            **_mcp_effect_fields(server, MCPActionEffect.WRITE, action),
         )
 
 
@@ -2005,6 +2222,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             "external_account",
             "delete",
             capability_id=_MCP_AUTHORIZATION_CAPABILITY,
+            **_mcp_effect_fields(server, MCPActionEffect.DESTRUCTIVE, action),
         )
     if action in _EXTERNAL_COMMIT_ACTIONS or action.startswith(_EXTERNAL_COMMIT_PREFIXES):
         if any(marker in server for marker in (
@@ -2053,6 +2271,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             "external_account",
             "modify",
             capability_id=_MCP_AUTHORIZATION_CAPABILITY,
+            **_mcp_effect_fields(server, MCPActionEffect.WRITE, action),
         )
     return None
 
@@ -2147,17 +2366,20 @@ async def _code_project_workspace_file_scope(
         return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
     if not arguments.get("files"):
         return RuntimeWorkspaceFileScope(WorkspaceFileExistence.EXISTS, root_path)
-    exists = [
-        _entity_file_exists(entity_id, target)
-        for target in code_project_target_paths(root_path, arguments)
-    ]
+    return RuntimeWorkspaceFileScope(
+        _targets_existence(entity_id, code_project_target_paths(root_path, arguments)),
+        root_path,
+    )
+
+
+def _targets_existence(entity_id: str, targets: list[str]) -> WorkspaceFileExistence:
+    """Create vs modify for a multi-file write, as the file guard computes it for the same targets."""
+    exists = [_entity_file_exists(entity_id, target) for target in targets]
     if any(item is True for item in exists):
-        existence = WorkspaceFileExistence.EXISTS
-    elif exists and all(item is False for item in exists):
-        existence = WorkspaceFileExistence.MISSING
-    else:
-        existence = WorkspaceFileExistence.UNKNOWN
-    return RuntimeWorkspaceFileScope(existence, root_path)
+        return WorkspaceFileExistence.EXISTS
+    if exists and all(item is False for item in exists):
+        return WorkspaceFileExistence.MISSING
+    return WorkspaceFileExistence.UNKNOWN
 
 
 async def resolve_runtime_workspace_file_scope(
@@ -2343,10 +2565,15 @@ async def resolve_runtime_workspace_file_scope(
         or args.get("output_directory") or args.get("path") or args.get("target_path")
         or params.get("name") or params.get("output_name") or params.get("filename") or ""
     ).strip()
-    requested_target = scope_workspace_artifact_path(requested_output, artifact_base)
-    if (
-        requested_target.startswith(workspace_base + "/")
-        and not requested_target.startswith(artifact_base + "/")
+    # A media tool with several outputs names them its own way (a narration
+    # timeline's normalized_output_directory, manifest_name, ...).
+    requested_outputs = [requested_output, *(
+        str(args.get(key) or "").strip()
+        for key in WorkspaceFileAuthorizationResourceFactory.media_output_argument_names(normalized_tool)
+    )]
+    if any(
+        target.startswith(workspace_base + "/") and not target.startswith(artifact_base + "/")
+        for target in (scope_workspace_artifact_path(output, artifact_base) for output in requested_outputs if output)
     ):
         # Explicit Workspace destinations (including ledgers and canonical
         # sibling files) keep their identity even inside an execution archive.
@@ -2484,6 +2711,22 @@ async def resolve_runtime_workspace_file_scope(
             artifact_base,
         )
     resource = resources[0]
+    if (
+        resource.match_kind is WorkspaceFileResourceMatchKind.TREE
+        and normalized_tool == "generate_file"
+        and str(args.get("kind") or "").strip().lower() == "code"
+    ):
+        # A code bundle writes its files at fixed paths in the folder, so
+        # rewriting it (a retried Flow step, an updated checkpoint) replaces them.
+        from packages.core.ai.tools.generate_file.code import _extract_files
+
+        bundle = scope_workspace_artifact_path(resource.resource_id, artifact_base)
+        files = _extract_files(params, args)
+        if files:
+            return RuntimeWorkspaceFileScope(
+                _targets_existence(normalized_entity_id, [f"{bundle}/{file['path']}" for file in files]),
+                artifact_base,
+            )
     if resource.match_kind in {
         WorkspaceFileResourceMatchKind.TREE,
         WorkspaceFileResourceMatchKind.COLLISION_SAFE_FILE,
@@ -2584,12 +2827,18 @@ def _classify_bash_tool(
             ).command
         except BashOutputPathError:
             return RuntimeApprovalAction("action", "workspace.file.write", "high", "write workspace file", "file", "modify")
+    command = BashCommandSpecFactory.without_manor_cli(command)
     if not command:
         return RuntimeApprovalAction("action", "cli.exec", "low", "run a command", "cli", "execute")
     base_cmd = _base_command(command)
     if not base_cmd:
         return RuntimeApprovalAction("action", "cli.exec", "low", "run a command", "cli", "execute")
 
+    if (
+        base_cmd in _FILE_DELETE_BASE_CMDS | _FILE_MUTATION_BASE_CMDS | _FILE_CREATE_BASE_CMDS
+        and _bash_targets_only_sandbox_scratch(command)
+    ):
+        return RuntimeApprovalAction("action", "cli.exec", "low", "run a command", "cli", "execute")
     if base_cmd in _FILE_DELETE_BASE_CMDS:
         return RuntimeApprovalAction("action", "workspace.file.delete", "high", "delete files from this workspace", "file", "delete")
     if _command_has_delete_hint(command):
@@ -2652,7 +2901,7 @@ def bash_write_targets(command: str) -> list[str]:
     Chained commands are split into simple shell segments; each segment is
     still parsed conservatively, so unknown segments simply add no paths.
     """
-    stripped = command.strip()
+    stripped = BashCommandSpecFactory.without_manor_cli(command).strip()
     if not stripped:
         return []
     if _SHELL_SEGMENT_SEPARATOR_RE.search(stripped):
@@ -2711,7 +2960,24 @@ def bash_write_targets(command: str) -> list[str]:
             if idx + 1 < len(args):
                 targets.append(args[idx + 1])
     targets.extend(BashCommandSpecFactory.write_redirection_targets(stripped))
-    return list(dict.fromkeys(t for t in targets if t))
+    # Sandbox scratch (/tmp, /dev/null, ...) is not a Workspace file.
+    entity_targets = (BashCommandSpecFactory.entity_target(t) for t in targets if t)
+    return list(dict.fromkeys(t for t in entity_targets if t))
+
+
+def _bash_targets_only_sandbox_scratch(command: str) -> bool:
+    """A file command whose every target is outside the entity working copy."""
+
+    try:
+        args = shlex.split(command.strip())
+    except ValueError:
+        return False
+    if len(args) < 2 or _SHELL_SEGMENT_SEPARATOR_RE.search(command):
+        return False
+    operands = [arg for arg in args[1:] if arg and not arg.startswith("-")]
+    return bool(operands) and all(
+        BashCommandSpecFactory.entity_target(arg) is None for arg in operands
+    )
 
 
 def _entity_file_exists(entity_id: str | None, rel_path: str) -> bool | None:
@@ -2748,6 +3014,4 @@ def split_mcp_tool(tool_name: str) -> tuple[str | None, str | None]:
 
 def _looks_public_or_paid(server: str, action: str, args: dict[str, Any]) -> bool:
     text = f"{server} {action} {json.dumps(args, ensure_ascii=False, default=str)[:500]}".lower()
-    if server == "suno" and action in {"generate_music", "create_cover", "create_mashup"}:
-        return True
     return any(word in text for word in ("publish", "post", "send", "payment", "charge", "refund", "invoice"))

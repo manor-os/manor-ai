@@ -71,6 +71,7 @@ function monthKeysInRange(startsAt: string, endsAt: string, timezone: string): s
 }
 
 function formatMonthLabel(monthKey: string): string {
+  // timezone-exempt: month key parsed as a device-local wall-clock date
   return new Intl.DateTimeFormat(undefined, {
     month: "long",
     year: "numeric",

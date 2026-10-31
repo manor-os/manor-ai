@@ -55,6 +55,105 @@ async def test_exact_durable_upload_is_readable_on_followup(db_session, attachme
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", [False, True])
+async def test_scoped_upload_reads_original_bytes_and_honors_revocation(
+    db_session, attachment_fs, monkeypatch, workspace,
+):
+    from packages.core.services.file_context import _save_chat_upload
+
+    user, conv, msg, ws, _source, _path = await seed_attachment(
+        db_session, attachment_fs, workspace=workspace,
+    )
+    original = b"sku,quantity\nSYNTHETIC-001,7\n"
+    path, _url = _save_chat_upload(
+        original, "inventory.csv", user.entity_id, "text/csv", storage_scope=conv.id,
+    )
+    msg.attachments = [{"kind": "chat_upload", "path": path}]
+    await db_session.commit()
+    args = dict(entity_id=user.entity_id, user_id=user.id, conversation_id=conv.id,
+                workspace_id=ws.id if ws else None)
+    assert await permissions.guard_ai_file_read_access(**args, tool_name="invoke_skill", paths=[path]) is None
+    result = json.loads(await file_tools._read_file(**args, path=path))
+    assert result["content"] == original.decode()
+    assert result["source_sha256"] == hashlib.sha256(original).hexdigest()
+    assert permissions.visible_user_paths([path]) == []
+
+    msg.attachments = None
+    await db_session.commit()
+
+    async def forbidden_read(*_args, **_kwargs):
+        pytest.fail("Revoked scoped attachment reached byte extraction")
+
+    monkeypatch.setattr(file_tools, "_read_supported_text", forbidden_read)
+    assert await permissions.guard_ai_file_read_access(**args, tool_name="invoke_skill", paths=[path])
+    denied = json.loads(await file_tools._read_file(**args, path=path))
+    assert "error" in denied and "content" not in denied
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restriction", [
+    None, "with_conversation", "invalid_conversation", "paused_workspace", "inactive_user",
+    "trashed", "foreign_entity", "wrong_workspace", "restricted", "userless",
+])
+async def test_probe_knowledge_document_keeps_canonical_source_under_workflow_scope(
+    db_session, attachment_fs, monkeypatch, restriction,
+):
+    from packages.core.ai.tools import media_tools
+    from packages.core.services.generated_media_naming import WorkspaceArtifactScope, workspace_artifact_scope
+
+    user, conv, _msg, ws, _upload, _path = await seed_attachment(db_session, attachment_fs, workspace=True)
+    if restriction == "paused_workspace":
+        ws.status = "paused"
+    if restriction == "inactive_user":
+        user.status = "inactive"
+    allowed = restriction in (None, "with_conversation")
+    source = attachment_fs / user.entity_id / "source.wav"
+    source.write_bytes(b"synthetic root Knowledge audio")
+    document = Document(
+        entity_id=user.entity_id, name="source.wav", fs_path="source.wav", file_type="wav",
+        source="upload", owner_id=user.id, visibility="entity", is_trashed=restriction == "trashed",
+        classification="restricted" if restriction == "restricted" else "internal",
+    )
+    db_session.add(document)
+    await db_session.commit()
+    calls = []
+
+    async def probe(_ffprobe, actual_path, *, pass_fds):
+        from pathlib import Path
+
+        assert allowed, "Unauthorized Knowledge source reached ffprobe"
+        assert pass_fds == (int(Path(actual_path).name),)
+        assert Path(actual_path).read_bytes() == source.read_bytes()
+        calls.append(actual_path)
+        return {"duration_seconds": 10.0, "has_audio": True}
+
+    monkeypatch.setattr(media_tools.shutil, "which", lambda _name: "/test/ffprobe")
+    monkeypatch.setattr(media_tools, "_probe_media_report", probe)
+    with workspace_artifact_scope(WorkspaceArtifactScope(
+        entity_id=user.entity_id, workspace_id=ws.id, workflow_run_id=generate_ulid(),
+    )):
+        result = json.loads(await media_tools._probe_media_handler(
+            entity_id=generate_ulid() if restriction == "foreign_entity" else user.entity_id,
+            _user_id_from_context=None if restriction == "userless" else user.id,
+            workspace_id=generate_ulid() if restriction == "wrong_workspace" else ws.id,
+            conversation_id=(
+                conv.id if restriction == "with_conversation"
+                else generate_ulid() if restriction == "invalid_conversation" else None
+            ), document_id=document.id,
+        ))
+    if not allowed:
+        assert result["status"] == "error"
+        assert not calls
+    else:
+        assert result["status"] == "completed", result
+        assert result["document_id"] == document.id
+        assert result["fs_path"] == "source.wav"
+        assert result["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+        assert result["report"] == {"duration_seconds": 10.0, "has_audio": True}
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("restriction", [None, "unprojected", "foreign_workspace", "unlinked", "private", "trashed", "restricted", "quarantined", "userless", "symlink", "missing_file"])
 @pytest.mark.parametrize("reader", ["read_file", "probe_media", "probe_media_url"])
 async def test_workspace_task_thread_reads_only_authorized_projected_upload(
@@ -365,7 +464,13 @@ async def test_expired_upload_does_not_fall_back_to_same_basename(db_session, at
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["uploads/chat", "uploads/chat/guess.docx", "uploads/chat/../private.docx", ".ai/secret", "uploads/chat/1234567890abcdef.docx/extra"])
+@pytest.mark.parametrize("path", [
+    "uploads/chat", "uploads/chat/guess.docx", "uploads/chat/../private.docx", ".ai/secret",
+    "uploads/chat/1234567890abcdef.docx/extra",
+    "uploads/chat/0123456789abcdef/../1234567890abcdef.docx",
+    "uploads/chat/0123456789abcdef/0123456789abcdef/1234567890abcdef.docx",
+    "uploads/chat/0123456789abcdef/1234567890abcdef.docx?x=1",
+])
 async def test_hidden_aliases_never_become_attachment_authority(attachment_fs, path):
     assert not permissions.is_chat_upload_path(path)
     assert await permissions.guard_ai_file_read_access(entity_id="entity", user_id="user", conversation_id="chat", tool_name="generate_file", paths=[path])

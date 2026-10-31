@@ -58,10 +58,11 @@ def validate_review_definition(collector_type: str, config: dict, cadence: str |
         raise StatError("assessment.missing_evidence must be unknown")
     if assessment.get("subject") != "workspace":
         raise StatError("Workspace metrics require assessment.subject=workspace; do not mix per-release scores")
+    # Scores are bounded (0–100); counts such as views only have a floor.
     scale = assessment.get("scale")
-    if not isinstance(scale, dict) or not {"minimum", "maximum"} <= scale.keys():
-        raise StatError("assessment.scale requires minimum and maximum")
-    if _normalize_stat_number(scale["minimum"]) >= _normalize_stat_number(scale["maximum"]):
+    if not isinstance(scale, dict) or "minimum" not in scale:
+        raise StatError("assessment.scale requires minimum")
+    if "maximum" in scale and _normalize_stat_number(scale["minimum"]) >= _normalize_stat_number(scale["maximum"]):
         raise StatError("assessment.scale minimum must be less than maximum")
 
 

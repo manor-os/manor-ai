@@ -2,25 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import exists, func, literal, or_, select, text
+from sqlalchemy import exists, func, or_, select, text
+from sqlalchemy.orm import aliased
 
 from packages.core.celery_app import celery_app
 from packages.core.config import get_settings
 from packages.core.constants.advisory_locks import AdvisoryLockNamespace
-from packages.core.constants.execution import (
-    COORDINATOR_CHILD_WAKE_AT_PARAM_KEY,
-    ExecutionPlanStatus,
-    ExecutionStepStatus,
-    PLAN_TERMINAL_STATUSES,
-    WorkLeaseStatus,
-)
 from packages.core.constants.task import TaskRuntimeKind, TaskStatus
-from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.runtime_run import (
     RuntimeOutboxEvent,
     SandboxReservation,
@@ -29,24 +23,11 @@ from packages.core.models.runtime_run import (
     SandboxRunnerStatus,
 )
 from packages.core.models.task import Task
+from packages.core.models.task_agent_child import TaskAgentChildRun
 from packages.core.models.task_coordinator import (
     TaskCoordinatorEngine,
     TaskCoordinatorPhase,
     TaskCoordinatorRun,
-)
-from packages.core.plans.coordinator import (
-    TASK_COORDINATOR_PLAN_VERSION,
-    TASK_COORDINATOR_PLAN_VERSION_KEY,
-    TASK_COORDINATOR_RUN_ID_KEY,
-)
-from packages.core.models.worker import WorkLease
-from packages.core.plans.wakeup import (
-    PLAN_CYCLE_AWAITING_CONTROL_ACK,
-    PLAN_CYCLE_AWAITING_HEAVY_ACK,
-    PLAN_CYCLE_OUTBOX_EVENT,
-    PLAN_CYCLE_PENDING,
-    plan_cycle_outbox_dedupe_key,
-    stage_plan_cycle_wake,
 )
 from packages.core.queues import queue_for_task
 from packages.core.services.task_execution import (
@@ -56,7 +37,35 @@ from packages.core.services.task_execution import (
     task_execution_intent_dedupe_key,
     task_execution_intent_generation,
 )
+from packages.core.models.task_run_journal import TaskRunJournalKind
+from packages.core.services import durable_run
 from packages.core.services.durable_run import close_run_wake, clear_run_claim_and_wake
+from packages.core.services.task_run_journal import (
+    append_agent_loop_run_journal,
+    append_run_journal,
+    terminal_payload,
+    wake_payload,
+)
+from packages.core.services.task_agent_child_settlement import (
+    cancel_root_delegation,
+    settle_waiting_batch,
+)
+from packages.core.services.task_agent_child_wakeup import (
+    TASK_AGENT_CHILD_AWAITING_ACK,
+    TASK_AGENT_CHILD_AWAITING_HEAVY_ACK,
+    TASK_AGENT_CHILD_CLOSED_CARD_PHASES,
+    TASK_AGENT_CHILD_CLOSED_PREFIX,
+    TASK_AGENT_CHILD_OUTBOX_EVENT,
+    TASK_AGENT_CHILD_RECOVERY_PHASES,
+    TASK_AGENT_CHILD_RUN_TASK,
+    awaited_child_refusal,
+    cancel_task_agent_children,
+    parked_run_wake_time,
+    stage_task_agent_child_wake,
+    task_agent_child_delivery_state,
+    task_agent_child_outbox_dedupe_key,
+    waiting_child_batch,
+)
 from packages.core.services.task_coordinator_wakeup import (
     TASK_COORDINATOR_AWAITING_ACK,
     TASK_COORDINATOR_OUTBOX_EVENT,
@@ -70,17 +79,33 @@ from packages.core.services.runtime_human_input import (
     expire_runtime_human_input_requests,
 )
 from packages.core.services.sandbox_queue_service import (
+    adopt_follower_reservations,
+    list_exec_slot_waits,
+    redeliver_exec_slot_resumes,
+    wake_exec_slot_wait,
     claim_due_sandbox_runner_health_checks,
     claim_next_sandbox_allocation,
+    classify_allocation_error,
     complete_sandbox_allocation,
     configured_sandbox_runners,
+    count_waiting_sandbox_reservations,
     effective_runner_limits,
     expire_sandbox_reservations,
     fail_sandbox_allocation,
+    load_pool_ceiling,
+    next_waiting_ticket_need,
+    normalize_runner_pool,
+    parse_memory_mb,
     reconciled_runner_active_count,
     reconcile_sandbox_runners,
+    record_runner_memory,
     recover_stale_sandbox_allocations,
+    recover_waiting_sandbox_runs,
+    sandbox_create_idempotency_key,
     release_vanished_sandbox_instances,
+    runner_memory_deficit_mb,
+    runner_memory_from_health,
+    sandboxes_free_for_handover,
 )
 from packages.core.services.runtime_run_terminal import (
     RUNTIME_RUN_TERMINAL_NOTICE_EVENT,
@@ -95,15 +120,10 @@ from packages.core.services.workspace_access import lock_workspace_access_bounda
 
 logger = logging.getLogger(__name__)
 
-_TASK_RUNTIME_RESUME_REDELIVERY_AFTER_SECONDS = 120
-_TASK_RUNTIME_RESUME_INVALID_SENTINEL = (
-    "permanent:runtime_approval_resume_delivery_invalid"
-)
 _TASK_EXECUTION_ACK_TIMEOUT_SECONDS = 120
-_PLAN_CYCLE_ACK_TIMEOUT_SECONDS = 120
 _TASK_COORDINATOR_ACK_TIMEOUT_SECONDS = 120
 _TASK_COORDINATOR_AWAITING_HEAVY_ACK = "task coordinator heavy execution awaiting acknowledgment"
-_PLAN_CYCLE_STALE_RECONCILE_SECONDS = 120
+_TASK_AGENT_CHILD_ACK_TIMEOUT_SECONDS = 120
 _TASK_EXECUTION_CLOSED_SENTINEL = "permanent:task_execution_intent_closed"
 _TASK_EXECUTION_AWAITING_ACK = "task execution delivery awaiting consumer acknowledgment"
 _TASK_EXECUTION_DEFERRED_PREFIX = "task execution delivery deferred"
@@ -114,35 +134,14 @@ _RUNTIME_OUTBOX_RETRY_MAX_SECONDS = 300
 # base ACK timeout. Re-arming a new generation resets attempt_count to 0, so
 # only repeated silence for the *same* generation slows down.
 _RUNTIME_OUTBOX_ACK_MAX_SECONDS = 1800
+# A Task agent loop's root run waiting on a person is woken by the sweep only
+# once its card closed without a decision (recover_runs_on_closed_cards_once).
+TASK_AGENT_ROOT_CLOSED_CARD_PHASES = frozenset({TaskCoordinatorPhase.WAITING_HUMAN.value})
 _TASK_TERMINAL_STATUSES = frozenset({
     TaskStatus.COMPLETED.value,
     TaskStatus.CANCELLED.value,
     TaskStatus.FAILED.value,
 })
-_PLAN_TERMINAL_STATUS_VALUES = tuple(
-    status.value for status in PLAN_TERMINAL_STATUSES
-)
-_PLAN_CYCLE_RUNNABLE_STATUSES = (
-    ExecutionPlanStatus.DRAFT.value,
-    ExecutionPlanStatus.PENDING.value,
-    ExecutionPlanStatus.RUNNING.value,
-)
-
-
-def _runtime_outbox_plan_category_filter(*, plan_cycle: bool):
-    """Match the exact partial-index predicate for fair quota scans.
-
-    ``literal_execute`` keeps this server-owned event type out of a generic
-    prepared-plan parameter. PostgreSQL can then prove that the query implies
-    the corresponding category partial index predicate.
-    """
-
-    plan_event_type = literal(PLAN_CYCLE_OUTBOX_EVENT, literal_execute=True)
-    if plan_cycle:
-        return RuntimeOutboxEvent.event_type == plan_event_type
-    return RuntimeOutboxEvent.event_type != plan_event_type
-
-
 def _runtime_outbox_retry_available_at(
     now: datetime,
     *,
@@ -180,93 +179,6 @@ def _runtime_outbox_ack_available_at(
     return now + timedelta(seconds=delay_seconds)
 
 
-async def _recover_task_runtime_resume_outbox(
-    db,
-    *,
-    now: datetime,
-    batch_size: int,
-) -> int:
-    """Re-arm only the still-current signed resume generation.
-
-    ``delivered_at`` proves broker acceptance, not worker ownership.  A broker
-    loss after acceptance must therefore be recoverable, while an event for an
-    older approval generation must remain a permanent no-op.
-    """
-
-    from packages.core.services.task_runtime_approvals import (
-        TASK_RUNTIME_RESUME_EVENT,
-        validate_task_runtime_resume_delivery,
-    )
-
-    cutoff = now - timedelta(
-        seconds=_TASK_RUNTIME_RESUME_REDELIVERY_AFTER_SECONDS
-    )
-    events = list((await db.execute(
-        select(RuntimeOutboxEvent)
-        .where(
-            RuntimeOutboxEvent.event_type == TASK_RUNTIME_RESUME_EVENT,
-            RuntimeOutboxEvent.delivered_at.is_not(None),
-            RuntimeOutboxEvent.delivered_at <= cutoff,
-            or_(
-                RuntimeOutboxEvent.last_error.is_(None),
-                RuntimeOutboxEvent.last_error
-                != _TASK_RUNTIME_RESUME_INVALID_SENTINEL,
-            ),
-        )
-        .order_by(RuntimeOutboxEvent.delivered_at.asc())
-        .limit(batch_size)
-    )).scalars().all())
-    rearmed = 0
-    for event in events:
-        payload = dict(event.payload or {})
-        hitl_id = str(payload.get("runtime_hitl_id") or "").strip()
-        valid = bool(hitl_id) and await validate_task_runtime_resume_delivery(
-            db,
-            task_id=str(payload.get("task_id") or ""),
-            agent_id=payload.get("agent_id"),
-            scheduled_run_id=payload.get("scheduled_run_id"),
-            scheduled_job_id=payload.get("scheduled_job_id"),
-            runtime_hitl_id=hitl_id,
-            runtime_hitl_generation=payload.get("runtime_hitl_generation"),
-            runtime_hitl_checkpoint_digest=str(
-                payload.get("runtime_hitl_checkpoint_digest") or ""
-            ),
-            runtime_hitl_checkpoint_signature=str(
-                payload.get("runtime_hitl_checkpoint_signature") or ""
-            ),
-            runtime_hitl_resolution_signature=str(
-                payload.get("runtime_hitl_resolution_signature") or ""
-            ),
-            allow_resuming=True,
-        )
-        locked_event = (await db.execute(
-            select(RuntimeOutboxEvent)
-            .where(RuntimeOutboxEvent.id == event.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-        if (
-            locked_event is None
-            or locked_event.delivered_at is None
-            or locked_event.delivered_at > cutoff
-            or dict(locked_event.payload or {}) != payload
-        ):
-            continue
-        event = locked_event
-        if not valid:
-            # A stale generation, terminal origin, invalid signature, or an
-            # already-claimed continuation can never become valid again.  Keep
-            # the broker-acceptance timestamp as audit evidence and mark the
-            # row so it cannot monopolize the oldest recovery batch forever.
-            event.last_error = _TASK_RUNTIME_RESUME_INVALID_SENTINEL
-            continue
-        event.delivered_at = None
-        event.available_at = now
-        event.last_error = "runtime approval resume delivery was not claimed"
-        rearmed += 1
-    return rearmed
-
-
 async def _task_execution_delivery_state(
     db,
     event: RuntimeOutboxEvent,
@@ -296,302 +208,18 @@ async def _task_execution_delivery_state(
     if task_execution_intent_generation(task) != generation:
         return None, "stale_task_intent"
 
-    active_plan = (await db.execute(
-        select(ExecutionPlan)
-        .where(
-            ExecutionPlan.task_id == task_id,
-            ExecutionPlan.status.not_in(_PLAN_TERMINAL_STATUS_VALUES),
-        )
-        .limit(1)
-    )).scalar_one_or_none()
-    if active_plan is not None:
-        marker = active_plan.dispatcher_state if isinstance(active_plan.dispatcher_state, dict) else {}
-        if marker.get(TASK_COORDINATOR_PLAN_VERSION_KEY) != TASK_COORDINATOR_PLAN_VERSION:
-            return None, "active_plan"
-        run = (await db.execute(
-            select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task_id)
-        )).scalar_one_or_none()
-        if (
-            run is None
-            or marker.get(TASK_COORDINATOR_RUN_ID_KEY) != run.id
-            or run.current_plan_id != active_plan.id
-        ):
-            return None, "foreign_active_plan"
-
     dispatch = await resolve_task_execution(db, task)
     if dispatch.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN:
         return None, "non_coordinated_runtime"
     return dispatch, "current"
 
 
-async def _plan_cycle_delivery_state(
-    db,
-    event: RuntimeOutboxEvent,
-) -> tuple[ExecutionPlan | None, str]:
-    """Validate one exact, still-active Plan wake generation."""
-
-    payload = dict(event.payload or {})
-    plan_id = str(payload.get("plan_id") or "").strip()
-    generation = str(payload.get("wake_generation") or "").strip()
-    if (
-        not plan_id
-        or not generation
-        or event.event_type != PLAN_CYCLE_OUTBOX_EVENT
-        or event.aggregate_id != plan_id
-        or event.dedupe_key != plan_cycle_outbox_dedupe_key(plan_id)
-    ):
-        return None, "invalid_event"
-    plan = await db.get(ExecutionPlan, plan_id)
-    if plan is None:
-        return None, "missing_plan"
-    if plan.status in _PLAN_TERMINAL_STATUS_VALUES:
-        return None, "terminal_plan"
-    if plan.status not in _PLAN_CYCLE_RUNNABLE_STATUSES:
-        return None, "inactive_plan"
-    return plan, "current"
-
-
-async def _recover_stalled_plan_cycle_wakes(
-    db,
-    *,
-    now: datetime,
-    batch_size: int,
-) -> int:
-    """Reconstruct a lost wake from durable non-terminal Plan state.
-
-    This is the backstop for legacy/future writers that commit a Step change
-    without staging the outbox row.  It deliberately skips a Plan that already
-    has a pending generation, an active worker lease, or only human-paused
-    work.  Candidate Plan locks use a stable bounded SKIP LOCKED scan so many
-    sweepers cannot manufacture a wake storm.
-    """
-
-    plan_cycle_dedupe_key = "plan-cycle:" + ExecutionPlan.id
-    pending_event = exists().where(
-        RuntimeOutboxEvent.dedupe_key == plan_cycle_dedupe_key,
-        RuntimeOutboxEvent.delivered_at.is_(None),
-    ).correlate(ExecutionPlan)
-    active_lease = exists().where(
-        WorkLease.plan_id == ExecutionPlan.id,
-        WorkLease.status == WorkLeaseStatus.ACTIVE.value,
-    ).correlate(ExecutionPlan)
-    unfinished_step = exists().where(
-        ExecutionStep.plan_id == ExecutionPlan.id,
-        ExecutionStep.step_status.not_in((
-            ExecutionStepStatus.DONE.value,
-            ExecutionStepStatus.FAILED.value,
-            ExecutionStepStatus.SKIPPED.value,
-            ExecutionStepStatus.CANCELLED.value,
-        )),
-    ).correlate(ExecutionPlan)
-    runnable_unfinished_step = exists().where(
-        ExecutionStep.plan_id == ExecutionPlan.id,
-        ExecutionStep.step_status.not_in((
-            ExecutionStepStatus.DONE.value,
-            ExecutionStepStatus.FAILED.value,
-            ExecutionStepStatus.SKIPPED.value,
-            ExecutionStepStatus.CANCELLED.value,
-            ExecutionStepStatus.WAITING_HUMAN.value,
-            ExecutionStepStatus.PAUSED.value,
-        )),
-    ).correlate(ExecutionPlan)
-    waiting_human_step = exists().where(
-        ExecutionStep.plan_id == ExecutionPlan.id,
-        ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN.value,
-    ).correlate(ExecutionPlan)
-    last_delivered_at = (
-        select(RuntimeOutboxEvent.delivered_at)
-        .where(
-            RuntimeOutboxEvent.dedupe_key == plan_cycle_dedupe_key,
-        )
-        .correlate(ExecutionPlan)
-        .scalar_subquery()
-    )
-    changed_step_since_delivery = exists().where(
-        ExecutionStep.plan_id == ExecutionPlan.id,
-        ExecutionStep.updated_at > last_delivered_at,
-    ).correlate(ExecutionPlan)
-    plans = list((await db.execute(
-        select(ExecutionPlan)
-        .where(
-            ExecutionPlan.status.in_(_PLAN_CYCLE_RUNNABLE_STATUSES),
-            ~pending_event,
-            ~active_lease,
-            # A parked coordinator root is PAUSED. Wake it when its child is
-            # terminal (no WAITING_HUMAN remains), but do not poll a root whose
-            # child is still waiting on the user. Ordinary runnable and all-
-            # terminal Plans retain their normal recovery paths.
-            or_(
-                ~unfinished_step,
-                runnable_unfinished_step,
-                ~waiting_human_step,
-            ),
-            or_(
-                last_delivered_at.is_(None),
-                ExecutionPlan.updated_at > last_delivered_at,
-                changed_step_since_delivery,
-                last_delivered_at
-                <= now - timedelta(seconds=_PLAN_CYCLE_STALE_RECONCILE_SECONDS),
-            ),
-        )
-        # Match the runnable partial/expression index. ``updated_at`` is
-        # nullable on legacy/create_all rows, so created_at is the stable
-        # fallback instead of PostgreSQL's starvation-prone NULLS LAST order.
-        # A recovered Plan's pending row excludes it from the next batch.
-        .order_by(
-            func.coalesce(
-                ExecutionPlan.updated_at,
-                ExecutionPlan.created_at,
-            ).asc(),
-            ExecutionPlan.id.asc(),
-        )
-        .limit(batch_size)
-        .with_for_update(skip_locked=True)
-    )).scalars().all())
-    recovered = 0
-    terminal_step_statuses = {
-        ExecutionStepStatus.DONE.value,
-        ExecutionStepStatus.FAILED.value,
-        ExecutionStepStatus.SKIPPED.value,
-        ExecutionStepStatus.CANCELLED.value,
-    }
-    human_wait_statuses = {
-        ExecutionStepStatus.WAITING_HUMAN.value,
-    }
-    for plan in plans:
-        steps = list((await db.execute(
-            select(ExecutionStep)
-            .where(ExecutionStep.plan_id == plan.id)
-            .order_by(ExecutionStep.created_at.asc(), ExecutionStep.id.asc())
-        )).scalars().all())
-        unfinished = [
-            step for step in steps if step.step_status not in terminal_step_statuses
-        ]
-        # SQL already excludes active leases and human-only waits. Keep this
-        # defensive recheck for rows that changed after candidate selection.
-        if unfinished and all(step.step_status in human_wait_statuses for step in unfinished):
-            continue
-
-        delay_seconds = 0.0
-        pending = [
-            step for step in unfinished
-            if step.step_status == ExecutionStepStatus.PENDING.value
-        ]
-        if pending and all(step.kind == "sleep" for step in pending):
-            from packages.core.plans.executor import PlanExecutor
-
-            delays = [
-                PlanExecutor._sleep_seconds(
-                    step.params if isinstance(step.params, dict) else {}
-                )
-                for step in pending
-                # ``seconds`` is relative to the executor admitting the sleep,
-                # so delaying recovery by that duration would apply it twice.
-                # Only already-absolute deadlines are safe to honor here.
-                if isinstance(step.params, dict)
-                and (
-                    COORDINATOR_CHILD_WAKE_AT_PARAM_KEY in step.params
-                    or "until" in step.params
-                )
-            ]
-            positive_delays = [delay for delay in delays if delay > 0]
-            if positive_delays:
-                delay_seconds = min(positive_delays)
-        wake = await stage_plan_cycle_wake(
-            db,
-            plan.id,
-            delay_seconds=delay_seconds,
-            reason="stalled_plan_backstop",
-        )
-        if wake is not None:
-            recovered += 1
-    return recovered
-
-
-async def recover_stalled_plan_cycle_wakes_once(*, batch_size: int = 100) -> int:
-    """Run the bounded lost-wake backstop independently of outbox publish.
-
-    Normal Plan mutations stage their generation in the same transaction, so
-    this scan is exceptional recovery rather than the delivery fast path.  A
-    dedicated lower-frequency task plus a transaction advisory lock prevents
-    multiple CONTROL workers from repeating the correlated parked-Plan scan.
-    """
-
-    from packages.core.database import create_worker_session
-
-    session_factory = create_worker_session()
-    async with session_factory() as db:
-        dialect = getattr(getattr(db, "bind", None), "dialect", None)
-        if getattr(dialect, "name", None) == "postgresql":
-            claimed = await db.scalar(
-                text(
-                    "SELECT pg_try_advisory_xact_lock(:namespace, :sweep_key)"
-                ),
-                {
-                    "namespace": int(
-                        AdvisoryLockNamespace.PLAN_CYCLE_RECOVERY_SWEEP
-                    ),
-                    "sweep_key": 0,
-                },
-            )
-            if not claimed:
-                await db.rollback()
-                return 0
-        recovered = await _recover_stalled_plan_cycle_wakes(
-            db,
-            now=datetime.now(timezone.utc),
-            batch_size=max(1, int(batch_size)),
-        )
-        await db.commit()
-        return recovered
-
-
-_PARKED_JOB_POLL_SECONDS = 300
-
-
-async def _parked_agent_loop_wake_time(db, run, *, now: datetime) -> datetime:
-    """When a parked agent loop with no pending wake should wake.
-
-    A timer resumes at its own time; a job wait resumes when its jobs are
-    terminal or its deadline passed, and otherwise polls again. A malformed
-    wait wakes at once so the worker surfaces it.
-    """
-
-    from packages.core.models.media_job import MediaJob, MediaJobStatus
-    from packages.core.services.task_coordinator_wakeup import TASK_LOOP_WAIT_KEY
-
-    checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
-    wait = checkpoint.get(TASK_LOOP_WAIT_KEY)
-    wait = wait if isinstance(wait, dict) else {}
-
-    def _time(value):
-        try:
-            parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-
-    if run.phase == TaskCoordinatorPhase.WAITING_TIMER.value:
-        wake_at = _time(wait.get("wake_at"))
-        return max(now, wake_at) if wake_at is not None else now
-    deadline = _time(wait.get("deadline_at"))
-    job_ids = [str(item) for item in wait.get("job_ids") or [] if item]
-    if deadline is None or not job_ids or deadline <= now:
-        return now
-    still_open = (await db.execute(
-        select(MediaJob.id).where(
-            MediaJob.entity_id == run.entity_id,
-            MediaJob.id.in_(job_ids),
-            MediaJob.status.in_((MediaJobStatus.PENDING.value, MediaJobStatus.PROCESSING.value)),
-        ).limit(1)
-    )).scalar_one_or_none()
-    if still_open is None:
-        return now
-    return min(deadline, now + timedelta(seconds=_PARKED_JOB_POLL_SECONDS))
+# When a parked agent loop (root or child) with no pending wake should wake.
+_parked_agent_loop_wake_time = parked_run_wake_time
 
 
 async def recover_stalled_task_coordinator_wakes_once(*, batch_size: int = 100) -> int:
-    """Bounded backstop for missing V3 Task wakes; never poll live children."""
+    """Bounded backstop for missing Task run wakes; never poll live children."""
 
     from packages.core.database import create_worker_session
 
@@ -627,7 +255,6 @@ async def recover_stalled_task_coordinator_wakes_once(*, batch_size: int = 100) 
                 TaskCoordinatorRun.phase.in_((
                     TaskCoordinatorPhase.READY.value,
                     TaskCoordinatorPhase.RUNNING.value,
-                    TaskCoordinatorPhase.WAITING_PLAN.value,
                     TaskCoordinatorPhase.WAITING_CHILD.value,
                     # A parked agent loop whose wake row was lost. Only an
                     # overdue wait is woken; otherwise its wake is restored.
@@ -651,12 +278,6 @@ async def recover_stalled_task_coordinator_wakes_once(*, batch_size: int = 100) 
             .with_for_update(skip_locked=True, of=TaskCoordinatorRun)
         )).all())
         recovered = 0
-        terminal = {
-            ExecutionStepStatus.DONE.value,
-            ExecutionStepStatus.FAILED.value,
-            ExecutionStepStatus.SKIPPED.value,
-            ExecutionStepStatus.CANCELLED.value,
-        }
         for run, task in run_tasks:
             # A Task retry can leave a stale terminal generation on the old
             # Run. Only the exact start intent may manufacture a recovery
@@ -664,29 +285,20 @@ async def recover_stalled_task_coordinator_wakes_once(*, batch_size: int = 100) 
             if run.lifecycle_generation != task_execution_intent_generation(task):
                 continue
             if run.phase == TaskCoordinatorPhase.WAITING_CHILD.value:
-                checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
-                control = checkpoint.get("task_coordinator_control")
-                if not isinstance(control, dict):
-                    # Missing child lineage is a durable error for the Task
-                    # worker to surface, not a guessed release.
-                    ready = True
-                else:
-                    step_ids = control.get("step_ids")
-                    if not isinstance(step_ids, list) or not step_ids:
-                        ready = True
-                    else:
-                        statuses = list((await db.execute(
-                            select(ExecutionStep.id, ExecutionStep.step_status)
-                            .where(
-                                ExecutionStep.plan_id == run.current_plan_id,
-                                ExecutionStep.id.in_(step_ids),
-                            )
-                        )).all())
-                        ready = len(statuses) != len(step_ids) or all(
-                            status in terminal for _, status in statuses
-                        )
-                if not ready:
+                # An agent loop waits on its delegated child runs, which move
+                # themselves forward. A batch whose children all ended but
+                # that nothing settled is settled here, in the run's lock
+                # (Run -> child rows), which also stages its wake. A batch
+                # that settled (its wake was lost) or whose wait is malformed
+                # (the worker surfaces it) is woken.
+                batch = await waiting_child_batch(db, run)
+                if batch.state == "running":
                     continue
+                if batch.state == "all_terminal" and await settle_waiting_batch(db, task=task, parent=run):
+                    recovered += 1
+                    continue
+                # Nothing to settle into (no parked call): the woken worker
+                # gives the call an honest unavailable result.
             available_at = None
             if run.phase in {
                 TaskCoordinatorPhase.WAITING_TIMER.value,
@@ -699,126 +311,180 @@ async def recover_stalled_task_coordinator_wakes_once(*, batch_size: int = 100) 
             )
             if wake is not None:
                 recovered += 1
+                checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
+                # A lost wake restored by the backstop; a parked run names its wait.
+                await append_agent_loop_run_journal(
+                    db, run=run, kind=TaskRunJournalKind.WAKE,
+                    payload=wake_payload(
+                        checkpoint.get("task_loop_wait") if run.phase in {
+                            TaskCoordinatorPhase.WAITING_TIMER.value,
+                            TaskCoordinatorPhase.WAITING_JOB.value,
+                            TaskCoordinatorPhase.WAITING_CHILD.value,
+                        } else None,
+                        resolution="recovered", task_resumed=False,
+                    ),
+                )
         await db.commit()
         return recovered
 
 
-async def recover_task_coordinator_terminal_cleanup_once(*, batch_size: int = 50) -> int:
-    """Retry idempotent HITL cleanup after a V3 terminal commit and wake ACK.
+async def recover_stalled_task_agent_child_wakes_once(*, batch_size: int = 100) -> int:
+    """Backstop for lost wakes of delegated child runs; never poll live ones.
 
-    Cleanup locks HITL before Task, so it cannot run inside finalization's
-    Task -> Plan transaction. A process death in that gap leaves this marker
-    unset; this bounded sweep closes the gap without replaying any Step.
+    A candidate is a non-terminal child in a recoverable phase with no live
+    claim and no pending wake of its current generation, whose Task is in
+    progress, whose lifecycle is the Task's current one and whose direct
+    parent (root run or child row) is waiting_child. A ready/running child is
+    restaged now; a timer/job wait at its own time; a waiting_child child only
+    once its own batch settled, ended or is malformed. A child waiting on a
+    person is never woken here (the person's answer reopens it).
     """
 
     from packages.core.database import create_worker_session
-    from packages.core.plans.executor import PlanExecutor
 
+    parent_child = aliased(TaskAgentChildRun)
     session_factory = create_worker_session()
     async with session_factory() as db:
-        candidates = list((await db.execute(
-            select(TaskCoordinatorRun.id, TaskCoordinatorRun.task_id, TaskCoordinatorRun.current_plan_id)
-            .where(
-                TaskCoordinatorRun.phase == TaskCoordinatorPhase.COMPLETED.value,
-                TaskCoordinatorRun.terminal_cleanup_at.is_(None),
-                TaskCoordinatorRun.current_plan_id.is_not(None),
+        dialect = getattr(getattr(db, "bind", None), "dialect", None)
+        if getattr(dialect, "name", None) == "postgresql":
+            claimed = await db.scalar(
+                text("SELECT pg_try_advisory_xact_lock(:namespace, :sweep_key)"),
+                {
+                    "namespace": int(AdvisoryLockNamespace.PLAN_CYCLE_RECOVERY_SWEEP),
+                    "sweep_key": 2,
+                },
             )
-            .order_by(TaskCoordinatorRun.updated_at, TaskCoordinatorRun.id)
-            .limit(max(1, min(int(batch_size), 50)))
+            if not claimed:
+                return 0
+        now = datetime.now(timezone.utc)
+        pending_event = exists().where(
+            RuntimeOutboxEvent.dedupe_key == (
+                "task-agent-child:" + TaskAgentChildRun.id
+            ),
+            RuntimeOutboxEvent.delivered_at.is_(None),
+            RuntimeOutboxEvent.payload["wake_generation"].as_string()
+            == TaskAgentChildRun.wake_generation,
+        ).correlate(TaskAgentChildRun)
+        root_waiting = exists().where(
+            TaskCoordinatorRun.id == TaskAgentChildRun.parent_ref,
+            TaskCoordinatorRun.task_id == TaskAgentChildRun.task_id,
+            TaskCoordinatorRun.phase == TaskCoordinatorPhase.WAITING_CHILD.value,
+        ).correlate(TaskAgentChildRun)
+        parent_child_waiting = exists().where(
+            parent_child.id == TaskAgentChildRun.parent_child_id,
+            parent_child.task_id == TaskAgentChildRun.task_id,
+            parent_child.phase == TaskCoordinatorPhase.WAITING_CHILD.value,
+        ).correlate(TaskAgentChildRun)
+        child_tasks = list((await db.execute(
+            select(TaskAgentChildRun, Task)
+            .join(Task, Task.id == TaskAgentChildRun.task_id)
+            .where(
+                Task.status == TaskStatus.IN_PROGRESS.value,
+                TaskAgentChildRun.phase.in_(tuple(sorted(TASK_AGENT_CHILD_RECOVERY_PHASES))),
+                ~pending_event,
+                or_(
+                    TaskAgentChildRun.claim_expires_at.is_(None),
+                    TaskAgentChildRun.claim_expires_at <= now,
+                ),
+                or_(
+                    TaskAgentChildRun.parent_child_id.is_(None) & root_waiting,
+                    TaskAgentChildRun.parent_child_id.is_not(None) & parent_child_waiting,
+                ),
+            )
+            .order_by(
+                func.coalesce(
+                    TaskAgentChildRun.updated_at,
+                    TaskAgentChildRun.created_at,
+                ).asc(),
+                TaskAgentChildRun.id.asc(),
+            )
+            .limit(max(1, min(int(batch_size), 100)))
+            .with_for_update(skip_locked=True, of=TaskAgentChildRun)
         )).all())
-    cleaned = 0
-    for run_id, task_id, plan_id in candidates:
-        try:
-            async with session_factory() as db:
-                await PlanExecutor._cleanup_terminal_approvals_after_commit(
-                    db, plan_id=plan_id, task_id=task_id, reason="plan_terminal",
+        recovered = 0
+        for child, task in child_tasks:
+            # The same rule as delivery: a wake the publisher would close as
+            # unusable is never staged (it would be restaged every tick).
+            if await awaited_child_refusal(db, child, task) is not None:
+                continue
+            if child.phase == TaskCoordinatorPhase.WAITING_CHILD.value:
+                batch = await waiting_child_batch(db, child)
+                if batch.state == "running":
+                    continue
+                # Settled in the child's lock, which stages its wake.
+                if batch.state == "all_terminal" and await settle_waiting_batch(db, task=task, parent=child):
+                    recovered += 1
+                    continue
+            available_at = None
+            if child.phase in {
+                TaskCoordinatorPhase.WAITING_TIMER.value,
+                TaskCoordinatorPhase.WAITING_JOB.value,
+            }:
+                available_at = await _parked_agent_loop_wake_time(db, child, now=now)
+            wake = await stage_task_agent_child_wake(
+                db, child_id=child.id, reason="stalled_task_agent_child_backstop",
+                available_at=available_at,
+            )
+            if wake is not None:
+                recovered += 1
+                checkpoint = child.checkpoint if isinstance(child.checkpoint, dict) else {}
+                await append_run_journal(
+                    db, run=child, kind=TaskRunJournalKind.WAKE,
+                    payload=wake_payload(
+                        checkpoint.get("task_loop_wait") if child.phase in {
+                            TaskCoordinatorPhase.WAITING_TIMER.value,
+                            TaskCoordinatorPhase.WAITING_JOB.value,
+                            TaskCoordinatorPhase.WAITING_CHILD.value,
+                        } else None,
+                        resolution="recovered", task_resumed=False,
+                    ),
                 )
-                run = (await db.execute(
-                    select(TaskCoordinatorRun).where(TaskCoordinatorRun.id == run_id)
-                    .with_for_update().execution_options(populate_existing=True)
-                )).scalar_one_or_none()
-                if (
-                    run is not None
-                    and run.phase == TaskCoordinatorPhase.COMPLETED.value
-                    and run.current_plan_id == plan_id
-                    and run.terminal_cleanup_at is None
-                ):
-                    run.terminal_cleanup_at = datetime.now(timezone.utc)
-                    await db.commit()
-                    cleaned += 1
-        except Exception:
-            logger.exception("Task coordinator terminal cleanup retry failed for plan %s", plan_id)
-            # Rotate a repeatedly failing old Plan behind newer candidates;
-            # otherwise one hot row can monopolize every bounded sweep.
-            try:
-                async with session_factory() as retry_db:
-                    retry_run = (await retry_db.execute(
-                        select(TaskCoordinatorRun).where(TaskCoordinatorRun.id == run_id)
-                        .with_for_update().execution_options(populate_existing=True)
-                    )).scalar_one_or_none()
-                    if (
-                        retry_run is not None
-                        and retry_run.phase == TaskCoordinatorPhase.COMPLETED.value
-                        and retry_run.current_plan_id == plan_id
-                        and retry_run.terminal_cleanup_at is None
-                    ):
-                        retry_run.updated_at = datetime.now(timezone.utc)
-                        await retry_db.commit()
-            except Exception:
-                logger.exception("Could not rotate terminal cleanup retry for Plan %s", plan_id)
-    return cleaned
+        await db.commit()
+        return recovered
 
 
 async def reconcile_terminal_task_coordinator_runs_once(*, batch_size: int = 50) -> int:
-    """Stop orphan V3 execution after an external Task terminal transition.
+    """Stop an agent loop after an external Task terminal transition.
 
-    Normal submit completes Task, Plan, and Run atomically. A user/system
-    cancellation or failure can instead terminalize the Task first. Reconcile
-    under Task -> Plan/Lease/Step -> Run locks so no stale coordinator wake
-    continues to release children after that boundary.
+    A user/system cancellation or failure terminalizes the Task first; its run
+    and delegated child runs stop here, under Task -> Run -> child locks, so
+    no stale wake continues the loop after that boundary.
     """
 
     from packages.core.database import create_worker_session
-    from packages.core.plans.coordinator import (
-        TASK_COORDINATOR_PLAN_VERSION,
-        TASK_COORDINATOR_PLAN_VERSION_KEY,
-        TASK_COORDINATOR_RUN_ID_KEY,
-    )
-    from packages.core.plans.service import cancel_plan
 
     session_factory = create_worker_session()
-    stopped_with_active_plan = exists(
-        select(ExecutionPlan.id).where(
-            ExecutionPlan.id == TaskCoordinatorRun.current_plan_id,
-            ExecutionPlan.task_id == TaskCoordinatorRun.task_id,
-            ExecutionPlan.entity_id == TaskCoordinatorRun.entity_id,
-            ExecutionPlan.workspace_id == TaskCoordinatorRun.workspace_id,
-            ExecutionPlan.status.not_in(_PLAN_TERMINAL_STATUS_VALUES),
-            ExecutionPlan.dispatcher_state[TASK_COORDINATOR_PLAN_VERSION_KEY].astext
-            == str(TASK_COORDINATOR_PLAN_VERSION),
-            ExecutionPlan.dispatcher_state[TASK_COORDINATOR_RUN_ID_KEY].astext
-            == TaskCoordinatorRun.id,
-        ).correlate(TaskCoordinatorRun)
-    )
+    limit = max(1, min(int(batch_size), 50))
     async with session_factory() as db:
         candidates = list((await db.execute(
             select(TaskCoordinatorRun.task_id)
             .join(Task, Task.id == TaskCoordinatorRun.task_id)
             .where(
                 Task.status.in_(tuple(_TASK_TERMINAL_STATUSES)),
-                or_(
-                    TaskCoordinatorRun.phase.not_in(tuple(TaskCoordinatorPhase.terminal())),
-                    # A coordinator can stop after exhausting its internal
-                    # acceptance loop while preserving its active Plan and
-                    # DONE Steps for retry. An external Task cancellation must
-                    # still close that Plan; do not scan unrelated failed Runs.
-                    (TaskCoordinatorRun.phase == TaskCoordinatorPhase.FAILED.value)
-                    & stopped_with_active_plan,
-                ),
+                TaskCoordinatorRun.phase.not_in(tuple(TaskCoordinatorPhase.terminal())),
             )
             .order_by(TaskCoordinatorRun.updated_at, TaskCoordinatorRun.id)
-            .limit(max(1, min(int(batch_size), 50)))
+            .limit(limit)
         )).scalars().all())
+        # Terminal Tasks whose delegated child runs still live (their root
+        # may already have stopped). Scanned from the live child rows, so a
+        # tick costs nothing while no child is live.
+        child_task_ids = (await db.execute(
+            select(TaskAgentChildRun.task_id)
+            .join(Task, Task.id == TaskAgentChildRun.task_id)
+            .where(
+                Task.status.in_(tuple(_TASK_TERMINAL_STATUSES)),
+                TaskAgentChildRun.phase.not_in(tuple(TaskCoordinatorPhase.terminal())),
+            )
+            .group_by(TaskAgentChildRun.task_id)
+            .order_by(
+                func.min(func.coalesce(TaskAgentChildRun.updated_at, TaskAgentChildRun.created_at)),
+                TaskAgentChildRun.task_id,
+            )
+            .limit(limit)
+        )).scalars().all()
+        seen = set(candidates)
+        candidates.extend(task_id for task_id in child_task_ids if task_id not in seen)
     reconciled = 0
     for task_id in candidates:
         async with session_factory() as db:
@@ -831,33 +497,8 @@ async def reconcile_terminal_task_coordinator_runs_once(*, batch_size: int = 50)
             run = (await db.execute(
                 select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task_id)
             )).scalar_one_or_none()
-            if run is None or run.phase in {
-                TaskCoordinatorPhase.COMPLETED.value,
-                TaskCoordinatorPhase.CANCELLED.value,
-            }:
-                continue
-            stopped_failed_run = run.phase == TaskCoordinatorPhase.FAILED.value
-            cancelled_active_plan = False
-            if run.current_plan_id:
-                plan = (await db.execute(
-                    select(ExecutionPlan).where(ExecutionPlan.id == run.current_plan_id)
-                )).scalar_one_or_none()
-                state = plan.dispatcher_state if plan is not None and isinstance(plan.dispatcher_state, dict) else {}
-                if (
-                    plan is not None
-                    and plan.task_id == task.id
-                    and state.get(TASK_COORDINATOR_PLAN_VERSION_KEY) == TASK_COORDINATOR_PLAN_VERSION
-                    and state.get(TASK_COORDINATOR_RUN_ID_KEY) == run.id
-                    and plan.status not in _PLAN_TERMINAL_STATUS_VALUES
-                ):
-                    await cancel_plan(
-                        db, plan.id, reason=f"Task became {task.status}",
-                    )
-                    cancelled_active_plan = True
-            if stopped_failed_run and not cancelled_active_plan:
-                # A concurrent finalization or retry may have removed the
-                # active Plan after the candidate scan. The already-stopped
-                # Run needs no further mutation in this sweep.
+            if run is None or run.phase in TaskCoordinatorPhase.terminal():
+                reconciled += await _reconcile_terminal_task_children(db, task, run)
                 continue
             run = (await db.execute(
                 select(TaskCoordinatorRun)
@@ -868,6 +509,7 @@ async def reconcile_terminal_task_coordinator_runs_once(*, batch_size: int = 50)
                 TaskCoordinatorPhase.COMPLETED.value,
                 TaskCoordinatorPhase.CANCELLED.value,
             }:
+                reconciled += await _reconcile_terminal_task_children(db, task, run)
                 continue
             run.phase = (
                 TaskCoordinatorPhase.FAILED.value
@@ -882,10 +524,67 @@ async def reconcile_terminal_task_coordinator_runs_once(*, batch_size: int = 50)
                 key=task_id,
                 last_error="permanent:task_coordinator_intent_closed:terminal_task",
             )
+            # The run stops mid-work because its Task was cancelled or failed
+            # (who did it is on the Task's status-change log and ledger event).
+            await append_agent_loop_run_journal(
+                db, run=run, kind=TaskRunJournalKind.TERMINAL,
+                payload=terminal_payload(
+                    status=task.status, phase=run.phase, error_code=f"task_{task.status}",
+                    files=None, source="task_status",
+                ),
+            )
+            await _stop_task_children(db, task, run)
             await db.commit()
             reconciled += 1
     await _close_terminal_agent_loop_input_cards(session_factory, batch_size=batch_size)
     return reconciled
+
+
+async def _reconcile_terminal_task_children(db, task: Task, run: Any) -> int:
+    """Cancel a terminal Task's live child runs when its root run is already stopped.
+
+    Locks the root run (Task -> Run -> child order) and commits only when a
+    child was cancelled. Returns 1 when it did, else 0.
+    """
+
+    if run is None:
+        return 0
+    root = await durable_run.lock_run(db, TASK_COORDINATOR_RUN_SPEC, task.id)
+    if not await _stop_task_children(db, task, root):
+        return 0
+    await db.commit()
+    return 1
+
+
+async def _stop_task_children(db, task: Task, root: Any) -> int:
+    """Cancel a terminal Task's open child runs (the caller holds Task -> root Run).
+
+    An agent-loop root still parked on their batch gets the cancelled batch
+    in its parked call, so a retry continues from what the children did
+    (their receipts, an unknown last round) instead of "did not run".
+    """
+
+    from packages.core.models.task_agent_child import TASK_AGENT_CHILD_TERMINAL_PHASES
+
+    open_ids = list((await db.execute(
+        select(TaskAgentChildRun.id).where(
+            TaskAgentChildRun.task_id == task.id,
+            TaskAgentChildRun.phase.not_in(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+        )
+    )).scalars().all())
+    if not open_ids:
+        return 0
+    if (
+        root is not None
+        and root.engine == TaskCoordinatorEngine.AGENT_LOOP.value
+        and isinstance(root.checkpoint, dict)
+    ):
+        root.checkpoint = await cancel_root_delegation(
+            db, task=task, run=root, checkpoint=root.checkpoint, error_code=f"task_{task.status}",
+        )
+    else:
+        await cancel_task_agent_children(db, task=task)
+    return len(open_ids)
 
 
 async def _close_terminal_agent_loop_input_cards(session_factory: Any, *, batch_size: int) -> int:
@@ -911,7 +610,7 @@ async def _close_terminal_agent_loop_input_cards(session_factory: Any, *, batch_
                 HitlRequest.action_key == TASK_INPUT_ACTION_KEY,
                 HitlRequest.status == ApprovalStatus.PENDING.value,
                 Task.status.in_(tuple(_TASK_TERMINAL_STATUSES)),
-                TaskCoordinatorRun.engine == TaskCoordinatorEngine.AGENT_LOOP.value,
+                TaskCoordinatorRun.engine.in_((TaskCoordinatorEngine.AGENT_LOOP.value, TaskCoordinatorEngine.PLAN_DAG.value)),
             )
             .distinct()
             .limit(max(1, min(int(batch_size), 50)))
@@ -932,96 +631,133 @@ async def _close_terminal_agent_loop_input_cards(session_factory: Any, *, batch_
     return closed
 
 
-async def consume_plan_cycle_intent_once(
-    *,
-    event_id: str,
-    plan_id: str,
-    wake_generation: str,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    """Handoff one durable Plan wake from CONTROL to the HEAVY queue."""
+async def recover_ended_child_cards_once(*, batch_size: int = 50) -> int:
+    """Backstop: close the open cards of delegated child runs that have ended.
 
+    A child stopped by its parent (or any path that skipped the post-commit
+    close) can leave its question or approval card open; nothing can resume
+    it any more. Each Task found is cleaned in its own transaction under the
+    approval-boundary -> HitlRequest -> Task order
+    (``close_ended_child_cards``).
+    """
+
+    from packages.core.constants.approvals import (
+        APPROVAL_LIVE_STATUSES,
+        ApprovalOriginKind,
+    )
     from packages.core.database import create_worker_session
-    from packages.core.tasks.ai_tasks import run_plan
-
-    normalized_event_id = str(event_id or "").strip()
-    normalized_plan_id = str(plan_id or "").strip()
-    normalized_generation = str(wake_generation or "").strip()
-    if not normalized_event_id or not normalized_plan_id or not normalized_generation:
-        return {"status": "closed", "reason": "invalid_delivery"}
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task_agent_child import TASK_AGENT_CHILD_TERMINAL_PHASES
+    from packages.core.services.task_agent_loop_hitl import (
+        TASK_AGENT_LOOP_HITL_CONTEXT_KEY,
+        close_ended_child_cards,
+    )
 
     session_factory = create_worker_session()
+    owner = func.coalesce(
+        HitlRequest.context["run_id"].astext,
+        HitlRequest.context[(TASK_AGENT_LOOP_HITL_CONTEXT_KEY, "run_id")].astext,
+    )
     async with session_factory() as db:
-        event = (await db.execute(
-            select(RuntimeOutboxEvent)
+        task_ids = list((await db.execute(
+            select(HitlRequest.origin_task_id)
+            .join(
+                TaskAgentChildRun,
+                (TaskAgentChildRun.id == owner)
+                & (TaskAgentChildRun.task_id == HitlRequest.origin_task_id),
+            )
             .where(
-                RuntimeOutboxEvent.id == normalized_event_id,
-                RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
-                RuntimeOutboxEvent.aggregate_id == normalized_plan_id,
-                RuntimeOutboxEvent.dedupe_key
-                == plan_cycle_outbox_dedupe_key(normalized_plan_id),
+                HitlRequest.origin_kind.in_((ApprovalOriginKind.TASK.value, ApprovalOriginKind.TOOL_CALL.value)),
+                HitlRequest.status.in_(tuple(status.value for status in APPROVAL_LIVE_STATUSES)),
+                TaskAgentChildRun.phase.in_(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+                # An external action crossed its linearization point: it is
+                # reconciled, never expired (and would be picked forever).
+                ~HitlRequest.context.has_key("provider_action_claim"),
             )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-        if event is None:
-            return {"status": "closed", "reason": "missing_event"}
-        payload = dict(event.payload or {})
-        if str(payload.get("wake_generation") or "") != normalized_generation:
-            return {"status": "closed", "reason": "stale_generation"}
-        if event.delivered_at is not None:
-            return {"status": "closed", "reason": "already_acknowledged"}
-        now = datetime.now(timezone.utc)
-        if (
-            event.last_error == PLAN_CYCLE_PENDING
-            and event.available_at is not None
-            and event.available_at > now
-        ):
-            # A delayed duplicate CONTROL message may still carry the current
-            # generation after cycle_busy/supervisor re-armed it. Exact
-            # identity does not authorize crossing its new not-before time.
-            return {"status": "suppressed", "reason": "not_due"}
-        plan, state = await _plan_cycle_delivery_state(db, event)
-        if plan is None:
-            event.delivered_at = datetime.now(timezone.utc)
-            event.last_error = f"permanent:plan_cycle_intent_closed:{state}"
-            await db.commit()
-            return {"status": "closed", "reason": state}
-        if (
-            event.last_error == PLAN_CYCLE_AWAITING_HEAVY_ACK
-            and event.available_at is not None
-            and event.available_at > now
-        ):
-            return {"status": "suppressed", "reason": "heavy_handoff_pending"}
+            .distinct()
+            .order_by(HitlRequest.origin_task_id)
+            .limit(max(1, min(int(batch_size), 50)))
+        )).scalars().all())
+    closed = 0
+    for task_id in task_ids:
         try:
-            run_plan.apply_async(
-                args=[normalized_plan_id],
-                kwargs={
-                    "outbox_event_id": normalized_event_id,
-                    "wake_generation": normalized_generation,
-                },
+            async with session_factory() as db:
+                closed += await close_ended_child_cards(db, task_id=str(task_id))
+                await db.commit()
+        except Exception:
+            logger.exception("Task %s ended delegated run card cleanup failed", task_id)
+    return closed
+
+
+async def recover_runs_on_closed_cards_once(*, batch_size: int = 50) -> int:
+    """Backstop: wake a Task agent loop run still parked on a card that is no longer pending.
+
+    The one person-phase case the sweep handles, for the Task's root run and
+    its delegated children alike. Every writer that closes a request
+    undecided wakes its run in the same transaction
+    (``wake_run_for_closed_request``); a close path that did not (or a
+    decision made on a surface that does not route to the park) would leave
+    the run waiting on nothing. A candidate is a ``waiting_human`` run of a
+    non-terminal Task whose wait has no resolution and whose request is not
+    pending. Each is settled in its own transaction under the approval
+    boundary -> HitlRequest -> Task -> root Run -> child order, exactly as
+    the card would have (``settle_closed_park``).
+    """
+
+    from packages.core.constants.approvals import ApprovalStatus
+    from packages.core.database import create_worker_session
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+    from packages.core.services.task_runtime_approvals import lock_task_runtime_approval_boundary
+
+    session_factory = create_worker_session()
+    limit = max(1, min(int(batch_size), 50))
+
+    def _closed(model, *, phases, extra=()):
+        wait = model.checkpoint["task_loop_wait"]
+        return (
+            select(HitlRequest.id, model.task_id, model.id)
+            .join(
+                model,
+                (HitlRequest.id == wait["hitl_request_id"].astext)
+                & (HitlRequest.origin_task_id == model.task_id),
             )
-        except Exception as exc:
-            event.attempt_count += 1
-            event.available_at = _runtime_outbox_retry_available_at(
-                now,
-                attempt_count=event.attempt_count,
+            .join(Task, Task.id == model.task_id)
+            .where(
+                model.phase.in_(tuple(sorted(phases))),
+                wait["resolution"].astext.is_(None),
+                HitlRequest.status != ApprovalStatus.PENDING.value,
+                Task.status.not_in(tuple(_TASK_TERMINAL_STATUSES)),
+                *extra,
             )
-            event.last_error = str(exc)[:2000]
-            await db.commit()
-            return {"status": "deferred", "reason": "broker_failure"}
-        event.available_at = _runtime_outbox_ack_available_at(
-            now,
-            base_seconds=_PLAN_CYCLE_ACK_TIMEOUT_SECONDS,
-            attempt_count=event.attempt_count,
+            .order_by(model.id)
+            .limit(limit)
         )
-        event.last_error = PLAN_CYCLE_AWAITING_HEAVY_ACK
-        await db.commit()
-        return {
-            "status": "dispatched",
-            "plan_id": normalized_plan_id,
-            "reason": reason,
-        }
+
+    async with session_factory() as db:
+        candidates = list((await db.execute(_closed(
+            TaskCoordinatorRun,
+            phases=TASK_AGENT_ROOT_CLOSED_CARD_PHASES,
+            extra=(TaskCoordinatorRun.engine == TaskCoordinatorEngine.AGENT_LOOP.value,),
+        ))).all())
+        candidates += list((await db.execute(_closed(
+            TaskAgentChildRun, phases=TASK_AGENT_CHILD_CLOSED_CARD_PHASES,
+        ))).all())
+    woken = 0
+    for request_id, task_id, _run_id in candidates[:limit]:
+        try:
+            async with session_factory() as db:
+                await lock_task_runtime_approval_boundary(db, task_id=str(task_id))
+                request = (await db.execute(
+                    select(HitlRequest).where(HitlRequest.id == request_id)
+                    .with_for_update().execution_options(populate_existing=True)
+                )).scalar_one_or_none()
+                if request is not None and await wake_run_for_closed_request(db, request):
+                    woken += 1
+                await db.commit()
+        except Exception:
+            logger.exception("Task %s run on a closed card could not be woken", task_id)
+    return woken
 
 
 async def consume_task_coordinator_intent_once(
@@ -1065,17 +801,10 @@ async def consume_task_coordinator_intent_once(
             event.last_error = f"permanent:task_coordinator_intent_closed:{state}"
             await db.commit()
             return {"status": "closed", "reason": state}
-        from packages.core.models.task_coordinator import TaskCoordinatorEngine
-
-        # The engine was frozen when the run was created; route on it, never
-        # on the current flag value.
-        consumer_task = (
-            run_task_agent_loop_task
-            if getattr(run, "engine", None) == TaskCoordinatorEngine.AGENT_LOOP.value
-            else run_task_coordinator_task
-        )
         try:
-            consumer_task.apply_async(
+            # Every Task run is an agent loop (the retired engine's runs were
+            # closed out by migration 20261025_10 and switch on retry).
+            run_task_agent_loop_task.apply_async(
                 kwargs={
                     "event_id": event_id,
                     "task_id": task_id,
@@ -1099,6 +828,79 @@ async def consume_task_coordinator_intent_once(
         event.last_error = _TASK_COORDINATOR_AWAITING_HEAVY_ACK
         await db.commit()
         return {"status": "dispatched", "task_id": task_id}
+
+
+async def consume_task_agent_child_intent_once(
+    *,
+    event_id: str,
+    task_id: str,
+    child_id: str,
+    wake_generation: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Handoff one exact child-run wake to HEAVY without ACKing business work."""
+
+    from packages.core.database import create_worker_session
+
+    session_factory = create_worker_session()
+    async with session_factory() as db:
+        event = (await db.execute(
+            select(RuntimeOutboxEvent)
+            .where(
+                RuntimeOutboxEvent.id == event_id,
+                RuntimeOutboxEvent.event_type == TASK_AGENT_CHILD_OUTBOX_EVENT,
+                RuntimeOutboxEvent.aggregate_id == child_id,
+                RuntimeOutboxEvent.dedupe_key == task_agent_child_outbox_dedupe_key(child_id),
+            )
+            .with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if event is None or event.delivered_at is not None:
+            return {"status": "closed", "reason": "missing_or_acknowledged"}
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if (
+            payload.get("wake_generation") != wake_generation
+            or payload.get("task_id") != task_id
+        ):
+            return {"status": "closed", "reason": "stale_generation"}
+        now = datetime.now(timezone.utc)
+        if (
+            event.available_at is not None
+            and event.available_at > now
+            and event.last_error != TASK_AGENT_CHILD_AWAITING_ACK
+        ):
+            return {"status": "suppressed", "reason": "not_due"}
+        child, state = await task_agent_child_delivery_state(db, event)
+        if child is None:
+            event.delivered_at = now
+            event.last_error = f"{TASK_AGENT_CHILD_CLOSED_PREFIX}:{state}"
+            await db.commit()
+            return {"status": "closed", "reason": state}
+        try:
+            run_task_agent_child_task.apply_async(
+                kwargs={
+                    "event_id": event_id,
+                    "task_id": task_id,
+                    "child_id": child_id,
+                    "wake_generation": wake_generation,
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:
+            event.attempt_count += 1
+            event.available_at = _runtime_outbox_retry_available_at(
+                now, attempt_count=event.attempt_count,
+            )
+            event.last_error = str(exc)[:2000]
+            await db.commit()
+            return {"status": "deferred", "reason": "broker_failure"}
+        event.available_at = _runtime_outbox_ack_available_at(
+            now,
+            base_seconds=_TASK_AGENT_CHILD_ACK_TIMEOUT_SECONDS,
+            attempt_count=event.attempt_count,
+        )
+        event.last_error = TASK_AGENT_CHILD_AWAITING_HEAVY_ACK
+        await db.commit()
+        return {"status": "dispatched", "child_id": child_id}
 
 
 async def consume_task_execution_intent_once(
@@ -1127,13 +929,15 @@ async def consume_task_execution_intent_once(
             select(Task.entity_id, Task.workspace_id)
             .where(Task.id == normalized_task_id)
         )).one_or_none()
-        if scope is None or not scope.workspace_id:
-            return {"status": "closed", "reason": "missing_workspace_task"}
-        workspace = await lock_workspace_access_boundary(
-            db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
-        )
-        if workspace is None:
-            return {"status": "deferred", "reason": "workspace_unavailable"}
+        if scope is None:
+            return {"status": "closed", "reason": "missing_task"}
+        if scope.workspace_id:
+            # A Task assigned directly to an Agent has no Workspace boundary.
+            workspace = await lock_workspace_access_boundary(
+                db, workspace_id=scope.workspace_id, entity_id=scope.entity_id,
+            )
+            if workspace is None:
+                return {"status": "deferred", "reason": "workspace_unavailable"}
         task = (await db.execute(
             select(Task).where(Task.id == normalized_task_id)
             .with_for_update().execution_options(populate_existing=True)
@@ -1340,6 +1144,12 @@ async def _refresh_runner_health(runner_id: str) -> None:
                 observed_active=observed_active,
             )
             runner.executing_count = max(0, int(health.get("executing") or 0))
+            # Memory placement needs the runner's free memory; an older runner
+            # without it is placed by slots alone (mixed-version rollout).
+            record_runner_memory(
+                runner,
+                runner_memory_from_health(health, now=runner.last_health_at),
+            )
             runner_config = dict(runner.config or {})
             has_active_limit = health.get("max_active") is not None
             has_executing_limit = health.get("max_executing") is not None
@@ -1399,18 +1209,144 @@ async def _create_reserved_sandbox(
         "allowed_sensitive_keys": list(payload.get("allowed_sensitive_keys") or []),
         "config": payload.get("config"),
         "auto_install": bool(payload.get("auto_install", True)),
-        "idempotency_key": reservation_id,
+        # Attempts of one ticket share the runner's idempotent create, so a
+        # lease retry gets the container its predecessor is still creating.
+        # A ticket requeued because its container was lost bumps the
+        # generation and asks for a new one.
+        "idempotency_key": sandbox_create_idempotency_key(reservation_id, payload),
     }
+    if payload.get("isolation_ref"):
+        # Resolved only here, where the container is created: what it stands
+        # for (credentials, for one) never sits in the ticket. Raises
+        # SandboxIsolationUnavailable rather than create without it.
+        from packages.core.services.sandbox_isolation import resolve_isolation_ref
+
+        kwargs.update(await resolve_isolation_ref(str(payload["isolation_ref"])))
+    from packages.core.services import sandbox_session_service
+
     async with SandboxClient(
         base_url=base_url,
         timeout=180.0,
         api_token=settings.SANDBOX_API_TOKEN,
     ) as client:
+        # A create a new-runner feature shapes (egress) is refused unless the
+        # runner's /health proves it supports that: without a loader the
+        # client knows nothing of this runner and refuses every such create.
+        client.capability_loader = functools.partial(sandbox_session_service.runner_capabilities, base_url)
         if source == "builtin":
-            result = await client.create_from_builtin(**kwargs)
+            from packages.core.services.sandbox_baked_skills import (
+                BakedSkillRef,
+                create_builtin_sandbox,
+            )
+
+            # The image's copy when this runner holds the ticket's digest; the
+            # packaged files (read here if the ticket carries none) otherwise.
+            result = await create_builtin_sandbox(
+                client,
+                baked=BakedSkillRef.from_payload(payload.get("baked_skill")),
+                **kwargs,
+            )
         else:
             result = await client.create_from_files(**kwargs)
     return result.sandbox_id
+
+
+async def _hand_finished_sandboxes_to_queue(session_factory: Any) -> int:
+    """Give queued tickets the warm containers of conversations that ended.
+
+    A finished run leaves its container warm for the conversation's next
+    turn, holding a runner slot until the idle reaper (300-600 s). While
+    tickets wait and a runner is full, that slot belongs to the queue: the
+    least recently used containers whose conversations have no active run are
+    destroyed, so the next claim (this tick) gets the slot. A container any
+    run of its conversation still uses, or one running a command, is never
+    taken. Returns the number of containers handed over.
+    """
+
+    from packages.core.services.sandbox_sdk import SandboxClient
+    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+    from packages.core.services.sandbox_session_service import forget_vanished_sandbox
+
+    settings = get_settings()
+    async with session_factory() as db:
+        if not await count_waiting_sandbox_reservations(db):
+            return 0
+        # Per runner pool: only a ticket of the runner's own pool can take a
+        # container it frees, so another pool's queue never costs it warm work.
+        demand: dict[str, tuple[int, Any, Any]] = {}
+        runners = []
+        for runner in (
+            await db.execute(
+                select(SandboxRunner).where(
+                    SandboxRunner.status == SandboxRunnerStatus.HEALTHY.value,
+                )
+            )
+        ).scalars().all():
+            pool = normalize_runner_pool(getattr(runner, "pool", None))
+            if pool not in demand:
+                waiting = await count_waiting_sandbox_reservations(db, pool=pool)
+                need = await next_waiting_ticket_need(db, pool=pool) if waiting else None
+                ceiling = await load_pool_ceiling(db, pool) if need is not None else None
+                demand[pool] = (waiting, need, ceiling)
+            waiting, need, ceiling = demand[pool]
+            if not waiting:
+                continue
+            need_mb, need_cpus = need if need is not None else (None, None)
+            slots_full = runner.active_count >= runner.active_limit
+            # A runner with free slots can still be too full in memory for the
+            # next ticket: then idle warm containers are freed until it fits.
+            deficit_mb = 0 if slots_full else runner_memory_deficit_mb(
+                runner, need_mb, need_cpus=need_cpus, ceiling=ceiling,
+            )
+            if slots_full or deficit_mb > 0:
+                runners.append((runner.id, runner.base_url, slots_full, deficit_mb, pool))
+    handed_over = 0
+    handed_by_pool: dict[str, int] = {}
+    for runner_id, base_url, slots_full, deficit_mb, pool in runners:
+        waiting = demand[pool][0]
+        if handed_by_pool.get(pool, 0) >= waiting:
+            continue
+        try:
+            async with SandboxClient(
+                base_url=base_url, timeout=15.0, api_token=settings.SANDBOX_API_TOKEN,
+            ) as client:
+                idle = [
+                    info for info in await client.list()
+                    if info.status == "ready" and not info.active_execution_id
+                ]
+                async with session_factory() as db:
+                    free = await sandboxes_free_for_handover(
+                        db, runner_id=runner_id, sandbox_ids=[info.sandbox_id for info in idle],
+                    )
+                for info in sorted(idle, key=lambda item: item.last_used_at or 0.0):
+                    if slots_full and handed_by_pool.get(pool, 0) >= waiting:
+                        break
+                    if not slots_full and deficit_mb <= 0:
+                        break
+                    if info.sandbox_id not in free:
+                        continue
+                    try:
+                        await client.destroy(info.sandbox_id)
+                    except SandboxNotFoundError:
+                        pass
+                    # Drops the warm registration and releases the instance
+                    # row, which returns the runner slot to the scheduler.
+                    await forget_vanished_sandbox(info.sandbox_id)
+                    handed_over += 1
+                    handed_by_pool[pool] = handed_by_pool.get(pool, 0) + 1
+                    if not slots_full:
+                        # Unknown size: stop after this one rather than guess.
+                        config = info.config if isinstance(info.config, dict) else {}
+                        deficit_mb -= parse_memory_mb(config.get("memory")) or deficit_mb
+                    logger.info(
+                        "Sandbox runner %s: handed idle warm sandbox %s to the queue (%d waiting)",
+                        runner_id,
+                        info.sandbox_id,
+                        waiting,
+                    )
+        except Exception:  # noqa: BLE001 - the next tick retries; the reaper is the backstop
+            logger.warning("Sandbox runner %s: handover to the queue failed", runner_id, exc_info=True)
+    return handed_over
 
 
 async def run_sandbox_scheduler_once() -> dict[str, Any]:
@@ -1432,24 +1368,131 @@ async def run_sandbox_scheduler_once() -> dict[str, Any]:
     async with session_factory() as db:
         expired = await expire_sandbox_reservations(db)
         recovered = await recover_stale_sandbox_allocations(db)
+        recovered += await recover_waiting_sandbox_runs(db)
+        recovered += await adopt_follower_reservations(db)
+        recovered += await redeliver_exec_slot_resumes(db)
         claim = await claim_next_sandbox_allocation(db)
-        if claim is None:
-            await db.commit()
-            return {
-                "enabled": True,
-                "allocation_queued": False,
-                "expired": expired,
-                "recovered": recovered,
-            }
-        reservation, _runner = claim
+        claimed_id = claim[0].id if claim is not None else None
         await db.commit()
-        return {
-            "enabled": True,
-            "allocation_queued": True,
-            "expired": expired,
-            "recovered": recovered,
-            "reservation_id": reservation.id,
-        }
+    handed_over = 0
+    if claimed_id is None:
+        handed_over = await _hand_finished_sandboxes_to_queue(session_factory)
+        if handed_over:
+            async with session_factory() as db:
+                claim = await claim_next_sandbox_allocation(db)
+                claimed_id = claim[0].id if claim is not None else None
+                await db.commit()
+    woken = await _wake_exec_slot_waiters(session_factory)
+    result = {
+        "enabled": True,
+        "allocation_queued": claimed_id is not None,
+        "expired": expired,
+        "recovered": recovered,
+        "handed_over": handed_over,
+        "exec_slot_woken": woken,
+    }
+    if claimed_id is not None:
+        result["reservation_id"] = claimed_id
+    return result
+
+
+async def _wake_exec_slot_waiters(session_factory: Any) -> int:
+    """Resume runs whose command left its sandbox's slot queue.
+
+    One status call per sandbox with parked runs: a command no longer in the
+    runner's ``queued_execution_ids`` has started (or finished, or was
+    cancelled), and a sandbox the runner no longer has lost it -- either way
+    the run resumes and its re-executed tool call collects the outcome by
+    execution id. A ticket past its deadline wakes too, so a runner that
+    stays unreachable never strands a run. A runner that cannot answer right
+    now is asked again on the next tick.
+    """
+
+    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+    from packages.core.services.sandbox_session_service import sandbox_client_for
+
+    async with session_factory() as db:
+        tickets = await list_exec_slot_waits(db)
+        waiting = [
+            (
+                ticket.id,
+                str((ticket.request_payload or {}).get("sandbox_id") or ""),
+                str((ticket.request_payload or {}).get("execution_id") or ""),
+                ticket.deadline_at,
+            )
+            for ticket in tickets
+        ]
+    if not waiting:
+        return 0
+    now = datetime.now(timezone.utc)
+    by_sandbox: dict[str, list[tuple[str, str, Any]]] = {}
+    for ticket_id, sandbox_id, execution_id, deadline in waiting:
+        by_sandbox.setdefault(sandbox_id, []).append((ticket_id, execution_id, deadline))
+
+    async def probe(sandbox_id: str) -> tuple[set[str] | None, bool]:
+        """(queued execution ids, gone) of one sandbox; (None, False) when unknown."""
+        if not sandbox_id:
+            return None, True
+        try:
+            async with await sandbox_client_for(sandbox_id, timeout=5.0) as client:
+                info = await client.status(sandbox_id)
+            return set(info.queued_execution_ids or []), False
+        except SandboxNotFoundError:
+            return None, True
+        except Exception as exc:  # noqa: BLE001 - unknown: ask again next tick
+            if type(exc).__name__ == "SandboxRouteNotFoundError":
+                return None, True
+            logger.info("Exec-slot sweep could not reach sandbox %s: %s", sandbox_id, exc)
+            return None, False
+
+    # One probe per sandbox, concurrently: a runner that does not answer
+    # costs one short timeout per tick, never one per parked run.
+    sandbox_ids = list(by_sandbox)
+    probes = dict(zip(sandbox_ids, await asyncio.gather(*(probe(sandbox_id) for sandbox_id in sandbox_ids))))
+    wake: list[tuple[str, str]] = []
+    for sandbox_id, entries in by_sandbox.items():
+        queued, gone = probes[sandbox_id]
+        for ticket_id, execution_id, deadline in entries:
+            if gone:
+                wake.append((ticket_id, "sandbox_gone"))
+            elif queued is not None and execution_id not in queued:
+                wake.append((ticket_id, "left_queue"))
+            elif deadline is not None and deadline <= now:
+                wake.append((ticket_id, "deadline"))
+    woken = 0
+    for ticket_id, reason in wake:
+        async with session_factory() as db:
+            if await wake_exec_slot_wait(db, reservation_id=ticket_id, reason=reason):
+                woken += 1
+            await db.commit()
+    return woken
+
+
+async def _container_shared_with_newer_attempt(
+    session_factory: Any,
+    *,
+    reservation_id: str,
+    runner_id: str,
+    sandbox_id: str,
+) -> bool:
+    """Does a newer allocation attempt of this ticket hold this container?
+
+    Every attempt creates with the ticket id as the runner's idempotency key,
+    so a later attempt on the same runner gets the same container while the
+    ticket is still being allocated or was just allocated with it.
+    """
+
+    async with session_factory() as db:
+        current = await db.get(SandboxReservation, reservation_id)
+        return bool(
+            current is not None
+            and current.runner_id == runner_id
+            and current.status in {
+                SandboxReservationStatus.ALLOCATING.value,
+                SandboxReservationStatus.ALLOCATED.value,
+            }
+            and current.sandbox_id in {None, sandbox_id}
+        )
 
 
 async def allocate_reserved_sandbox_once(
@@ -1502,21 +1545,42 @@ async def allocate_reserved_sandbox_once(
             payload=payload,
         )
     except Exception as exc:
+        # A full runner, or one restarting or unreachable, is not a failure
+        # (the ticket waits for it until its deadline); a request the runner
+        # rejects can never succeed (fail at once); anything else is retried
+        # a bounded number of times.
+        outcome, error = classify_allocation_error(exc)
+        runner_report = None
+        if outcome == "capacity":
+            body = getattr(exc, "body", None)
+            if isinstance(body, dict) and body.get("available_memory_mb") is not None:
+                runner_report = runner_memory_from_health(
+                    {
+                        "memory_available_mb": body.get("available_memory_mb"),
+                        "max_container_memory_mb": body.get("max_container_memory_mb"),
+                        "memory_budget_mb": body.get("memory_budget_mb"),
+                        "largest_allocatable_mb": body.get("largest_allocatable_mb"),
+                    },
+                    now=datetime.now(timezone.utc),
+                )
         async with session_factory() as db:
             await fail_sandbox_allocation(
                 db,
                 reservation_id=reservation_id,
                 expected_reservation_version=reservation_version,
-                error=exc.__class__.__name__,
+                error=error,
+                outcome=outcome,
+                runner_report=runner_report,
             )
             await db.commit()
         logger.warning(
-            "Sandbox reservation allocation failed reservation=%s runner=%s type=%s",
+            "Sandbox reservation allocation failed reservation=%s runner=%s outcome=%s error=%s",
             reservation_id,
             runner_id,
-            exc.__class__.__name__,
+            outcome,
+            error[:300],
         )
-        return {"enabled": True, "claimed": True, "allocated": False}
+        return {"enabled": True, "claimed": True, "allocated": False, "outcome": outcome}
 
     try:
         async with session_factory() as db:
@@ -1531,6 +1595,21 @@ async def allocate_reserved_sandbox_once(
     except Exception as exc:
         from packages.core.services.sandbox_sdk import SandboxClient
 
+        if await _container_shared_with_newer_attempt(
+            session_factory, reservation_id=reservation_id, runner_id=runner_id, sandbox_id=sandbox_id,
+        ):
+            # Lease recovery requeued this ticket while our create was still
+            # running, and a newer attempt on the same runner received the
+            # same container (the create is idempotent on the ticket id). The
+            # container is that attempt's to record; destroying it here would
+            # hand the run a dead sandbox.
+            logger.info(
+                "Stale Sandbox allocation leaves the shared container to the newer attempt "
+                "reservation=%s sandbox=%s",
+                reservation_id,
+                sandbox_id,
+            )
+            return {"enabled": True, "claimed": True, "allocated": False}
         try:
             async with SandboxClient(
                 base_url=base_url,
@@ -1586,21 +1665,15 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
         # Each timed-out run stages its own terminal notice (Message settled,
         # SSE frames + realtime refresh delivered by the loop below).
         await expire_runtime_human_input_requests(db, now=now)
-        await _recover_task_runtime_resume_outbox(
-            db,
-            now=now,
-            batch_size=batch_size,
-        )
-        # Recovery may have inserted or re-armed the exact row the broker
-        # message names. Commit before publication: a fast CONTROL consumer
-        # must never observe ``missing_event`` merely because it beat this
-        # transaction's final commit. The following SELECT starts a fresh
-        # transaction and claims only committed due rows.
+        # Recovery may have inserted the exact row the broker message names.
+        # Commit before publication: a fast CONTROL consumer must never
+        # observe ``missing_event`` merely because it beat this transaction's
+        # final commit. The following SELECT starts a fresh transaction and
+        # claims only committed due rows.
         await db.commit()
-        # Resume-recovery timestamps can be a few microseconds after the
+        # Recovery timestamps can be a few microseconds after the
         # publisher's original clock. Refresh before selecting due rows so an
-        # immediately re-armed event can publish in this tick. Plan lost-wake
-        # recovery runs in its own lower-frequency task.
+        # immediately re-armed event can publish in this tick.
         now = datetime.now(timezone.utc)
         due_filters = (
             RuntimeOutboxEvent.delivered_at.is_(None),
@@ -1614,51 +1687,15 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
             RuntimeOutboxEvent.created_at.asc(),
             RuntimeOutboxEvent.id.asc(),
         )
-        # Reserve capacity in both directions. A hot fleet of stable Plan rows
-        # cannot starve Task/approval/Sandbox traffic, and an older generic
-        # backlog cannot prevent Plan cycles from advancing. The final query
-        # fills unused quota from either category, preserving throughput.
-        category_quota = max(1, batch_size // 2) if batch_size > 1 else 0
-        events: list[RuntimeOutboxEvent] = []
-        if category_quota:
-            events.extend((await db.execute(
-                select(RuntimeOutboxEvent)
-                .where(
-                    *due_filters,
-                    _runtime_outbox_plan_category_filter(plan_cycle=False),
-                )
-                .order_by(*due_order)
-                .limit(category_quota)
-                .with_for_update(skip_locked=True)
-            )).scalars().all())
-            events.extend((await db.execute(
-                select(RuntimeOutboxEvent)
-                .where(
-                    *due_filters,
-                    _runtime_outbox_plan_category_filter(plan_cycle=True),
-                )
-                .order_by(*due_order)
-                .limit(category_quota)
-                .with_for_update(skip_locked=True)
-            )).scalars().all())
-        remaining = max(0, int(batch_size) - len(events))
-        if remaining:
-            selected_ids = [event.id for event in events]
-            fill_query = select(RuntimeOutboxEvent).where(*due_filters)
-            if selected_ids:
-                fill_query = fill_query.where(
-                    RuntimeOutboxEvent.id.not_in(selected_ids)
-                )
-            events.extend((await db.execute(
-                fill_query
-                # Match the partial due index and rotate redeliveries by
-                # their next eligible time. Ordering only by the stable
-                # ``created_at`` let one hot, old Plan row monopolize each
-                # bounded batch and starve newer event categories.
-                .order_by(*due_order)
-                .limit(remaining)
-                .with_for_update(skip_locked=True)
-            )).scalars().all())
+        events = list((await db.execute(
+            select(RuntimeOutboxEvent)
+            .where(*due_filters)
+            # Rotate redeliveries by their next eligible time so one hot,
+            # old row cannot monopolize each bounded batch.
+            .order_by(*due_order)
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+        )).scalars().all())
         delivered = 0
         for event in events:
             try:
@@ -1669,7 +1706,9 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
                 task_coordinator_event = (
                     event.event_type == TASK_COORDINATOR_OUTBOX_EVENT
                 )
-                plan_cycle_event = event.event_type == PLAN_CYCLE_OUTBOX_EVENT
+                task_agent_child_event = (
+                    event.event_type == TASK_AGENT_CHILD_OUTBOX_EVENT
+                )
                 if event.event_type == RUNTIME_RUN_TERMINAL_NOTICE_EVENT:
                     # Not a Celery task: the committed terminal transition is
                     # announced here, and a failed publish retries like any row.
@@ -1710,16 +1749,14 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
                         )
                         continue
                     payload["event_id"] = event.id
-                elif plan_cycle_event:
-                    plan, reason = await _plan_cycle_delivery_state(db, event)
-                    if plan is None:
+                elif task_agent_child_event:
+                    child, reason = await task_agent_child_delivery_state(db, event)
+                    if child is None:
                         event.delivered_at = now
-                        event.last_error = (
-                            f"permanent:plan_cycle_intent_closed:{reason}"
-                        )
+                        event.last_error = f"{TASK_AGENT_CHILD_CLOSED_PREFIX}:{reason}"
                         continue
                     payload["event_id"] = event.id
-                if task_coordinator_event or plan_cycle_event:
+                if task_coordinator_event or task_agent_child_event:
                     # Version belongs to the durable envelope, not the Celery
                     # consumer signature. Consumers reload and fence the row.
                     payload.pop("version", None)
@@ -1732,7 +1769,7 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
                 if task_execution_event:
                     # Broker acceptance is not execution ownership. Keep the
                     # row in the indexed pending set until the consumer ACKs;
-                    # if it crashes before creating a Plan, the same event is
+                    # if it crashes before creating its run, the same event is
                     # eligible for redelivery after this bounded deadline.
                     event.available_at = _runtime_outbox_ack_available_at(
                         now,
@@ -1750,16 +1787,15 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
                         attempt_count=event.attempt_count,
                     )
                     event.last_error = TASK_COORDINATOR_AWAITING_ACK
-                elif plan_cycle_event:
-                    # Broker acceptance only reached the CONTROL consumer.
-                    # Keep the generation pending through its HEAVY handoff
-                    # and until the Plan cycle itself settles it.
+                elif task_agent_child_event:
+                    # Same as the Task run: the child's worker ACKs only its
+                    # exact generation; until then the row stays sweepable.
                     event.available_at = _runtime_outbox_ack_available_at(
                         now,
-                        base_seconds=_PLAN_CYCLE_ACK_TIMEOUT_SECONDS,
+                        base_seconds=_TASK_AGENT_CHILD_ACK_TIMEOUT_SECONDS,
                         attempt_count=event.attempt_count,
                     )
-                    event.last_error = PLAN_CYCLE_AWAITING_CONTROL_ACK
+                    event.last_error = TASK_AGENT_CHILD_AWAITING_ACK
                 else:
                     event.delivered_at = now
                     event.last_error = None
@@ -1856,30 +1892,6 @@ def dispatch_task_coordinator_intent_task(
         raise self.retry(exc=exc, countdown=countdown)
 
 
-@celery_app.task(
-    bind=True,
-    name="runtime.run_task_coordinator",
-    max_retries=0,
-    soft_time_limit=540,
-    time_limit=600,
-)
-def run_task_coordinator_task(
-    self,
-    event_id: str,
-    task_id: str,
-    wake_generation: str,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    from packages.core.workers.task_coordinator import run_task_coordinator_once
-
-    return run_in_worker(run_task_coordinator_once(
-        event_id=event_id,
-        task_id=task_id,
-        wake_generation=wake_generation,
-        reason=reason,
-    ))
-
-
 # A Task agent loop yields at its time slice (well below the soft limit) and
 # re-stages its own wake, so one delivery never approaches the broker's
 # visibility timeout. Ordering is guarded in test_orchestration_hardening.
@@ -1913,26 +1925,55 @@ def run_task_agent_loop_task(
 
 @celery_app.task(
     bind=True,
-    name=PLAN_CYCLE_OUTBOX_EVENT,
+    name=TASK_AGENT_CHILD_OUTBOX_EVENT,
     max_retries=3,
 )
-def dispatch_plan_cycle_intent_task(
+def dispatch_task_agent_child_intent_task(
     self,
     event_id: str,
-    plan_id: str,
+    task_id: str,
+    child_id: str,
     wake_generation: str,
     reason: str | None = None,
 ) -> dict[str, Any]:
     try:
-        return run_in_worker(consume_plan_cycle_intent_once(
+        return run_in_worker(consume_task_agent_child_intent_once(
             event_id=event_id,
-            plan_id=plan_id,
+            task_id=task_id,
+            child_id=child_id,
             wake_generation=wake_generation,
             reason=reason,
         ))
     except Exception as exc:
         countdown = min(60, 5 * (2 ** self.request.retries))
         raise self.retry(exc=exc, countdown=countdown)
+
+
+# A delegated child run is an agent loop too: the same slice and limits.
+@celery_app.task(
+    bind=True,
+    name=TASK_AGENT_CHILD_RUN_TASK,
+    max_retries=0,
+    soft_time_limit=TASK_AGENT_LOOP_SOFT_TIME_LIMIT_SECONDS,
+    time_limit=TASK_AGENT_LOOP_TIME_LIMIT_SECONDS,
+)
+def run_task_agent_child_task(
+    self,
+    event_id: str,
+    task_id: str,
+    child_id: str,
+    wake_generation: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    from packages.core.workers.task_agent_child_loop import run_task_agent_child_once
+
+    return run_in_worker(run_task_agent_child_once(
+        event_id=event_id,
+        task_id=task_id,
+        child_id=child_id,
+        wake_generation=wake_generation,
+        reason=reason,
+    ))
 
 
 @celery_app.task(name="runtime.sandbox_scheduler", max_retries=0)
@@ -1945,20 +1986,15 @@ def runtime_outbox_dispatch_task() -> dict[str, int]:
     return {"delivered": run_in_worker(dispatch_runtime_outbox_once())}
 
 
-@celery_app.task(name="runtime.plan_cycle_recovery", max_retries=0)
-def plan_cycle_recovery_task() -> dict[str, int]:
-    return {
-        "recovered": run_in_worker(recover_stalled_plan_cycle_wakes_once())
-    }
-
-
 @celery_app.task(name="runtime.task_coordinator_recovery", max_retries=0)
 def task_coordinator_recovery_task() -> dict[str, int]:
     results: dict[str, int] = {}
     for key, operation in (
         ("recovered", recover_stalled_task_coordinator_wakes_once),
+        ("children_recovered", recover_stalled_task_agent_child_wakes_once),
         ("terminal_reconciled", reconcile_terminal_task_coordinator_runs_once),
-        ("terminal_cleaned", recover_task_coordinator_terminal_cleanup_once),
+        ("child_cards_closed", recover_ended_child_cards_once),
+        ("runs_on_closed_cards", recover_runs_on_closed_cards_once),
     ):
         try:
             results[key] = run_in_worker(operation())
@@ -2198,3 +2234,30 @@ def resume_runtime_run_task(
         )
     except Exception as exc:
         raise self.retry(exc=exc, countdown=5)
+
+
+async def _reevaluate_pending_approvals_once(**payload: Any) -> dict[str, int]:
+    from packages.core.database import create_worker_session
+    from packages.core.governance.approval_policy_reevaluation import reevaluate_pending_approvals
+
+    async with create_worker_session()() as db:
+        return await reevaluate_pending_approvals(db, **payload)
+
+
+@celery_app.task(bind=True, name="approval.reevaluate_pending", max_retries=3)
+def reevaluate_pending_approvals_task(
+    self,
+    entity_id: str,
+    scope_kind: str,
+    scope_id: str,
+    revision: int,
+    actor_id: str | None = None,
+) -> dict[str, int]:
+    """Re-decide pending policy approvals after a committed policy write."""
+    try:
+        return run_in_worker(_reevaluate_pending_approvals_once(
+            entity_id=entity_id, scope_kind=scope_kind, scope_id=scope_id,
+            revision=revision, actor_id=actor_id,
+        ))
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=10)

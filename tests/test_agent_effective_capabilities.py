@@ -10,7 +10,6 @@ from packages.core.ai.runtime.strategist import (
     runtime_strategist_task_capabilities_block,
 )
 from packages.core.ai.runtime.tool_bindings import RuntimeMCPProviderToolScope
-from packages.core.plans.planner import _Context, _require_task_capabilities, TaskCapabilityGapError
 from packages.core.services.agent_effective_capabilities import (
     AgentEffectiveCapabilityFactory,
     EffectiveAgentCapabilities,
@@ -229,22 +228,6 @@ def test_strategist_only_describes_projected_service_capabilities():
     ctx.service_capabilities = {}
     assert "web.safe_search" not in runtime_strategist_task_capabilities_block(ctx)
     assert '"scope_status":"unknown"' in runtime_strategist_services_block(ctx)
-
-
-def test_planner_does_not_fall_back_to_union_when_effective_scope_is_empty():
-    sub = _subscription("reader")
-    ctx = _Context(
-        workspace=None, subscriptions=[sub], agents_by_id={"agent": SimpleNamespace(name="Reader")},
-        allowed_service_keys={"reader"}, provider_actions={},
-        service_tool_names={"reader": ["web_search"]}, service_capabilities={},
-    )
-    task = SimpleNamespace(id="task", details={"runtime_context": {"required_capabilities": ["web.safe_search"]}})
-    with pytest.raises(TaskCapabilityGapError) as exc:
-        _require_task_capabilities(task, ctx)
-    assert exc.value.affected_agents == ({
-        "service_key": "reader", "subscription_id": "sub-reader",
-        "agent_id": "agent", "agent_name": "Reader",
-    },)
 
 
 @pytest.mark.asyncio

@@ -30,9 +30,9 @@ from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
 from packages.core.models.skill import AgentSkillBinding, Skill
-from packages.core.models.worker import SubscriptionWorker
 from packages.core.models.workspace import Agent, AgentSubscription, AgentToolBinding, Workspace
 from packages.core.models.workspace_draft import WorkspaceDraft
+from packages.core.models.workflow import WorkflowDefinition
 from packages.core.services.workspace_draft_service import (
     _refresh_missing_from_lint,
     apply_blueprint,
@@ -42,6 +42,210 @@ from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_applied_blueprint_draft_materializes_workflows_and_data_app_per_workspace(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draft finalization uses the same resource installer as direct install."""
+    from packages.core.blueprints.exporter import export_workspace
+
+    entity_id, creator_id = generate_ulid(), generate_ulid()
+    payload = _payload(agent_slug="draft-flow-agent", skill_slug="draft-flow-skill", server_slug="draft-flow-server")
+    payload["embedded"] = {"agents": [], "skills": [], "tools": [], "mcp_servers": []}
+    payload["contract"]["requires"] = {"skills": [], "mcp_servers": [{
+        "slug": "optional-draft-provider", "required": False, "install_blocking": False,
+    }], "tools": []}
+    payload["recipe"]["subscriptions"] = []
+    payload["recipe"]["operating_model"]["services"] = []
+    payload["recipe"]["goals"] = []
+    payload["recipe"]["stats"] = []
+    workflow = {
+        "slug": "campaign_flow", "name": "Campaign flow", "trigger_type": "manual",
+        "steps": [
+            {"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
+                "operation": "create", "project_type": "campaign", "project_key": "campaign",
+                "schema_version": 1, "state_schema": {"type": "object", "properties": {"status": {"type": "string"}}},
+                "state": {}, "current_stage": "new",
+            }},
+        ],
+    }
+    payload["recipe"]["workflows"] = [workflow]
+    payload["recipe"]["operating_model"]["app_view"] = {
+        "data_sources": {"campaigns": {"type": "workflow_projects", "project_type": "campaign",
+            "producer_workflows": ["workflow_definition:campaign_flow"], "fields": [["status"]]}},
+        "components": [{"type": "data_view", "schema_version": 1, "key": "campaign_results", "title": "Campaigns",
+            "context": {"kind": "workspace"}, "blocks": [{"key": "progress", "type": "progress", "source": "campaigns"}]}],
+    }
+    blueprint = WorkspaceBlueprint(id=generate_ulid(), entity_id=entity_id, slug="draft-flow", title="Draft flow", payload=payload, status="published")
+    db_session.add(blueprint)
+    await db_session.flush()
+
+    async def no_reuse(*_args, **_kwargs):
+        return None
+    monkeypatch.setattr("packages.core.services.agent_provisioning_service._select_existing_skill_for_missing_spec", no_reuse)
+    async def ready_without_agent_repair(*_args, **_kwargs):
+        return True
+    monkeypatch.setattr("packages.core.services.workspace_draft_service._refresh_missing_from_lint", ready_without_agent_repair)
+
+    ids: list[str] = []
+    for _ in range(2):
+        draft = WorkspaceDraft(id=generate_ulid(), entity_id=entity_id, user_id=creator_id, fields=dict(DEFAULT_FIELDS), messages=[], missing=[], ready=False, status="active")
+        db_session.add(draft)
+        await db_session.flush()
+        await apply_blueprint(db_session, draft_id=draft.id, entity_id=entity_id, blueprint_id=blueprint.id, user_id=creator_id)
+        draft.ready = True
+        draft.status = "ready"
+        workspace_id, _ = await finalize_draft(db_session, draft_id=draft.id, entity_id=entity_id, user_id=creator_id)
+        ids.append(workspace_id)
+    definitions = []
+    for workspace_id in ids:
+        definition = (await db_session.execute(select(WorkflowDefinition).where(
+            WorkflowDefinition.workspace_id == workspace_id, WorkflowDefinition.name == "campaign_flow",
+        ))).scalar_one()
+        definitions.append(definition)
+        workspace = await db_session.get(Workspace, workspace_id)
+        assert workspace.operating_model["app_view"]["components"][0]["key"] == "campaign_results"
+        assert workspace.operating_model["app_view"]["data_sources"]["campaigns"]["producer_workflows"] == [f"workflow_definition:{definition.id}"]
+        exported = await export_workspace(db_session, workspace_id, title="Draft export")
+        assert exported["contract"]["requires"]["mcp_servers"] == [{
+            "slug": "optional-draft-provider", "purpose": None, "config_fields_to_set": [],
+            "required": False, "install_blocking": False,
+        }]
+    assert definitions[0].id != definitions[1].id
+
+
+async def test_draft_resource_materialization_failure_leaves_no_workspace(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalization resource failures remain transactionally recoverable."""
+    from packages.core.services.workspace_draft_service import WorkspaceDraftMaterializationError
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    draft = WorkspaceDraft(
+        id=generate_ulid(), entity_id=entity_id, user_id=user_id,
+        fields={
+            **dict(DEFAULT_FIELDS), "name": "Rollback test", "kind": "operations",
+            "operating_context": "Verify atomic configuration.", "primary_work": "Verify rollback.",
+            "services": [], "agent_mappings": [], "goals": [], "stats": [],
+            "workflows": [{
+                "slug": "rollback_flow", "name": "Rollback flow", "trigger_type": "manual",
+                "steps": [{"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
+                    "operation": "create", "project_type": "rollback", "project_key": "rollback",
+                    "schema_version": 1, "state_schema": {"type": "object", "properties": {}},
+                    "state": {}, "current_stage": "new",
+                }}],
+            }],
+        },
+        messages=[], missing=[], ready=True, status="ready",
+    )
+    draft_id = draft.id
+    db_session.add(draft)
+    await db_session.commit()
+
+    async def lint_ready(*_args, **_kwargs):
+        return True
+
+    async def fail_materialization(*_args, **_kwargs):
+        raise RuntimeError("unexpected installer transport failure")
+
+    monkeypatch.setattr("packages.core.services.workspace_draft_service._refresh_missing_from_lint", lint_ready)
+    from packages.core.blueprints import installer
+    materialize = installer.materialize_workspace_recipe_resources
+    monkeypatch.setattr(installer, "materialize_workspace_recipe_resources", fail_materialization)
+
+    with pytest.raises(WorkspaceDraftMaterializationError, match="unexpected installer transport failure"):
+        await finalize_draft(db_session, draft_id=draft_id, entity_id=entity_id, user_id=user_id)
+
+    # Service-owned savepoint prevents a caller that catches the exception and
+    # commits its outer work from accidentally retaining the Workspace shell.
+    await db_session.commit()
+    assert not list((await db_session.execute(select(Workspace).where(Workspace.entity_id == entity_id))).scalars())
+    restored = await db_session.get(WorkspaceDraft, draft_id)
+    assert restored is not None
+    assert restored.status == "ready"
+    assert restored.finalized_workspace_id is None
+
+    monkeypatch.setattr(installer, "materialize_workspace_recipe_resources", materialize)
+    workspace_id, finalized = await finalize_draft(
+        db_session, draft_id=draft_id, entity_id=entity_id, user_id=user_id,
+    )
+    await db_session.commit()
+    assert await db_session.get(Workspace, workspace_id) is not None
+    assert finalized.status == "finalized"
+
+
+async def test_architect_resource_tools_materialize_and_export_from_a_draft(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AI tool surface writes native resources, not App-only metadata."""
+    from packages.core.ai.tools.workspace_arch_tools import (
+        _accept_app_view, _design_app_view, _propose_stat, _propose_workflow,
+    )
+    from packages.core.services import workspace_app_designer
+    from packages.core.blueprints.exporter import export_workspace
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    fields = {**dict(DEFAULT_FIELDS), "name": "Delivery board", "kind": "operations",
+              "operating_context": "Track client work.", "primary_work": "Deliver client work.",
+              "services": [], "agent_mappings": [], "goals": [], "stats": []}
+    draft = WorkspaceDraft(id=generate_ulid(), entity_id=entity_id, user_id=user_id,
+                           fields=fields, messages=[], missing=[], ready=False, status="active")
+    db_session.add(draft)
+    await db_session.flush()
+    workflow = await _propose_workflow(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
+        slug="delivery_flow", name="Delivery flow", steps=[{"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
+            "operation": "create", "project_type": "delivery", "project_key": "delivery", "schema_version": 1,
+            "state_schema": {"type": "object", "properties": {
+                "status": {"type": "string"}, "title": {"type": "string"}, "publication": {"type": "object"},
+            }}, "state": {}, "current_stage": "new"}}])
+    assert json.loads(workflow)["ok"] is True
+    stat = await _propose_stat(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
+        key="delivery.completed", name="Completed deliveries", collector_type="manual", value_type="number", window="latest")
+    assert json.loads(stat)["ok"] is True
+    page = {
+        "data_sources": {"deliveries": {"type": "workflow_projects", "project_type": "delivery",
+            "producer_workflows": ["workflow_definition:delivery_flow"], "fields": [["status"], ["title"]]},
+            "publications": {"type": "project_records", "parent": "deliveries", "record_path": ["publication"],
+                             "record_schema": "publication-receipt/v1"},
+            "results": {"type": "publication_stats", "parent": "publications", "subject": "deliveries", "metric_keys": ["views"]}},
+        "components": [{"type": "data_view", "schema_version": 1, "key": "delivery_results", "title": "Deliveries",
+            "context": {"kind": "workspace"}, "blocks": [{"key": "progress", "type": "progress", "source": "deliveries"},
+                {"key": "published", "type": "records", "source": "publications", "metrics_source": "results",
+                 "record_display": {"title": {"source": "deliveries", "field": ["title"]}}}]}],
+    }
+
+    async def designer(context, **_kwargs):
+        # The sub-agent's model is scripted; its tools and checks are real.
+        state: dict = {}
+        tools = workspace_app_designer.app_designer_executor(context, state)
+        await tools("app_read_context", {})
+        submitted = json.loads(await tools("app_submit_candidate", {"app_view": page, "recipes": ["publishing with results"]}))
+        assert submitted["ok"] is True, submitted
+        return workspace_app_designer.AppDesignResult(
+            app_view=state["candidate"], recipes=state["recipes"], warnings=state["warnings"],
+            notes="Publishing with results.", attempts=state["attempts"])
+
+    monkeypatch.setattr(workspace_app_designer, "run_app_designer", designer)
+    app = await _design_app_view(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
+                                 brief="See each delivery and its publication views.")
+    assert json.loads(app)["ok"] is True, app
+    assert "app_view" not in draft.fields
+    app = await _accept_app_view(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id)
+    assert json.loads(app)["ok"] is True, app
+    async def ready(*_args, **_kwargs): return True
+    monkeypatch.setattr("packages.core.services.workspace_draft_service._refresh_missing_from_lint", ready)
+    draft.ready, draft.status = True, "ready"
+    workspace_id, _ = await finalize_draft(db_session, draft_id=draft.id, entity_id=entity_id, user_id=user_id)
+    exported = await export_workspace(db_session, workspace_id, title="Delivery board")
+    assert [item["slug"] for item in exported["recipe"]["workflows"]] == ["delivery_flow"]
+    assert [item["key"] for item in exported["recipe"]["stats"]] == ["delivery.completed"]
+    assert exported["recipe"]["operating_model"]["app_view"]["components"][0]["key"] == "delivery_results"
+    block = exported["recipe"]["operating_model"]["app_view"]["components"][0]["blocks"][1]
+    assert block["metrics_source"] == "results"
+    assert block["record_display"]["title"] == {"source": "deliveries", "field": ["title"]}
 
 
 async def test_workspace_draft_persists_platform_blueprint_ids(
@@ -480,11 +684,6 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert len((await db_session.execute(
         select(AgentMCPBinding).where(AgentMCPBinding.agent_id == agent.id)
     )).scalars().all()) == 1
-    assert (await db_session.execute(
-        select(SubscriptionWorker).where(
-            SubscriptionWorker.subscription_id == subscription.id,
-        )
-    )).scalar_one_or_none() is not None
 
     skill = (await db_session.execute(
         select(Skill).join(

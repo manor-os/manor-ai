@@ -145,6 +145,7 @@ async def run_memory_skill(
         source=RUNTIME_INTERNAL_WORKER_SOURCE,
         model=None,
         metadata=None,
+        workspace_id=workspace_id,
     )
     key = f"memory:{'judgment' if operation == 'select' else 'extraction'}:v2:" + _digest(
         {

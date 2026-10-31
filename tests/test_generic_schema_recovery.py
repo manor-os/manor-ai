@@ -33,13 +33,11 @@ from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
 from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.ai.tools.generate_file.schema import GENERATE_FILE_SCHEMA
-from packages.core.contracts.step_execution import current_step_effects, step_execution_scope
 
 
 pytestmark = pytest.mark.unit
 VALID = {"kind": "document", "name": "report.md", "content": "body"}
 INVALID = {"name": "report.md", "content": "body"}
-WRITE = {"delivery": "artifact", "effects": "artifact_write"}
 MCP_TOOL = "mcp__test__create_file"
 
 
@@ -202,14 +200,13 @@ async def test_concurrent_schema_correction_is_isolated_between_steps(monkeypatc
         return name, [], {}
 
     async def run(index):
-        with step_execution_scope(WRITE), runtime_tool_effect_intent_scope(intent):
+        with runtime_tool_effect_intent_scope(intent):
             result = await loop_module.agentic_loop(
                 system_prompt="system", user_message=f"report-{index}.md",
                 tools=[GENERATE_FILE_SCHEMA], tool_executor=pool.execute, max_rounds=4,
             )
             assert result.error is None
             assert result.content == f"report-{index}.md"
-        assert current_step_effects() is None
 
     pool.register("generate_file", GENERATE_FILE_SCHEMA, handler)
     monkeypatch.setattr(RuntimeApprovalMiddleware, "guard_request", _allow)
@@ -274,7 +271,7 @@ async def test_nested_skill_checkpoint_keeps_schema_error_without_replaying_pare
     monkeypatch.setattr(RuntimeApprovalMiddleware, "guard_request", _allow)
     monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", model)
     with (
-        step_execution_scope(WRITE), runtime_nested_checkpoint_scope(persist),
+        runtime_nested_checkpoint_scope(persist),
         runtime_tool_effect_intent_scope(intent), runtime_tool_effect_result_scope(receipt),
     ):
         with pytest.raises(Crash):

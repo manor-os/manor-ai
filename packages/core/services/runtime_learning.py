@@ -57,6 +57,8 @@ _MAX_EXCERPT_CHARS = 700
 _MAX_TOOL_RESULTS = 12
 _RECENT_PATTERN_WINDOW = 25
 _AUTO_APPLY_CANDIDATE_TYPES = {"agent_profile_patch"}
+# Candidate resolution key: the external collaborators who queued an apply.
+LEARNING_APPLY_COLLABORATORS_KEY = "acting_collaborator_ids"
 _AGENT_FILE_MAX_APPEND_CHARS = 1200
 _AGENT_FILE_SOFT_LIMIT_CHARS = 12_000
 _RUNTIME_REF_ID_MAX_CHARS = 26
@@ -1139,13 +1141,18 @@ async def apply_queued_learning_candidate(
     if apply_status not in {"queued", "retry", "failed"}:
         raise ValueError("Learning candidate is not queued for apply")
     approval_mode = str(resolution.get("approval_mode") or "manual").strip().lower()
-    await _apply_learning_candidate_row(
-        db,
-        row,
-        entity_id=entity_id,
-        user_id=user_id or row.resolved_by_user_id,
-        approval_mode=approval_mode,
-    )
+    from packages.core.services.collaborator_steering import collaborator_steering_scope, collaborators_acting
+
+    with collaborator_steering_scope():
+        # The collaborators who queued it act again here, as at queue time.
+        collaborators_acting(entity_id, resolution.get(LEARNING_APPLY_COLLABORATORS_KEY) or ())
+        await _apply_learning_candidate_row(
+            db,
+            row,
+            entity_id=entity_id,
+            user_id=user_id or row.resolved_by_user_id,
+            approval_mode=approval_mode,
+        )
     return row
 
 
@@ -1386,11 +1393,20 @@ async def _mark_learning_candidate_apply_queued(
     user_id: str | None,
     approval_mode: str,
 ) -> None:
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
     queued_at = datetime.now(timezone.utc)
     row.status = "accepted"
     row.resolved_by_user_id = user_id
+    resolution = {
+        key: value for key, value in (row.resolution or {}).items() if key != LEARNING_APPLY_COLLABORATORS_KEY
+    }
+    # The worker applies outside this request or run; it acts for the external
+    # collaborators acting now (HTTP boundary, runtime gate).
+    if acting := collaborators_acting_now(row.entity_id):
+        resolution[LEARNING_APPLY_COLLABORATORS_KEY] = sorted(acting)
     row.resolution = {
-        **(row.resolution or {}),
+        **resolution,
         "status": "accepted",
         "apply_status": "queued",
         "apply_queued_at": queued_at.isoformat(),
@@ -2052,7 +2068,7 @@ async def _apply_candidate_payload(
     if ctype == "memory":
         return await _apply_memory_candidate(db, candidate, entity_id=entity_id, user_id=user_id)
     if ctype == "skill":
-        return await _apply_skill_candidate(db, candidate, entity_id=entity_id)
+        return await _apply_skill_candidate(db, candidate, entity_id=entity_id, user_id=user_id)
     if ctype == "tool_experience":
         return _apply_runtime_file_candidate(candidate, entity_id=entity_id, filename="TOOLS.md")
     if ctype == "agent_profile_patch":
@@ -2157,8 +2173,34 @@ async def _apply_skill_candidate(
     candidate: AgentLearningCandidate,
     *,
     entity_id: str,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
+    """Create the learned Skill and bind it to the candidate's Agent.
+
+    Applied by an external collaborator, the Skill belongs to the candidate's
+    Workspace (never the company) and is bound only to an Agent that lives in
+    that Workspace; a company Agent's candidate is refused.
+    """
     from packages.core.services.skill_service import bind_skill_to_agent, create_skill
+
+    skill_scope: dict[str, Any] = {}
+    from packages.core.services.collaborator_scope import actor_workspace_scope
+
+    collaborator_scope = await actor_workspace_scope(db, user_id=user_id, entity_id=entity_id)
+    if collaborator_scope is not None:
+        from packages.core.models.workspace import Agent
+
+        if not candidate.workspace_id or candidate.workspace_id not in collaborator_scope:
+            raise ValueError("External collaborators apply learning only inside their Workspace")
+        if candidate.agent_id and await db.scalar(
+            select(Agent.workspace_id).where(Agent.id == candidate.agent_id, Agent.entity_id == entity_id)
+        ) != candidate.workspace_id:
+            raise ValueError("External collaborators bind learned Skills only to this Workspace's own Agents")
+        from packages.core.models.permission import Visibility
+
+        skill_scope = {
+            "workspace_id": candidate.workspace_id, "owner_user_id": user_id, "visibility": Visibility.WORKSPACE,
+        }
 
     payload = candidate.payload or {}
     tools = _normalize_tool_names(
@@ -2187,6 +2229,7 @@ async def _apply_skill_candidate(
             "evidence_ids": list(candidate.evidence_ids or []),
             "confidence": candidate.confidence,
         },
+        **skill_scope,
     )
     binding_id = None
     if candidate.agent_id:

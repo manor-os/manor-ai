@@ -30,7 +30,7 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from html import escape
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Union
+from typing import Literal, Mapping, Optional, Sequence, Union
 
 import httpx
 
@@ -57,7 +57,7 @@ def _get_smtp_config() -> dict:
     return {
         "hostname": os.getenv("SMTP_HOST", "smtp.gmail.com"),
         "port": int(os.getenv("SMTP_PORT", "587")),
-        # SMTP_USERNAME was used by early DOKS runtime files. Keep it as a
+        # SMTP_USERNAME was used by early runtime files. Keep it as a
         # fallback while standardizing new configuration on SMTP_USER.
         "username": os.getenv("SMTP_USER") or os.getenv("SMTP_USERNAME", ""),
         "password": os.getenv("SMTP_PASSWORD", ""),
@@ -130,6 +130,29 @@ def _format_from(name: str, email: str) -> str:
     return formataddr((_encode_header_text(name), email))
 
 
+_PROTECTED_HEADERS = {
+    "subject", "from", "to", "cc", "bcc", "reply-to", "content-type", "mime-version",
+    "sender", "return-path", "content-transfer-encoding", "disposition-notification-to",
+}
+# RFC 5322 ftext: printable ASCII except space and colon.
+_HEADER_NAME = re.compile(r"[!-9;-~]+")
+
+
+def _safe_extra_headers(headers: Optional[dict[str, str]]) -> dict[str, str]:
+    """Drop header injection attempts and anything that changes routing."""
+    safe: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str) or not _HEADER_NAME.fullmatch(key):
+            continue
+        if any((ord(ch) < 32 and ch != "\t") or ch == "\x7f" for ch in value):
+            continue
+        lowered = key.lower()
+        if lowered in _PROTECTED_HEADERS or lowered.startswith("resent-"):
+            continue
+        safe[key] = value
+    return safe
+
+
 async def _deliver_email(
     to: str,
     subject: str,
@@ -184,11 +207,7 @@ async def _deliver_email(
     msg["Subject"] = _encode_header_text(subject)
     msg["From"] = _format_from(config["from_name"], config["from_email"])
     msg["To"] = to
-    for key, value in (headers or {}).items():
-        if "\r" in key or "\n" in key or "\r" in value or "\n" in value:
-            continue
-        if key.lower() in {"subject", "from", "to", "content-type", "mime-version"}:
-            continue
+    for key, value in _safe_extra_headers(headers).items():
         msg[key] = value
 
     try:
@@ -233,6 +252,11 @@ def _attachment_mime_part(attachment: EmailAttachment) -> MIMEBase:
 def is_email_delivery_enabled() -> bool:
     """Return whether this deployment is configured for real SMTP delivery."""
     return bool(_get_smtp_config()["enabled"])
+
+
+def support_inbox_address() -> str:
+    """Mailbox that receives support and content reports (``SMTP_FROM_EMAIL``)."""
+    return _get_smtp_config()["from_email"]
 
 
 async def send_email(
@@ -338,6 +362,21 @@ async def send_waitlist_confirmation_email(to: str, display_name: str) -> bool:
     subject = "You're on the Manor AI waitlist"
     body = _render("waitlist_confirmation", display_name=display_name or "there")
     return await send_email(to, subject, body)
+
+
+async def send_collaboration_confirmation_email(to: str, display_name: str, topic: str) -> bool:
+    """Reply to someone who sent the collaboration form on the marketing site."""
+    name = html.escape((display_name or "").strip() or "there")
+    topic_label = html.escape((topic or "").strip())
+    topic_line = f" ({topic_label})" if topic_label else ""
+    content = (
+        f"<p>Hi {name},</p>"
+        f"<p>Thanks for reaching out to collaborate with Manor. We have your request{topic_line}.</p>"
+        "<p>We read every request and will reply by email with next steps. "
+        "If you want to add anything, just reply to this email.</p>"
+        "<p>The Manor AI team</p>"
+    )
+    return await send_common_email(to, "Thanks for reaching out to collaborate with Manor", content)
 
 
 # ── Announcement email ───────────────────────────────────────────────
@@ -867,9 +906,13 @@ async def send_task_checkin_email(to: str, checkin_url: str) -> bool:
     return await send_email(to, subject, html)
 
 
-async def send_common_email(to: str, subject: str, content: str) -> bool:
+async def send_common_email(
+    to: str, subject: str, content: str, *, headers: Optional[dict[str, str]] = None,
+) -> bool:
     """Send a generic email with custom HTML content in the branded wrapper."""
     html = _render("common", content=content)
+    if headers:
+        return await send_email(to, subject, html, headers=headers)
     return await send_email(to, subject, html)
 
 
@@ -894,9 +937,54 @@ def connected_smtp_sender(credentials: dict) -> str:
     return address
 
 
+def _connected_smtp_connection(credentials: dict) -> dict:
+    """Host, port, login and TLS mode for a saved SMTP account."""
+    port = int(credentials.get("smtp_port") or credentials.get("port") or 587)
+    return {
+        "hostname": credentials.get("smtp_host") or credentials.get("host"),
+        "port": port,
+        "username": credentials["username"],
+        "password": credentials["password"],
+        "use_starttls": bool(credentials.get("use_tls_smtp", port == 587)),
+        "use_ssl": bool(credentials.get("use_ssl_smtp", port == 465)),
+    }
+
+
+async def connected_smtp_mailbox_status(
+    credentials: dict, expected_sender: str,
+) -> Literal["ok", "lost", "unreachable"]:
+    """Say whether a saved SMTP account can still log in as the pinned sender.
+
+    ``lost``: the identity changed or the server rejected the credentials.
+    ``unreachable``: login could not be checked (network, TLS, timeout).
+    """
+    import smtplib
+
+    try:
+        if connected_smtp_sender(credentials) != expected_sender:
+            return "lost"
+        connection = _connected_smtp_connection(credentials)
+    except ValueError:
+        return "lost"
+    try:
+        await smtp_transport.check_login_async(
+            host=connection["hostname"], port=connection["port"],
+            username=connection["username"], password=connection["password"],
+            use_starttls=connection["use_starttls"], use_ssl=connection["use_ssl"],
+            timeout=20,
+        )
+    except (smtplib.SMTPAuthenticationError, smtp_transport.SMTPTransportConfigurationError):
+        # Rejected credentials or a permanently invalid saved config.
+        return "lost"
+    except Exception:
+        logger.warning("Connected SMTP mailbox login check could not complete")
+        return "unreachable"
+    return "ok"
+
+
 async def send_connected_email(
     credentials: dict, *, to: str, subject: str, content: str,
-    sender_name: str, expected_sender: str,
+    sender_name: str, expected_sender: str, headers: Optional[dict[str, str]] = None,
 ) -> bool:
     """Send a transactional message through the owner's saved SMTP account."""
     from email.utils import parseaddr
@@ -908,39 +996,88 @@ async def send_connected_email(
     if sender != expected_sender:
         return False
     configured_name = parseaddr(str(credentials.get("from_address") or ""))[0]
-    port = int(credentials.get("smtp_port") or credentials.get("port") or 587)
     config = {
-        "hostname": credentials.get("smtp_host") or credentials.get("host"),
-        "port": port,
-        "username": credentials["username"],
-        "password": credentials["password"],
-        "use_starttls": bool(credentials.get("use_tls_smtp", port == 587)),
-        "use_ssl": bool(credentials.get("use_ssl_smtp", port == 465)),
+        **_connected_smtp_connection(credentials),
         "from_email": sender,
         "from_name": re.sub(r"[\r\n]+", " ", configured_name or sender_name).strip(),
         "enabled": True,
     }
-    delivered, _error = await _deliver_email(to, subject, _render("common", content=content), None, config)
+    delivered, _error = await _deliver_email(
+        to, subject, _render("common", content=content), None, config, headers,
+    )
     return delivered
+
+
+_OAUTH_PROFILE_URLS = {
+    "gmail": "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+    "outlook": "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName",
+}
+
+
+_RATE_LIMIT_REASONS = {"ratelimitexceeded", "userratelimitexceeded", "dailylimitexceeded"}
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """Google reports quota exhaustion as 403; that is not a lost mailbox."""
+    try:
+        error = response.json().get("error")
+        if not isinstance(error, dict):
+            return False
+        reasons = {
+            str(item.get("reason", "")).lower()
+            for item in error.get("errors") or [] if isinstance(item, dict)
+        }
+        return bool(reasons & _RATE_LIMIT_REASONS) or error.get("status") == "RESOURCE_EXHAUSTED"
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+async def _fetch_oauth_profile_address(provider: str, url: str, access_token: str) -> str:
+    """Normalised address from the provider profile; transport and parse errors propagate."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        response.raise_for_status()
+        profile = response.json()
+    return str(
+        profile.get("emailAddress") if provider == "gmail"
+        else profile.get("mail") or profile.get("userPrincipalName") or ""
+    ).strip().lower()
+
+
+async def connected_oauth_mailbox_status(
+    provider: str, access_token: str, expected_sender: str,
+) -> Literal["ok", "lost", "unreachable"]:
+    """Say whether an OAuth token still belongs to the pinned mailbox.
+
+    ``lost``: the provider rejected the token (401/403) or it now belongs to a
+    different mailbox. ``unreachable``: the identity could not be read.
+    """
+    url = _OAUTH_PROFILE_URLS.get(provider)
+    if url is None:
+        return "lost"
+    try:
+        address = await _fetch_oauth_profile_address(provider, url, access_token)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_code == 401 or (status_code == 403 and not _is_rate_limited(exc.response)):
+            return "lost"
+        logger.warning("Connected %s mailbox identity check failed", provider)
+        return "unreachable"
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        logger.warning("Connected %s mailbox identity check failed", provider)
+        return "unreachable"
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address):
+        return "unreachable"
+    return "ok" if address == expected_sender else "lost"
 
 
 async def connected_oauth_sender(provider: str, access_token: str) -> str | None:
     """Read the actual mailbox behind a Google/Microsoft access token."""
-    if provider == "gmail":
-        url = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
-    elif provider == "outlook":
-        url = "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName"
-    else:
+    url = _OAUTH_PROFILE_URLS.get(provider)
+    if url is None:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
-            response.raise_for_status()
-            profile = response.json()
-        address = str(
-            profile.get("emailAddress") if provider == "gmail"
-            else profile.get("mail") or profile.get("userPrincipalName") or ""
-        ).strip().lower()
+        address = await _fetch_oauth_profile_address(provider, url, access_token)
         return address if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) else None
     except (httpx.HTTPError, ValueError, TypeError):
         logger.warning("Connected %s mailbox identity check failed", provider)
@@ -949,7 +1086,7 @@ async def connected_oauth_sender(provider: str, access_token: str) -> str | None
 
 async def send_connected_oauth_email(
     provider: str, access_token: str, *, to: str, subject: str, content: str,
-    sender_name: str, expected_sender: str,
+    sender_name: str, expected_sender: str, headers: Optional[dict[str, str]] = None,
 ) -> bool:
     """Send via the exact OAuth mailbox; never fall back to platform SMTP."""
     actual_sender = await connected_oauth_sender(provider, access_token)
@@ -962,9 +1099,12 @@ async def send_connected_oauth_email(
         message["From"] = _format_from(re.sub(r"[\r\n]+", " ", sender_name).strip(), actual_sender)
         message["To"] = to
         message["Subject"] = _encode_header_text(safe_subject)
+        for key, value in _safe_extra_headers(headers).items():
+            message[key] = value
         url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
         payload = {"raw": base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")}
     elif provider == "outlook":
+        # ``headers`` are intentionally not sent: Graph accepts only X- headers.
         url = "https://graph.microsoft.com/v1.0/me/sendMail"
         payload = {"message": {
             "subject": safe_subject,
@@ -1287,7 +1427,15 @@ async def send_waitlist_invite_email(
 
 # Backward-compatible aliases
 async def send_notification_email(to: str, notification_title: str, notification_body: str) -> bool:
-    return await send_common_email(to, f"Manor AI: {notification_title}", notification_body)
+    # Notification text is plain text by contract (task titles, card questions,
+    # digest lines), but the common template inserts content as raw HTML. Escape
+    # the body so ``<``/``&`` render literally; newlines survive for the
+    # template's ``white-space: pre-line``. The subject is a header, not HTML.
+    return await send_common_email(
+        to,
+        f"Manor AI: {notification_title}",
+        html.escape(notification_body, quote=True),
+    )
 
 
 async def send_task_assigned_email(to: str, task_title: str, assigner_name: str) -> bool:

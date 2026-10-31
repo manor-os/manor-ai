@@ -857,3 +857,162 @@ async def test_resumed_sandbox_handoff_extends_a_small_round_budget(monkeypatch)
     assert resumed.stop_reason == "completed"
     assert resumed.content == "done"
     assert round_calls == 7
+
+
+# ── Park/resume keeps the turn's loop state (2026-10-19 audit) ────────────────
+# A durable turn runs in segments: a tool parks, the process exits, a new one
+# resumes from the checkpoint. State the loop keeps only in memory is lost at
+# that boundary (video_edit's guide check rejected an admitted call on every
+# resume). Every field below must survive the round trip, and the resumed loop
+# must see the same budget and tool surface the parked one had.
+
+def _populated_checkpoint() -> RuntimeAgentCheckpoint:
+    return RuntimeAgentCheckpoint(
+        messages=[{"role": "user", "content": "go"}],
+        usage={"total": 1},
+        rounds=3,
+        tool_calls_made=["look"],
+        pending_tool_call={"id": "call-1", "name": "look", "arguments": {}},
+        remaining_tool_calls=[{"id": "call-2", "name": "write", "arguments": {}}],
+        pending_attempt=2,
+        seen_tool_result_digests={"look": "digest"},
+        disable_followup_tools=True,
+        tool_continuations={"call-1": {"kind": "retry"}},
+        pending_tool_result={"id": "call-1", "content": "answer"},
+        final_response_evidence={"requires_execution": True},
+        tool_evidence={"effect_floor": 0, "observations": []},
+        tool_guidance={"look": "a" * 64},
+        web_source_slices=[{"url": "https://example.com", "text": "x"}],
+        loaded_gateway_tools=["look"],
+        max_rounds=9,
+        sandbox_budget_extended_for=["code"],
+        tool_narrowing=[{"mode": "allowlist", "names": ["look"]}],
+    )
+
+
+def test_every_checkpoint_field_survives_a_park() -> None:
+    import dataclasses
+
+    populated = _populated_checkpoint()
+    defaults = RuntimeAgentCheckpoint(
+        messages=[], usage={}, rounds=0, tool_calls_made=[],
+        pending_tool_call={"id": "call-1", "name": "look"},
+    )
+    names = [field.name for field in dataclasses.fields(RuntimeAgentCheckpoint)]
+    # A new field must be added to _populated_checkpoint (and so to this round trip).
+    assert [name for name in names if getattr(populated, name) == getattr(defaults, name)] == []
+
+    restored = RuntimeAgentCheckpoint.from_dict(populated.to_dict())
+    assert {name: getattr(restored, name) for name in names} == {
+        name: getattr(populated, name) for name in names
+    }
+
+
+def _resume_checkpoint(**fields) -> dict:
+    pending = {"id": "call-pending", "name": "look", "arguments": {}}
+    return RuntimeAgentCheckpoint(**{
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call-pending", "type": "function",
+                "function": {"name": "look", "arguments": "{}"},
+            }]},
+        ],
+        "usage": {}, "rounds": 3, "tool_calls_made": ["look"],
+        "pending_tool_call": pending, "remaining_tool_calls": [],
+        **fields,
+    }).to_dict()
+
+
+@pytest.mark.unit
+async def test_a_resume_keeps_the_round_budget_the_turn_had(monkeypatch) -> None:
+    """A sandbox handoff extended the budget to 9; the resumed worker passes the
+    caller's 2. Before: rounds 3 > 2 skipped the loop straight to synthesis."""
+
+    offered: list[list[str]] = []
+
+    async def fake_round(_messages, tools, **_kwargs):
+        offered.append(sorted(tool["function"]["name"] for tool in tools))
+        return "done", [], {}
+
+    async def tool_executor(_name, _args):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_round)
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="go", tools=[_tool("look"), _tool("write")],
+        tool_executor=tool_executor, max_rounds=2,
+        resume_checkpoint=_resume_checkpoint(max_rounds=9, sandbox_budget_extended_for=["code"]),
+    )
+
+    assert result.content == "done"
+    assert offered == [["look", "write"]]  # a tool round, not a forced tool-free synthesis
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("narrowing", "expected"), [
+    ([], ["look", "write"]),
+    ([{"mode": "read_only"}], ["look"]),
+    ([{"mode": "none"}], []),
+    ([{"mode": "allowlist", "names": ["write"]}], ["write"]),
+])
+async def test_a_resume_keeps_the_tool_surface_the_turn_narrowed(monkeypatch, narrowing, expected) -> None:
+    """After an approved write failed pre-I/O the turn kept only read-only tools;
+    a park on a read-only call must not hand the full list back on resume."""
+
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+
+    offered: list[list[str]] = []
+
+    async def fake_round(_messages, tools, **_kwargs):
+        offered.append(sorted(tool["function"]["name"] for tool in tools))
+        return "done", [], {}
+
+    async def tool_executor(_name, _args):
+        return json.dumps({"status": "ok"})
+
+    def classify(name, _arguments):
+        effect = RuntimeToolEffect.READ_ONLY if name == "look" else RuntimeToolEffect.ACTION
+        return type("Classification", (), {"effect": effect})()
+
+    monkeypatch.setattr(loop_module, "classify_runtime_tool", classify)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_round)
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="go", tools=[_tool("look"), _tool("write")],
+        tool_executor=tool_executor, max_rounds=6,
+        resume_checkpoint=_resume_checkpoint(tool_narrowing=narrowing),
+    )
+
+    # With no tools left the loop answers on its tool-free path (not this mock).
+    assert (offered[0] if offered else []) == expected
+    if expected:
+        assert result.error is None
+
+
+@pytest.mark.unit
+async def test_a_resumed_run_can_still_unload_schemas_discovery_loaded(monkeypatch) -> None:
+    """The restored discovery schemas overflow the provider request: the loop
+    must drop them and retry, as it would have before the park."""
+
+    offered: list[list[str]] = []
+
+    async def fake_round(_messages, tools, **_kwargs):
+        offered.append(sorted(tool["function"]["name"] for tool in tools))
+        if len(offered) == 1:
+            return "", [], {"error": "request too large"}
+        return "done", [], {}
+
+    async def tool_executor(_name, _args):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_round)
+    result = await loop_module.agentic_loop(
+        system_prompt="system", user_message="go",
+        tools=[_tool("look"), _tool("found_by_search")],
+        tool_executor=tool_executor, max_rounds=6,
+        resume_checkpoint=_resume_checkpoint(loaded_gateway_tools=["found_by_search"]),
+    )
+
+    assert result.content == "done"
+    assert offered == [["found_by_search", "look"], ["look"]]

@@ -73,6 +73,9 @@ class RuntimeToolClassification:
     action: RuntimeApprovalAction | None = None
     authorization: RuntimeToolAuthorization | None = None
     reason: str | None = None
+    # Set only on an UNKNOWN call the tool itself cannot execute: the gate
+    # answers with this tool error instead of a configuration refusal.
+    error_code: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.effect, RuntimeToolEffect):
@@ -87,6 +90,8 @@ class RuntimeToolClassification:
             RuntimeToolEffect.UNKNOWN,
         } and not str(self.reason or "").strip():
             raise ValueError(f"{self.effect.value} classification requires a reason")
+        if self.error_code is not None and self.effect is not RuntimeToolEffect.UNKNOWN:
+            raise ValueError("Only UNKNOWN classification may carry an error code")
         if self.effect is RuntimeToolEffect.UNKNOWN and self.authorization is not None:
             raise ValueError("UNKNOWN classification cannot carry authorization metadata")
         if self.effect is not RuntimeToolEffect.UNKNOWN and self.authorization is None:
@@ -158,6 +163,11 @@ class RuntimeToolClassification:
     @classmethod
     def unknown(cls, reason: str) -> "RuntimeToolClassification":
         return cls(RuntimeToolEffect.UNKNOWN, reason=reason)
+
+    @classmethod
+    def unsupported(cls, reason: str) -> "RuntimeToolClassification":
+        """A call naming an operation the tool has no handler for: nothing can run."""
+        return cls(RuntimeToolEffect.UNKNOWN, reason=reason, error_code="unsupported_action")
 
 
 @dataclass(frozen=True)

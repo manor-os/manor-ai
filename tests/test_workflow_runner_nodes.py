@@ -21,6 +21,277 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
 
 
+def test_workflow_effect_deadline_is_scoped_and_uses_strict_time_boundary() -> None:
+    from datetime import datetime, timezone
+
+    from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+    from packages.core.ai.runtime.effect_deadline import workflow_effect_deadline_expired
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolClassification
+
+    publication = RuntimeToolClassification.action_call(
+        RuntimeApprovalAction("action", "submission.send", "low", "submit", "external", "write")
+    )
+    unrelated = RuntimeToolClassification.action_call(
+        RuntimeApprovalAction("action", "document.save", "low", "save", "document", "write")
+    )
+    boundary = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    assert workflow_effect_deadline_expired(
+        deadline_at="2026-10-14T00:00:00Z", action_keys=["submission.send"],
+        classification=publication, now=boundary,
+    ) is True
+    assert workflow_effect_deadline_expired(
+        deadline_at="2026-10-14T00:00:00Z", action_keys=["submission.send"],
+        classification=unrelated, now=boundary,
+    ) is False
+    assert workflow_effect_deadline_expired(
+        deadline_at=None, action_keys=["submission.send"], classification=publication, now=boundary,
+    ) is False
+
+
+def test_workflow_effect_deadline_freezes_trusted_context(runner) -> None:
+    run = _run({"deadline": "2026-10-14T08:00:00+08:00"})
+    step = {
+        "type": "workflow_effect_deadline",
+        "config": {"deadline_at": "{{deadline}}", "action_keys": ["submission.send"], "output_var": "bound"},
+    }
+    first = runner._execute_workflow_effect_deadline_step(step, run.variables, run)
+    assert first["status"] == "completed"
+    assert first["output"] == {"deadline_at": "2026-10-14T00:00:00Z", "action_keys": ["submission.send"]}
+    assert run.trigger_data["_workflow_runtime_context"]["workflow_effect_deadline_at"] == "2026-10-14T00:00:00Z"
+    rerun = runner._execute_workflow_effect_deadline_step(step, {"deadline": "2026-10-15T00:00:00Z"}, run)
+    assert rerun["status"] == "failed"
+    child = workflow_runner_module._child_workflow_context(run, {
+        "workflow_effect_deadline_at": "2030-01-01T00:00:00Z",
+        "workflow_effect_deadline_action_keys": ["document.save"],
+    })
+    assert child["workflow_effect_deadline_at"] == "2026-10-14T00:00:00Z"
+    assert child["workflow_effect_deadline_action_keys"] == ["submission.send"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_handler_blocks_expired_declared_external_action_before_handler():
+    from packages.core.ai.runtime.tool_context import (
+        runtime_injected_tool_context_args,
+        runtime_tool_call_context_from_kwargs,
+    )
+    from packages.core.ai.runtime.approvals import (
+        RuntimeApprovalDecision,
+        RuntimeApprovalRequest,
+    )
+    from packages.core.ai.runtime.authorization_receipts import (
+        RuntimeToolAuthorizationLeaseFactory,
+        RuntimeToolAuthorizationReceiptFactory,
+    )
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolClassification
+    from packages.core.ai.runtime.tool_execution import (
+        RuntimePreparedToolExecution,
+        runtime_execute_prepared_tool_handler,
+    )
+
+    from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+
+    classification = RuntimeToolClassification.action_call(RuntimeApprovalAction(
+        "action", "submission.send", "low", "submit", "external", "write",
+    ))
+    calls: list[str] = []
+
+    def handler(**_kwargs):
+        calls.append("called")
+        return "submitted"
+
+    def prepared(deadline: str) -> RuntimePreparedToolExecution:
+        context = runtime_tool_call_context_from_kwargs({
+            "_workflow_effect_deadline_at_from_context": deadline,
+            "_workflow_effect_deadline_action_keys_from_context": ["submission.send"],
+        })
+        arguments = runtime_injected_tool_context_args(
+            workflow_effect_deadline_at=context.workflow_effect_deadline_at,
+            workflow_effect_deadline_action_keys=context.workflow_effect_deadline_action_keys,
+        )
+        receipt = RuntimeToolAuthorizationReceiptFactory.create(
+            decision=RuntimeApprovalDecision.allow(classification),
+            request=RuntimeApprovalRequest(
+                tool_name="submit_application", arguments=arguments,
+                entity_id="entity-1", user_id="user-1",
+            ),
+        )
+        assert receipt is not None
+        return RuntimePreparedToolExecution(
+            arguments=arguments, classification=classification,
+            authorization_lease=RuntimeToolAuthorizationLeaseFactory.create(receipt),
+        )
+
+    expired = prepared("2020-01-01T00:00:00Z")
+    blocked = await runtime_execute_prepared_tool_handler(
+        tool_name="submit_application", handler=handler, prepared=expired, entity_id="entity-1",
+    )
+    assert json.loads(blocked) == {"error": "workflow_effect_deadline_expired", "action_executed": False}
+    assert calls == []
+
+    allowed = prepared("2999-01-01T00:00:00Z")
+    assert await runtime_execute_prepared_tool_handler(
+        tool_name="submit_application", handler=handler, prepared=allowed, entity_id="entity-1",
+    ) == "submitted"
+    assert calls == ["called"]
+
+
+def test_runtime_social_publication_action_keys_match_provider_classification():
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
+
+    keys = {
+        tool_name: classify_runtime_tool_action(tool_name, {}).action_key
+        for tool_name in (
+            "mcp__facebook__create_instagram_media",
+            "mcp__facebook__publish_instagram_media",
+            "mcp__tiktok__post_video",
+            "mcp__tiktok__post_photo",
+        )
+    }
+    assert keys == {
+        "mcp__facebook__create_instagram_media": "facebook.create_instagram_media",
+        "mcp__facebook__publish_instagram_media": "social_post.publish",
+        "mcp__tiktok__post_video": "social_post.publish",
+        "mcp__tiktok__post_photo": "social_post.publish",
+    }
+
+
+@pytest.mark.asyncio
+async def test_chrome_mutation_family_deadline_blocks_unlabelled_publish_click():
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.tool_context import (
+        runtime_injected_tool_context_args,
+        runtime_tool_call_context_from_kwargs,
+    )
+    from packages.core.ai.runtime.tool_execution import (
+        RuntimePreparedToolExecution,
+        runtime_execute_prepared_tool_handler,
+    )
+
+    context = runtime_tool_call_context_from_kwargs({
+        "_workflow_effect_deadline_at_from_context": "2020-01-01T00:00:00Z",
+        "_workflow_effect_deadline_action_keys_from_context": ["chrome.browser.interact"],
+    })
+    forwarded = runtime_injected_tool_context_args(
+        workflow_effect_deadline_at=context.workflow_effect_deadline_at,
+        workflow_effect_deadline_action_keys=context.workflow_effect_deadline_action_keys,
+    )
+    arguments = {
+        **forwarded,
+        "target": {"role": "button", "name": "Publish"},
+        "operation_intent": {"effect": "prepare"},
+    }
+    classification = classify_runtime_tool("mcp__chrome__click_element", arguments)
+    assert classification.action is not None
+    assert classification.action.action_key == "chrome.representational_communication.confirm"
+    writes: list[bool] = []
+
+    def browser_handler(**_kwargs):
+        writes.append(True)
+        return "unexpected"
+
+    result = await runtime_execute_prepared_tool_handler(
+        tool_name="mcp__chrome__click_element", handler=browser_handler,
+        prepared=RuntimePreparedToolExecution(arguments=arguments, classification=classification),
+        entity_id="entity-1",
+    )
+    assert json.loads(result)["error"] == "workflow_effect_deadline_expired"
+    assert writes == []
+
+    read_arguments = forwarded
+    read_classification = classify_runtime_tool("mcp__chrome__read_page", read_arguments)
+    assert await runtime_execute_prepared_tool_handler(
+        tool_name="mcp__chrome__read_page", handler=lambda **_kwargs: "observed",
+        prepared=RuntimePreparedToolExecution(arguments=read_arguments, classification=read_classification),
+        entity_id="entity-1",
+    ) == "observed"
+
+
+@pytest.mark.asyncio
+async def test_expired_deadline_settles_claimed_provider_approval(monkeypatch):
+    from packages.core.ai.runtime import tool_execution
+    from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolClassification
+    from packages.core.ai.runtime.tool_execution import (
+        RuntimePreparedToolExecution,
+        runtime_execute_prepared_tool_handler,
+    )
+
+    classification = RuntimeToolClassification.action_call(RuntimeApprovalAction(
+        "action", "submission.send", "low", "submit", "external", "write",
+    ))
+    settled: dict[str, object] = {}
+
+    async def settle(**kwargs):
+        settled.update(kwargs)
+        return "settled-before-provider-write"
+
+    monkeypatch.setattr(tool_execution, "runtime_settle_provider_approval_preflight_failure", settle)
+    result = await runtime_execute_prepared_tool_handler(
+        tool_name="submit_application",
+        handler=lambda **_kwargs: pytest.fail("handler must not run"),
+        prepared=RuntimePreparedToolExecution(
+            arguments={
+                "_workflow_effect_deadline_at_from_context": "2020-01-01T00:00:00Z",
+                "_workflow_effect_deadline_action_keys_from_context": ["submission.send"],
+            },
+            classification=classification,
+        ),
+        entity_id="entity-1",
+    )
+    assert result == "settled-before-provider-write"
+    assert settled["result"] == json.dumps({"error": "workflow_effect_deadline_expired", "action_executed": False})
+
+
+@pytest.mark.asyncio
+async def test_tiktok_review_resume_cannot_begin_provider_write_after_deadline():
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.approvals import (
+        RuntimeApprovalDecision,
+        RuntimeApprovalRequest,
+    )
+    from packages.core.ai.runtime.authorization_receipts import (
+        RuntimeToolAuthorizationLeaseFactory,
+        RuntimeToolAuthorizationReceiptFactory,
+    )
+    from packages.core.ai.runtime.tool_execution import (
+        RuntimePreparedToolExecution,
+        runtime_execute_prepared_tool_handler,
+    )
+
+    arguments = {
+        "video_url": "https://media.example/video.mp4",
+        "privacy_level": "SELF_ONLY",
+        "_workflow_effect_deadline_at_from_context": "2020-01-01T00:00:00Z",
+        "_workflow_effect_deadline_action_keys_from_context": ["social_post.publish"],
+    }
+    classification = classify_runtime_tool("mcp__tiktok__post_video", arguments)
+    receipt = RuntimeToolAuthorizationReceiptFactory.create(
+        decision=RuntimeApprovalDecision.allow(classification),
+        request=RuntimeApprovalRequest(
+            tool_name="mcp__tiktok__post_video", arguments=arguments,
+            entity_id="entity-1", user_id="operator-1",
+        ),
+    )
+    assert receipt is not None
+    provider_writes: list[bool] = []
+
+    def provider_handler(**_kwargs):
+        provider_writes.append(True)
+        return "unexpected post"
+
+    result = await runtime_execute_prepared_tool_handler(
+        tool_name="mcp__tiktok__post_video",
+        handler=provider_handler,
+        prepared=RuntimePreparedToolExecution(
+            arguments=arguments, classification=classification,
+            authorization_lease=RuntimeToolAuthorizationLeaseFactory.create(receipt),
+        ),
+        entity_id="entity-1", user_id="operator-1",
+    )
+    assert json.loads(result)["error"] == "workflow_effect_deadline_expired"
+    assert provider_writes == []
+
+
 def _run(variables: dict | None = None) -> WorkflowRun:
     return WorkflowRun(
         id="run1", workflow_id="wf1", entity_id="ent1",
@@ -28,9 +299,84 @@ def _run(variables: dict | None = None) -> WorkflowRun:
     )
 
 
+def test_scheduled_workflow_context_uses_legacy_fallback_only_without_trusted_context() -> None:
+    from packages.core.ai.runtime.workflow_tools import runtime_workflow_run_context
+
+    legacy = SimpleNamespace(
+        trigger_source="schedule",
+        trigger_data={
+            "conversation_id": "legacy-conversation",
+            "task_id": "legacy-task",
+            "workflow_action_grant_id": "untrusted-grant",
+        },
+        variables={"context": {"conversation_id": "variable-conversation", "task_id": "variable-task"}},
+    )
+    authoritative = SimpleNamespace(
+        trigger_source="schedule",
+        trigger_data={
+            "conversation_id": "legacy-conversation",
+            "task_id": "legacy-task",
+            "_workflow_runtime_context": {
+                "conversation_id": "trusted-conversation",
+                "task_id": "trusted-task",
+                "workflow_action_grant_id": "trusted-grant",
+            },
+        },
+        variables={"context": {"conversation_id": "variable-conversation", "task_id": "variable-task"}},
+    )
+    empty_authoritative = SimpleNamespace(
+        trigger_source="schedule",
+        trigger_data={
+            "conversation_id": "legacy-conversation",
+            "task_id": "legacy-task",
+            "_workflow_runtime_context": {},
+        },
+        variables={"context": {"conversation_id": "variable-conversation", "task_id": "variable-task"}},
+    )
+
+    legacy_context = runtime_workflow_run_context(legacy)
+    assert legacy_context["conversation_id"] == "legacy-conversation"
+    assert legacy_context["task_id"] == "legacy-task"
+    assert legacy_context["workflow_action_grant_id"] is None
+
+    authoritative_context = runtime_workflow_run_context(authoritative)
+    assert authoritative_context["conversation_id"] == "trusted-conversation"
+    assert authoritative_context["task_id"] == "trusted-task"
+    assert authoritative_context["workflow_action_grant_id"] == "trusted-grant"
+
+    empty_context = runtime_workflow_run_context(empty_authoritative)
+    assert empty_context["conversation_id"] is None
+    assert empty_context["task_id"] is None
+
+
 @pytest.fixture
 def runner() -> WorkflowRunner:
     return WorkflowRunner()
+
+
+def test_datetime_node_resolves_bound_amount_and_rejects_invalid_amount(runner):
+    step = {
+        "type": "datetime",
+        "config": {
+            "operation": "add",
+            "value": "2026-01-01T00:00:00+00:00",
+            "amount": "{{invoice.payment_terms_days}}",
+            "unit": "days",
+        },
+    }
+    result = runner._execute_datetime_step(step, {"invoice": {"payment_terms_days": 30}})
+    assert result["status"] == "completed"
+    assert result["output"].startswith("2026-01-31")
+    assert runner._execute_datetime_step(
+        step, {"invoice": {"payment_terms_days": "later"}}
+    )["code"] == "datetime_amount_invalid"
+    assert runner._execute_datetime_step(step, {"invoice": {}})["code"] == "datetime_amount_invalid"
+    assert runner._execute_datetime_step(
+        step, {"invoice": {"payment_terms_days": ""}}
+    )["code"] == "datetime_amount_invalid"
+    assert runner._execute_datetime_step(
+        step, {"invoice": {"payment_terms_days": "NaN"}}
+    )["code"] == "datetime_amount_invalid"
 
 
 class _CheckpointDb:
@@ -278,6 +624,25 @@ async def test_trigger_and_end_are_passthrough(runner):
         None,
     )
     assert end == {"status": "completed", "output": "final answer"}
+
+
+@pytest.mark.asyncio
+async def test_needs_input_end_carries_its_repair_hint(runner):
+    end = await runner._execute_step(
+        {"id": "needs_input", "type": "end", "name": "Explain", "config": {
+            "retry_from_step_id": "prepare",
+            "retry_state": {"observed_problem": "{{result.summary}}",
+                            "editable_input_schema": {"type": "object", "properties": {"brief": {"type": "string"}}}},
+        }},
+        _run({"result": {"status": "needs_input", "summary": "No episode topic"}}),
+        None,
+    )
+    assert end["status"] == "completed"
+    assert end["retry_state"] == {
+        "observed_problem": "No episode topic",
+        "editable_input_schema": {"type": "object", "properties": {"brief": {"type": "string"}}},
+        "retry_from_step_id": "prepare",
+    }
 
 
 @pytest.mark.asyncio
@@ -927,6 +1292,20 @@ async def test_end_prefers_explicit_input_binding(runner):
     assert result["output"] == {"text": "digest"}
 
 
+@pytest.mark.asyncio
+async def test_end_returns_its_declared_output_and_never_runtime_bookkeeping(runner):
+    """An end's declared ``output`` is the result; a launch key recorded last is never shown as one."""
+    variables = {"qa": {"summary": "Ready to watch.", "passed": True},
+                 "_workspace_flow_launch_key": "manual:01M6370XY6Y65ZK4K70GTZB3JH:01M62TVP9KCPHKZ6N5NKMD7ZPG"}
+    declared = {"id": "done", "type": "end", "name": "Done",
+                "config": {"output": {"summary": "{{qa.summary}}", "qa_passed": "{{qa.passed}}"}}}
+    result = await runner._execute_step(declared, _run(dict(variables)), None)
+    assert result["output"] == {"summary": "Ready to watch.", "qa_passed": True}
+    # Without a declaration it passes the latest business value through, not the launch key.
+    result = await runner._execute_step({"id": "done", "type": "end", "name": "Done"}, _run(dict(variables)), None)
+    assert result["output"] == {"summary": "Ready to watch.", "passed": True}
+
+
 def test_final_run_output_prefers_end_then_latest_business_step():
     steps = [
         {"id": "start", "type": "trigger", "name": "Start"},
@@ -1486,6 +1865,90 @@ async def test_http_node_blocks_hostname_resolving_to_private_network(runner, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scheme,port,url_host,tls_host", [
+    ("https", 443, "example.test", "example.test"),
+    ("http", 80, "example.test", None),
+    ("https", 443, "[2606:4700:4700:0000:0000:0000:0000:1111]", "2606:4700:4700::1111"),
+])
+async def test_http_node_connects_to_validated_ip_without_resolving_again(runner, monkeypatch, scheme, port, url_host, tls_host):
+    import httpcore
+    from httpcore._backends.auto import AutoBackend
+
+    dns_calls = []
+    connections = []
+    writes = []
+    tls_hosts = []
+
+    def rebinding_dns(hostname, resolved_port, **_kwargs):
+        dns_calls.append((hostname, resolved_port))
+        address = "93.184.216.34" if len(dns_calls) == 1 else "127.0.0.1"
+        return [(2, 1, 6, "", (address, resolved_port))]
+
+    class Stream(httpcore.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            writes.append(buffer)
+
+        async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            tls_hosts.append(server_hostname)
+            return self
+
+    class NetworkBoundary:
+        async def connect_tcp(self, host, connected_port, **_kwargs):
+            connections.append((host, connected_port))
+            return Stream([b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{"ok":true}'])
+
+    async def forbid_unpinned_connection(*_args, **_kwargs):
+        raise AssertionError("Workflow HTTP must use the validated-IP transport")
+
+    monkeypatch.setattr(workflow_runner_module.socket, "getaddrinfo", rebinding_dns)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", NetworkBoundary)
+    monkeypatch.setattr(AutoBackend, "connect_tcp", forbid_unpinned_connection)
+
+    result = await runner._execute_http_step(
+        {"id": "h", "type": "http", "config": {"url": f"{scheme}://{url_host}/data"}}, {},
+    )
+
+    assert result["status"] == "completed"
+    assert result["output"]["status_code"] == 200
+    assert result["output"]["data"] == {"ok": True}
+    assert dns_calls == [(tls_host or "example.test", port)]
+    assert connections == [("93.184.216.34", port)]
+    assert f"Host: {url_host}\r\n".encode() in b"".join(writes)
+    # TLS verifies the original URL identity; canonicalization is only for the
+    # DNS/connection target comparison, including equivalent IPv6 spellings.
+    assert tls_hosts == ([url_host.strip("[]")] if scheme == "https" else [])
+
+
+@pytest.mark.asyncio
+async def test_http_node_preserves_cookies_across_pinned_redirect_hops(runner, monkeypatch):
+    import httpcore
+
+    requests = []
+    responses = iter([
+        b'HTTP/1.1 302 Found\r\nLocation: /logout\r\nSet-Cookie: fixture=ok; Path=/\r\nContent-Length: 0\r\n\r\n',
+        b'HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: fixture=; Max-Age=0; Path=/\r\nContent-Length: 0\r\n\r\n',
+        b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{"ok":true}',
+    ])
+    class Stream(httpcore.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            requests.append(buffer)
+    class NetworkBoundary:
+        async def connect_tcp(self, host, port, **_kwargs):
+            assert host == "93.184.216.34"
+            return Stream([next(responses)])
+    monkeypatch.setattr(workflow_runner_module.socket, "getaddrinfo", lambda hostname, port, **kwargs: [(2, 1, 6, "", ("93.184.216.34", port))])
+    monkeypatch.setattr(httpcore, "AnyIOBackend", NetworkBoundary)
+    result = await runner._execute_http_step(
+        {"id": "h", "type": "http", "config": {"url": "https://example.test/start"}}, {},
+    )
+    assert result["status"] == "completed"
+    logout_request = next(value for value in requests if value.startswith(b"GET /logout "))
+    final_request = next(value for value in requests if value.startswith(b"GET /final "))
+    assert b"Cookie: fixture=ok\r\n" in logout_request
+    assert b"Cookie:" not in final_request
+
+
+@pytest.mark.asyncio
 async def test_parallel_node_does_not_share_db_session_concurrently(runner, monkeypatch):
     active = 0
     max_active = 0
@@ -1525,6 +1988,41 @@ async def test_llm_node_routes_to_agent_step(runner, monkeypatch):
     monkeypatch.setattr(runner, "_execute_agent_step", fake_agent)
     res = await runner._execute_step({"id": "l", "type": "llm", "config": {}}, _run(), None)
     assert seen.get("called") and res["output"] == "drafted"
+
+
+def test_agent_contract_failure_names_the_tool_error_not_the_provider():
+    """A step that spent its rounds on a failing tool reports that tool's error."""
+    import json
+
+    from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+    from packages.core.ai.workflow_runner import _agent_loop_failure_message
+
+    rejected = tool_error_payload(
+        tool_name="record_stat_assessment", code="stat_assessment_invalid",
+        message="idempotency key already records a different assessment",
+    )
+    result = SimpleNamespace(
+        content="", control=None, stop_reason="error", error="final_response_validation_failed",
+        error_detail=tool_error_payload(
+            tool_name="stat_assessment", code="measurement_receipt_missing",
+            message="Required assessments have not been persisted for this run.",
+        ),
+        messages=[
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "manor", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call-1", "content": json.dumps(rejected)},
+        ],
+    )
+
+    message = _agent_loop_failure_message(result)
+
+    assert "Model provider" not in message
+    assert message == (
+        "Agent step ended without meeting its completion requirement. "
+        "Required assessments have not been persisted for this run. Last tool error: "
+        "manor: stat_assessment_invalid: idempotency key already records a different assessment"
+    )
 
 
 @pytest.mark.asyncio
@@ -1588,6 +2086,56 @@ async def test_agent_provider_failure_is_not_reparsed_as_invalid_json(runner, mo
 
 
 @pytest.mark.asyncio
+async def test_agent_catalog_refresh_releases_writes_before_nested_tools(db_session, monkeypatch):
+    """A refreshed Skill must be visible and unlocked to a nested invocation."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from packages.core.models.skill import Skill
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    skill = Skill(
+        id=generate_ulid(), name="event-planning-probe", slug="event-planning-probe",
+        description="original", system_prompt="Plan an event.", status="active",
+    )
+    db_session.add(skill)
+    await db_session.commit()
+    skill_id = skill.id
+    pending_id = generate_ulid()
+    db_session.add(Skill(
+        id=pending_id, name="uncommitted-event", slug="uncommitted-event",
+        system_prompt="Caller-owned change.", status="active",
+    ))
+
+    async def refresh_catalog(db, **_kwargs):
+        row = await db.get(Skill, skill_id)
+        row.description = "refreshed"
+        await db.flush()
+        return SimpleNamespace(
+            prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None,
+        )
+
+    async def nested_tool(**_kwargs):
+        async with factory() as nested:
+            row = (await nested.execute(
+                select(Skill).where(Skill.id == skill_id).with_for_update(nowait=True)
+            )).scalar_one()
+            assert row.description == "refreshed"
+            assert await nested.get(Skill, pending_id) is None
+        return SimpleNamespace(
+            content="Event plan ready", usage={}, tool_calls_made=[], rounds=1,
+            stop_reason="completed", error=None, error_detail=None,
+        )
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", refresh_catalog)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", nested_tool)
+    result = await WorkflowRunner(session_factory=factory)._execute_agent_step(
+        {"id": "plan_event", "type": "agent", "config": {"prompt": "Plan an event."}},
+        {}, "entity-1", "user-1", {}, db_session,
+    )
+    assert result["status"] == "completed"
+    assert result["output"] == "Event plan ready"
+
+
+@pytest.mark.asyncio
 async def test_agent_step_releases_read_transaction_before_workflow_agent_loop(
     runner,
     monkeypatch,
@@ -1648,9 +2196,70 @@ async def test_agent_step_releases_read_transaction_before_workflow_agent_loop(
         object(),
     )
 
-    assert order == ["appendix", "release", "loop"]
+    assert order == ["release", "appendix", "release", "loop"]
     assert result["status"] == "completed"
     assert result["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_workflow_skill_captures_approval_gates_and_only_resumes_saved_checkpoints(
+    runner,
+    monkeypatch,
+):
+    """All calls capture gates; only approval resume carries a saved checkpoint."""
+
+    seen: list[dict] = []
+    approval_resume = None
+
+    async def fake_resume(*_args, **_kwargs):
+        return approval_resume
+
+    async def fake_get_skill(*_args, **_kwargs):
+        return SimpleNamespace(id="chrome", slug="chrome", name="chrome")
+
+    async def fake_release(_db):
+        return None
+
+    async def fake_invoke_skill(*_args, **kwargs):
+        seen.append(kwargs)
+        return {
+            "content": '{"saved":true}',
+            "usage": {},
+            "tools_used": [],
+            "stop_reason": "completed",
+            "control": {},
+        }
+
+    monkeypatch.setattr(runner, "_native_approval_resume", fake_resume)
+    monkeypatch.setattr("packages.core.services.skill_service.get_skill", fake_get_skill)
+    monkeypatch.setattr("packages.core.services.skill_service._determine_skill_type", lambda _skill: "prompt")
+    monkeypatch.setattr(workflow_runner_module, "release_read_transaction", fake_release)
+    monkeypatch.setattr(workflow_runner_module, "runtime_invoke_skill", fake_invoke_skill)
+
+    step = {
+        "id": "upload",
+        "type": "agent",
+        "config": {"skill": "chrome", "input": "Upload the approved video", "output_format": "json"},
+    }
+    for _ in range(2):
+        result = await runner._execute_agent_step(
+            step, {}, "entity-1", "user-1", {}, object(),
+        )
+        assert result["status"] == "completed"
+
+    approval_resume = {
+        "agent_id": None,
+        "checkpoint": {"messages": [], "pending_tool_call": {"id": "resume", "name": "invoke_skill", "arguments": {}}},
+    }
+    result = await runner._execute_agent_step(
+        step, {}, "entity-1", "user-1", {}, object(),
+    )
+
+    assert result["status"] == "completed"
+    assert [call["hitl_resume_checkpoint"] for call in seen] == [True, True, True]
+    assert seen[0]["runtime_checkpoint"] is None
+    assert seen[1]["runtime_checkpoint"] is None
+    assert seen[2]["runtime_checkpoint"] == approval_resume["checkpoint"]
 
 
 
@@ -1662,6 +2271,7 @@ _UNCONFIRMED_CONTROL = {
     "retryable": False,
     "do_not_replay": True,
     "effect_state": "unconfirmed",
+    "child_skill_results": [{"skill_id": "delivery-skill", "result": {"content": "Receipt exists: report-42"}}],
 }
 
 
@@ -1735,6 +2345,7 @@ async def test_agent_step_failure_carries_replay_fields(
     assert result["do_not_replay"] is True
     if control is not None:
         assert result["retryable"] is False
+        assert result["child_skill_results"] == control["child_skill_results"]
     assert result["effect_state"] == "unconfirmed"
 
 
@@ -1788,6 +2399,10 @@ async def test_rag_node_calls_rag_tool(runner, monkeypatch):
     assert captured["config"]["tool"] == "rag"
     assert captured["config"]["args"]["question"] == "refund policy"
     assert captured["config"]["output_var"] == "kb"
+    assert "output_format" not in captured["config"]
+    # JSON keeps the result's sources readable by later steps.
+    await runner._execute_step({**step, "config": {**step["config"], "output_format": "json"}}, _run(), None)
+    assert captured["config"]["output_format"] == "json"
 
 
 # ── Compound and/or conditions ──
@@ -1906,34 +2521,26 @@ async def test_cache_miss_on_changed_inputs():
     assert res["output"] == [99]
 
 
+@pytest.fixture
+def workflow_runner_sandbox(monkeypatch):
+    from packages.core.config import get_settings
+    from sandbox_entry_fakes import FakeRunner
+
+    fake = FakeRunner()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "SANDBOX_SERVICE_URL", "http://sandbox")
+    monkeypatch.setattr(settings, "SANDBOX_COORDINATION_MODE", "local")
+    monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", fake.client_class)
+    return fake
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("allow_network", [False, True])
-async def test_code_node_executes_in_ephemeral_sandbox(runner, monkeypatch, allow_network):
-    captured = {}
-
-    class FakeSandboxClient:
-        def __init__(self, **kwargs):
-            captured["client"] = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return None
-
-        async def create_from_files(self, **kwargs):
-            captured["create"] = kwargs
-            return SimpleNamespace(sandbox_id="sbx-1", workdir="/skill")
-
-        async def exec(self, **kwargs):
-            captured["exec"] = kwargs
-            return SimpleNamespace(stdout='{"answer": 42}', stderr="", exit_code=0)
-
-        async def destroy(self, sandbox_id):
-            captured.setdefault("destroy", []).append(sandbox_id)
-
-    monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_url", lambda: "http://sandbox")
-    monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", FakeSandboxClient)
+async def test_code_node_executes_in_ephemeral_sandbox(runner, workflow_runner_sandbox, allow_network):
+    fake = workflow_runner_sandbox
+    fake.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
+        stdout='{"answer": 42}', stderr="", exit_code=0,
+    )
     step = {"id": "c", "type": "code",
             "config": {"code": "print(inputs['value'])", "language": "python", "output_var": "r", "allow_network": allow_network}}
     res = await runner._execute_step(step, _run({"value": 42}), None)
@@ -1941,55 +2548,68 @@ async def test_code_node_executes_in_ephemeral_sandbox(runner, monkeypatch, allo
     assert res["output"] == {"answer": 42}
     assert res["output_var"] == "r"
     assert res["sandboxed"] is True
-    assert json.loads(captured["create"]["files"]["inputs.json"]) == {"value": 42}
+    [created] = fake.created
+    assert created["skill_name"] == "workflow-code-c"
+    assert json.loads(created["files"]["inputs.json"]) == {"value": 42}
     if allow_network:
-        assert "network" not in captured["create"]["config"]
+        assert "network" not in created["config"]
     else:
-        assert captured["create"]["config"]["network"] == "none"
-    assert captured["exec"]["command"] == "python run.py"
-    assert captured["destroy"] == ["sbx-1"]
+        assert created["config"]["network"] == "none"
+    [execution] = [call for name, call in fake.calls if name == "exec"]
+    assert execution["command"] == "python run.py"
+    assert execution["sandbox_id"] == created["sandbox_id"]
+    assert fake.destroyed == [created["sandbox_id"]]
+    assert fake.live() == set()
 
 
 @pytest.mark.asyncio
-async def test_code_node_with_network_uses_the_runner_default_network(runner, monkeypatch):
+async def test_code_node_with_network_uses_the_runner_default_network(runner, workflow_runner_sandbox):
     """External runners only allow their dedicated bridge (``manor-sandbox``);
     a hardcoded ``"bridge"`` override was rejected there. Opting into network
     access must leave the network to the runner instead of naming one."""
 
-    captured = {}
-
-    class FakeSandboxClient:
-        def __init__(self, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return None
-
-        async def create_from_files(self, **kwargs):
-            captured["create"] = kwargs
-            return SimpleNamespace(sandbox_id="sbx-net", workdir="/skill")
-
-        async def exec(self, **kwargs):
-            return SimpleNamespace(stdout='{"ok": true}', stderr="", exit_code=0)
-
-        async def destroy(self, sandbox_id):
-            return None
-
-    monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_url", lambda: "http://sandbox")
-    monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", FakeSandboxClient)
+    fake = workflow_runner_sandbox
+    fake.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
+        stdout='{"ok": true}', stderr="", exit_code=0,
+    )
     step = {"id": "c", "type": "code",
             "config": {"code": "print('{}')", "language": "python", "allow_network": True}}
     res = await runner._execute_step(step, _run({}), None)
     assert res["status"] == "completed"
-    assert "network" not in captured["create"]["config"]
+    assert "network" not in fake.created[0]["config"]
+
+
+@pytest.mark.asyncio
+async def test_code_node_requests_bounded_limits_and_names_the_runner_kill(runner, workflow_runner_sandbox):
+    """A headless browser needs more pids (threads count) than a plain script;
+    when the runner kills a command, the step says which limit was hit."""
+
+    fake = workflow_runner_sandbox
+    fake.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
+        stdout="", stderr="", exit_code=137, outcome="pids_killed",
+        outcome_detail="killed: the command's processes exhausted the sandbox's process limit",
+    )
+    step = {"id": "c", "type": "code", "config": {
+        "code": "node collect.js", "language": "bash", "allow_network": True,
+        "memory": "1.5g", "pids_limit": 5000, "cpus": "2",
+    }}
+    res = await runner._execute_step(step, _run({}), None)
+    assert res["status"] == "failed"
+    assert res["error"].startswith("Code was stopped by the sandbox: killed: the command's processes")
+    config = fake.created[0]["config"]
+    assert (config["memory"], config["pids_limit"], config["cpus"]) == ("1536m", 1024, 2.0)
+
+    await runner._execute_step(
+        {"id": "d", "type": "code", "config": {"code": "true", "language": "bash", "memory": "lots"}},
+        _run({}), None,
+    )
+    config = fake.created[1]["config"]
+    assert (config["memory"], config["pids_limit"], config["cpus"]) == ("512m", 512, 1.0)
 
 
 @pytest.mark.asyncio
 async def test_code_node_requires_sandbox_service(runner, monkeypatch):
-    monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_url", lambda: "")
+    monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_configured", lambda: False)
     res = await runner._execute_step(
         {"id": "c", "type": "code", "config": {"code": "print(1)", "language": "python"}},
         _run(),
@@ -2105,12 +2725,29 @@ async def test_retry_on_fail_retries_until_success(runner, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_on_fail_never_replays_an_unsafe_attempt(runner, monkeypatch):
+@pytest.mark.parametrize(
+    ("effect_state", "error"),
+    [
+        (None, "agent execution stopped before it returned a receipt"),
+        ("unknown", "provider returned an unknown effect state"),
+        ("confirmed", "weekly report delivery failed after the delivery was accepted"),
+        ("unconfirmed", "publication outcome is unknown"),
+    ],
+)
+async def test_retry_on_fail_never_replays_an_attempt_with_an_effect_receipt(
+    runner,
+    monkeypatch,
+    effect_state,
+    error,
+):
     calls = {"n": 0}
 
     async def unsafe(step, run, db):
         calls["n"] += 1
-        return {"status": "failed", "error": "outcome unknown", "do_not_replay": True, "retryable": False}
+        result = {"status": "failed", "error": error}
+        if effect_state is not None:
+            result["effect_state"] = effect_state
+        return result
 
     monkeypatch.setattr(runner, "_execute_step", unsafe)
     step = {"id": "s", "type": "agent", "config": {"retry_on_fail": True, "max_tries": 3, "retry_wait_ms": 0}}
@@ -2129,7 +2766,12 @@ async def test_retry_on_fail_still_retries_an_exhausted_in_loop_budget(runner, m
     async def transient(step, run, db):
         calls["n"] += 1
         if calls["n"] < 3:
-            return {"status": "failed", "error": "provider kept failing", "retryable": False}
+            return {
+                "status": "failed",
+                "error": "provider kept failing",
+                "retryable": False,
+                "effect_state": "none",
+            }
         return {"status": "completed", "output": "ok"}
 
     monkeypatch.setattr(runner, "_execute_step", transient)
@@ -2436,6 +3078,37 @@ def test_workflow_validation_checks_nested_step_schema_contracts() -> None:
     )
 
 
+def test_workflow_validation_rejects_condition_routes_inside_config() -> None:
+    from packages.core.services.workflow_service import validate_workflow_steps
+
+    validation = validate_workflow_steps(
+        [
+            {"id": "start", "type": "trigger", "next": ["upload_complete"]},
+            {
+                "id": "upload_complete",
+                "type": "condition",
+                "config": {
+                    "expression": "upload.succeeded",
+                    "true_next": ["publish"],
+                    "false_next": ["blocked"],
+                },
+            },
+            {"id": "publish", "type": "end", "next": []},
+            {"id": "blocked", "type": "end", "next": []},
+        ]
+    )
+
+    assert validation["valid"] is False
+    errors = [
+        error for error in validation["errors"]
+        if error["code"] == "misplaced_condition_route"
+    ]
+    assert {error["message"] for error in errors} == {
+        "Node 'upload_complete' config.true_next is ignored; move it to top-level 'true_next'.",
+        "Node 'upload_complete' config.false_next is ignored; move it to top-level 'false_next'.",
+    }
+
+
 def test_workflow_validation_checks_entry_run_input_schema_contracts() -> None:
     from packages.core.services.workflow_service import validate_workflow_steps
 
@@ -2460,6 +3133,42 @@ def test_workflow_validation_checks_entry_run_input_schema_contracts() -> None:
         and "run input 'request'" in error["message"]
         for error in validation["errors"]
     )
+
+
+_RECORDS_UI = {"control": "record_select", "record_source": {
+    "ledger": "relationship_ledger",
+    "filter": {"contact_points.kind": "instagram", "status": {"$ne": "paused"}},
+}}
+
+
+@pytest.mark.parametrize(("schema", "valid"), [
+    ({"type": "array", "items": {"type": "string"}, "x-ui": _RECORDS_UI}, True),
+    ({"type": "string", "x-ui": {"control": "record_select", "record_source": {
+        "ledger": "manor.relationship_ledger/v1", "label_field": "display_name", "secondary_field": "stage",
+    }}}, True),
+    ({"type": "array", "items": {"type": "string"}, "x-ui": {"control": "record_select", "record_source": {
+        "ledger": "not_a_ledger",
+    }}}, False),
+    # The filter goes through query_ledger's own validation.
+    ({"type": "array", "items": {"type": "string"}, "x-ui": {"control": "record_select", "record_source": {
+        "ledger": "relationship_ledger", "filter": {"status": {"$regex": "x"}},
+    }}}, False),
+    ({"type": "array", "items": {"type": "string", "enum": ["lead:1"]}, "x-ui": _RECORDS_UI}, False),
+    ({"type": "number", "x-ui": _RECORDS_UI}, False),
+    ({"type": "object", "properties": {"creators": {"type": "string", "x-ui": _RECORDS_UI}}}, False),
+])
+def test_workflow_validation_checks_record_select_run_inputs(schema, valid) -> None:
+    from packages.core.services.workflow_service import validate_workflow_steps
+
+    validation = validate_workflow_steps([{
+        "id": "start",
+        "type": "trigger",
+        "config": {"run_inputs": [{"key": "creators", "type": "json", "schema": schema}]},
+        "next": [],
+    }])
+
+    errors = [error for error in validation["errors"] if error["code"] == "invalid_input_schema"]
+    assert bool(errors) is not valid, errors
 
 
 def test_runtime_contract_preflight_preserves_imported_graph_compatibility() -> None:
@@ -2808,6 +3517,8 @@ def test_workflow_tools_exposed():
     tools = get_tools()
     names = {s["function"]["name"] for s, _ in tools}
     assert names == {
+        "expand_schedule_occurrences",
+        "query_workflow_projects",
         "list_workspace_flows",
         "start_workspace_flow",
         "list_workflows",
@@ -2830,6 +3541,48 @@ def test_workflow_tools_exposed():
     }
     run = next(s for s, _ in tools if s["function"]["name"] == "run_workflow")
     assert "workflow" in run["function"]["parameters"]["required"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["invalid_input", "wait_changed"])
+async def test_resume_workflow_tool_reports_unaccepted_resume_outcomes(monkeypatch, outcome):
+    """A native input or changed wait must not be presented as a resumed run."""
+    import packages.core.ai.tools.workflow_tools as workflow_tools
+
+    run = SimpleNamespace(id="run-1", status="paused")
+
+    class FakeDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def get_run(*_args):
+        return run
+
+    async def can_control(*_args, **_kwargs):
+        return True
+
+    async def resume(*_args, **_kwargs):
+        return outcome
+
+    monkeypatch.setattr(workflow_tools, "async_session", lambda: FakeDB())
+    monkeypatch.setattr("packages.core.services.workflow_service.get_run", get_run)
+    monkeypatch.setattr(workflow_tools, "_user_can_control_workflow_run", can_control)
+    monkeypatch.setattr(WorkflowRunner, "resume", resume)
+
+    response = json.loads(await workflow_tools._resume_workflow_run(
+        entity_id="ent1",
+        user_id="user1",
+        run_id=run.id,
+        inputs={"required_field": "invalid-for-current-wait"},
+    ))
+
+    assert response == {
+        "ok": False,
+        "error": f"Could not resume workflow run: {outcome}",
+    }
 
 
 def test_workflow_service_validation_catches_graph_errors():
@@ -3031,6 +3784,35 @@ def test_failed_retry_blocked_step_has_no_chat_retry_checkpoint():
             "upload_youtube_video": {
                 "status": "failed",
                 "retry_blocked": True,
+            }
+        },
+        retry_from_step_id=None,
+        retry_of_run_id=None,
+    )
+
+    assert workflow_retry_from_step_id(run, {}) == ""
+
+
+def test_failed_unconfirmed_effect_has_no_chat_retry_checkpoint():
+    from packages.core.services.workflow_chat_projection import (
+        workflow_retry_from_step_id,
+    )
+
+    run = SimpleNamespace(
+        status="failed",
+        current_step_id="upload_youtube_video",
+        execution_snapshot={
+            "steps": [{
+                "id": "upload_youtube_video",
+                "type": "agent",
+                "config": {},
+            }],
+        },
+        step_results={
+            "upload_youtube_video": {
+                "status": "failed",
+                "effect_state": "unconfirmed",
+                "do_not_replay": True,
             }
         },
         retry_from_step_id=None,
@@ -4032,6 +4814,8 @@ def test_foreach_subworkflow_is_a_canonical_node_type():
             },
             "project_id",
         ),
+        ("workflow_project", {"operation": "lease_due", "project_type": "queue", "schema_version": 1, "state_schema": {"type": "object"}, "due_path": "due_at"}, "pending_stages"),
+        ("workflow_project", {"operation": "complete_lease", "project_id": "project", "project_type": "queue", "schema_version": 1, "state_schema": {"type": "object"}}, "current_stage"),
         ("workflow_action_grant", {"operation": "create"}, "approval_step_id"),
         ("browser_effect", {"operation": "transition", "record": {}}, "target_status"),
     ],
@@ -4207,6 +4991,27 @@ async def test_wait_input_safe_dispatch_pauses_before_required_submission(runner
     assert result["input_schema"] == schema
 
 
+@pytest.mark.asyncio
+async def test_wait_input_form_opens_with_defaults_bound_to_the_run(runner):
+    schema = {"type": "object", "required": ["title"], "properties": {
+        "title": {"type": "string", "default": "{{draft.title}}"},
+        "summary": {"type": "string", "default": "From {{draft.author}}"},
+        "notes": {"type": "string", "default": "{{missing.value}}"},
+    }}
+    step = {"id": "confirm", "type": "wait", "config": {"wait_type": "input", "input_schema": schema}}
+
+    result = await runner._execute_step(step, _run({"draft": {"title": "Q3 plan", "author": "Ana"}}), None)
+
+    assert result["status"] == "paused"
+    properties = result["input_schema"]["properties"]
+    assert properties["title"]["default"] == "Q3 plan"
+    assert properties["summary"]["default"] == "From Ana"
+    # An unresolved binding is never shown to the person as {{...}} text.
+    assert "default" not in properties["notes"]
+    # The configured form keeps its bindings for the next run.
+    assert schema["properties"]["title"]["default"] == "{{draft.title}}"
+
+
 def test_input_wait_rejects_refresh_invalid_submission():
     config = {
         "wait_type": "input",
@@ -4259,6 +5064,41 @@ def test_input_wait_drops_undeclared_nested_values_before_persisting():
     })
 
     assert value == {"cover_art": [{"document_id": "cover-doc"}]}
+
+
+def test_input_wait_lists_one_field_per_item_the_run_found_missing():
+    """A form asks for each missing item in its own field, from a list an earlier step produced."""
+    from packages.core.ai.workflow_runner import _bind_schema_defaults
+
+    config = {
+        "response_variable": "supplier_answer",
+        "input_schema": {"type": "object", "properties": {
+            "answers": {"type": "object", "default": {}, "x-fields-from": "{{review.gaps}}"},
+        }},
+    }
+    run_variables = {"review": {"gaps": [
+        {"label": "Tax ID", "hint": "As on the invoice"}, "Bank country", "Tax ID",
+        {"label": "Address", "value": "1 Main St", "source": "invoice.pdf"},
+    ]}}
+
+    shown = _bind_schema_defaults(config["input_schema"], run_variables)["properties"]["answers"]
+    assert list(shown["properties"]) == shown["x-ui"]["order"] == ["Tax ID", "Bank country", "Address"]
+    assert shown["x-ui"]["layout"] == "list"
+    assert shown["properties"]["Tax ID"]["x-ui"]["placeholder"] == "As on the invoice"
+    # What an earlier step found is filled in for the person to check, with its source.
+    assert shown["properties"]["Address"]["default"] == "1 Main St"
+    assert shown["properties"]["Address"]["x-ui"]["source"] == "invoice.pdf"
+    assert "default" not in shown["properties"]["Tax ID"]
+    assert "x-fields-from" not in shown
+    # The submission alone is validated against the form the run showed.
+    # Items left blank are not answers.
+    submitted = {"supplier_answer": {"answers": {"Bank country": "DE", "Tax ID": "  "}}}
+    assert workflow_input_wait_value(config, submitted, context=run_variables)[1] == {
+        "answers": {"Bank country": "DE"},
+    }
+    with pytest.raises(ValueError, match="Website"):
+        workflow_input_wait_value(config, {"supplier_answer": {"answers": {"Website": "x"}}},
+                                  context=run_variables)
 
 
 def test_input_wait_rejects_non_object_schema():
@@ -4328,6 +5168,31 @@ def test_render_template_dotted():
     assert _render_template("got {{r.context}}", v) == "got doc text"
     assert _render_template("{{missing}}", v) == "{{missing}}"   # visible, not blanked
     assert _render_template("{{r.nope}}", v) == "{{r.nope}}"
+
+
+def test_render_template_reads_lists_and_structures_as_text_not_python_repr():
+    from packages.core.ai.workflow_runner import _render_template
+    v = {"episodes": ["EP.05", "EP.06"], "refs": [{"name": "店面.jpg"}], "none": []}
+    # Review titles and Chat lines interpolate these; ['EP.05'] leaked before.
+    assert _render_template("审批 {{episodes}} 逐字剧本", v) == "审批 EP.05, EP.06 逐字剧本"
+    assert _render_template("refs: {{refs}}", v) == 'refs: [{"name": "店面.jpg"}]'
+    assert _render_template("[{{none}}]", v) == "[]"
+    # A list of sentences (blockers) must not read "platform., The next".
+    blockers = ["Connect the account first.", "Confirm the recipient."]
+    assert _render_template("Fix: {{b}}", {"b": blockers}) == "Fix: Connect the account first. Confirm the recipient."
+
+
+def test_stop_step_lists_items_as_separate_lines_under_the_message():
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    step = {"config": {"message": "Fix these, then retry:", "items": "{{setup.blockers}}"}}
+    variables = {"setup": {"blockers": ["Connect Instagram.", "Confirm the recipient.", "Connect Instagram."]}}
+    result = WorkflowRunner()._execute_stop_step(step, variables)
+    assert result["status"] == "failed"
+    # Duplicates collapse; each item keeps its own line for the run page.
+    assert result["error"] == "Fix these, then retry:\n- Connect Instagram.\n- Confirm the recipient."
+    # Without items the message is unchanged.
+    plain = WorkflowRunner()._execute_stop_step({"config": {"message": "Stop here."}}, {})
+    assert plain["error"] == "Stop here."
 
 
 def test_resolve_binding_preserves_type_for_single_ref():

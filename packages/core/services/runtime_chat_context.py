@@ -552,12 +552,14 @@ async def resolve_runtime_chat_context(
                     user_id=user_id,
                     entity_id=entity_id,
                     db=db,
+                    workspace_id=workspace_id,
                 )
             resolved_metadata = await resolve_llm_metadata_for_user(
                 model_role,
                 user_id=user_id,
                 entity_id=entity_id,
                 db=db,
+                workspace_id=workspace_id,
             )
             if resolved_metadata:
                 ctx.llm_metadata = {
@@ -607,10 +609,7 @@ async def resolve_runtime_chat_context(
     initial_messages: list[dict] = []
     if db and conversation_id:
         from packages.core.services.model_context_window import effective_context_window_tokens
-        from packages.core.ai.runtime.agentic_llm import (
-            RUNTIME_AGENTIC_TEXT_MAX_TOKENS,
-            RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS,
-        )
+        from packages.core.ai.runtime.agentic_llm import runtime_agentic_output_tokens
 
         message_preview = runtime_message_text_for_intent(message)
         overhead_tokens = (
@@ -618,11 +617,11 @@ async def resolve_runtime_chat_context(
             + runtime_estimate_tokens_for_text(json.dumps(tools))
             + runtime_estimate_tokens_for_text(message_preview)
         )
-        output_reserve = (
-            RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS if tools else RUNTIME_AGENTIC_TEXT_MAX_TOKENS
-        )
+        loop_model = getattr(ctx, "model", None)
+        loop_metadata = getattr(ctx, "llm_metadata", None)
+        output_reserve = runtime_agentic_output_tokens(loop_metadata, model=loop_model, tools=bool(tools))
         history_budget = max(
-            effective_context_window_tokens(getattr(ctx, "model", None)) - overhead_tokens - output_reserve,
+            effective_context_window_tokens(loop_model, loop_metadata) - overhead_tokens - output_reserve,
             0,
         )
         if turn_plan.history_token_budget is not None:

@@ -25,6 +25,7 @@ _VERCEL_CACHE_MODELS: dict[str, dict] = {}
 _VERCEL_PROVIDER_ALIASES = {
     "qwen": "alibaba",
     "kwaivgi": "klingai",
+    "xai": "spacexai",
 }
 
 
@@ -55,15 +56,6 @@ class FlatModelPrice:
     usd: float
     source: str
     note: str = ""
-
-
-def _configured_positive_price(env_name: str, default: float) -> float:
-    try:
-        value = float(os.getenv(env_name, str(default)) or default)
-    except (TypeError, ValueError):
-        logger.warning("Invalid %s; using %.3f", env_name, default)
-        return default
-    return value if value > 0 else default
 
 
 OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
@@ -319,26 +311,48 @@ OFFICIAL_IMAGE_PRICES: dict[str, FlatModelPrice] = {
     # $60/M image-output tokens; the default 1024px image is 1120 tokens ≈ $0.067.
     "google/gemini-3.1-flash-image-preview": FlatModelPrice("google", "image", 0.067, "official"),
     "google/gemini-3.1-flash-image": FlatModelPrice("google", "image", 0.067, "official"),
+    # Grok Imagine, per output image at the Vercel AI Gateway's default quality
+    # (managed calls route there; 2.0 low quality is $0.04, 2048px $0.08).
+    # Edits also bill each source image ($0.002 / $0.01 on 2.0).
+    "xai/grok-imagine-image": FlatModelPrice("xai", "image", 0.02, "vercel"),
+    "xai/grok-imagine-image-2.0": FlatModelPrice("xai", "image", 0.06, "vercel"),
 }
 
 
 OFFICIAL_AUDIO_PRICES: dict[str, FlatModelPrice] = {
-    "suno/music": FlatModelPrice(
-        "suno",
-        "audio_asset",
-        _configured_positive_price("SUNO_GENERATION_COST_USD", 0.10),
-        "configured",
-        "Override SUNO_GENERATION_COST_USD with the effective platform cost per generation.",
-    ),
     "google/gemini-3.1-flash-tts-preview": FlatModelPrice("google", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-hybrid": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-transformer": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
     "sesame/csm-1b": FlatModelPrice("openrouter", "audio_asset", 0.01, "openrouter_fallback"),
     "google/lyria-3-clip-preview": FlatModelPrice("google", "audio_asset", 0.04, "official"),
     "google/lyria-3-pro-preview": FlatModelPrice("google", "audio_asset", 0.08, "official"),
+    # Vercel AI Gateway list price per generated second; the gateway-reported
+    # cost is billed when the response carries one.
+    "elevenlabs/music-v2.5": FlatModelPrice("vercel", "second", 0.00125, "vercel"),
     "openai/gpt-audio-mini": FlatModelPrice("openai", "audio_asset", 0.02, "official"),
     "openai/gpt-audio": FlatModelPrice("openai", "audio_asset", 0.04, "official"),
 }
+# Lyria's per-asset price is the same on both of its routes: Google lists
+# $0.04 per Clip / $0.08 per Pro song, and OpenRouter passes those through
+# (https://openrouter.ai/google/lyria-3-clip-preview). OpenRouter-routed calls
+# bill the gateway-reported ``usage.cost`` when the stream carries one.
+
+
+# Speech models billed per input character (Unicode code points, inline audio
+# tags included). ElevenLabs only runs through OpenRouter, which passes
+# ElevenLabs list prices through without markup; rates from OpenRouter's model
+# list (``pricing.prompt`` per character), checked 2026-10-20.
+PER_CHARACTER_AUDIO_PRICES: dict[str, FlatModelPrice] = {
+    "elevenlabs/eleven-v4": FlatModelPrice("openrouter", "character", 0.00008, "openrouter"),
+    "elevenlabs/eleven-v4-turbo": FlatModelPrice("openrouter", "character", 0.00004, "openrouter"),
+    "elevenlabs/eleven-v3": FlatModelPrice("openrouter", "character", 0.00008, "openrouter"),
+    "elevenlabs/eleven-multilingual-v2": FlatModelPrice("openrouter", "character", 0.00008, "openrouter"),
+    "elevenlabs/eleven-flash-v2.5": FlatModelPrice("openrouter", "character", 0.00004, "openrouter"),
+}
+# Used when a caller cannot report the synthesized text length.
+_DEFAULT_SPEECH_CHARACTERS = 1000
+# Estimate for per-second music models: one full-length song.
+_DEFAULT_MUSIC_SECONDS = 180
 
 
 # Seedance bills per video token: tokens = W×H×fps(24)×seconds / 1024.
@@ -400,6 +414,28 @@ VIDEO_COST_PER_SECOND: dict[str, dict[str, float]] = {
         "720p": 0.008,
         "1080p": 0.012,
         "1440p": 0.012,
+    },
+    # Grok Imagine Video, USD per output second (docs.x.ai and the Vercel AI
+    # Gateway catalog agree, 2026-10). Managed calls go through Vercel and bill
+    # these rates; BYOK calls bill 0 credits. 1.5 also bills image/video inputs.
+    "xai/grok-imagine-video-1.5": {
+        "480p": 0.08,
+        "720p": 0.14,
+        "1080p": 0.25,
+        "1440p": 0.25,
+    },
+    "xai/grok-imagine-video-1.5-lite": {
+        "480p": 0.02,
+        "720p": 0.03,
+        "1080p": 0.14,
+        "1440p": 0.14,
+    },
+    # 720p at most: higher requests render at 720p (Vercel bills 720p at 0.07).
+    "xai/grok-imagine-video": {
+        "480p": 0.05,
+        "720p": 0.07,
+        "1080p": 0.07,
+        "1440p": 0.07,
     },
 }
 
@@ -521,7 +557,7 @@ def model_pricing_catalog() -> list[dict[str, Any]]:
             "source": price.source,
             "note": price.note,
         })
-    for model, price in OFFICIAL_AUDIO_PRICES.items():
+    for model, price in {**OFFICIAL_AUDIO_PRICES, **PER_CHARACTER_AUDIO_PRICES}.items():
         rows.append({
             "model": model,
             "provider": price.provider,
@@ -542,9 +578,14 @@ def model_pricing_catalog() -> list[dict[str, Any]]:
 
 
 def _lookup_token_price(model: str | None) -> TokenModelPrice | None:
-    if not model:
-        return None
-    model_id = str(model).strip()
+    for model_id in catalog_model_ids(model):
+        price = _lookup_token_price_for_id(model_id)
+        if price is not None:
+            return price
+    return None
+
+
+def _lookup_token_price_for_id(model_id: str) -> TokenModelPrice | None:
     if model_id in OFFICIAL_TOKEN_PRICES:
         return OFFICIAL_TOKEN_PRICES[model_id]
     bare = model_id.split("/", 1)[1] if "/" in model_id else model_id
@@ -579,27 +620,95 @@ def _openrouter_cached_price(model: str | None) -> tuple[float | None, float | N
     )
 
 
+def catalog_model_ids(model: str | None) -> list[str]:
+    """Catalog keys that may describe ``model``.
+
+    Catalogs key models as ``provider/model``. A native BYOK route calls the
+    provider's bare id (``gpt-6.1-sol``), so a bare id also tries the id
+    qualified with its provider; otherwise every catalog fact about it (context
+    window, reasoning controls, long-context tier) silently falls back to a
+    default.
+    """
+    model_id = str(model or "").strip()
+    if not model_id:
+        return []
+    ids = [model_id]
+    if "/" not in model_id:
+        from packages.core.ai.llm_client import provider_for_model
+
+        provider = provider_for_model(model_id)
+        if provider:
+            ids.append(f"{provider}/{model_id}")
+    return ids
+
+
+def _cached_catalog_entries(model_id: str) -> list[dict | None]:
+    """The Vercel and OpenRouter catalog entries for ``model_id``, if any."""
+    from packages.core.services.model_provider_handlers import openrouter_model_id
+
+    _load_vercel_cache_if_needed()
+    _load_openrouter_cache_if_needed()
+    ids = catalog_model_ids(model_id)
+    return [
+        next((_VERCEL_CACHE_MODELS[c] for m in ids for c in _vercel_cache_candidates(m)
+              if isinstance(_VERCEL_CACHE_MODELS.get(c), dict)), None),
+        next((_PRICING_CACHE_MODELS[c] for m in ids for c in dict.fromkeys((m, openrouter_model_id(m) or m))
+              if isinstance(_PRICING_CACHE_MODELS.get(c), dict)), None),
+    ]
+
+
 def cached_context_windows(model: str | None) -> list[int]:
     """Live context windows for ``model`` from the synced gateway caches."""
     if not model:
         return []
-    from packages.core.services.model_provider_handlers import openrouter_model_id
-
-    model_id = str(model).strip()
-    _load_vercel_cache_if_needed()
-    _load_openrouter_cache_if_needed()
-    entries = [
-        next((_VERCEL_CACHE_MODELS[c] for c in _vercel_cache_candidates(model_id)
-              if isinstance(_VERCEL_CACHE_MODELS.get(c), dict)), None),
-        next((_PRICING_CACHE_MODELS[c] for c in dict.fromkeys((model_id, openrouter_model_id(model_id) or model_id))
-              if isinstance(_PRICING_CACHE_MODELS.get(c), dict)), None),
-    ]
+    entries = _cached_catalog_entries(str(model).strip())
     windows = []
     for entry in entries:
         value = (entry or {}).get("context_window")
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             windows.append(value)
     return windows
+
+
+def cached_reasoning_efforts(model: str | None) -> list[str] | None:
+    """Reasoning efforts ``model`` accepts per the synced gateway catalogs.
+
+    None when no catalog lists an effort control for it (unknown or
+    non-reasoning model); the gateways can disagree, so Vercel's explicit
+    value list wins over OpenRouter's parameter flag.
+    """
+    if not model:
+        return None
+    entries = _cached_catalog_entries(str(model).strip())
+    for entry in entries:
+        values = (entry or {}).get("reasoning_efforts")
+        if isinstance(values, list) and values:
+            return [str(value) for value in values]
+    return None
+
+
+def cached_reasoning_controls(model: str | None) -> dict[str, Any]:
+    """How ``model``'s reasoning is controlled, per the synced gateway catalogs.
+
+    ``efforts`` (effort values or None), ``toggle`` (can be switched on) and
+    ``budget`` ({min, max} thinking tokens or None). Vercel's explicit options
+    win over OpenRouter's parameter flags.
+    """
+    controls: dict[str, Any] = {"efforts": None, "toggle": False, "budget": None}
+    if not model:
+        return controls
+    entries = _cached_catalog_entries(str(model).strip())
+    for entry in entries:
+        entry = entry or {}
+        values = entry.get("reasoning_efforts")
+        if controls["efforts"] is None and isinstance(values, list) and values:
+            controls["efforts"] = [str(value) for value in values]
+        if entry.get("reasoning_toggle") is True:
+            controls["toggle"] = True
+        budget = entry.get("reasoning_budget")
+        if controls["budget"] is None and isinstance(budget, dict) and isinstance(budget.get("max"), int):
+            controls["budget"] = {"min": int(budget.get("min") or 1), "max": int(budget["max"])}
+    return controls
 
 
 def long_context_threshold(model: str | None) -> int | None:
@@ -837,9 +946,15 @@ def estimate_image_cost_usd(model: str, size: str = "1024x1024") -> float:
     return base * max(1.0, area_ratio)
 
 
-def estimate_audio_cost_usd(model: str, *, purpose: str = "") -> float:
+def estimate_audio_cost_usd(model: str, *, purpose: str = "", characters: int | None = None) -> float:
     model_id = str(model or "").strip()
+    per_character = PER_CHARACTER_AUDIO_PRICES.get(model_id)
+    if per_character:
+        count = _DEFAULT_SPEECH_CHARACTERS if characters is None else max(0, int(characters))
+        return float(per_character.usd) * count
     price = OFFICIAL_AUDIO_PRICES.get(model_id)
+    if price and price.unit == "second":
+        return float(price.usd) * _DEFAULT_MUSIC_SECONDS
     if price:
         return float(price.usd)
     lowered = model_id.lower()

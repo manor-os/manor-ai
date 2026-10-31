@@ -121,6 +121,36 @@ test("all-conflict keep-only upgrade synchronizes while preserving customization
   expect(state.applies[0].configuration_resolutions).toEqual([{ key: "workspace:settings", resolution: "keep_yours" }]);
 });
 
+test("a kept local edit that breaks an upgraded Flow is explained and can switch to the Blueprint", async ({ page }) => {
+  const state = await mockUpgrade(page);
+  state.plan.items = [{
+    key: "skill:video-creator", kind: "skill", slug: "video-creator", name: "Video Creator",
+    action: "customized", changes: ["Component configuration and bindings"], baseline_known: true,
+    current_content: { tools: ["generate_video"] },
+    new_content: { tools: ["build_narration_timeline", "generate_video"] },
+    baseline_content: { tools: ["build_narration_timeline", "generate_video"] },
+    compatibility_issues: [{
+      code: "missing_tools", names: ["build_narration_timeline"], contract_required: ["build_narration_timeline"],
+      required_by: [{ key: "workflow:create-video", kind: "workflow", name: "Create Video" }],
+    }],
+  } as ReturnType<typeof planFixture>["items"][number]];
+  await page.goto(fixtureUrl);
+  const item = page.getByRole("region", { name: "Video Creator", exact: true });
+  await expect(item.getByText("Your edits kept · not changed in this version")).toBeVisible();
+  await expect(item.getByText("Breaks the upgrade")).toBeVisible();
+  await expect(item.getByText("Your version is missing tools that Create Video need: build_narration_timeline.")).toBeVisible();
+  const choice = item.getByRole("button", { name: "Resolve conflict for Video Creator" });
+  await expect(choice).toHaveText("Keep my version");
+  await choice.focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("option", { name: "Use Blueprint version", exact: true }).click();
+  await expect(item.getByText("Breaks the upgrade")).toHaveCount(0);
+  await page.getByRole("button", { name: "Update 1 item(s)", exact: true }).click();
+  await expect(page.getByText("The Workspace is synchronized with the latest Blueprint version.")).toBeVisible();
+  expect(state.applies[0].configuration_resolutions).toEqual([{ key: "skill:video-creator", resolution: "use_blueprint" }]);
+  expect(state.pageErrors).toEqual([]);
+});
+
 test("reopening an already customized Workspace does not claim identical content", async ({ page }) => {
   const state = await mockUpgrade(page);
   state.plan.items = [];
@@ -302,4 +332,39 @@ test("keeping runtime requirements does not demand a newly added unused connecti
   await page.getByRole("option", { name: "Keep my version", exact: true }).click();
   await page.getByRole("button", { name: "Update 1 item(s)", exact: true }).click();
   expect(state.applies[0].configuration_resolutions[0]).toEqual({ key: "runtime_requirements", resolution: "keep_yours" });
+});
+
+test("an earlier listed release can be the target, with its version step explained", async ({ page }) => {
+  const state = await mockUpgrade(page);
+  const release = (version: string, minBump: string | null, changelog: string | null) => ({
+    version, published_at: "2026-10-30T10:00:00Z", changelog, min_bump: minBump, deprecated: null, prerelease: false,
+  });
+  Object.assign(state.plan, {
+    installed_version: "1.0.1", latest_version: "1.1.0", target_version: "1.1.0",
+    available_versions: [release("1.1.0", "minor", "Optional guest name."), release("1.0.2", "patch", "Clearer notes."),
+      release("1.0.1", null, null)],
+    version_change: { from: "1.0.1", to: "1.1.0", min_bump: "minor", reasons: ["workflow:episode takes a new optional input 'guest'"] },
+  });
+  await page.route("**/blueprint/upgrade/v3/preview", async (route) => {
+    const body = route.request().postDataJSON();
+    state.previews.push(body);
+    await route.fulfill({ json: { ...state.plan, target_version: body.target_version, plan_fingerprint: "reviewed-1.0.2",
+      version_change: { from: "1.0.1", to: "1.0.2", min_bump: "patch", reasons: [] } } });
+  });
+  await page.goto(fixtureUrl);
+  const version = page.getByRole("region", { name: "Version", exact: true });
+  await expect(version.getByText(/A minor update/)).toBeVisible();
+  await expect(version.getByText("workflow:episode takes a new optional input 'guest'")).toBeVisible();
+  await version.getByRole("button", { name: "Version", exact: true }).click();
+  await page.getByRole("option", { name: "1.0.2", exact: true }).click();
+  await expect(version.getByText(/A patch/)).toBeVisible();
+  await version.locator("summary").click();
+  await expect(version.getByText("Clearer notes.")).toBeVisible();
+  await expect(version.getByText("Optional guest name.")).toHaveCount(0);
+  await page.getByRole("button", { name: "Update 2 item(s)", exact: true }).click();
+  await expect(page.getByText("The Workspace now runs release 1.0.2; 1.1.0 is the latest.")).toBeVisible();
+  expect(state.previews[0].target_version).toBe("1.0.2");
+  expect(state.applies[0].target_version).toBe("1.0.2");
+  expect(state.applies[0].expected_plan_fingerprint).toBe("reviewed-1.0.2");
+  expect(state.pageErrors).toEqual([]);
 });

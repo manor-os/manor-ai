@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Group attachment preview regression</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React, { useState } from "react";
+      import { createRoot } from "react-dom/client";
+      import { ChatRoomConversation, RoomMessageAttachment } from "/src/components/ChatRooms.tsx";
+      import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+      import { MemoryRouter } from "react-router-dom";
+      import { api } from "/src/lib/api.ts";
+      import "/src/index.css";
+
+      localStorage.setItem("manor_locale", "en");
+      const params = new URLSearchParams(location.search);
+      localStorage.setItem("manor_token", `h.${btoa(JSON.stringify({ sub: params.get("account") || "fixture", entity_id: params.get("company") || "fixture", exp: 9e9 }))}.s`);
+      const h = React.createElement;
+      const file = { id: "fixture-file", name: "image.png", mime_type: "image/png", size: 46 * 1024 };
+      function Fixture() {
+        const [shown, setShown] = useState(true);
+        const [opened, setOpened] = useState("");
+        return h("main", { style: { padding: 16, maxWidth: 600 } },
+          h("h1", null, "Group attachment"),
+          h("button", { onClick: () => setShown((value) => !value) }, shown ? "Hide attachment" : "Show attachment"),
+          shown && h(RoomMessageAttachment, { roomId: "fixture-room", file, onOpen: async () => {
+            await api.chatRooms.downloadFile("fixture-room", file.id);
+            setOpened("Preview opened");
+          } }),
+          h("p", null, opened),
+        );
+      }
+      const content = params.has("conversation")
+        ? h(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
+          h(MemoryRouter, null, h("main", { style: { height: "100vh" } },
+            h(ChatRoomConversation, { roomId: "fixture-room", currentUserId: "fixture" }))))
+        : h(Fixture);
+      createRoot(document.getElementById("root")).render(h(React.StrictMode, null, content));
+    </script>
+  </body>
+</html>

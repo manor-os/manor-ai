@@ -33,6 +33,23 @@ from packages.core.services.sandbox_queue_service import (
 )
 
 
+@pytest.fixture
+async def db_session(db_session):
+    """Each queue test owns the whole runner/reservation pool.
+
+    The test database is not truncated between tests, and other suites leave
+    healthy runners and queued reservations behind (test_runtime_run_terminal
+    inserts ``runner-<reservation id>``). A claim picks across the whole pool,
+    so leftovers from whichever files share this shard change its answer.
+    """
+    from sqlalchemy import delete
+
+    for model in (SandboxInstance, SandboxReservation, SandboxRunner):
+        await db_session.execute(delete(model))
+    await db_session.flush()
+    yield db_session
+
+
 def test_single_runner_fallback_uses_deployable_capacity_defaults(monkeypatch) -> None:
     monkeypatch.setattr(
         sandbox_queue_service,
@@ -52,6 +69,7 @@ def test_single_runner_fallback_uses_deployable_capacity_defaults(monkeypatch) -
             "active_limit": 5,
             "executing_limit": 2,
             "config": {},
+            "pool": "default",
         }
     ]
 
@@ -1105,3 +1123,126 @@ async def test_expire_orphaned_pending_checkpoint_ticket_without_failing_a_run_t
     assert parked.status == SandboxReservationStatus.EXPIRED.value
     assert stuck.status == RuntimeRunStatus.FAILED.value
     assert stuck.status_reason == "sandbox_queue_timeout"
+
+
+async def _allocating_ticket(db_session, *, run: RuntimeRun, runner_id: str, now: datetime) -> SandboxReservation:
+    runner = SandboxRunner(
+        id=runner_id,
+        base_url=f"http://{runner_id}:8000",
+        status=SandboxRunnerStatus.HEALTHY.value,
+        active_limit=4,
+        executing_limit=2,
+    )
+    db_session.add_all([run, runner])
+    await db_session.flush()
+    reservation = await enqueue_sandbox_reservation(
+        db_session,
+        run=run,
+        tool_call_id=f"call-{runner_id}",
+        request_payload={"skill_name": "pdf"},
+        now=now,
+    )
+    await db_session.flush()
+    claim = await claim_next_sandbox_allocation(db_session, now=now)
+    assert claim is not None and claim[0].id == reservation.id
+    assert run.reservation_id == reservation.id
+    return reservation
+
+
+def _move_run_to_another_wait(run: RuntimeRun) -> None:
+    # What a later park of a different kind does: drop the ticket pointer.
+    run.reservation_id = None
+    run.status = RuntimeRunStatus.WAITING_RESOURCE.value
+    run.status_reason = "awaiting_human_input"
+
+
+async def _resume_events(db_session, run_id: str) -> int:
+    return int(
+        await db_session.scalar(
+            select(func.count(RuntimeOutboxEvent.id)).where(
+                RuntimeOutboxEvent.aggregate_id == run_id,
+                RuntimeOutboxEvent.event_type == "runtime.resume_run",
+            )
+        )
+        or 0
+    )
+
+
+@pytest.mark.integration
+async def test_stale_allocation_completion_leaves_a_run_that_moved_on_untouched(db_session) -> None:
+    now = datetime.now(timezone.utc)
+    current_run, moved_on = _run(81), _run(82)
+    current = await _allocating_ticket(db_session, run=current_run, runner_id="runner-complete-current", now=now)
+    stale = await _allocating_ticket(db_session, run=moved_on, runner_id="runner-complete-stale", now=now)
+    _move_run_to_another_wait(moved_on)
+    await db_session.flush()
+
+    await complete_sandbox_allocation(
+        db_session, reservation_id=stale.id, sandbox_id="sandbox-stale", runner_id="runner-complete-stale", now=now,
+    )
+    await complete_sandbox_allocation(
+        db_session, reservation_id=current.id, sandbox_id="sandbox-current", runner_id="runner-complete-current", now=now,
+    )
+    await db_session.flush()
+
+    assert stale.status == SandboxReservationStatus.ALLOCATED.value
+    assert moved_on.status_reason == "awaiting_human_input"
+    assert moved_on.reservation_id is None
+    assert await _resume_events(db_session, moved_on.id) == 0
+
+    assert current.status == SandboxReservationStatus.ALLOCATED.value
+    assert current_run.status == RuntimeRunStatus.WAITING_RESOURCE.value
+    assert current_run.status_reason == "sandbox_allocated"
+    assert await _resume_events(db_session, current_run.id) == 1
+
+
+@pytest.mark.integration
+async def test_stale_allocation_recovery_fails_only_the_run_parked_on_the_ticket(db_session) -> None:
+    now = datetime.now(timezone.utc)
+    current_run, moved_on = _run(83), _run(84)
+    current = await _allocating_ticket(db_session, run=current_run, runner_id="runner-recover-current", now=now)
+    stale = await _allocating_ticket(db_session, run=moved_on, runner_id="runner-recover-stale", now=now)
+    _move_run_to_another_wait(moved_on)
+    await db_session.flush()
+
+    recovered = await sandbox_queue_service.recover_stale_sandbox_allocations(
+        db_session, now=now + timedelta(seconds=241), max_attempts=1,
+    )
+    await db_session.flush()
+
+    assert recovered == 2
+    assert stale.status == SandboxReservationStatus.FAILED.value
+    assert moved_on.status == RuntimeRunStatus.WAITING_RESOURCE.value
+    assert moved_on.status_reason == "awaiting_human_input"
+    assert current.status == SandboxReservationStatus.FAILED.value
+    assert current_run.status == RuntimeRunStatus.FAILED.value
+    assert current_run.status_reason == "sandbox_allocation_failed"
+
+
+@pytest.mark.integration
+async def test_failed_allocation_fails_only_the_run_parked_on_the_ticket(db_session) -> None:
+    now = datetime.now(timezone.utc)
+    current_run, later_ticket_run = _run(85), _run(86)
+    current = await _allocating_ticket(db_session, run=current_run, runner_id="runner-fail-current", now=now)
+    stale = await _allocating_ticket(db_session, run=later_ticket_run, runner_id="runner-fail-stale", now=now)
+    # This run moved on to a later sandbox ticket rather than another wait kind.
+    later = await enqueue_sandbox_reservation(
+        db_session,
+        run=later_ticket_run,
+        tool_call_id="call-later-ticket",
+        request_payload={"skill_name": "pdf"},
+        now=now,
+    )
+    assert later_ticket_run.reservation_id == later.id
+    await db_session.flush()
+
+    await fail_sandbox_allocation(db_session, reservation_id=stale.id, error="boom", now=now, max_attempts=1)
+    await fail_sandbox_allocation(db_session, reservation_id=current.id, error="boom", now=now, max_attempts=1)
+    await db_session.flush()
+
+    assert stale.status == SandboxReservationStatus.FAILED.value
+    assert later_ticket_run.status == RuntimeRunStatus.WAITING_RESOURCE.value
+    assert later_ticket_run.status_reason == "sandbox_capacity"
+    assert current.status == SandboxReservationStatus.FAILED.value
+    assert current_run.status == RuntimeRunStatus.FAILED.value
+    assert current_run.status_reason == "sandbox_allocation_failed"

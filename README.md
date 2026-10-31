@@ -245,9 +245,11 @@ setup or user-facing behavior changes.
 
 Manor AI is fair-code: source-available, self-hostable, and extensible under the
 Sustainable Use License 1.0. Internal business, personal, and non-commercial use
-are permitted. White-labeling Manor AI, charging others for access to a hosted
-Manor AI service, or otherwise providing the software commercially requires a
-separate written agreement with Manor AI. Commercial consulting and support
+are permitted. Distribution or provision to others is permitted only free of
+charge for non-commercial purposes under this license. Charging for hosted
+access or otherwise providing the software commercially requires a separate
+written agreement with Manor AI. Keep license and copyright notices intact and
+identify modifications. Commercial consulting and support
 around a customer's internal deployment are permitted. The Manor AI name and
 marks are governed separately by [TRADEMARKS.md](TRADEMARKS.md).
 

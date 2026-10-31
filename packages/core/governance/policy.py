@@ -41,6 +41,8 @@ class PolicyDecision:
     reason: Optional[str] = None
     matched_rule: Optional[str] = None
     explanation: dict[str, Any] | None = None
+    # The ActionFacts the consent evaluator judged (None when it did not run).
+    facts: Any = None
 
 
 def policy_from_dict(raw: Optional[dict]) -> WorkspacePolicy:

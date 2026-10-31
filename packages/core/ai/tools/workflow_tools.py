@@ -14,6 +14,8 @@ adapter; workflow semantics stay in the shared service and runner layers.
 from __future__ import annotations
 
 import json
+import re
+from copy import deepcopy
 from contextvars import ContextVar
 from time import perf_counter
 from typing import Any
@@ -23,6 +25,10 @@ from packages.core.services.workflow_run_trace import visible_workflow_tags
 
 
 _WORKFLOW_TOOL_DEPTH: ContextVar[int] = ContextVar("workflow_tool_depth", default=0)
+_WORKFLOW_PROJECT_STATE_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_WORKFLOW_PROJECT_STATE_PATH_LIMIT = 24
+_WORKFLOW_PROJECT_STATE_PATH_DEPTH = 8
+_WORKFLOW_PROJECT_EXECUTION_ERROR_LIMIT = 1000
 
 
 def _schema(
@@ -216,7 +222,13 @@ DEPLOY_WORKFLOW_SCHEMA = _schema(
     "deploy_workflow",
     "Deploy a valid workflow by creating a binding. Use trigger_type='mcp' to publish it as a callable Manor Agent tool.",
     {
-        **WORKFLOW_REF,
+        "workflow": {
+            "type": "string",
+            "description": (
+                "Workflow id, exact workflow name, or the Blueprint slug of a Flow "
+                "installed by a Workspace Blueprint in the target workspace."
+            ),
+        },
         "trigger_type": {
             "type": "string",
             "enum": ["mcp", "manual", "webhook", "event", "workspace_event", "schedule"],
@@ -227,8 +239,16 @@ DEPLOY_WORKFLOW_SCHEMA = _schema(
         "description": {"type": "string", "description": "Description exposed by an MCP deployment."},
         "trigger_config": {"type": "object"},
         "variables": {"type": "object"},
-        "cron": {"type": "string", "description": "Cron expression when trigger_type is schedule."},
+        "cron": {"type": "string", "description": "Cron expression for a recurring schedule."},
+        "run_at": {
+            "type": "string",
+            "description": "Timezone-aware ISO time for a one-shot schedule instead of cron; a past time runs on the next scheduler tick.",
+        },
         "timezone": {"type": "string", "default": "UTC"},
+        "inputs": {"type": "object", "description": "Declared run input values for a scheduled workflow."},
+        "stop_after": {"type": "string", "description": "Exclusive timezone-aware end of the schedule."},
+        "owner_project_id": {"type": "string", "description": "Optional Workspace WorkflowProject owning this runtime schedule."},
+        "idempotency_key": {"type": "string", "description": "Stable execution key to prevent duplicate schedules on retry."},
     },
     ["workflow"],
 )
@@ -470,7 +490,7 @@ def _binding_dict(binding) -> dict:
     }
 
 
-async def _resolve_workflow(db, entity_id: str, target: object):
+async def _resolve_workflow(db, entity_id: str, target: object, *, workspace_id: str | None = None):
     from packages.core.services import workflow_service as svc
 
     value = str(target or "").strip()
@@ -478,9 +498,42 @@ async def _resolve_workflow(db, entity_id: str, target: object):
         return None
     by_id = await svc.get_workflow(db, value, entity_id)
     if by_id is not None:
-        return by_id
+        return by_id if workspace_id is None or by_id.workspace_id in {None, workspace_id} else None
+    if workspace_id is not None:
+        installed = await _installed_blueprint_workflow(db, entity_id, value, workspace_id=workspace_id)
+        if installed is not None:
+            return installed
     workflows = await svc.list_workflows(db, entity_id)
-    return next((wf for wf in workflows if wf.name.lower() == value.lower()), None)
+    matches = [wf for wf in workflows if wf.name.lower() == value.lower()]
+    if workspace_id is not None:
+        local = [wf for wf in matches if wf.workspace_id == workspace_id]
+        matches = local or [wf for wf in matches if wf.workspace_id is None]
+        return matches[0] if len(matches) == 1 else None
+    return next(iter(matches), None)
+
+
+async def _installed_blueprint_workflow(db, entity_id: str, key: str, *, workspace_id: str):
+    """A Flow installed by a Workspace Blueprint, found by its Blueprint slug.
+
+    Installation records each Flow's portable slug, so Blueprint steps can
+    name a Flow in their own Workspace without depending on its editable name.
+    """
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowTemplateInstallation
+
+    rows = (await db.execute(
+        select(WorkflowDefinition)
+        .join(WorkflowTemplateInstallation, WorkflowTemplateInstallation.workflow_id == WorkflowDefinition.id)
+        .where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
+            WorkflowTemplateInstallation.source_type == "workspace_blueprint",
+            WorkflowTemplateInstallation.component_key == key,
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.workspace_id == workspace_id,
+        )
+    )).scalars().unique().all()
+    return rows[0] if len(rows) == 1 else None
 
 
 async def _exposed_workflows(
@@ -554,18 +607,35 @@ async def _list_workflows(entity_id: str = "", **kwargs: Any) -> str:
         })
 
 
+def _run_workspace_id(kwargs: dict[str, Any]) -> str | None:
+    from packages.core.ai.runtime.tool_context import (
+        runtime_tool_call_context_from_kwargs,
+        runtime_trusted_workspace_id_from_context,
+    )
+
+    return runtime_trusted_workspace_id_from_context(runtime_tool_call_context_from_kwargs(kwargs))
+
+
 async def _workspace_flow_rows(
     db,
     *,
     entity_id: str,
     user_id: str,
     require_control: bool = False,
+    run_workspace_id: str | None = None,
 ) -> list[tuple[Any, Any, Any, Any]]:
+    """The Workspace flows a user may see (or, ``require_control``, start).
+
+    An external collaborator's persisted company is their own, not the
+    customer's: their flows are those of the run's Workspace when their live
+    grant covers it (their seat there is the owner seat, so they control it).
+    """
     from sqlalchemy import select
 
     from packages.core.models.user import User
     from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
     from packages.core.models.workspace import Workspace
+    from packages.core.services.collaborator_scope import actor_workspace_scope
     from packages.core.services.workspace_access import (
         user_can_read_workspace,
         user_can_write_workspace_artifacts,
@@ -573,7 +643,12 @@ async def _workspace_flow_rows(
     from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
 
     user = await db.get(User, user_id) if user_id else None
-    if user is None or user.entity_id != entity_id:
+    if user is None:
+        return []
+    collaborator_scope = await actor_workspace_scope(db, user_id=user.id, entity_id=entity_id)
+    if collaborator_scope is not None:
+        collaborator_scope = collaborator_scope & {str(run_workspace_id or "")}
+    elif user.entity_id != entity_id:
         return []
     rows = (await db.execute(
         select(WorkflowBinding, WorkflowDefinition, Workspace)
@@ -593,6 +668,10 @@ async def _workspace_flow_rows(
     for binding, workflow, workspace in rows:
         entrypoint = normalize_chat_entrypoint(binding, workflow)
         if entrypoint is None:
+            continue
+        if collaborator_scope is not None:
+            if workspace.id in collaborator_scope:
+                visible.append((entrypoint, binding, workflow, workspace))
             continue
         if not await user_can_read_workspace(db, workspace=workspace, user=user):
             continue
@@ -632,6 +711,7 @@ async def _list_workspace_flows(
             db,
             entity_id=entity_id,
             user_id=user_id,
+            run_workspace_id=_run_workspace_id(kwargs),
         )
         descriptors = [
             _workspace_flow_descriptor(*row)
@@ -737,6 +817,7 @@ async def _start_workspace_flow(
             entity_id=entity_id,
             user_id=user_id,
             require_control=True,
+            run_workspace_id=_run_workspace_id(kwargs),
         )
         described = [(*row, _workspace_flow_descriptor(*row)) for row in rows]
         matches = []
@@ -912,6 +993,34 @@ async def _get_workflow(entity_id: str = "", **kwargs: Any) -> str:
         return _dump({"ok": True, "workflow": payload})
 
 
+async def _collaborator_steps_refused(db, entity_id: str, kwargs: dict[str, Any], steps: Any) -> str | None:
+    """A collaborator-steered call saves only steps that stay inside the run Workspace.
+
+    Steps a model wrote or generate_workflow produced alike: subworkflows,
+    Agents, Skills, Knowledge and tools must be the run Workspace's.
+    """
+    from packages.core.ai.runtime.tool_context import (
+        runtime_tool_call_context_from_kwargs,
+        runtime_trusted_workspace_id_from_context,
+    )
+    from packages.core.services.collaborator_scope import workflow_steps_outside
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    collaborators = collaborators_acting_now(entity_id)
+    if not collaborators:
+        return None
+    context = runtime_tool_call_context_from_kwargs(kwargs)
+    if await workflow_steps_outside(
+        db,
+        entity_id=entity_id,
+        workspace_id=runtime_trusted_workspace_id_from_context(context),
+        steps=steps,
+        user_id=context.user_id if context.user_id in collaborators else None,
+    ):
+        return _error("The Workflow names a Workflow, Agent, Skill, Knowledge or tool outside this Workspace.")
+    return None
+
+
 async def _create_workflow(entity_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
     from packages.core.services.workflow_generator import generate_workflow
@@ -941,10 +1050,25 @@ async def _create_workflow(entity_id: str = "", **kwargs: Any) -> str:
     name = str(kwargs.get("name") or (generated or {}).get("name") or "Untitled workflow").strip()
     if not name:
         return _error("Workflow name is required")
+    from packages.core.ai.runtime.tool_context import (
+        runtime_tool_call_context_from_kwargs,
+        runtime_trusted_workspace_id_from_context,
+    )
+    from packages.core.services.collaborator_steering import collaborators_acting_now
+
+    # A collaborator authors Workflows owned by the run Workspace only.
+    owner_workspace_id = (
+        runtime_trusted_workspace_id_from_context(runtime_tool_call_context_from_kwargs(kwargs))
+        if collaborators_acting_now(entity_id)
+        else None
+    )
     async with async_session() as db:
+        if refused := await _collaborator_steps_refused(db, entity_id, kwargs, steps):
+            return refused
         wf = await svc.create_workflow(
             db,
             entity_id=entity_id,
+            workspace_id=owner_workspace_id,
             created_by=str(kwargs.get("user_id") or "").strip() or None,
             name=name[:255],
             steps=steps or [],
@@ -982,6 +1106,8 @@ async def _ai_edit_workflow(entity_id: str = "", **kwargs: Any) -> str:
         validation = svc.validate_workflow_steps(generated.get("steps"))
         if not validation["valid"] and not bool(kwargs.get("allow_invalid")):
             return _error("AI Edit produced an invalid graph", validation=validation, draft=generated)
+        if refused := await _collaborator_steps_refused(db, entity_id, kwargs, generated.get("steps")):
+            return refused
         if not bool(kwargs.get("save", True)):
             return _dump({"ok": True, "saved": False, "draft": generated, "validation": validation, "version": wf.version})
         changes: dict[str, Any] = {
@@ -1026,6 +1152,8 @@ async def _update_workflow(entity_id: str = "", **kwargs: Any) -> str:
         )
         if "steps" in changes and not validation["valid"] and not bool(kwargs.get("allow_invalid")):
             return _error("Workflow graph is invalid", validation=validation)
+        if "steps" in changes and (refused := await _collaborator_steps_refused(db, entity_id, kwargs, changes["steps"])):
+            return refused
         wf = await svc.update_workflow(db, wf.id, entity_id, **changes)
         await db.commit()
         return _dump({"ok": True, "updated": True, "workflow": _workflow_dict(wf), "validation": validation})
@@ -1057,9 +1185,11 @@ async def _deploy_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any
     from packages.core.services import workflow_service as svc
 
     trigger_type = str(kwargs.get("trigger_type") or "mcp").strip().lower()
-    workspace_id = str(kwargs.get("target_workspace_id") or "").strip() or None
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+    context = runtime_tool_call_context_from_kwargs(kwargs, entity_id=entity_id, user_id=user_id or None)
+    workspace_id = str(kwargs.get("target_workspace_id") or context.workspace_id or "").strip() or None
     async with async_session() as db:
-        wf = await _resolve_workflow(db, entity_id, kwargs.get("workflow"))
+        wf = await _resolve_workflow(db, entity_id, kwargs.get("workflow"), workspace_id=workspace_id)
         if wf is None:
             return _error("Workflow not found")
         validation = svc.validate_workflow_definition(wf)
@@ -1069,21 +1199,30 @@ async def _deploy_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any
             return _error("Workflow must be active before deployment")
         if trigger_type == "schedule":
             cron = str(kwargs.get("cron") or (kwargs.get("trigger_config") or {}).get("cron") or "").strip()
-            if not cron:
-                return _error("Scheduled deployment requires cron")
+            run_at = str(kwargs.get("run_at") or "").strip() or None
+            if bool(cron) == bool(run_at):
+                return _error("Scheduled deployment requires exactly one of cron or run_at")
             try:
                 job = await svc.schedule_workflow(
                     db,
                     entity_id=entity_id,
                     workflow_id=wf.id,
-                    cron=cron,
+                    cron=cron or None,
+                    run_at=run_at,
                     name=str(kwargs.get("name") or wf.name),
                     workspace_id=workspace_id,
                     timezone_str=str(kwargs.get("timezone") or "UTC"),
-                    created_by=user_id or None,
+                    created_by=context.user_id,
+                    conversation_id=context.conversation_id,
+                    inputs=kwargs.get("inputs"),
+                    stop_after=kwargs.get("stop_after"),
+                    owner_project_id=kwargs.get("owner_project_id"),
+                    idempotency_key=kwargs.get("idempotency_key"),
                 )
             except svc.ScheduledWorkflowInputsError as exc:
                 return _error(str(exc), required_inputs=exc.labels)
+            except (ValueError, PermissionError) as exc:
+                return _error(str(exc))
             await db.commit()
             return _dump({"ok": True, "kind": "automation", "scheduled_job_id": job.id, "workflow_id": wf.id})
 
@@ -1481,6 +1620,7 @@ async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
             return _error("Workflow run not found")
         if run.status in {"completed", "cancelled", "failed"}:
             return _error(f"Run is already {run.status}", run=_run_dict(run, detailed=False))
+        from packages.core.constants.task import CancelSource
         from packages.core.services.workflow_run_control import (
             active_subworkflow_descendant_ids,
             cancel_active_subworkflow_descendants,
@@ -1488,7 +1628,8 @@ async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
         )
 
         descendant_run_ids = await active_subworkflow_descendant_ids(db, run)
-        cancel_run(run, actor_id=user_id)
+        # An agent acted, even on the user's behalf: a system cancel.
+        cancel_run(run, actor_id=user_id, source=CancelSource.SYSTEM)
         cancelled_children = await cancel_active_subworkflow_descendants(
             db,
             run,
@@ -1552,8 +1693,10 @@ async def _resume_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
         "not_found",
         "not_paused",
         "invalid_approval",
+        "invalid_input",
         "definition_changed",
         "continuation_required",
+        "wait_changed",
     }:
         return _error(f"Could not resume workflow run: {outcome}")
     async with async_session() as db:
@@ -1585,9 +1728,156 @@ async def _import_workflow(entity_id: str = "", **kwargs: Any) -> str:
         return _error(str(exc))
 
 
+async def _expand_schedule_occurrences(entity_id: str = "", **kwargs: Any) -> str:
+    from packages.core.services.schedule_occurrences import expand_schedule_occurrences
+    try:
+        return _dump(expand_schedule_occurrences(
+            start_at=kwargs["start_at"], end_at=kwargs["end_at"], cron=kwargs["cron"],
+            timezone=kwargs.get("timezone", "UTC"), lead_seconds=kwargs.get("lead_seconds", 0),
+            max_occurrences=kwargs.get("max_occurrences", 500),
+        ))
+    except (ValueError, KeyError, TypeError) as exc:
+        return _error(str(exc))
+
+
+async def _query_workflow_projects(entity_id: str = "", **kwargs: Any) -> str:
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+    from packages.core.services.workflow_project_service import list_workflow_projects
+    from packages.core.services.workspace_access import lock_workspace_access_boundary, user_can_read_workspace_id
+
+    try:
+        context = runtime_tool_call_context_from_kwargs(kwargs, entity_id=entity_id)
+        if not context.workspace_id or not context.user_id:
+            raise PermissionError("An authenticated Workspace runtime is required")
+        stages = kwargs.get("stages")
+        if stages is not None and (not isinstance(stages, list) or any(not isinstance(s, str) for s in stages)):
+            raise ValueError("stages must be a list of stage names")
+        state_paths = _workflow_project_state_paths(kwargs.get("state_paths"))
+        include_execution = kwargs.get("include_execution", False)
+        if not isinstance(include_execution, bool):
+            raise ValueError("include_execution must be a boolean")
+        async with async_session() as db:
+            workspace = await lock_workspace_access_boundary(db, workspace_id=context.workspace_id, entity_id=entity_id)
+            from packages.core.services.workspace_autonomy import workspace_allows_configured_work
+
+            if not workspace_allows_configured_work(workspace):
+                raise PermissionError("Workspace is unavailable")
+            if not await user_can_read_workspace_id(
+                db, workspace_id=context.workspace_id, entity_id=entity_id, user_id=context.user_id,
+            ):
+                raise PermissionError("Workspace read access is required")
+            rows, cursor = await list_workflow_projects(
+                db, entity_id=entity_id, workspace_id=context.workspace_id,
+                project_type=str(kwargs.get("project_type") or ""), stages=set(stages) if stages else None,
+                parent_id=kwargs.get("parent_id"), parent_state_key=str(kwargs.get("parent_state_key") or "parent_project_id"),
+                limit=int(kwargs.get("limit") or 20), after_id=kwargs.get("after_id"),
+            )
+            executions = await _workflow_project_executions(
+                db, entity_id=entity_id, workspace_id=context.workspace_id, rows=rows,
+            ) if include_execution else {}
+            return _dump({
+                "projects": [{"project_id": row.id, "project_type": row.project_type,
+                    "project_key": row.project_key, "schema_version": row.schema_version,
+                    "current_stage": row.current_stage,
+                    "state": _workflow_project_state_projection(row.state, state_paths), "revision": row.revision,
+                    "last_run_id": row.last_run_id, "created_by": row.created_by,
+                    **({"execution": executions.get(row.id)} if include_execution else {})} for row in rows],
+                "has_more": cursor is not None, "next_cursor": cursor,
+            })
+    except (PermissionError, ValueError, TypeError) as exc:
+        return _error(str(exc))
+
+
+def _workflow_project_state_paths(value: Any) -> list[tuple[str, ...]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not 1 <= len(value) <= _WORKFLOW_PROJECT_STATE_PATH_LIMIT:
+        raise ValueError("state_paths must contain 1-24 bounded state paths")
+    paths = []
+    for raw_path in value:
+        if not isinstance(raw_path, str):
+            raise ValueError("state_paths must contain dot-separated state paths")
+        path = tuple(raw_path.split("."))
+        if (not path or len(path) > _WORKFLOW_PROJECT_STATE_PATH_DEPTH
+                or any(not _WORKFLOW_PROJECT_STATE_KEY.fullmatch(key) for key in path)):
+            raise ValueError("state_paths must contain bounded dot-separated object paths")
+        paths.append(path)
+    return paths
+
+
+def _workflow_project_state_projection(state: Any, paths: list[tuple[str, ...]] | None) -> Any:
+    if paths is None:
+        return state
+    projected: dict[str, Any] = {}
+    missing = object()
+    for path in paths:
+        value = state
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = missing
+                break
+            value = value[key]
+        if value is missing:
+            continue
+        target = projected
+        for key in path[:-1]:
+            child = target.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                target[key] = child
+            target = child
+        target[path[-1]] = deepcopy(value)
+    return projected
+
+
+async def _workflow_project_executions(db: Any, *, entity_id: str, workspace_id: str, rows: list[Any]) -> dict[str, dict[str, Any]]:
+    from sqlalchemy import select
+    from packages.core.models.workflow import WorkflowRun
+
+    run_ids = {row.last_run_id for row in rows if row.last_run_id}
+    if not run_ids:
+        return {}
+    runs = list((await db.execute(select(WorkflowRun).where(
+        WorkflowRun.id.in_(run_ids), WorkflowRun.entity_id == entity_id, WorkflowRun.workspace_id == workspace_id,
+    ))).scalars())
+    by_id = {
+        run.id: {"run_id": run.id, "status": run.status, "current_step_id": run.current_step_id,
+                 "error": run.error[:_WORKFLOW_PROJECT_EXECUTION_ERROR_LIMIT] if run.error else None}
+        for run in runs
+    }
+    return {row.id: by_id[row.last_run_id] for row in rows if row.last_run_id in by_id}
+
+
+QUERY_WORKFLOW_PROJECTS_SCHEMA = _schema(
+    "query_workflow_projects",
+    "Read a cursor page of Workflow projects in the current Workspace, including execution state and receipts. Optionally select bounded dot-separated state paths to keep large project state compact.",
+    {"project_type": {"type": "string"}, "stages": {"type": "array", "items": {"type": "string"}},
+     "parent_id": {"type": "string"}, "parent_state_key": {"type": "string", "default": "parent_project_id"},
+     "after_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+     "include_execution": {"type": "boolean", "default": False,
+                           "description": "Include the linked same-Workspace WorkflowRun status, current step, and bounded error when available."},
+     "state_paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 24,
+                     "description": "Optional dot-separated object paths from project state; returns only requested present paths while preserving explicit nulls."}},
+    ["project_type"],
+)
+
+
+EXPAND_SCHEDULE_OCCURRENCES_SCHEMA = _schema(
+    "expand_schedule_occurrences",
+    "Expand a finite recurring queue using the Scheduler calendar. Does not create jobs or publish content.",
+    {"start_at": {"type": "string"}, "end_at": {"type": "string"},
+     "cron": {"type": "string"}, "timezone": {"type": "string", "default": "UTC"},
+     "lead_seconds": {"type": "number", "minimum": 0, "maximum": 2678400},
+     "max_occurrences": {"type": "integer", "minimum": 1, "maximum": 1000}},
+    ["start_at", "end_at", "cron"],
+)
+
+
 def get_tools() -> list[tuple[dict, Any]]:
     """Return the complete first-party Workflow tool package."""
     return [
+        (QUERY_WORKFLOW_PROJECTS_SCHEMA, _query_workflow_projects),
+        (EXPAND_SCHEDULE_OCCURRENCES_SCHEMA, _expand_schedule_occurrences),
         (LIST_WORKSPACE_FLOWS_SCHEMA, _list_workspace_flows),
         (START_WORKSPACE_FLOW_SCHEMA, _start_workspace_flow),
         (LIST_WORKFLOWS_SCHEMA, _list_workflows),

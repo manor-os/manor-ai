@@ -92,12 +92,18 @@ from packages.core.services.task_comment_approval_origin import (
     validate_task_comment_approval_origin,
 )
 
+from packages.core.governance.action_effects import GATE_RESOLVED_ACTION_KEYS, provider_policy_effect
+
 logger = logging.getLogger(__name__)
 
 APPROVAL_TOKEN_IGNORED = "__runtime_approval_token_ignored__"
+# A previewed call whose gate would stop for a human, or that the preview
+# cannot decide without the live gate's writes (a token, a grant to spend, a
+# provider continuation). Never returned by the live gate.
+RUNTIME_GATE_PREVIEW_UNDECIDED = "__runtime_gate_preview_undecided__"
 
 _RUNTIME_ORIGIN_KIND = ApprovalOriginKind.TOOL_CALL.value
-_TIKTOK_PUBLISH_TOOL = "mcp__tiktok__post_video"
+_TIKTOK_PUBLISH_TOOLS = frozenset({"mcp__tiktok__post_video", "mcp__tiktok__post_photo"})
 _CHROME_PUBLICATION_ACTION = "chrome.publication.publish"
 
 
@@ -291,6 +297,243 @@ _AUTOMATED_PROVIDER_HUMAN_BLOCKERS = frozenset({
 })
 
 
+_HITL_RESOLVE_GUARDED_ACTIONS = {
+    # A Workspace operation review card guards applying (or discarding) its draft.
+    ("workspace_operation_review", "approve"): "workspace.operation.apply",
+    ("workspace_operation_review", "reject"): "workspace.operation.discard",
+}
+
+
+async def _runtime_gate_resolved_action(
+    db, *, action: RuntimeApprovalAction, tool_name: str, arguments: dict[str, Any],
+    conversation_id: str | None,
+) -> RuntimeApprovalAction:
+    """Give a relayed card decision the effect of the operation the card guards.
+
+    The guarded operation's classified effect and risk are taken from the
+    runtime's own action tables; a card that cannot be resolved here, or a
+    decision whose operation has no declared effect, is unknown (it asks).
+    """
+    from dataclasses import replace as dc_replace
+
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
+    from packages.core.ai.runtime.workspace_operation_actions import _pending_hitl_id
+    from packages.core.models.task import Message
+
+    unknown = dc_replace(action, impact="unknown", category="unknown", gate="policy")
+    call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
+    params = call.arguments.get("params") if call.tool_name == "workspace_agent" else call.arguments
+    params = params if isinstance(params, dict) else {}
+    decision = str(params.get("action") or "").strip().lower()
+    if decision == "respond":
+        # Relaying the user's own answer to an input card: the handler accepts
+        # only input kinds (never a decision card), so it is human input.
+        from packages.core.governance.action_effects import declared_action_effect
+
+        human_input = declared_action_effect("human.input.request")
+        return dc_replace(action, impact=human_input.impact, category=human_input.category,
+                          gate=human_input.gate.value)
+    message_id = str(params.get("message_id") or "").strip()
+    hitl_id = str(params.get("hitl_id") or "").strip()
+    if not conversation_id or not (message_id or hitl_id):
+        return unknown
+    rows = (await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.pending_action.isnot(None),
+            Message.resolved_at.is_(None),
+        ).order_by(Message.created_at.desc()).limit(25)
+    )).scalars().all()
+    card = next((row for row in rows if isinstance(row.pending_action, dict) and (
+        row.id == message_id
+        or (hitl_id and hitl_id in {_pending_hitl_id(row.pending_action), str(row.pending_action.get("draft_id") or "")})
+    )), None)
+    if card is None:
+        return unknown
+    guarded_tool_action = _HITL_RESOLVE_GUARDED_ACTIONS.get(
+        (str(card.pending_action.get("kind") or ""), decision),
+    )
+    if guarded_tool_action is None:
+        return unknown
+    guarded = classify_runtime_tool("workspace_operation", {
+        "action": "apply_draft" if guarded_tool_action.endswith(".apply") else "discard_draft",
+        "draft_id": str(card.pending_action.get("draft_id") or ""),
+    }).action
+    if guarded is None or guarded.action_key != guarded_tool_action or guarded.impact in {None, "unknown"}:
+        return unknown
+    return _relay_judged_as(action, action_key=guarded.action_key, risk_level=guarded.risk_level,
+                            **guarded.policy_effect())
+
+
+def _relay_judged_as(
+    action: RuntimeApprovalAction, *, action_key: str | None, risk_level: str | None,
+    impact: str | None, category: str | None, gate: str | None, aliases: tuple[str, ...] = (),
+) -> RuntimeApprovalAction:
+    """The relay keeps its own key; it is judged as the operation it guards.
+
+    The facts are the guarded operation's (impact, category, gate and its own
+    classified risk), under the user's mode and the explicit rules for that
+    operation (its key and aliases). Rules on the relay's own generic key may
+    still deny or ask, never allow: a past "always approve" on task updates
+    must not approve the destructive step a confirmation runs. An effect it
+    cannot name is unknown.
+    """
+    from dataclasses import replace as dc_replace
+
+    restrict_only = tuple(dict.fromkeys((*action.restrict_only_keys, action.action_key)))
+    if not impact or impact == "unknown":
+        return dc_replace(action, impact="unknown", category="unknown", gate="policy",
+                          restrict_only_keys=restrict_only)
+    keys = tuple(dict.fromkeys(
+        key for key in (*action.aliases, action_key, *aliases) if key and key != action.action_key
+    ))
+    return dc_replace(action, risk_level=risk_level or action.risk_level, impact=impact,
+                      category=category or "unknown", gate=gate or "policy", aliases=keys,
+                      restrict_only_keys=restrict_only)
+
+
+def _relayed_blocker_call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``answer_task_blocker`` params of this call, whichever surface named it."""
+    from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory, WorkspaceToolAction
+
+    call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
+    if call.tool_name == WorkspaceToolAction.ANSWER_TASK_BLOCKER.value:
+        return dict(call.arguments)
+    if (
+        call.tool_name == "workspace_agent"
+        and str(call.arguments.get("action") or "").strip() == WorkspaceToolAction.ANSWER_TASK_BLOCKER.value
+    ):
+        params = call.arguments.get("params")
+        return dict(params) if isinstance(params, dict) else {}
+    return None
+
+
+def _stored_effect(request: Any) -> dict[str, Any] | None:
+    """The effect a request was judged by when it was minted, if it recorded one."""
+    context = request.context if isinstance(request.context, dict) else {}
+    facts = context.get("approval_facts")
+    if not isinstance(facts, dict) or not facts.get("impact"):
+        return None
+    return {
+        "action_key": str(facts.get("action_key") or request.action_key or "") or None,
+        "risk_level": str(facts.get("risk_level") or request.risk_level or "") or None,
+        "impact": facts.get("impact"), "category": facts.get("category"), "gate": facts.get("gate"),
+        "aliases": tuple(str(key) for key in facts.get("aliases") or () if key),
+    }
+
+
+# Blocker kinds whose answer lets the waiting step's own action run (again).
+_STEP_ACTION_BLOCKER_KINDS = frozenset({"needs_confirmation", "effect_reconciliation"})
+
+
+async def _runtime_blocker_relay_action(
+    db, *, action: RuntimeApprovalAction, params: dict[str, Any], entity_id: str,
+) -> RuntimeApprovalAction:
+    """Judge an agent's ``answer_task_blocker`` relay by what the blocker guards.
+
+    Mirrors ``answer_task_blocker`` branch for branch and reads the same row
+    it acts on, in the same scope (the caller's entity); who may relay is
+    unchanged and the handler still runs its own checks:
+
+    * ``refuse`` cancels the waiting step and runs nothing: the relay's own
+      declared effect.
+    * A delegated child approval (coordinator-owned) grants the exact nested
+      call: that call's recorded effect.
+    * ``needs_confirmation`` and ``effect_reconciliation`` let the step's own
+      action run (again): the step's action, judged by its factory like any
+      plan step.
+    * Every other blocker the handler answers (a task question, human_input,
+      needs_input, needs_login) is the user's own input; the step's action
+      crosses its own gate when it resumes.
+    * Anything else cannot be resolved here: unknown.
+
+    Strategist proposal approvals are not task blockers (the handler refuses
+    them) and keep their own flow.
+    """
+    from sqlalchemy import select
+
+    from packages.core.ai.pending_action import LEASE_HITL_CLOSEABLE_KINDS
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+    from packages.core.constants.execution import COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.governance.action_effects import declared_action_effect
+    from packages.core.governance.approval_facts import EXEMPT
+    from packages.core.governance.approvals import ApprovalSubject, subject_policy_facts
+    from packages.core.models.execution import ExecutionStep
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.services.task_chat_hitl import TASK_INPUT_ACTION_KEY
+
+    if params.get("refuse"):
+        return action
+    unknown = _relay_judged_as(action, action_key=None, risk_level=None, impact=None, category=None, gate=None)
+    human_input = declared_action_effect("human.input.request")
+    as_human_input = _relay_judged_as(
+        action, action_key=None, risk_level=action.risk_level, impact=human_input.impact,
+        category=human_input.category, gate=human_input.gate.value,
+    )
+
+    def _scoped(query):
+        # Exactly the handler's scope (entity), so the gate judges the very
+        # row the handler acts on.
+        return query.where(HitlRequest.entity_id == entity_id)
+
+    request_id = str(params.get("request_id") or "").strip()
+    request = (await db.execute(_scoped(select(HitlRequest).where(
+        HitlRequest.id == request_id,
+    )))).scalar_one_or_none() if request_id else None
+    if request is None or request.status != ApprovalStatus.PENDING.value:
+        return unknown
+    if request.origin_kind == ApprovalOriginKind.TASK.value and request.action_key == TASK_INPUT_ACTION_KEY:
+        return as_human_input
+    if request.origin_kind != ApprovalOriginKind.LEASE.value:
+        return unknown
+    context = request.context if isinstance(request.context, dict) else {}
+    pending_kind = str(context.get("pending_kind") or PendingActionKind.HUMAN_INPUT.value)
+    if pending_kind not in LEASE_HITL_CLOSEABLE_KINDS:
+        return unknown
+
+    binding = context.get(COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY)
+    if binding is not None:
+        # Granting a delegated child's approval runs that exact nested call.
+        nested_id = str(binding.get("request_id") or "").strip() if isinstance(binding, dict) else ""
+        nested = (await db.execute(_scoped(select(HitlRequest).where(
+            HitlRequest.id == nested_id,
+        )))).scalar_one_or_none() if nested_id else None
+        effect = _stored_effect(nested) if nested is not None else None
+        if effect is None and nested is not None:
+            declared = declared_action_effect(nested.action_key)
+            if declared is not None:
+                effect = {"action_key": nested.action_key, "risk_level": nested.risk_level,
+                          "impact": declared.impact, "category": declared.category,
+                          "gate": declared.gate.value}
+        return _relay_judged_as(action, **effect) if effect is not None else unknown
+
+    if pending_kind not in _STEP_ACTION_BLOCKER_KINDS:
+        return as_human_input
+    # needs_confirmation resumes the step to run its own action, so the relay
+    # is judged as that action. A replay of an effect that already happened
+    # cannot come through here: a worker Step paused after an unconfirmed
+    # external action is failed (ExternalEffectUnconfirmed), not parked, and
+    # effect_reconciliation cards belonged to the retired Plan engine.
+    step = await db.get(ExecutionStep, request.origin_step_id) if request.origin_step_id else None
+    if step is None or str(step.entity_id or "") != str(entity_id):
+        return unknown
+    facts = subject_policy_facts(ApprovalSubject(
+        entity_id=entity_id, workspace_id=step.workspace_id, action_key=step.action_key,
+        risk_level=step.risk_level or request.risk_level or "medium", kind=step.kind,
+        provider=step.provider, arguments=step.params if isinstance(step.params, dict) else None,
+    ))
+    if facts is EXEMPT:
+        return unknown
+    return _relay_judged_as(
+        action, action_key=facts.action_key, risk_level=facts.risk_level, impact=facts.impact,
+        category=facts.category, gate=facts.gate, aliases=tuple(facts.aliases),
+    )
+
+
 def _provider_requires_human(request: dict[str, Any]) -> bool:
     confirmation_mode = str(request.get("confirmation_mode") or "").strip().lower()
     policy_category = str(request.get("policy_category") or "").strip().lower()
@@ -380,10 +623,8 @@ async def runtime_auto_confirm_provider_approval(
             db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
             kind="action", action_key=action_key, resource_id=resource_id,
             capability_id=capability_id, risk_level="high", task_id=task_id,
+            **provider_policy_effect(provider, request.get("policy_category")),
             workflow_run_id=workflow_scope_id,
-            # A normalized, machine-answerable provider gate represents an
-            # external action; confirm/retry still cross runtime permissions.
-            impact="external" if workflow_scope_id else None,
         )
         if not current_policy.allowed and not current_policy.pause_for_hitl:
             return result
@@ -642,6 +883,7 @@ async def runtime_auto_confirm_provider_approval(
         granted = await _standing_grant(
             db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
             action_key=action_key, resource_id=resource_id, capability_id=capability_id,
+            policy_category=request.get("policy_category"),
             **({"workflow_run_id": workflow_scope_id} if workflow_scope_id else {}),
         )
     if not granted:
@@ -715,15 +957,15 @@ def _provider_approval_token(confirmation: Any) -> str | None:
 async def _standing_grant(
     db, *, entity_id: str, workspace_id: str | None, user_id: str | None,
     action_key: str, resource_id: str | None, capability_id: str,
-    workflow_run_id: str | None = None,
+    workflow_run_id: str | None = None, policy_category: str | None = None,
 ) -> bool:
     from packages.core.governance.service import check_step_policy
     decision = await check_step_policy(
         db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
         kind="action", action_key=action_key, resource_id=resource_id,
         capability_id=capability_id, risk_level="high",
+        **provider_policy_effect(capability_id.removesuffix(".action"), policy_category),
         workflow_run_id=workflow_run_id,
-        impact="external" if workflow_run_id else None,
     )
     return decision.allowed
 
@@ -863,8 +1105,8 @@ def _task_origin_conversation_matches(
 
     A foreground run presents the Task's own conversation.  A conversation-less
     worker run has no conversation row at all: its sandbox-bound tools present
-    ``runtime_task_binding_key(task_id)`` as their authorization scope (see
-    ``runtime_authorization_conversation_id``).  That key names the very Task
+    ``runtime_task_binding_key(task_id)`` as their approval scope (see
+    ``RuntimeApprovalRequest.approval_scope_id``).  That key names the very Task
     this guard has already loaded and locked, so it is at least as tightly bound
     as a conversation match; any other foreign scope is still refused.
     """
@@ -936,6 +1178,10 @@ async def _foreground_cannot_claim_worker_approval(db, *, request, runtime_envel
     ))).scalar_one_or_none() == TaskType.GENERAL.value
 
 
+# Flows, Tasks and scheduled agents all resume this way; name none of them.
+BACKGROUND_APPROVAL_REPLY = "Approved. The paused work continues with the exact action that was waiting."
+
+
 async def _stage_background_runtime_approval_resolution(db, *, request, **kwargs):
     from packages.core.services.workflow_runtime_approvals import workflow_approval_owned, stage_workflow_approval_resolution
     if workflow_approval_owned(request):
@@ -948,10 +1194,13 @@ async def _stage_background_runtime_approval_resolution(db, *, request, **kwargs
         return await _stage_task_agent_loop_resolution(
             db, request=request, choice=kwargs["choice"],
         )
-    from packages.core.services.task_runtime_approvals import (
-        stage_task_runtime_approval_resolution,
-    )
-    return await stage_task_runtime_approval_resolution(db, request=request, **kwargs)
+    if not getattr(request, "origin_task_id", None):
+        return None
+    from packages.core.services.task_runtime_approvals import TaskRuntimeApprovalError
+
+    # Every Task runs on the agent loop: an untagged Task-origin request has
+    # no run that could resume it, so its decision never executes anything.
+    raise TaskRuntimeApprovalError("No Task agent loop is parked on this approval")
 
 
 async def _stage_task_agent_loop_resolution(db, *, request, choice: str, reason: str | None = None):
@@ -1114,30 +1363,12 @@ async def _runtime_render_context(
     )
     content_preview = approval_content_preview(public_content) if public_content else ""
     confirmation_receipt = _chrome_confirmation_receipt(tool_name, arguments)
-    publish_review = {}
-    if action.action_key == _CHROME_PUBLICATION_ACTION:
-        review = _chrome_publication_review(arguments)
-        binding = await _chrome_publication_binding(
-            db, entity_id=entity_id, user_id=user_id,
-            workspace_id=workspace_id, arguments=arguments,
-        )
-        publish_review = {
-            "review": {**review, "documents": binding["documents"]},
-            "chrome_publication_binding": binding,
-        }
-    if tool_name == _TIKTOK_PUBLISH_TOOL:
-        from packages.core.services.tiktok_publish_review import prepare_tiktok_publish_review
+    from packages.core.ai.runtime.approval_reviews import ReviewRequest, prepare_review
 
-        try:
-            publish_review = await prepare_tiktok_publish_review(
-                tool_name=tool_name,
-                arguments=runtime_approval_continuation(tool_name, arguments)["arguments"],
-                entity_id=entity_id,
-                user_id=user_id, conversation_id=conversation_id,
-                workspace_id=workspace_id,
-            )
-        except ValueError as exc:
-            raise RuntimeApprovalContinuationError(str(exc)) from exc
+    publish_review = await prepare_review(ReviewRequest(
+        db=db, tool_name=tool_name, arguments=arguments, action=action, entity_id=entity_id,
+        user_id=user_id, conversation_id=conversation_id, workspace_id=workspace_id,
+    ))
     return {
         "tool": tool_name,
         "args_hash": approval_args_hash(arguments, tool_name=tool_name),
@@ -1306,18 +1537,24 @@ async def _chrome_ref_approval_token_preflight_failed(
 
 def _chrome_ref_approval_action(action_key: str) -> RuntimeApprovalAction | None:
     """Closed set of ref actions allowed to resume after a one-time review."""
+    from packages.core.governance.action_effects import provider_policy_effect
+
     actions = {
         "chrome.browser.interact": RuntimeApprovalAction(
             "action", "chrome.browser.interact", "low", "interact with Chrome",
             "browser", "modify", capability_id="manor.composite",
         ),
+        # Chrome's confirmation category is the fact, exactly as the classifier
+        # writes it for the same key (an unmapped category stays unknown).
         "chrome.ordinary_page_action.confirm": RuntimeApprovalAction(
             "action", "chrome.ordinary_page_action.confirm", "high", "confirm Chrome action",
             "external_account", "execute", capability_id="manor.composite",
+            **provider_policy_effect("chrome", "ordinary_page_action"),
         ),
         "chrome.representational_communication.confirm": RuntimeApprovalAction(
             "action", "chrome.representational_communication.confirm", "high", "confirm Chrome action",
             "external_account", "execute", capability_id="manor.composite",
+            **provider_policy_effect("chrome", "representational_communication"),
         ),
     }
     return actions.get(action_key)
@@ -1341,6 +1578,10 @@ def _runtime_continuation_error_result(
     tool_name: str,
     error: RuntimeApprovalContinuationError,
 ) -> str:
+    from packages.core.ai.runtime.approval_reviews import ReviewTargetUnavailable
+
+    if isinstance(error, ReviewTargetUnavailable):
+        return json.dumps({**error.result, "tool": tool_name, "action_executed": False}, ensure_ascii=False)
     return json.dumps(
         {
             "error": "approval_continuation_unavailable",
@@ -1377,10 +1618,12 @@ def _runtime_hitl_payload(
         for key in ("confirmation_mode", "policy_category", "preapproved")
         if key in render
     }
+    from packages.core.ai.runtime.approval_reviews import review_provider_for
+
+    reviewer = review_provider_for(tool_name, action.action_key)
     publish_review = (
         {"review": render["review"]}
-        if (tool_name == _TIKTOK_PUBLISH_TOOL or action.action_key == _CHROME_PUBLICATION_ACTION)
-        and isinstance(render.get("review"), dict)
+        if reviewer is not None and isinstance(render.get("review"), dict)
         else {}
     )
     return json.dumps({
@@ -1398,10 +1641,10 @@ def _runtime_hitl_payload(
             "paths": render.get("paths"),
             "content": render.get("content"),
             "args_preview": render.get("args_preview"),
-            "options": one_time_approval_options() if tool_name == _TIKTOK_PUBLISH_TOOL else approval_options(),
+            "options": one_time_approval_options() if reviewer is not None and reviewer.one_time else approval_options(),
             **confirmation_receipt,
             **publish_review,
-            **({"review_read_only": True} if action.action_key == _CHROME_PUBLICATION_ACTION else {}),
+            **({"review_read_only": True} if reviewer is not None and reviewer.read_only else {}),
         },
         "message": (
             "Workspace governance requires approval before this action. "
@@ -1442,6 +1685,7 @@ async def _runtime_block_payload(
     origin_step_id: str | None = None,
     workflow_run_id: str | None = None,
     runtime_envelope: Any | None = None,
+    companion_subjects: tuple[Any, ...] = (),
 ) -> str | None:
     """Re-evaluate an uncovered call without reopening a terminal operation.
 
@@ -1481,6 +1725,8 @@ async def _runtime_block_payload(
                 kind=action.kind,
                 requires_approval=True,
                 user_id=user_id, operation=action.operation, account_id=account_id,
+                **action.policy_effect(), action_key_aliases=action.aliases,
+                restrict_only_keys=action.restrict_only_keys,
                 resource_ids=runtime_media_output_policy_resources(),
             ),
             origin=ApprovalOrigin(
@@ -1496,8 +1742,9 @@ async def _runtime_block_payload(
             intrinsic_rule=matched_rule_hint or "approval_payload_changed",
             intrinsic_reason=reason,
             require_explicit_approval=(
-                tool_name == _TIKTOK_PUBLISH_TOOL or action.action_key == _CHROME_PUBLICATION_ACTION
+                tool_name in _TIKTOK_PUBLISH_TOOLS or action.action_key == _CHROME_PUBLICATION_ACTION
             ),
+            companion_subjects=companion_subjects,
         )
     except RuntimeApprovalContinuationError as exc:
         return _runtime_continuation_error_result(
@@ -1505,7 +1752,7 @@ async def _runtime_block_payload(
             error=exc,
         )
     if decision.outcome is ApprovalOutcome.ALLOW:
-        if tool_name == _TIKTOK_PUBLISH_TOOL:
+        if tool_name in _TIKTOK_PUBLISH_TOOLS:
             if decision.request is None:
                 return json.dumps({"error": "tiktok_publish_review_required"})
             return await consume_runtime_approval(
@@ -1554,6 +1801,43 @@ async def _runtime_block_payload(
     )
 
 
+async def _collaborator_refusal_result(
+    db,
+    *,
+    decision,
+    authorization,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    principal: Any,
+    name: str,
+    arguments: dict,
+) -> str | None:
+    """The blocking result when a collaborator's admitted call names outside resources."""
+    from packages.core.services.runtime_authorization.collaborator import collaborator_call_refusal
+
+    refusal = await collaborator_call_refusal(
+        db,
+        decision=decision,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        user_id=user_id or (getattr(principal, "execution_user_id", None) if principal is not None else None),
+        tool_name=name,
+        arguments=arguments,
+    )
+    if not refusal:
+        return None
+    return json.dumps({
+        "error": "blocked_by_permission",
+        "message": refusal,
+        "action_key": authorization.action_key,
+        "capability_id": authorization.capability_id,
+        "matched_rule": AuthorizationRule.COLLABORATOR_SUBJECT.value,
+        "action_executed": False,
+        "tool": name,
+    }, ensure_ascii=False)
+
+
 async def guard_runtime_tool_action(
     *,
     name: str,
@@ -1568,6 +1852,7 @@ async def guard_runtime_tool_action(
     classification: RuntimeToolClassification | None = None,
     operation_id: str | None = None,
     account_id: str | None = None,
+    preview: bool = False,
 ) -> str | None:
     """Return a blocking tool result, or ``None`` when execution may continue.
 
@@ -1576,8 +1861,19 @@ async def guard_runtime_tool_action(
     human review and one-time continuations retain their own lifecycle checks.
     Approval tokens cannot survive role, membership, tenant-scope, or tool
     binding revocation.
+
+    ``preview`` runs the same decision without writing, locking or spending
+    anything. It returns ``None`` when the call would pass with no human, a
+    refusal when it would be refused, and ``RUNTIME_GATE_PREVIEW_UNDECIDED``
+    when it would stop for a human or depends on a one-time continuation.
     """
     from packages.core.ai.runtime.chrome_routing import chrome_policy_arguments
+
+    if preview and (
+        name.startswith("mcp__chrome__")
+        or str(arguments.get("approval_token") or "").strip()
+    ):
+        return RUNTIME_GATE_PREVIEW_UNDECIDED
 
     if name == "search_tools":
         from packages.core.ai.runtime.tool_discovery import runtime_prepare_search_tools_request
@@ -1659,6 +1955,14 @@ async def guard_runtime_tool_action(
                 **({"next_required_tool": "mcp__chrome__read_page"}
                    if chrome_decision.kind == "observation_required" else {}),
             })
+    if classification.effect is RuntimeToolEffect.UNKNOWN and classification.error_code:
+        from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+
+        return json.dumps(tool_error_payload(
+            tool_name=name, code=classification.error_code,
+            message=classification.reason or "This operation has no executable handler.",
+            details={"action_executed": False},
+        ), ensure_ascii=False)
     if classification.effect is RuntimeToolEffect.UNKNOWN:
         return json.dumps({
             "error": "blocked_by_authorization_configuration",
@@ -1677,6 +1981,9 @@ async def guard_runtime_tool_action(
             "tool": name,
         }, ensure_ascii=False)
 
+    companion_subjects: tuple[Any, ...] = ()
+    companion_blocked: str | None = None
+
     from packages.core.database import async_session
 
     async with async_session() as db:
@@ -1685,7 +1992,9 @@ async def guard_runtime_tool_action(
         )
 
         task_comment_origin = None
-        if task_id:
+        # A preview takes no task approval-boundary lock: an unexecutable
+        # origin is a refusal at the live gate, never a human stop.
+        if task_id and not preview:
             from sqlalchemy import select
 
             from packages.core.models.task import Task
@@ -1789,6 +2098,13 @@ async def guard_runtime_tool_action(
                 ),
                 "tool": name,
             }, ensure_ascii=False)
+        if collaborator_refusal := await _collaborator_refusal_result(
+            db, decision=permission_decision, authorization=authorization, entity_id=entity_id,
+            workspace_id=workspace_id, user_id=user_id, principal=principal, name=name, arguments=arguments,
+        ):
+            return collaborator_refusal
+        if companion_blocked:
+            return companion_blocked
 
         workflow_execution = False
         workflow_run_id = None
@@ -1807,19 +2123,41 @@ async def guard_runtime_tool_action(
                     "tool": name,
                 })
 
-        if classification.effect is RuntimeToolEffect.ORCHESTRATOR:
-            # This closed classification includes only invoke_skill and an
-            # immutable leased action; both recheck each concrete child effect.
-            return None
-        if classification.effect is RuntimeToolEffect.CONTROL and authorization.action_key in {
-            "runtime.control.submit_result", "runtime.control.sandbox_destroy",
-        }:
-            return None
         from packages.core.ai.runtime.approval_classifier import (
+            runtime_effect_gate,
             runtime_policy_action_for_classification,
         )
+        from packages.core.governance.action_effects import EffectGate
 
-        action, impact = runtime_policy_action_for_classification(classification)
+        if (
+            runtime_effect_gate(classification) is EffectGate.LEAF_ONLY
+            and classification.effect is not RuntimeToolEffect.ACTION
+        ):
+            # CONTROL, ORCHESTRATOR and the agent's own discovery reads never
+            # cross the consent gate: the leaf calls they cause do. Hard
+            # authorization above already ran. A replayed legacy approval
+            # token has nothing to authorize here.
+            arguments.pop("approval_token", None)
+            return None
+
+        # A declared leaf_only ACTION (delegation, request_input) continues:
+        # its facts carry gate=leaf_only, so only an explicit action/resource
+        # rule for that exact key can ask or deny.
+        action, _impact = runtime_policy_action_for_classification(classification)
+        if preview and (
+            action.action_key in GATE_RESOLVED_ACTION_KEYS
+            or _relayed_blocker_call(name, arguments) is not None
+        ):
+            return RUNTIME_GATE_PREVIEW_UNDECIDED
+        if action.action_key in GATE_RESOLVED_ACTION_KEYS:
+            action = await _runtime_gate_resolved_action(
+                db, action=action, tool_name=name, arguments=arguments,
+                conversation_id=conversation_id,
+            )
+        elif (blocker_params := _relayed_blocker_call(name, arguments)) is not None:
+            action = await _runtime_blocker_relay_action(
+                db, action=action, params=blocker_params, entity_id=entity_id,
+            )
 
         if not operation_id and not arguments.get("approval_token") and classification.effect is not RuntimeToolEffect.READ_ONLY:
             return json.dumps({"error": "approval_operation_identity_missing", "action_executed": False,
@@ -1832,6 +2170,14 @@ async def guard_runtime_tool_action(
             classification.action is not None
             and classification.action.action_key == _CHROME_PUBLICATION_ACTION
         )
+        if preview and (
+            provider_execution is not None
+            or chrome_publication
+            or name in _TIKTOK_PUBLISH_TOOLS
+        ):
+            # Provider continuations and publication reviews spend their own
+            # one-time consent at the live gate.
+            return RUNTIME_GATE_PREVIEW_UNDECIDED
         if chrome_publication and _chrome_publication_review(arguments) is None:
             return json.dumps({
                 "error": "invalid_publication_intent",
@@ -1841,7 +2187,7 @@ async def guard_runtime_tool_action(
         if (
             provider_execution is not None
             and name in {provider_execution[1], provider_execution[2]}
-            and name != _TIKTOK_PUBLISH_TOOL
+            and name not in _TIKTOK_PUBLISH_TOOLS
             and not chrome_publication
         ):
             from packages.core.governance.service import check_step_policy
@@ -1850,7 +2196,9 @@ async def guard_runtime_tool_action(
                 kind=action.kind, action_key=action.action_key,
                 resource_kind=action.resource_kind, resource_id=action.resource_id,
                 risk_level=action.risk_level, capability_id=action.capability_id,
-                operation=action.operation, impact=impact, account_id=account_id, task_id=task_id,
+                operation=action.operation, **action.policy_effect(), aliases=action.aliases,
+                restrict_only_keys=action.restrict_only_keys,
+                account_id=account_id, task_id=task_id,
                 workflow_run_id=workflow_run_id,
             )
             if not current_policy.allowed and not current_policy.pause_for_hitl:
@@ -1888,7 +2236,9 @@ async def guard_runtime_tool_action(
                 kind=action.kind, action_key=action.action_key, resource_id=action.resource_id,
                 resource_kind=action.resource_kind, resource_ids=runtime_media_output_policy_resources(),
                 risk_level=action.risk_level, capability_id=action.capability_id,
-                operation=action.operation, impact=impact, account_id=account_id, task_id=task_id,
+                operation=action.operation, **action.policy_effect(), aliases=action.aliases,
+                restrict_only_keys=action.restrict_only_keys,
+                account_id=account_id, task_id=task_id,
                 workflow_run_id=workflow_run_id,
             )
             if not token_policy.allowed and not token_policy.pause_for_hitl:
@@ -1905,9 +2255,9 @@ async def guard_runtime_tool_action(
                 tool_name=name,
                 arguments=arguments,
                 action=action,
-                impact=impact,
                 permission_decision=permission_decision,
                 runtime_envelope=runtime_envelope,
+                companion_subjects=companion_subjects,
             )
             await db.commit()
             if result is None:
@@ -1964,6 +2314,12 @@ async def guard_runtime_tool_action(
                         ),
                         "tool": name,
                     }, ensure_ascii=False)
+                if collaborator_refusal := await _collaborator_refusal_result(
+                    db, decision=permission_decision, authorization=authorization, entity_id=entity_id,
+                    workspace_id=workspace_id, user_id=user_id, principal=principal, name=name,
+                    arguments=arguments,
+                ):
+                    return collaborator_refusal
             else:
                 return result
 
@@ -2020,7 +2376,9 @@ async def guard_runtime_tool_action(
                     risk_level=action.risk_level,
                     kind=action.kind,
                     requires_approval=False,
-                    user_id=user_id, operation=action.operation, impact=impact, account_id=account_id,
+                    user_id=user_id, operation=action.operation, **action.policy_effect(),
+                    action_key_aliases=action.aliases, restrict_only_keys=action.restrict_only_keys,
+                    account_id=account_id,
                     resource_ids=runtime_media_output_policy_resources(),
                 ),
                 origin=ApprovalOrigin(
@@ -2041,14 +2399,34 @@ async def guard_runtime_tool_action(
                 ),
                 permission_decision=permission_decision,
                 spent_credits=spent_credits_per_kind,
-                require_explicit_approval=name == _TIKTOK_PUBLISH_TOOL,
-
+                # A running, actor-scoped Workflow has already passed its
+                # declared approval path. It may satisfy the inherited mode
+                # prompt for this exact call, while explicit policy rules and
+                # tool-specific reviews (such as TikTok) remain authoritative.
+                policy_hitl_preauthorized=(
+                    workflow_execution and action.impact not in {None, "unknown"}
+                ),
+                require_explicit_approval=name in _TIKTOK_PUBLISH_TOOLS,
+                companion_subjects=companion_subjects,
+                preview=preview,
             )
         except RuntimeApprovalContinuationError as exc:
             return _runtime_continuation_error_result(
                 tool_name=name,
                 error=exc,
             )
+
+        if preview:
+            if decision.outcome is ApprovalOutcome.DENY:
+                return json.dumps({
+                    "error": "blocked_by_governance", "tool": name,
+                    "matched_rule": decision.matched_rule, "action_executed": False,
+                }, ensure_ascii=False)
+            if decision.outcome is ApprovalOutcome.ALLOW and decision.request is None:
+                return None
+            # A human stop, or an allow that rests on a one-time grant the
+            # live gate must claim.
+            return RUNTIME_GATE_PREVIEW_UNDECIDED
 
         if decision.request is not None and (
             not _runtime_request_matches_task_origin(decision.request, task_id)
@@ -2078,7 +2456,7 @@ async def guard_runtime_tool_action(
                     connection_epoch=binding["connection_epoch"],
                 ))
                 return None
-            if name == _TIKTOK_PUBLISH_TOOL or chrome_publication or (
+            if name in _TIKTOK_PUBLISH_TOOLS or chrome_publication or (
                 decision.request is not None and runtime_media_output_policy_resources()
             ):
                 # Tokenless grants must revalidate operator consent or the
@@ -2091,8 +2469,7 @@ async def guard_runtime_tool_action(
                     tool_name=name, arguments=arguments, action=action,
                     permission_decision=permission_decision, runtime_envelope=runtime_envelope,
                     workflow_run_id=workflow_run_id,
-                    impact=impact,
-                )
+                    )
                 await db.commit()
                 return result
             # If the allow rests on a one-time operator grant, spend it NOW —
@@ -2146,6 +2523,7 @@ async def guard_runtime_tool_action(
                         action_key=action.action_key,
                         capability_id=action.capability_id,
                         matched_rule=decision.matched_rule,
+                        category=action.category,
                     )
                 except Exception:  # noqa: BLE001 — provenance is advisory
                     logger.warning("hard-block provenance lookup failed", exc_info=True)
@@ -2239,10 +2617,14 @@ async def _stage_task_runtime_no_action(
         return None
     if request.status != ApprovalStatus.PENDING:
         return None
+    from packages.core.services.task_agent_loop_hitl import verified_request_tag
+
+    if not workflow_owned and verified_request_tag(request) is None:
+        from packages.core.services.task_runtime_approvals import TaskRuntimeApprovalError
+
+        # Every Task runs on the agent loop: nothing could resume this one.
+        raise TaskRuntimeApprovalError("No Task agent loop is parked on this approval")
     from packages.core.governance.approvals import deny_approval
-    from packages.core.services.task_runtime_approvals import (
-        stage_task_runtime_approval_resolution,
-    )
 
     await deny_approval(
         db,
@@ -2258,21 +2640,12 @@ async def _stage_task_runtime_no_action(
         hitl_id=hitl_id,
         choice=card_choice,
     )
-    from packages.core.services.task_agent_loop_hitl import verified_request_tag
-
     if workflow_owned:
         from packages.core.services.workflow_runtime_approvals import stage_workflow_approval_resolution
         return await stage_workflow_approval_resolution(db, request=request, choice=APPROVAL_CHOICE_REJECT)
-    if verified_request_tag(request) is not None:
-        # The parked loop hears that the action did not run, and why.
-        return await _stage_task_agent_loop_resolution(
-            db, request=request, choice=APPROVAL_CHOICE_REJECT, reason=reason,
-        )
-    return await stage_task_runtime_approval_resolution(
-        db,
-        request=request,
-        choice=APPROVAL_CHOICE_REJECT,
-        runtime_metadata=None,
+    # The parked loop hears that the action did not run, and why.
+    return await _stage_task_agent_loop_resolution(
+        db, request=request, choice=APPROVAL_CHOICE_REJECT, reason=reason,
     )
 
 
@@ -2286,8 +2659,13 @@ async def resolve_runtime_approval_turn(
     action: str,
     revision_request: str | None = None,
     submitted_review: Any = None,
+    decided_via: str = "chat_card",
 ) -> RuntimeApprovalResolution | None:
-    """Resolve a runtime approval and expose any deterministic continuation."""
+    """Resolve a runtime approval and expose any deterministic continuation.
+
+    ``decided_via`` records who decided a one-time approval: the card, or a
+    host decision such as a policy change taking the same path.
+    """
     # ── unified store first: the token is a HitlRequest id ──
     req = await _load_runtime_request(
         db,
@@ -2299,10 +2677,10 @@ async def resolve_runtime_approval_turn(
     if req is not None:
         from packages.core.governance.approvals import (
             coordinator_outer_approval_id,
-            is_coordinator_owned_nested_approval_durable,
+            is_coordinator_owned_nested_approval,
         )
 
-        if await is_coordinator_owned_nested_approval_durable(db, req):
+        if is_coordinator_owned_nested_approval(req):
             outer_id = coordinator_outer_approval_id(req)
             return RuntimeApprovalResolution(
                 "This delegated action is controlled by its Task approval. "
@@ -2345,10 +2723,7 @@ async def resolve_runtime_approval_turn(
         # compatibility lookup but before this locked refresh.  Recheck under
         # the row lock so a stale, already-rendered nested Chat card cannot win
         # the pre-link race and resolve independently of the parent Task card.
-        if (
-            req is not None
-            and await is_coordinator_owned_nested_approval_durable(db, req)
-        ):
+        if req is not None and is_coordinator_owned_nested_approval(req):
             outer_id = coordinator_outer_approval_id(req)
             return RuntimeApprovalResolution(
                 "This delegated action is controlled by its Task approval. "
@@ -2364,17 +2739,11 @@ async def resolve_runtime_approval_turn(
         item = _runtime_request_item(req)
         is_provider = (req.context or {}).get("kind") == "provider"
         normalized = normalize_approval_choice(action)
-        from packages.core.services.task_runtime_approvals import (
-            existing_task_runtime_approval_resolution,
+        from packages.core.services.task_agent_loop_hitl import (
+            existing_task_agent_loop_resolution,
         )
 
-        existing_task_resolution = existing_task_runtime_approval_resolution(req)
-        if existing_task_resolution is None:
-            from packages.core.services.task_agent_loop_hitl import (
-                existing_task_agent_loop_resolution,
-            )
-
-            existing_task_resolution = existing_task_agent_loop_resolution(req)
+        existing_task_resolution = existing_task_agent_loop_resolution(req)
         actionable_provider_grant = (
             is_provider
             and req.status == ApprovalStatus.GRANTED
@@ -2418,11 +2787,14 @@ async def resolve_runtime_approval_turn(
             workflow_owned = await workflow_approval_origin(db, req)
             if workflow_owned and req.status == ApprovalStatus.PENDING:
                 try:
-                    await ensure_workflow_approval_current(db, request=req)
-                except WorkflowRuntimeApprovalError:
+                    workflow_run = await ensure_workflow_approval_current(db, request=req)
+                except WorkflowRuntimeApprovalError as exc:
+                    logger.warning("Expiring workflow approval %s: %s", req.id, exc)
                     req.status = ApprovalStatus.EXPIRED.value
                     req.resolved_reason = "workflow_approval_not_current"
                     req.decided_at = datetime.now(timezone.utc)
+                    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                    await wake_run_for_closed_request(db, req)
                     await mark_runtime_hitl_request_resolved(db, conversation_id=conversation_id, hitl_id=hitl_id, choice="expired")
                     return RuntimeApprovalResolution(
                         "This Workflow approval is no longer current. No action was run.",
@@ -2451,18 +2823,15 @@ async def resolve_runtime_approval_turn(
                     f"{existing_choice}; its prior decision was not changed.",
                     existing_task_resolution,
                 )
-            agent_loop_owned = False
             if not workflow_owned and getattr(req, "origin_task_id", None) and not has_task_comment_origin(req):
                 from packages.core.services.task_agent_loop_hitl import (
                     task_agent_loop_approval_is_current,
-                    task_agent_loop_owns_request,
                 )
 
-                agent_loop_owned = await task_agent_loop_owns_request(db, request=req)
-            if agent_loop_owned:
-                # A Task agent loop resumes only from the exact park this card
-                # was shown for. Anything else (a stale card, a request the
-                # loop never parked on) closes without touching the Task.
+                # Every Task runs on the agent loop, which resumes only from
+                # the exact park this card was shown for. Anything else (a
+                # stale card, a request no loop parked on) closes without
+                # touching the Task.
                 if not await task_agent_loop_approval_is_current(db, request=req):
                     from packages.core.services.task_runtime_approvals import (
                         expire_task_runtime_approval_request,
@@ -2479,32 +2848,6 @@ async def resolve_runtime_approval_turn(
                             "approval_outcome": "expired",
                         },
                     )
-            elif not workflow_owned and getattr(req, "origin_task_id", None) and not has_task_comment_origin(req):
-                from packages.core.services.task_runtime_approvals import (
-                    TaskRuntimeApprovalError,
-                    ensure_task_runtime_approval_resolvable,
-                    fail_task_runtime_approval_origin,
-                )
-
-                try:
-                    await ensure_task_runtime_approval_resolvable(
-                        db,
-                        request=req,
-                    )
-                except TaskRuntimeApprovalError:
-                    await fail_task_runtime_approval_origin(
-                        db,
-                        request=req,
-                        reason="runtime_approval_checkpoint_invalid",
-                    )
-                    return RuntimeApprovalResolution(
-                        "This scheduled-agent approval is no longer attached "
-                        "to a valid waiting Task. No action was run.",
-                        {
-                            "approval_kind": "runtime_terminal",
-                            "approval_outcome": "expired",
-                        },
-                    )
         if req.status != ApprovalStatus.PENDING and not actionable_provider_grant:
             status_label = {"granted": "approved", "denied": "rejected"}.get(
                 req.status, req.status
@@ -2513,13 +2856,24 @@ async def resolve_runtime_approval_turn(
                 f"Runtime approval {hitl_id} is already {status_label}. "
                 "Do not retry the blocked tool call."
             )
-        if (req.context or {}).get("tool") == _TIKTOK_PUBLISH_TOOL:
+        if (req.context or {}).get("tool") in _TIKTOK_PUBLISH_TOOLS:
             if normalized not in {APPROVAL_CHOICE_APPROVE, APPROVAL_CHOICE_REJECT}:
                 return RuntimeApprovalResolution(
                     "TikTok publishing requires review of this one post. Choose approve or reject.",
                     {"approval_kind": "runtime_terminal", "approval_outcome": "pending"},
                 )
             if normalized == APPROVAL_CHOICE_APPROVE:
+                if workflow_owned and req.status == ApprovalStatus.PENDING:
+                    from packages.core.services.workflow_runtime_approvals import workflow_approval_effect_window
+
+                    window = workflow_approval_effect_window(workflow_run, req)
+                    if window and window["expired"]:
+                        return RuntimeApprovalResolution(
+                            f"The publishing window ended at {window['deadline_at']}. "
+                            "No post was sent. Return to the workflow to arrange a new publishing "
+                            "window and review; retrying this approval cannot extend it.",
+                            {"approval_kind": "runtime_terminal", "approval_outcome": "pending"},
+                        )
                 context = dict(req.context or {})
                 if (
                     context.get("requested_by") != user_id
@@ -2549,7 +2903,7 @@ async def resolve_runtime_approval_turn(
                     final_arguments = apply_tiktok_publish_review(
                         review, submitted_review, original,
                     )
-                    continuation = runtime_approval_continuation(_TIKTOK_PUBLISH_TOOL, final_arguments)
+                    continuation = runtime_approval_continuation(str(context["tool"]), final_arguments)
                 except (ValueError, TypeError, RuntimeApprovalContinuationError) as exc:
                     return RuntimeApprovalResolution(
                         f"TikTok review was not accepted: {exc}. This request remains pending.",
@@ -2603,6 +2957,8 @@ async def resolve_runtime_approval_turn(
             req.decided_at = datetime.now(timezone.utc)
             req.decided_via = "chat_card_revise"
             req.resolved_reason = "revision_requested"
+            from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+            await wake_run_for_closed_request(db, req)
             await mark_runtime_hitl_request_resolved(
                 db,
                 conversation_id=conversation_id,
@@ -2648,6 +3004,8 @@ async def resolve_runtime_approval_turn(
                     req.status = ApprovalStatus.EXPIRED.value
                     req.resolved_reason = "provider_approval_expired"
                     req.decided_at = datetime.now(timezone.utc)
+                    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                    await wake_run_for_closed_request(db, req)
                     await mark_runtime_hitl_request_resolved(
                         db,
                         conversation_id=conversation_id,
@@ -2689,6 +3047,8 @@ async def resolve_runtime_approval_turn(
                     req.status = ApprovalStatus.EXPIRED.value
                     req.resolved_reason = "approval_continuation_unavailable"
                     req.decided_at = datetime.now(timezone.utc)
+                    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                    await wake_run_for_closed_request(db, req)
                     await mark_runtime_hitl_request_resolved(
                         db,
                         conversation_id=conversation_id,
@@ -2734,7 +3094,7 @@ async def resolve_runtime_approval_turn(
                         )
                 elif req.status == ApprovalStatus.PENDING:
                     await grant_approval(
-                        db, req, by_user_id=user_id, via="chat_card",
+                        db, req, by_user_id=user_id, via=decided_via,
                     )
                 task_resolution = await _stage_background_runtime_approval_resolution(
                     db,
@@ -2750,8 +3110,7 @@ async def resolve_runtime_approval_turn(
                         choice=normalized,
                     )
                     return RuntimeApprovalResolution(
-                        "Approved. The scheduled agent will resume the exact "
-                        "blocked action.",
+                        BACKGROUND_APPROVAL_REPLY,
                         task_resolution,
                     )
                 # Keep the card actionable until the exact provider attempt
@@ -2783,6 +3142,8 @@ async def resolve_runtime_approval_turn(
                 req.status = ApprovalStatus.EXPIRED.value
                 req.resolved_reason = "approval_continuation_unavailable"
                 req.decided_at = datetime.now(timezone.utc)
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 await mark_runtime_hitl_request_resolved(
                     db,
                     conversation_id=conversation_id,
@@ -2826,6 +3187,8 @@ async def resolve_runtime_approval_turn(
                 req.status = ApprovalStatus.EXPIRED.value
                 req.resolved_reason = "approved_tool_schema_unavailable"
                 req.decided_at = datetime.now(timezone.utc)
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 await mark_runtime_hitl_request_resolved(
                     db,
                     conversation_id=conversation_id,
@@ -2861,6 +3224,8 @@ async def resolve_runtime_approval_turn(
                 req.status = ApprovalStatus.EXPIRED.value
                 req.resolved_reason = "approved_tool_input_invalid"
                 req.decided_at = datetime.now(timezone.utc)
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 await mark_runtime_hitl_request_resolved(
                     db,
                     conversation_id=conversation_id,
@@ -2895,6 +3260,8 @@ async def resolve_runtime_approval_turn(
                         task_resolution,
                     )
                 req.status = ApprovalStatus.EXPIRED.value
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 req.resolved_reason = (
                     "delegated_approval_continuation_unavailable"
                 )
@@ -2929,7 +3296,7 @@ async def resolve_runtime_approval_turn(
                         db, req, by_user_id=user_id, via="chat_card_always",
                     )
             else:
-                await grant_approval(db, req, by_user_id=user_id, via="chat_card")
+                await grant_approval(db, req, by_user_id=user_id, via=decided_via)
             await mark_runtime_hitl_request_resolved(
                 db,
                 conversation_id=conversation_id,
@@ -2944,8 +3311,7 @@ async def resolve_runtime_approval_turn(
             )
             if task_resolution is not None:
                 return RuntimeApprovalResolution(
-                    "Approved. The scheduled agent will resume the exact "
-                    "blocked action.",
+                    BACKGROUND_APPROVAL_REPLY,
                     task_resolution,
                 )
             return RuntimeApprovalResolution(
@@ -3067,6 +3433,8 @@ async def _expire_provider_runtime_approval(
     req.resolved_reason = reason
     req.decided_at = datetime.now(timezone.utc)
     req.consumed_at = None
+    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+    await wake_run_for_closed_request(db, req)
     from packages.core.ledger import adapters as ledger_adapters
     from packages.core.ledger import event_types as ledger_et
 
@@ -3288,6 +3656,8 @@ async def prepare_provider_runtime_approval_execution(
         kind="action", action_key=req.action_key, resource_id=req.resource_id,
         resource_kind=req.resource_kind, capability_id=req.capability_id, risk_level=req.risk_level,
         account_id=context.get("approval_account_id"), task_id=task_id,
+        **provider_policy_effect(str(req.capability_id or "").removesuffix(".action"),
+                                 continuation.get("policy_category")),
     )
     if ((not current_policy.allowed and not current_policy.pause_for_hitl)
         or not set(_consent_requirements(current_policy)).issubset(set(context.get("approval_requirements") or []))):
@@ -3298,39 +3668,30 @@ async def prepare_provider_runtime_approval_execution(
             changed=True,
         )
 
-    task_marker_changed = False
     if getattr(req, "origin_task_id", None) and not has_task_comment_origin(req):
+        # A Task agent loop re-runs its approved call through the approval
+        # token, never through a provider continuation, so a Task-origin
+        # provider continuation has no host that may execute it.
         from packages.core.services.task_runtime_approvals import (
-            TaskRuntimeApprovalError,
-            claim_task_runtime_approval_execution,
             expire_task_runtime_approval_request,
         )
 
-        try:
-            task_marker_changed = await claim_task_runtime_approval_execution(
-                db,
-                request=req,
-                task_id=task_id,
-            )
-        except TaskRuntimeApprovalError as exc:
-            changed = await expire_task_runtime_approval_request(
-                db,
-                request=req,
-                reason="runtime_approval_origin_not_executable",
-            )
-            return ProviderRuntimeApprovalExecutionPreflight(
-                result=_provider_execution_blocked_result(
-                    hitl_id=hitl_id,
-                    status="expired",
-                    reason=f"{exc}. No external action was executed.",
+        changed = await expire_task_runtime_approval_request(
+            db,
+            request=req,
+            reason="runtime_approval_origin_not_executable",
+        )
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="expired",
+                reason=(
+                    "This Task approval has no run that can execute it. "
+                    "No external action was executed."
                 ),
-                changed=changed,
-            )
-
-        # ``claim_task_runtime_approval_execution`` adds the signed durable
-        # standard-action attempt to request.context.  Continue from that
-        # refreshed mapping so provider receipt/claim writes cannot clobber it.
-        context = dict(req.context or {})
+            ),
+            changed=changed,
+        )
 
     receipt = context.get("provider_confirmation_receipt")
     receipt_matches = _provider_confirmation_receipt_matches(
@@ -3340,9 +3701,7 @@ async def prepare_provider_runtime_approval_execution(
     )
     if tool_name == confirmation_tool:
         if not receipt_matches:
-            return ProviderRuntimeApprovalExecutionPreflight(
-                changed=task_marker_changed
-            )
+            return ProviderRuntimeApprovalExecutionPreflight()
         return ProviderRuntimeApprovalExecutionPreflight(
             result=json.dumps(
                 {
@@ -3353,7 +3712,6 @@ async def prepare_provider_runtime_approval_execution(
                 },
                 ensure_ascii=False,
             ),
-            changed=task_marker_changed,
         )
 
     if not receipt_matches:
@@ -3784,6 +4142,7 @@ async def register_provider_runtime_approval(
         db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id, kind="action",
         action_key=action_key, resource_id=resource_id, capability_id=capability_id,
         risk_level="high", task_id=task_id,
+        **provider_policy_effect(provider, request.get("policy_category")),
     )
     if not current_policy.allowed and not current_policy.pause_for_hitl:
         return None
@@ -3953,6 +4312,8 @@ async def cancel_pending_runtime_approvals(
             row.status = ApprovalStatus.EXPIRED.value
             row.resolved_reason = reason
             row.decided_at = now_dt
+            from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+            await wake_run_for_closed_request(db, row)
             cancelled_ids.append(row.id)
         cancelled += 1
 
@@ -4079,7 +4440,7 @@ async def consume_runtime_approval(
     permission_decision: PermissionDecision,
     runtime_envelope=None,
     workflow_run_id: str | None = None,
-    impact: str | None = None,
+    companion_subjects: tuple[Any, ...] = (),
 ) -> str | None:
     if not conversation_id:
         return json.dumps({"error": "approval_token_requires_conversation"})
@@ -4181,6 +4542,8 @@ async def consume_runtime_approval(
             if not ctx.get("chrome_publication_binding") or current_binding != ctx["chrome_publication_binding"]:
                 req.status = ApprovalStatus.EXPIRED.value
                 req.resolved_reason = "chrome_publication_binding_changed"
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 return json.dumps({
                     "error": "approval_payload_changed",
                     "message": "The browser connection or publication attachment changed. Review and approve again.",
@@ -4225,15 +4588,29 @@ async def consume_runtime_approval(
             kind=action.kind, action_key=action.action_key, resource_id=action.resource_id,
             resource_kind=action.resource_kind, resource_ids=runtime_media_output_policy_resources(),
             risk_level=action.risk_level, capability_id=action.capability_id,
-            operation=action.operation, impact=impact, account_id=ctx.get("approval_account_id"), task_id=task_id,
+            operation=action.operation, account_id=ctx.get("approval_account_id"), task_id=task_id,
+            **action.policy_effect(), aliases=action.aliases,
+            restrict_only_keys=action.restrict_only_keys,
             workflow_run_id=workflow_run_id,
         )
+        if companion_subjects:
+            # Operations this call stands in for are rechecked like its own
+            # action: a new ask on them is a new requirement for this grant.
+            from packages.core.governance.approvals import ApprovalOrigin, with_companion_policies
+
+            current_policy = await with_companion_policies(
+                db, current_policy, companion_subjects,
+                origin=ApprovalOrigin(
+                    kind=_RUNTIME_ORIGIN_KIND, conversation_id=conversation_id,
+                    task_id=task_id, workflow_run_id=workflow_run_id,
+                ),
+            )
         if not current_policy.allowed and not current_policy.pause_for_hitl:
             return json.dumps({"error": "blocked_by_governance", "message": current_policy.reason})
 
 
         publish_consent = None
-        if tool_name == _TIKTOK_PUBLISH_TOOL:
+        if tool_name in _TIKTOK_PUBLISH_TOOLS:
             from packages.core.ai.runtime.authorization_receipts import TikTokPublishConsent
             from packages.core.services.tiktok_publish_review import (
                 _arguments_hash, apply_tiktok_publish_review,
@@ -4269,8 +4646,10 @@ async def consume_runtime_approval(
             ):
                 req.status = ApprovalStatus.EXPIRED.value
                 req.resolved_reason = "tiktok_publish_consent_missing"
+                from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+                await wake_run_for_closed_request(db, req)
                 return await _runtime_block_payload(
-                    db, conversation_id=conversation_id, entity_id=entity_id,
+                    db, companion_subjects=companion_subjects, conversation_id=conversation_id, entity_id=entity_id,
                     user_id=user_id, workspace_id=req.workspace_id,
                     tool_name=tool_name, arguments=arguments, action=action,
                     permission_decision=permission_decision,
@@ -4310,15 +4689,9 @@ async def consume_runtime_approval(
                     db, request=req, reason="payload_changed_after_approval",
                 )
                 return json.dumps({"error": "approval_payload_changed", "approval_token": hitl_id})
-            from packages.core.services.task_agent_loop_hitl import (
-                task_agent_loop_owns_request,
-                verified_request_tag,
-            )
-
-            if verified_request_tag(req) is not None or await task_agent_loop_owns_request(db, request=req):
-                # A Task agent loop continues: the changed action did not run
-                # and the loop may ask for approval of the new one. Never the
-                # TaskRunner fail path, even for a tag that no longer verifies.
+            if getattr(req, "origin_task_id", None):
+                # The Task continues: the changed action did not run and its
+                # agent loop may ask for approval of the new one.
                 from packages.core.services.task_runtime_approvals import (
                     expire_task_runtime_approval_request,
                 )
@@ -4334,29 +4707,13 @@ async def consume_runtime_approval(
                     ),
                     "approval_token": hitl_id,
                 }, ensure_ascii=False)
-            if getattr(req, "origin_task_id", None):
-                from packages.core.services.task_runtime_approvals import (
-                    fail_task_runtime_approval_origin,
-                )
-
-                await fail_task_runtime_approval_origin(
-                    db,
-                    request=req,
-                    reason="payload_changed_after_approval",
-                )
-                return json.dumps({
-                    "error": "approval_payload_changed",
-                    "message": (
-                        "The scheduled action changed after approval. The origin "
-                        "Task was stopped and no action was run."
-                    ),
-                    "approval_token": hitl_id,
-                }, ensure_ascii=False)
             req.status = ApprovalStatus.EXPIRED.value
             req.resolved_reason = "payload_changed_after_approval"
             req.decided_at = datetime.now(timezone.utc)
+            from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+            await wake_run_for_closed_request(db, req)
             return await _runtime_block_payload(
-                db,
+                db, companion_subjects=companion_subjects,
                 conversation_id=conversation_id,
                 entity_id=entity_id,
                 user_id=user_id,
@@ -4376,7 +4733,7 @@ async def consume_runtime_approval(
         # also introduces a new policy requirement.
         if not set(_consent_requirements(current_policy)).issubset(set(ctx.get("approval_requirements") or [])):
             return await _runtime_block_payload(
-                db, conversation_id=conversation_id, entity_id=entity_id, user_id=user_id,
+                db, companion_subjects=companion_subjects, conversation_id=conversation_id, entity_id=entity_id, user_id=user_id,
                 workspace_id=req.workspace_id, tool_name=tool_name, arguments=arguments,
                 action=action, permission_decision=permission_decision,
                 reason="The action has a new approval requirement. Review it before execution.",
@@ -4386,35 +4743,26 @@ async def consume_runtime_approval(
                 workflow_run_id=workflow_run_id, runtime_envelope=runtime_envelope,
             )
         if not workflow_owned and getattr(req, "origin_task_id", None) and not has_task_comment_origin(req):
-            from packages.core.services.task_runtime_approvals import (
-                TaskRuntimeApprovalError,
-                claim_task_runtime_approval_execution,
-                expire_task_runtime_approval_request,
-            )
-
             from packages.core.services.task_agent_loop_hitl import verified_request_tag
 
             # A Task agent loop's approval is spent by the re-executed call
-            # itself; it has no TaskRunner checkpoint or execution attempt.
-            claim_scheduled_task = verified_request_tag(req) is None
-            if claim_scheduled_task:
-                try:
-                    await claim_task_runtime_approval_execution(
-                        db,
-                        request=req,
-                        task_id=task_id,
-                    )
-                except TaskRuntimeApprovalError as exc:
-                    await expire_task_runtime_approval_request(
-                        db,
-                        request=req,
-                        reason="runtime_approval_origin_not_executable",
-                    )
-                    return json.dumps({
-                        "error": "approval_origin_not_executable",
-                        "message": f"{exc}. No action was run.",
-                        "approval_token": hitl_id,
-                    }, ensure_ascii=False)
+            # itself. Every Task runs on the agent loop, so a Task-origin
+            # grant without its signed park tag has no host that may spend it.
+            if verified_request_tag(req) is None:
+                from packages.core.services.task_runtime_approvals import (
+                    expire_task_runtime_approval_request,
+                )
+
+                await expire_task_runtime_approval_request(
+                    db,
+                    request=req,
+                    reason="runtime_approval_origin_not_executable",
+                )
+                return json.dumps({
+                    "error": "approval_origin_not_executable",
+                    "message": "This Task approval has no run that can execute it. No action was run.",
+                    "approval_token": hitl_id,
+                }, ensure_ascii=False)
         from packages.core.governance.approvals import claim_approval_consumption
 
         outcome = await claim_approval_consumption(db, req)
@@ -4439,7 +4787,7 @@ async def consume_runtime_approval(
             runtime_record_tiktok_publish_consent(publish_consent)
         return None
 
-    if task_id or tool_name == _TIKTOK_PUBLISH_TOOL:
+    if task_id or tool_name in _TIKTOK_PUBLISH_TOOLS:
         # Task continuations must spend the exact signed request id.  Falling
         # back to a same-payload direct-chat grant would bypass the Task
         # checkpoint/execution-attempt protocol.
@@ -4524,3 +4872,53 @@ async def consume_runtime_approval(
     # decide (tokens minted before the unified-store upgrade land here: the
     # gate re-asks with a fresh card).
     return APPROVAL_TOKEN_IGNORED
+
+
+# ── Review providers (approval_reviews.py) ──────────────────────────────
+
+
+async def _chrome_publication_review_provider(request) -> dict[str, Any]:
+    review = _chrome_publication_review(request.arguments)
+    binding = await _chrome_publication_binding(
+        request.db, entity_id=request.entity_id, user_id=request.user_id,
+        workspace_id=request.workspace_id, arguments=request.arguments,
+    )
+    return {
+        "review": {**review, "documents": binding["documents"]},
+        "chrome_publication_binding": binding,
+    }
+
+
+async def _tiktok_publish_review_provider(request) -> dict[str, Any]:
+    from packages.core.services.tiktok_publish_review import prepare_tiktok_publish_review
+
+    try:
+        return await prepare_tiktok_publish_review(
+            tool_name=request.tool_name,
+            arguments=runtime_approval_continuation(request.tool_name, request.arguments)["arguments"],
+            entity_id=request.entity_id,
+            user_id=request.user_id, conversation_id=request.conversation_id,
+            workspace_id=request.workspace_id,
+        )
+    except ValueError as exc:
+        raise RuntimeApprovalContinuationError(str(exc)) from exc
+
+
+def _register_builtin_reviews() -> None:
+    from packages.core.ai.runtime.approval_reviews import register_review_provider
+
+    register_review_provider(
+        "chrome.publication",
+        lambda tool_name, action_key: action_key == _CHROME_PUBLICATION_ACTION,
+        _chrome_publication_review_provider,
+        read_only=True,
+    )
+    register_review_provider(
+        "tiktok.publish",
+        lambda tool_name, action_key: tool_name in _TIKTOK_PUBLISH_TOOLS,
+        _tiktok_publish_review_provider,
+        one_time=True,
+    )
+
+
+_register_builtin_reviews()

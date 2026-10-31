@@ -63,7 +63,8 @@ async def runtime_workspace_answer_task_blocker_action(
                 confirm=bool(confirm) if confirm is not None else None,
                 refuse=refuse,
             )
-            plan_to_run = result.pop("_plan_to_run", None)
+            # A resumed worker job's Step is checked out again by its worker.
+            result.pop("_plan_to_run", None)
             task_to_run = result.pop("_task_to_run", None)
             await db.commit()
         except Exception:
@@ -79,15 +80,4 @@ async def runtime_workspace_answer_task_blocker_action(
             from packages.core.services.task_input_resume import dispatch_task_input_resume
 
             result["dispatched"] = dispatch_task_input_resume(*task_to_run)
-        if plan_to_run:
-            from packages.core.plans.wakeup import hint_pending_plan_cycle
-
-            # ``answer_task_blocker`` stages this wake with the blocker
-            # mutation. A broker hint is optional and can never unwind the
-            # already committed answer or park the Task again.
-            result["dispatched"] = await hint_pending_plan_cycle(
-                db,
-                plan_to_run,
-                reason="task_blocker_post_commit_hint",
-            )
     return _dumps(result)

@@ -24,7 +24,7 @@ import { matchSubAgentRuns } from "../../lib/subAgentDisplay";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
 import { parseMcpToolName } from "../../lib/toolRuntimeSurface";
 import AgentLoopStep from "./AgentLoopStep";
-import VideoCard from "./VideoCard";
+import MediaJobCard from "./MediaJobCard";
 
 const AI_EDIT_TOOL_LABELS: Record<string, string> = {
   ai_edit_read_current_file: "read current file",
@@ -100,6 +100,8 @@ interface ToolCallListProps {
   subAgentRuns?: SubAgentEvent[];
   /** Live chat turn: keep the quiet card on Processing even between tools. */
   streaming?: boolean;
+  /** Workspace chat: a finished, clean process reads "Process · N steps". */
+  stepsSummary?: boolean;
 }
 
 function parseToolResult(result?: unknown): Record<string, any> | null {
@@ -289,7 +291,14 @@ export default function ToolCallList(props: ToolCallListProps) {
   const activityLabel = summarizeToolActivity(displayTools.map((tool) => ({
     ...tool, status: isWebsiteAccessDenied(tool) ? "unavailable" : tool.status, label: displayToolName(tool),
   })));
-  const processLabel = `${activityLabel} · ${processTitle}${durationLabel ? ` · ${durationLabel}` : ""}`;
+  const processLabel = props.stepsSummary && processStatus === "success"
+    ? `${t(
+      displayTools.length === 1
+        ? "component.assistant_message_blocks.process_steps_one"
+        : "component.assistant_message_blocks.process_steps_other",
+      { count: displayTools.length },
+    )}${durationLabel ? ` · ${durationLabel}` : ""}`
+    : `${activityLabel} · ${processTitle}${durationLabel ? ` · ${durationLabel}` : ""}`;
   const toolGroups = groupConsecutiveByKey(displayTools, (tc, index) => {
     if (subAgentRunByTool.get(index)) return null;
     if (tc.status === "error" || tc.status === "unverified") return null;
@@ -636,7 +645,7 @@ function MediaPreview({ tc }: { tc: ToolCall }) {
       if (!isVideoJobResult(parsed)) return null;
     }
     return (
-      <VideoCard resultJson={parsed ? JSON.stringify(parsed) : resultText} />
+      <MediaJobCard resultJson={parsed ? JSON.stringify(parsed) : resultText} />
     );
   }
   return null;

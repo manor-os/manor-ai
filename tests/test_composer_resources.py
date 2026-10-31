@@ -43,10 +43,13 @@ def catalog(monkeypatch):
     monkeypatch.setattr(skill_service, "list_skills", AsyncMock(return_value=rows + [rows[0]]))
     monkeypatch.setattr(builtin_plugin_service, "load_user_builtin_plugin_preferences", AsyncMock(return_value={}))
 
-    async def access(_db, *, descriptor, **_kwargs):
-        return descriptor.resource_id != "forbidden"
+    async def access(_db, *, descriptors, **_kwargs):
+        return {descriptor.resource_id for descriptor in descriptors if descriptor.resource_id != "forbidden"}
 
-    monkeypatch.setattr(resource_access, "user_can_access_resource", access)
+    monkeypatch.setattr(resource_access, "readable_resource_ids", AsyncMock(side_effect=access))
+    monkeypatch.setattr(resource_access, "user_can_access_resource", AsyncMock(side_effect=AssertionError(
+        "Composer must not repeat role/grant queries for each Skill"
+    )))
     monkeypatch.setattr(composer_resources, "resource_workspace_names", AsyncMock(return_value={"studio": "Studio"}))
     return SimpleNamespace(id="user", entity_id="entity", role="member"), rows
 

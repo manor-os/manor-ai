@@ -30,4 +30,5 @@ async def handle_image(
         agent_id=agent_id,
         conversation_id=conversation_id or kwargs.get("conversation_id"),
         workspace_shared=str(kwargs.get("storage_scope") or "task").strip().lower() == "workspace",
+        workflow_context=kwargs,
     )

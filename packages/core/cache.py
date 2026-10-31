@@ -172,6 +172,34 @@ async def _get_redis():
     return redis
 
 
+#: The shared per-loop client, or None when Redis is unavailable.
+get_redis = _get_redis
+
+#: A slice when the client names no read timeout.
+_BLOCKING_SLICE_SECONDS = 4.0
+
+
+def blocking_slice_seconds(redis: Any, remaining: float) -> float:
+    """How long one blocking read (BLPOP, XREAD block) on ``redis`` may wait.
+
+    The client gives up reading after its socket timeout (redis-py 5.1+
+    defaults to 5 s), so a longer server-side block fails with "Timeout
+    reading" instead of waiting. Wait in slices that end before it, looping
+    until ``remaining`` runs out.
+    """
+
+    kwargs = getattr(getattr(redis, "connection_pool", None), "connection_kwargs", None) or {}
+    socket_timeout = kwargs.get("socket_timeout")
+    ceiling = _BLOCKING_SLICE_SECONDS
+    if isinstance(socket_timeout, (int, float)) and socket_timeout > 0:
+        # Redis expires blocking reads on its timer, so their actual duration
+        # can exceed the requested block by a tick plus scheduling/transport.
+        # Keep the usual one-second margin, or half a short client's budget.
+        margin = min(1.0, socket_timeout / 2)
+        ceiling = min(ceiling, socket_timeout - margin)
+    return max(0.0, min(remaining, ceiling))
+
+
 class Cache:
     """Redis-backed cache with JSON serialization."""
 

@@ -696,10 +696,12 @@ async def test_resumed_opening_reuses_committed_reply_without_second_architect_t
     monkeypatch: pytest.MonkeyPatch,
     initial_brief,
 ):
+    from packages.core.models.workspace_draft import WorkspaceDraft
     from packages.core.services import workspace_draft_service
 
-    draft = SimpleNamespace(
+    draft = WorkspaceDraft(
         status="active",
+        fields={},
         messages=[
             *([] if initial_brief == "begin" else [{"role": "user", "content": initial_brief}]),
             {"role": "assistant", "content": "What should it deliver?"},
@@ -731,6 +733,8 @@ async def test_resumed_opening_reuses_committed_reply_without_second_architect_t
     assert reply == "What should it deliver?"
     assert streamed == [("text_delta", {"content": "What should it deliver?"})]
     architect.assert_not_awaited()
+    # The replay drops its turn claim in the write the caller commits.
+    assert workspace_draft_service.TURN_CLAIM_FIELD not in draft.fields
 
 
 @pytest.mark.asyncio
@@ -816,6 +820,8 @@ async def test_terminal_draft_mutations_lock_and_fail_closed(
         "entity",
         "user",
         for_update=True,
+        # A message turn re-reads the row each time it locks the draft.
+        **({"populate_existing": True} if operation == "message" else {}),
     )
 
 
@@ -976,6 +982,90 @@ async def test_finalize_stream_commits_verified_not_ready_state(
     assert commits == [True]
     assert "event: error" in body
     assert "creation_preferences" in body
+
+
+@pytest.mark.asyncio
+async def test_finalize_rolls_back_resource_materialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A post-provisioning failure must not use the stale-ready commit path."""
+    from fastapi import HTTPException
+    from apps.api.routers import workspace_drafts
+    from packages.core.services.workspace_draft_service import WorkspaceDraftMaterializationError
+
+    db = AsyncMock()
+    monkeypatch.setattr(
+        workspace_drafts.draft_service,
+        "finalize_draft",
+        AsyncMock(side_effect=WorkspaceDraftMaterializationError("workflow install failed")),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await workspace_drafts.finalize(
+            "draft",
+            user=SimpleNamespace(entity_id="entity", id="creator"),
+            db=db,
+        )
+
+    assert error.value.status_code == 400
+    db.rollback.assert_awaited_once()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finalize_stream_rolls_back_resource_materialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import workspace_drafts
+    from packages.core.services.workspace_draft_service import WorkspaceDraftMaterializationError
+
+    commits: list[bool] = []
+    rollbacks: list[bool] = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def commit(self):
+            commits.append(True)
+
+        async def rollback(self):
+            rollbacks.append(True)
+
+    class FakeLease:
+        async def wrap(self, source):
+            async for chunk in source:
+                yield chunk
+
+    monkeypatch.setattr(workspace_drafts, "async_session", FakeSession)
+    monkeypatch.setattr(
+        workspace_drafts.draft_service,
+        "finalize_draft",
+        AsyncMock(side_effect=WorkspaceDraftMaterializationError("workflow install failed")),
+    )
+    monkeypatch.setattr(
+        workspace_drafts,
+        "acquire_chat_stream_lease",
+        AsyncMock(return_value=FakeLease()),
+    )
+
+    response = await workspace_drafts.finalize_stream(
+        "draft",
+        SimpleNamespace(entity_id="entity", id="creator"),
+        db=AsyncMock(),
+    )
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    body = "".join(chunks)
+
+    assert commits == []
+    assert rollbacks == [True]
+    assert "event: error" in body
+    assert "workflow install failed" in body
 
 
 @pytest.mark.asyncio

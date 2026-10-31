@@ -2,6 +2,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import type { WorkflowResultReference } from "../lib/chatStream";
 import { preserveReturnToInHistory } from "../lib/chatRouteReferences";
 import { t } from "../lib/i18n";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { workflowReferencePath } from "../lib/workflowRoutes";
 import { IconFlow } from "./icons";
 import CompactCard from "./ui/CompactCard";
@@ -20,6 +21,10 @@ export default function WorkflowResultCard({
 }) {
   const navigate = useNavigate();
   const location = useLocation();
+  // The run page is part of Flows. Without it the message above already
+  // carries the result and its files, so no card points at a closed page.
+  const flows = usePreviewFeatureAccess("flows");
+  if (!flows.enabled) return null;
   const href = workflowResultHref(result);
   const currentReturnTo = returnTo || `${location.pathname}${location.search}${location.hash}`;
   const completed = String(result.status || "completed").toLowerCase() === "completed";

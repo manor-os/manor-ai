@@ -29,7 +29,6 @@ from packages.core.models.task_coordinator import (
     TaskCoordinatorPhase,
     TaskCoordinatorRun,
 )
-from packages.core.services import feature_flags
 from packages.core.services import task_requester_identity
 from packages.core.services.task_coordinator_wakeup import (
     ensure_task_coordinator_run,
@@ -106,13 +105,7 @@ async def _task(db) -> Task:
     return task
 
 
-def _flag(monkeypatch, enabled: bool, calls: list | None = None) -> None:
-    async def is_enabled(_db, key, *, entity_id=None, user_id=None, fallback=False):
-        if calls is not None:
-            calls.append((key, entity_id, user_id))
-        return enabled
-
-    monkeypatch.setattr(feature_flags, "is_enabled", is_enabled)
+def _requester(monkeypatch) -> None:
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value="user-1"),
@@ -120,7 +113,7 @@ def _flag(monkeypatch, enabled: bool, calls: list | None = None) -> None:
 
 
 async def _agent_loop_run(db_session, monkeypatch) -> tuple[Task, TaskCoordinatorRun, CoordinatorRuntimeSelection, str, str]:
-    _flag(monkeypatch, True)
+    _requester(monkeypatch)
     task = await _task(db_session)
     selection = _selection()
     run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
@@ -153,19 +146,15 @@ def _install_host(monkeypatch, db_session, selection, *, conversation_hook=None)
     monkeypatch.setattr(worker, "create_worker_session", lambda: session_factory)
     monkeypatch.setattr(
         task_run_host, "lock_workspace_access_boundary",
-        AsyncMock(return_value=SimpleNamespace(status="active")),
+        # An active Workspace with no Blueprint setup gate.
+        AsyncMock(return_value=SimpleNamespace(status="active", operating_model={}, settings={})),
     )
     monkeypatch.setattr(worker, "lock_workspace_access_boundary", AsyncMock())
     monkeypatch.setattr(task_run_host, "workspace_allows_manual_work", lambda _workspace: True)
     monkeypatch.setattr(task_run_host, "resolve_task_execution", AsyncMock(return_value=SimpleNamespace(
         runtime_kind=TaskRuntimeKind.COORDINATED_PLAN, coordinator=selection,
     )))
-
-    async def never_reevaluate(*_args, **_kwargs):
-        raise AssertionError("the engine flag is never re-read at claim time")
-
-    monkeypatch.setattr(feature_flags, "is_enabled", never_reevaluate)
-    monkeypatch.setattr(worker, "resolve_task_execution_user_id", AsyncMock(return_value="user-1"))
+    monkeypatch.setattr(worker, "resolve_task_run_user_id", AsyncMock(return_value="user-1"))
     conversation_id = generate_ulid()
 
     async def ensure_conversation(_db, **kwargs):
@@ -285,46 +274,95 @@ def _call(call_id: str, name: str, arguments: dict) -> dict:
     return {"id": call_id, "name": name, "arguments": arguments}
 
 
-# ── (a) the flag freezes the engine at run creation ────────────────────
+# ── (a) every Task run is an agent loop that executes as a member ──────
 
 
 @pytest.mark.asyncio
-async def test_flag_decides_engine_once_when_the_run_is_created(db_session, monkeypatch):
-    calls: list = []
-    _flag(monkeypatch, True, calls)
+async def test_every_task_run_is_created_and_retried_as_an_agent_loop(db_session, monkeypatch):
     task = await _task(db_session)
     selection = _selection()
     run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
     assert run.engine == TaskCoordinatorEngine.AGENT_LOOP.value
-    assert calls == [("task_agent_loop", task.entity_id, "user-1")]
-
-    # Flipping the flag never moves an existing run, and is not even read.
-    _flag(monkeypatch, False, calls)
     again = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
     assert again.id == run.id and again.engine == TaskCoordinatorEngine.AGENT_LOOP.value
-    # A retried lifecycle reopens the same row with the same engine.
+    # A retried lifecycle reopens the same row on the agent loop.
     run.phase = TaskCoordinatorPhase.FAILED.value
     task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
     await db_session.flush()
     retried = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
+    assert retried.id == run.id
     assert retried.phase == TaskCoordinatorPhase.READY.value
     assert retried.engine == TaskCoordinatorEngine.AGENT_LOOP.value
-    assert len(calls) == 1
+    await db_session.rollback()
 
-    other = await _task(db_session)
-    dag = await ensure_task_coordinator_run(db_session, task=other, selection=_selection())
-    assert dag.engine == TaskCoordinatorEngine.PLAN_DAG.value
-    assert calls[-1] == ("task_agent_loop", other.entity_id, "user-1")
+
+async def _workspace_owner(db, task: Task, *, role: str = "owner", user_status: str = "active") -> str:
+    from packages.core.models.user import User, UserMembership
+    from packages.core.models.workspace import WorkspaceStaff
+
+    owner = User(
+        id=generate_ulid(), entity_id=task.entity_id, email=f"o-{generate_ulid()}@example.com",
+        password_hash="x", role="owner", status=user_status,
+    )
+    db.add_all([
+        owner,
+        UserMembership(user_id=owner.id, entity_id=task.entity_id, role="owner", status="active"),
+        WorkspaceStaff(workspace_id=task.workspace_id, user_id=owner.id, role=role, status="active"),
+    ])
+    await db.flush()
+    return owner.id
+
+
+@pytest.mark.asyncio
+async def test_system_task_runs_on_the_agent_loop_as_the_workspace_owner(db_session, monkeypatch):
+    """A Strategist/scheduler Task has no requester; its loop executes as the owner."""
+
+    monkeypatch.setattr(
+        task_requester_identity, "resolve_task_execution_user_id", AsyncMock(return_value=None),
+    )
+    task = await _task(db_session)
+    # A member who is not an owner, and an owner who left, never execute it.
+    await _workspace_owner(db_session, task, role="member")
+    await _workspace_owner(db_session, task, user_status="inactive")
+    owner_id = await _workspace_owner(db_session, task)
+    assert await task_requester_identity.resolve_task_run_user_id(db_session, task) == owner_id
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_system_task_outside_a_workspace_runs_as_the_account_owner(db_session, monkeypatch):
+    """A scheduled Task assigned directly to an Agent has no Workspace owner:
+    its loop executes as the account's owner, never a member or a former owner."""
+    from packages.core.models.user import User, UserMembership
+
+    monkeypatch.setattr(
+        task_requester_identity, "resolve_task_execution_user_id", AsyncMock(return_value=None),
+    )
+    task = await _task(db_session)
+    task.workspace_id = None
+    assert await task_requester_identity.resolve_task_run_user_id(db_session, task) is None
+
+    def member(role: str, status: str = "active") -> str:
+        user = User(
+            id=generate_ulid(), entity_id=task.entity_id, email=f"a-{generate_ulid()}@example.com",
+            password_hash="x", role=role, status=status,
+        )
+        db_session.add_all([user, UserMembership(user_id=user.id, entity_id=task.entity_id, role=role, status="active")])
+        return user.id
+
+    member("member")
+    member("owner", status="inactive")
+    owner_id = member("owner")
+    await db_session.flush()
+    assert await task_requester_identity.resolve_task_run_user_id(db_session, task) == owner_id
     await db_session.rollback()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requester", ["none", "unresolvable"])
-async def test_userless_task_stays_on_plan_dag_with_the_flag_on(db_session, monkeypatch, requester):
-    """Strategist/scheduler Tasks have no executing member; the loop needs one."""
+async def test_task_without_an_executing_member_has_no_one_to_run_as(db_session, monkeypatch, requester):
+    """No executable owner (or an invalid requester): the loop has no one to run as."""
 
-    calls: list = []
-    _flag(monkeypatch, True, calls)
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value=None) if requester == "none" else AsyncMock(
@@ -332,36 +370,34 @@ async def test_userless_task_stays_on_plan_dag_with_the_flag_on(db_session, monk
         ),
     )
     task = await _task(db_session)
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
-    assert run.engine == TaskCoordinatorEngine.PLAN_DAG.value
-    assert calls == [("task_agent_loop", task.entity_id, None)]
+    if requester == "unresolvable":
+        # An invalid requester is not a system Task: the owner never stands in.
+        await _workspace_owner(db_session, task)
+        with pytest.raises(task_requester_identity.TaskRequesterIdentityError):
+            await task_requester_identity.resolve_task_run_user_id(db_session, task)
+    else:
+        assert await task_requester_identity.resolve_task_run_user_id(db_session, task) is None
     await db_session.rollback()
 
 
-# ── (b) the consumer routes on the frozen engine ───────────────────────
+# ── (b) the consumer hands the wake to the agent loop worker ───────────
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [True, False])
-async def test_consumer_dispatches_by_run_engine(db_session, monkeypatch, enabled):
+async def test_consumer_dispatches_the_wake_to_the_agent_loop(db_session, monkeypatch):
     from packages.core import database
     from packages.core.tasks import runtime_tasks
 
-    _flag(monkeypatch, enabled)
     task = await _task(db_session)
     await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
     wake = await stage_task_coordinator_wake(db_session, task_id=task.id, reason="task_start")
     await db_session.commit()
     session_factory = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(database, "create_worker_session", lambda: session_factory)
-    sent: dict[str, list] = {"agent_loop": [], "plan_dag": []}
+    sent: list = []
     monkeypatch.setattr(
         runtime_tasks.run_task_agent_loop_task, "apply_async",
-        lambda **kwargs: sent["agent_loop"].append(kwargs),
-    )
-    monkeypatch.setattr(
-        runtime_tasks.run_task_coordinator_task, "apply_async",
-        lambda **kwargs: sent["plan_dag"].append(kwargs),
+        lambda **kwargs: sent.append(kwargs),
     )
 
     outcome = await runtime_tasks.consume_task_coordinator_intent_once(
@@ -370,13 +406,10 @@ async def test_consumer_dispatches_by_run_engine(db_session, monkeypatch, enable
     )
 
     assert outcome == {"status": "dispatched", "task_id": task.id}
-    expected = {"kwargs": {
+    assert sent == [{"kwargs": {
         "event_id": wake.event_id, "task_id": task.id,
         "wake_generation": wake.wake_generation, "reason": "task_start",
-    }}
-    routed, other = ("agent_loop", "plan_dag") if enabled else ("plan_dag", "agent_loop")
-    assert sent[routed] == [expected]
-    assert sent[other] == []
+    }}]
     # Same handoff protocol: the wake stays pending until the worker ACKs it.
     assert (await _event(db_session, task.id)).delivered_at is None
 
@@ -453,6 +486,8 @@ async def test_plan_work_and_complete_task_finishes_the_task(db_session, monkeyp
     assert context_kwargs["agent_subscription_id"] == selection.root.subscription_id
     assert context_kwargs["conversation_id"] == host.conversation_id
     assert "Write the launch note" in context_kwargs["active_user_message"]
+    # No Task-owned authorization: nothing extra rides the run's envelope.
+    assert context_kwargs["runtime_metadata"] is None
     loop = host.loop_calls[0]
     assert [tool["function"]["name"] for tool in loop["tools"]] == [
         "record_note", "request_input", "delegate_to_agent", "wait_until",
@@ -470,6 +505,8 @@ async def test_plan_work_and_complete_task_finishes_the_task(db_session, monkeyp
     assert loop["system_prompt"].startswith("AGENT PROMPT")
     assert "complete_task" in loop["system_prompt"]
     assert "delegate_to_agent" in loop["system_prompt"]
+    # No acquire_capabilities on this wake: a missing tool blocks, never a question.
+    assert loop["system_prompt"].endswith(worker._no_acquisition_section(can_delegate=True))
     assert set(loop["dynamic_tool_handlers"]) == {
         "wait_until", "wait_media_jobs", "update_task_plan", "complete_task",
     }
@@ -494,6 +531,56 @@ async def test_invalid_completion_is_returned_to_the_loop(db_session, monkeypatc
         event_id=event_id, task_id=task.id, wake_generation=generation,
     )
     assert outcome["status"] == "completed" and len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_declared_result_schema_is_enforced_and_becomes_the_task_result(db_session, monkeypatch):
+    """An Agent Initiative Task declares its decision as the result schema and
+    the tools its run must not use; settlement then reads the decision."""
+    from packages.core.contracts.agent_initiative import INITIATIVE_DECISION_RESULT_SCHEMA
+    from packages.core.tasks.ai_tasks import _task_terminal_result
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    task = await _fresh(db_session, Task, task.id)
+    task.details = {
+        "result_schema": INITIATIVE_DECISION_RESULT_SCHEMA,
+        "blocked_tool_names": ["notify_user"],
+    }
+    await db_session.commit()
+    host = _install_host(monkeypatch, db_session, selection)
+    decision = {"version": "1", "decision": "notify", "message": "Prices dropped.", "reason_code": "price_drop"}
+
+    def corrected(messages, tools):
+        # The host validates the full declared schema; the advertised one
+        # keeps its shape but drops conditionals some providers reject.
+        error = json.loads(messages[-1]["content"])
+        assert error["error"] == "invalid_arguments"
+        assert "result does not match" in error["message"] and "message" in error["message"]
+        complete = next(tool for tool in tools if tool["function"]["name"] == "complete_task")
+        advertised = complete["function"]["parameters"]["properties"]["result"]
+        assert advertised["required"] == ["version", "decision", "reason_code"]
+        assert "allOf" not in advertised
+        return "", [_call("done", "complete_task", {**COMPLETE_ARGS, "result": decision})]
+
+    seen = _model(monkeypatch, [
+        # A notify decision without its message does not settle: refused in the loop.
+        ("", [_call("bad", "complete_task", {
+            **COMPLETE_ARGS, "result": {"version": "1", "decision": "notify", "reason_code": "price_drop"},
+        })]),
+        corrected,
+    ])
+
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "completed", "task_id": task.id} and len(seen) == 2
+    task = await _fresh(db_session, Task, task.id)
+    assert task.actual_output["result"] == decision
+    assert task.actual_output["response"] == COMPLETE_ARGS["summary"]
+    settled = _task_terminal_result(task)
+    assert settled["initiative_decision"] == decision
+    assert host.context.await_args.kwargs["blocked_tool_names"] == ["notify_user"]
 
 
 @pytest.mark.asyncio
@@ -681,7 +768,7 @@ async def test_unresumable_approval_blocks_and_withdraws_its_card(db_session, mo
     )).scalar_one()
     assert log.content == message
     if withdrawn:
-        # Approving it later cannot reach fail_task_runtime_approval_origin.
+        # The withdrawn card cannot be approved later.
         hitl = await _fresh(db_session, HitlRequest, hitl_id)
         assert hitl.status == "expired" and hitl.resolved_reason == "agent_loop_approval_unresumable"
     assert (await _fresh(db_session, Task, task.id)).status == "blocked"
@@ -843,6 +930,59 @@ async def test_retry_continues_the_transcript_with_a_recheck_notice(db_session, 
     assert "retried_after" not in final
 
 
+@pytest.mark.asyncio
+async def test_a_manual_retry_note_reaches_only_the_run_that_retry_starts(db_session, monkeypatch):
+    from packages.core.services import task_retry_service, workspace_access, workspace_autonomy
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    monkeypatch.setattr(worker, "_NON_SUBMIT_RETRIES", 0)
+    monkeypatch.setattr(workspace_access, "lock_workspace_access_boundary", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(workspace_autonomy, "workspace_allows_manual_work", lambda _workspace: True)
+    monkeypatch.setattr(task_retry_service, "resolve_task_execution", AsyncMock(return_value=SimpleNamespace(
+        runtime_kind=TaskRuntimeKind.COORDINATED_PLAN, mode="coordinated_plan", coordinator=selection,
+    )))
+    monkeypatch.setattr(task_retry_service, "stage_task_execution_intent", AsyncMock())
+
+    async def start(event_id, generation):
+        _model(monkeypatch, [("Done, I think.", [])])
+        blocked = await worker.run_task_agent_loop_once(
+            event_id=event_id, task_id=task.id, wake_generation=generation,
+        )
+        assert blocked["code"] == "agent_loop_completion_missing"
+        return host.loop_calls[-1]["user_message"]
+
+    async def restart():
+        # What the Task execution intent consumer does with the new lifecycle.
+        fresh = await _fresh(db_session, Task, task.id)
+        reopened = await ensure_task_coordinator_run(db_session, task=fresh, selection=selection)
+        await db_session.commit()
+        return (await _event(db_session, task.id)).id, reopened.wake_generation
+
+    await start(event_id, generation)
+    blocked = await _fresh(db_session, Task, task.id)
+    await task_retry_service.prepare_task_retry(
+        db_session, task=blocked, user_id="user-1", user_label="Ana",
+        note="The client moved the launch to Friday; use the new date.",
+    )
+    await db_session.commit()
+
+    retried = await start(*await restart())
+    assert retried.startswith(
+        "Note from the person who retried this Task:\nThe client moved the launch to Friday; use the new date.\n\n"
+        "Task retried at "
+    )
+
+    # A later run of the same Task that no retry with a note started.
+    restarted = await _fresh(db_session, Task, task.id)
+    restarted.status = "in_progress"
+    restarted.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    await db_session.commit()
+    later = await start(*await restart())
+    assert later.startswith("Task retried at ")
+    assert "launch to Friday" not in later
+
+
 # ── Honest stop codes ──────────────────────────────────────────────────
 
 
@@ -895,26 +1035,6 @@ async def test_stop_reasons_block_with_honest_codes(
     if stop_reason == "error":
         assert failure["details"]["runtime_error"] == error
         assert failure["details"]["error_detail"] == {"provider": "x"}
-
-
-@pytest.mark.asyncio
-async def test_flag_evaluation_failure_falls_back_to_plan_dag(db_session, monkeypatch):
-    async def broken(db, *_args, **_kwargs):
-        from sqlalchemy import text
-
-        await db.execute(text("SELECT * FROM no_such_flag_table"))
-
-    monkeypatch.setattr(feature_flags, "is_enabled", broken)
-    monkeypatch.setattr(
-        task_requester_identity, "resolve_task_execution_user_id", AsyncMock(return_value=None),
-    )
-    task = await _task(db_session)
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=_selection())
-    # The failed lookup was confined to its savepoint; admission continues.
-    assert run.engine == TaskCoordinatorEngine.PLAN_DAG.value
-    wake = await stage_task_coordinator_wake(db_session, task_id=task.id, reason="task_start")
-    await db_session.commit()
-    assert wake is not None
 
 
 def test_empty_envelope_allowlist_is_never_widened():
@@ -1117,30 +1237,28 @@ async def test_stale_claim_aborts_without_writing(db_session, monkeypatch, when)
     assert (await _event(db_session, task.id)).delivered_at is None
 
 
-# ── (g) engines never run each other's runs ─────────────────────────────
+# ── (g) a retired Plan/Step run is never admitted by the agent loop ──
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("engine", ["plan_dag", "agent_loop"])
-async def test_each_worker_admits_only_its_engine(db_session, monkeypatch, engine):
-    from packages.core.workers import task_coordinator
-
-    _flag(monkeypatch, engine == "agent_loop")
+async def test_agent_loop_worker_never_admits_a_retired_plan_dag_run(db_session, monkeypatch):
+    _requester(monkeypatch)
     task = await _task(db_session)
     selection = _selection()
-    await ensure_task_coordinator_run(db_session, task=task, selection=selection)
+    run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
+    run.engine = TaskCoordinatorEngine.PLAN_DAG.value
     wake = await stage_task_coordinator_wake(db_session, task_id=task.id, reason="task_start")
     await db_session.commit()
     _install_host(monkeypatch, db_session, selection)
-    monkeypatch.setattr(task_coordinator, "create_worker_session", worker.create_worker_session)
-    wrong = task_coordinator if engine == "agent_loop" else worker
-    right = worker if engine == "agent_loop" else task_coordinator
 
-    claim, reason = await wrong._admit_and_claim(
+    claim, reason = await worker._admit_and_claim(
         event_id=wake.event_id, task_id=task.id, wake_generation=wake.wake_generation,
     )
     assert claim is None and reason == "engine_mismatch"
-    claim, reason = await right._admit_and_claim(
+    run = await _fresh(db_session, TaskCoordinatorRun, run.id)
+    run.engine = TaskCoordinatorEngine.AGENT_LOOP.value
+    await db_session.commit()
+    claim, reason = await worker._admit_and_claim(
         event_id=wake.event_id, task_id=task.id, wake_generation=wake.wake_generation,
     )
     assert reason == "claimed" and claim.task_id == task.id
@@ -1235,39 +1353,19 @@ def test_delegation_requires_its_canonical_action_rule():
     })
     assert delegation.effect is RuntimeToolEffect.ACTION
     assert delegation.action.action_key == "workspace.service.delegate"
-    assert evaluate_runtime_action(delegation.action).outcome == "ask"
-    rules = [{"id": "fixture-delegation", **action_rule("workspace.service.delegate")}]
-    assert evaluate_runtime_action(delegation.action, rules=rules).outcome == "allow"
-    unrelated = classify_runtime_tool("workspace_agent", {"action": "create_task"})
-    assert evaluate_runtime_action(unrelated.action, rules=rules).outcome == "ask"
-
-
-def test_engine_migration_matches_the_model():
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[1] / (
-        "packages/core/migrations/versions/20261003_02_task_coordinator_engine.py"
-    )
-    spec = importlib.util.spec_from_file_location("task_coordinator_engine_migration", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    added = {}
-    module.table_exists = lambda table: True
-    module.column_exists = lambda table, column: column in added
-    module.op = SimpleNamespace(
-        add_column=lambda table, column: added.update({column.name: column}),
-        drop_column=lambda table, column: added.pop(column),
-    )
-    module.upgrade()
-    module.upgrade()
-    column = added["engine"]
-    model = TaskCoordinatorRun.__table__.c.engine
-    assert not column.nullable and not model.nullable
-    assert column.type.length == model.type.length == 20
-    assert column.server_default.arg == model.server_default.arg == "plan_dag"
-    module.downgrade()
-    assert not added
+    # Delegation is leaf_only: no mode baseline or category rule gates it;
+    # each leaf call of the delegated agent crosses its own gate.
+    for mode in ("risk_based", "confirm_changes"):
+        assert evaluate_runtime_action(delegation.action, mode=mode).outcome == "allow"
+    category_ask = [{"id": "fixture-category", "effect": "ask",
+                     "selector": {"kind": "category", "category": "workspace"}}]
+    assert evaluate_runtime_action(delegation.action, rules=category_ask).outcome == "allow"
+    # Only the canonical action rule the user wrote governs it.
+    for effect in ("ask", "deny"):
+        rules = [{"id": "fixture-delegation", **action_rule("workspace.service.delegate", effect=effect)}]
+        assert evaluate_runtime_action(delegation.action, rules=rules).outcome == effect
+        unrelated = classify_runtime_tool("workspace_agent", {"action": "create_task"})
+        assert evaluate_runtime_action(unrelated.action, rules=rules).outcome == "allow"
 
 
 # ── Real harness and authorization (only the model round is faked) ─────
@@ -1362,7 +1460,7 @@ async def test_real_harness_delegates_and_completes(client, db_session, monkeypa
         db_session, workspace_id=env.workspace.id, entity_id=env.entity_id,
         actor_id=env.user_id, user_rules=[action_rule("workspace.service.delegate")],
     )
-    _flag(monkeypatch, True)
+    _requester(monkeypatch)
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value=env.user_id),
@@ -1422,7 +1520,7 @@ async def test_real_harness_task_created_in_the_loop_is_linked_and_listed(client
         db_session, workspace_id=env.workspace.id, entity_id=env.entity_id,
         actor_id=env.user_id, user_rules=[action_rule("workspace.task.create")],
     )
-    _flag(monkeypatch, True)
+    _requester(monkeypatch)
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value=env.user_id),
@@ -1972,7 +2070,7 @@ def workspace_files(monkeypatch, tmp_path):
         )
         db.add(document)
         await db.commit()
-        monkeypatch.setattr(worker, "resolve_task_execution_user_id", AsyncMock(return_value=user_id))
+        monkeypatch.setattr(worker, "resolve_task_run_user_id", AsyncMock(return_value=user_id))
         return SimpleNamespace(user_id=user_id, document_id=document.id, fs_path=name)
 
     return create
@@ -2025,25 +2123,122 @@ async def test_missing_acceptance_criterion_is_refused_then_completes(db_session
 
 
 @pytest.mark.asyncio
-async def test_unmet_criterion_cannot_be_reported_completed(db_session, monkeypatch):
+async def test_delivery_with_an_unmet_criterion_completes_with_its_exceptions_shown(
+    db_session, monkeypatch, workspace_files,
+):
+    """Delivered work whose self-check fell short is a delivery, not a block."""
+
+    from packages.core.models.task_run_journal import TaskRunJournal
+    from packages.core.services.task_event_notifications import task_event_message
+    from packages.core.tasks.ai_tasks import _task_terminal_result
+
     task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
-    _install_host(monkeypatch, db_session, selection)
+    host = _install_host(monkeypatch, db_session, selection)
+    file = await workspace_files(db_session, task, "Reports/launch-note.md")
+    _read_tool(host)
+
+    async def generate_file(args):
+        return json.dumps({"document": {"document_id": file.document_id, "fs_path": file.fs_path}})
+
+    host.extra_tools["generate_file"] = generate_file
+    spies = _terminal_spies(monkeypatch, host)
+    unmet = {
+        "criterion": "The note is under 50 words.",
+        "met": False,
+        "evidence": "Could not verify: no word count tool; the draft looks close to the limit.",
+    }
+    seen = _model(monkeypatch, [
+        ("", [_call("plan", "update_task_plan", TWO_CRITERIA_PLAN)]),
+        ("", [_call("gen", "generate_file", {"kind": "md"})]),
+        ("", [_call("read", "read_file", {"path": file.fs_path})]),
+        ("", [_call("done", "complete_task", _completion(
+            deliverables=[{"title": "Launch note", "reference": file.fs_path}],
+            acceptance=[_accept("The note names the launch date."), unmet],
+        ))]),
+        lambda messages, _tools: pytest.fail(_tool_error(messages)["message"]),
+    ])
+
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "completed", "task_id": task.id} and len(seen) == 4
+    task = await _fresh(db_session, Task, task.id)
+    assert task.status == "completed"
+    output = task.actual_output
+    # The acceptance report is kept as reported: the unmet criterion is not met.
+    assert output["acceptance"][1] == unmet and output["result"]["acceptance"][1] == unmet
+    assert output["acceptance_exceptions"] == [
+        {"criterion": unmet["criterion"], "evidence": unmet["evidence"]},
+    ]
+    assert output["outcome"]["outcome"] == "completed"
+    assert [f["document_id"] for f in output["files"]] == [file.document_id]
+    comment = (await db_session.execute(select(TaskLog).where(
+        TaskLog.task_id == task.id, TaskLog.log_type == "comment",
+    ))).scalar_one()
+    # The heading never claims full acceptance; the exception is listed.
+    assert comment.content.startswith(
+        "## Delivered — not every acceptance check passed\n\nRecorded the launch note."
+    )
+    assert (
+        "### Acceptance criteria not met or not verified\n"
+        f"- The note is under 50 words. — {unmet['evidence']}"
+    ) in comment.content
+    assert "names the launch date" not in comment.content.split("### Acceptance criteria", 1)[1]
+    terminal = (await db_session.execute(select(TaskLog).where(
+        TaskLog.task_id == task.id, TaskLog.log_type == "ai_execution_completed",
+    ))).scalar_one()
+    assert terminal.meta["acceptance_exceptions"] == output["acceptance_exceptions"]
+    # Notification: a delivery with exceptions, not "completed successfully".
+    [(event, committed_status)] = spies.events
+    assert event["event_type"] == "task.succeeded" and committed_status == "completed"
+    assert event["payload"]["acceptance_exceptions"] == 1
+    message = task_event_message(event["event_type"], event["payload"], task)
+    assert "successfully" not in message and "1 acceptance criterion was not met" in message
+    journal = (await db_session.execute(select(TaskRunJournal).where(
+        TaskRunJournal.run_id == run.id, TaskRunJournal.kind == "terminal",
+    ))).scalar_one()
+    assert journal.payload["status"] == "completed" and journal.payload["acceptance_exceptions"] == 1
+    # A scheduled occurrence settles completed and still carries the exceptions.
+    settled = _task_terminal_result(task)
+    assert settled["status"] == "completed"
+    assert settled["acceptance_exceptions"] == output["acceptance_exceptions"]
+
+
+@pytest.mark.asyncio
+async def test_nothing_delivered_is_not_a_delivery_and_blocks_on_what_is_needed(db_session, monkeypatch):
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    spies = _terminal_spies(monkeypatch, host)
+    reason = "The user must provide the launch date; it is in no file this Task can read."
+    unmet = [_accept("The note names the launch date.", met=False)]
 
     def refused(messages, _tools):
         error = _tool_error(messages)
-        assert "is met=false, but outcome=completed needs every criterion met" in error["message"]
-        return "", [_call("done", "complete_task", _completion())]
+        assert error["error"] == "completion_check_failed"
+        assert "nothing verified was delivered" in error["message"]
+        assert "names what is needed" in error["message"]
+        return "", [_call("blocked", "complete_task", _completion(
+            outcome="blocked", acceptance=unmet, blocked_reason=reason,
+            summary="No note was written: the launch date is unknown.",
+        ))]
 
     seen = _model(monkeypatch, [
-        ("", [_call("early", "complete_task", _completion(
-            acceptance=[_accept("The note names the launch date.", met=False)],
-        ))]),
+        ("", [_call("early", "complete_task", _completion(acceptance=unmet))]),
         refused,
     ])
     outcome = await worker.run_task_agent_loop_once(
         event_id=event_id, task_id=task.id, wake_generation=generation,
     )
-    assert outcome["status"] == "completed" and len(seen) == 2
+
+    assert outcome == {"status": "blocked", "task_id": task.id, "code": "agent_loop_reported_blocked"}
+    assert len(seen) == 2
+    task = await _fresh(db_session, Task, task.id)
+    assert task.status == "blocked"
+    assert "acceptance_exceptions" not in task.actual_output
+    [(event, _status)] = spies.events
+    assert event["event_type"] == "task.failed" and event["payload"]["issue"] == reason
+    assert "acceptance_exceptions" not in event["payload"]
 
 
 @pytest.mark.asyncio
@@ -2179,6 +2374,9 @@ async def test_unconfirmed_effect_is_refused_once_then_blocked_is_accepted(db_se
         error = _tool_error(messages)
         assert error["error"] == "unconfirmed_effects"
         assert "publish_post" in error["message"]
+        # Nothing verified was delivered: a completed claim would block for review.
+        assert "blocked for review" in error["message"]
+        assert "unconfirmed exceptions" not in error["message"]
         assert error["details"]["unconfirmed_calls"] == [
             {"call_id": "pub", "tool": "publish_post", "operation": "publish_post"},
         ]
@@ -2238,6 +2436,9 @@ async def test_insisting_on_completed_over_an_unconfirmed_effect_is_non_success(
     message = failure["message"]
     assert "Recorded the launch note." in message
     assert "publish_post" in message
+    # The block names what is needed to move on.
+    assert "Needed: confirm whether those calls took effect" in message
+    assert "unconfirmed_effects" not in task.actual_output
     # One list, in the message and the details alike.
     claimed = ["The note names the launch date.", "The note is under 50 words."]
     assert failure["details"]["criteria_claimed_not_confirmed"] == claimed
@@ -2566,6 +2767,223 @@ async def test_unconfirmed_ledger_and_refusal_survive_a_restage(db_session, monk
     assert refusals == ["unconfirmed_effects"] and len(seen) == 4
 
 
+@pytest.mark.asyncio
+async def test_a_skill_that_committed_the_deliverable_completes_despite_its_own_partial_verdict(
+    db_session, monkeypatch, workspace_files,
+):
+    """A Skill run that rendered the file but reported a partial verdict (its
+    reply status is "failed") is confirmed by its child ledger: the Task
+    completes instead of ending completed_non_success."""
+    from packages.core.ai.runtime.skills import runtime_format_invoke_skill_result
+    from packages.core.ai.runtime.tool_evidence import RuntimeToolEvidence
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    _read_tool(host)
+    video = await workspace_files(db_session, task, "Videos/final.md", "# Final cut\n")
+
+    async def invoke_skill(args):
+        child = RuntimeToolEvidence()
+        child.observe_tool_result("generate_file", "c-render", json.dumps({"document": {
+            "document_id": video.document_id, "fs_path": video.fs_path, "name": "final.md",
+        }}), {"kind": "md"})
+        return runtime_format_invoke_skill_result(args["skill"], {
+            "content": json.dumps({"status": "PARTIAL", "notes": "word sync not measurable"}),
+            "stop_reason": "completed", "tool_evidence": child.checkpoint_state(),
+        })
+
+    host.extra_tools["invoke_skill"] = invoke_skill
+    deliverable = {"title": "Final cut", "reference": video.fs_path}
+    seen = _model(monkeypatch, [
+        ("", [_call("skill", "invoke_skill", {"skill": "video-studio", "input": "Make the explainer."})]),
+        ("", [_call("read", "read_file", {"path": video.fs_path})]),
+        ("", [_call("done", "complete_task", _completion(deliverables=[deliverable]))]),
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome == {"status": "completed", "task_id": task.id}
+    assert len(seen) == 3  # never refused over the Skill call
+    evidence = (await _fresh(db_session, TaskCoordinatorRun, run.id)).checkpoint["tool_evidence"]
+    assert evidence["effect_state"] == "confirmed" and evidence["unconfirmed_calls"] == []
+    output = (await _fresh(db_session, Task, task.id)).actual_output
+    assert output["outcome"]["outcome"] == "completed"
+    assert [f["document_id"] for f in output["files"]] == [video.document_id]
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_write_re_read_with_the_reported_hash_completes(
+    db_session, monkeypatch, workspace_files,
+):
+    """The refusal names what to re-read; a host read of those bytes confirms
+    the call, so the next completed claim is a success."""
+    import hashlib
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    text = "# Plan\n"
+    plan = await workspace_files(db_session, task, "Reports/plan.md", text)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+
+    async def generate_file(args):
+        # Registered the document, then a later step failed: unconfirmed.
+        return json.dumps({"error": "thumbnail step failed", "document": {
+            "document_id": plan.document_id, "fs_path": plan.fs_path, "name": "plan.md", "source_sha256": digest,
+        }})
+
+    # The first read still sees other bytes (a stale copy); the second the reported ones.
+    measured = iter(["0" * 64, digest])
+
+    async def read_file(args):
+        # As the host read tool reports it: the bytes it hashed.
+        return json.dumps({
+            "path": plan.fs_path, "resolved_path": plan.fs_path, "document_id": plan.document_id,
+            "size": len(text), "source_sha256": next(measured), "content": text,
+        })
+
+    host.extra_tools.update(generate_file=generate_file, read_file=read_file)
+    deliverable = {"title": "Plan", "reference": plan.fs_path}
+
+    def refused(messages, _tools):
+        error = _tool_error(messages)
+        assert error["error"] == "unconfirmed_effects"
+        assert "read_file" in error["message"]
+        assert error["details"]["unconfirmed_calls"] == [{
+            "call_id": "gen", "tool": "generate_file", "operation": "generate_file",
+            "verify": [{"document_id": plan.document_id, "fs_path": plan.fs_path}],
+        }]
+        return "", [_call("reread", "read_file", {"document_id": plan.document_id})]
+
+    seen = _model(monkeypatch, [
+        ("", [_call("gen", "generate_file", {"kind": "md", "content": text})]),
+        ("", [_call("read", "read_file", {"document_id": plan.document_id})]),
+        ("", [_call("early", "complete_task", _completion(deliverables=[deliverable]))]),
+        refused,
+        ("", [_call("done", "complete_task", _completion(deliverables=[deliverable]))]),
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome == {"status": "completed", "task_id": task.id}
+    assert len(seen) == 5
+    evidence = (await _fresh(db_session, TaskCoordinatorRun, run.id)).checkpoint["tool_evidence"]
+    assert evidence["effect_state"] == "confirmed" and evidence["unconfirmed_calls"] == []
+    assert [(c["call_id"], c["reconciled_by"]) for c in evidence["reconciled_calls"]] == [("gen", "reread")]
+
+
+@pytest.mark.asyncio
+async def test_a_verified_delivery_completes_with_its_unconfirmed_calls_as_exceptions(
+    db_session, monkeypatch, workspace_files,
+):
+    """W1a, "delivered + exceptions": a still-unconfirmed call no longer blocks
+    a delivery the host verified; it is listed, never marked confirmed."""
+    from packages.core.models.task_run_journal import TaskRunJournal
+    from packages.core.services.task_event_notifications import task_event_message
+    from packages.core.tasks.ai_tasks import _task_terminal_result
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    file = await workspace_files(db_session, task, "Reports/launch-note.md")
+    _read_tool(host)
+
+    async def generate_file(args):
+        if args.get("name") == "draft":
+            # Registered a draft, then failed: it may have changed the draft.
+            return json.dumps({"error": "thumbnail step failed", "document": {
+                "document_id": "doc-draft", "fs_path": "Reports/draft.md", "source_sha256": "ab" * 32,
+            }})
+        return json.dumps({"document": {"document_id": file.document_id, "fs_path": file.fs_path}})
+
+    host.extra_tools["generate_file"] = generate_file
+    spies = _terminal_spies(monkeypatch, host)
+    deliverable = {"title": "Launch note", "reference": file.fs_path}
+
+    def refused(messages, _tools):
+        error = _tool_error(messages)
+        assert error["error"] == "unconfirmed_effects"
+        assert "listed on the Task as unconfirmed exceptions" in error["message"]
+        assert "blocked for review" not in error["message"]
+        return "", [_call("done", "complete_task", _completion(deliverables=[deliverable]))]
+
+    seen = _model(monkeypatch, [
+        ("", [_call("gen", "generate_file", {"kind": "md"})]),
+        ("", [_call("draft", "generate_file", {"kind": "md", "name": "draft"})]),
+        ("", [_call("read", "read_file", {"path": file.fs_path})]),
+        ("", [_call("early", "complete_task", _completion(deliverables=[deliverable]))]),
+        refused,
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "completed", "task_id": task.id} and len(seen) == 5
+    task = await _fresh(db_session, Task, task.id)
+    assert task.status == "completed"
+    output = task.actual_output
+    assert output["outcome"] == {
+        "kind": "outcome", "outcome": "completed", "effect_state": "unconfirmed",
+        "retryable": False, "do_not_replay": True, "downgraded_success": False,
+    }
+    assert output["unconfirmed_effects"] == [{"tool": "generate_file", "targets": ["Reports/draft.md"]}]
+    assert [f["document_id"] for f in output["files"]] == [file.document_id]
+    comment = (await db_session.execute(select(TaskLog).where(
+        TaskLog.task_id == task.id, TaskLog.log_type == "comment",
+    ))).scalar_one()
+    assert comment.content.startswith("## Delivered — some changes could not be confirmed\n\n")
+    assert (
+        "### Changes that could not be confirmed\n"
+        "- generate_file may have changed Reports/draft.md; this could not be confirmed"
+    ) in comment.content
+    [(event, committed_status)] = spies.events
+    assert event["event_type"] == "task.succeeded" and committed_status == "completed"
+    assert event["payload"]["unconfirmed_effects"] == 1
+    message = task_event_message(event["event_type"], event["payload"], task)
+    assert "successfully" not in message and "1 change could not be confirmed" in message
+    journal = (await db_session.execute(select(TaskRunJournal).where(
+        TaskRunJournal.run_id == run.id, TaskRunJournal.kind == "terminal",
+    ))).scalar_one()
+    assert journal.payload["status"] == "completed" and journal.payload["unconfirmed_effects"] == 1
+    assert _task_terminal_result(task)["unconfirmed_effects"] == output["unconfirmed_effects"]
+
+
+@pytest.mark.asyncio
+async def test_failed_commands_the_bash_handler_proves_changed_nothing_never_block_completion(
+    db_session, monkeypatch, tmp_path,
+):
+    """The music-video case: discovery commands refused by policy, or failing
+    without changing anything in Manor, are no effect by the handler's own proof."""
+    from packages.core.ai.tools import bash_tool
+    from tests.bash_sandbox_fakes import install
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    install(monkeypatch, tmp_path)
+
+    async def bash(args):
+        return await bash_tool._bash(task.entity_id, **args)
+
+    host.extra_tools["bash"] = bash
+    seen = _model(monkeypatch, [
+        ("", [_call("plan", "update_task_plan", PLAN_ARGS)]),
+        ("", [_call("b1", "bash", {"command": "sudo ls"})]),
+        ("", [_call("b2", "bash", {"command": "python3 -c 'import numpy_is_not_installed'"})]),
+        ("", [_call("b3", "bash", {"command": "python3 -c \"import wave; wave.open('s01.wav')\""})]),
+        ("", [_call("note", "record_note", {"text": "Launch on 2026-10-10"})]),
+        ("", [_call("done", "complete_task", COMPLETE_ARGS)]),
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome == {"status": "completed", "task_id": task.id}
+    assert len(seen) == 6  # never refused over the failed commands
+    evidence = (await _fresh(db_session, TaskCoordinatorRun, run.id)).checkpoint["tool_evidence"]
+    assert evidence["unconfirmed_calls"] == []
+    assert {o["call_id"]: o["effect_state"] for o in evidence["observations"] if o["tool"] == "bash"} == {
+        "b1": "none", "b2": "none", "b3": "none",
+    }
+    assert (await _fresh(db_session, Task, task.id)).actual_output["outcome"]["outcome"] == "completed"
+
+
 # ── Phase A2: the plan-free terminal writer ────────────────────────────
 
 
@@ -2573,8 +2991,7 @@ def _terminal_spies(monkeypatch, host):
     """Capture the post-commit task event and the in-transaction side effects."""
 
     from packages.core.ledger import adapters
-    from packages.core.plans.executor import PlanExecutor
-    from packages.core.services import workspace_operation_service
+    from packages.core.services import task_terminal_events, workspace_operation_service
 
     spies = SimpleNamespace(events=[], artifacts=[], batches=[])
 
@@ -2595,7 +3012,7 @@ def _terminal_spies(monkeypatch, host):
     async def check_work_batch_completion(db, task, *, trigger_source):
         spies.batches.append((task.id, task.status, trigger_source))
 
-    monkeypatch.setattr(PlanExecutor, "_emit_task_event", staticmethod(emit))
+    monkeypatch.setattr(task_terminal_events, "emit_task_event", emit)
     monkeypatch.setattr(adapters, "record_task_artifacts", record_task_artifacts)
     monkeypatch.setattr(
         workspace_operation_service, "check_work_batch_completion", check_work_batch_completion,
@@ -2614,6 +3031,10 @@ async def test_completed_task_writes_every_terminal_side_effect(db_session, monk
     row.details = {"scheduled_run_id": scheduled_run_id}
     await db_session.commit()
     host = _install_host(monkeypatch, db_session, selection)
+    from packages.core.workspace_chat import notifiers
+
+    announce = AsyncMock()
+    monkeypatch.setattr(notifiers, "notify_task_completed", announce)
     file = await workspace_files(db_session, task, "Reports/launch-note.md")
     brief = await workspace_files(db_session, task, "Briefs/launch-brief.md", "The brief.\n")
     _read_tool(host)
@@ -2677,6 +3098,46 @@ async def test_completed_task_writes_every_terminal_side_effect(db_session, monk
     assert evidence.status == "succeeded"
     assert evidence.trace_id is None, "no Plan is faked"
     assert evidence.metrics["artifact_count"] == 2
+    # The schedule's occurrence reports this result, not the Task.
+    announce.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_workspace_task_announces_its_result_in_the_chat(db_session, monkeypatch, workspace_files):
+    from packages.core.workspace_chat import notifiers
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    announce = AsyncMock()
+    monkeypatch.setattr(notifiers, "notify_task_completed", announce)
+    file = await workspace_files(db_session, task, "Reports/launch-note.md")
+    _read_tool(host)
+
+    async def generate_file(args):
+        return json.dumps({"document": {"document_id": file.document_id, "fs_path": file.fs_path}})
+
+    host.extra_tools["generate_file"] = generate_file
+    _model(monkeypatch, [
+        ("", [_call("gen", "generate_file", {"kind": "md"})]),
+        ("", [_call("read", "read_file", {"path": file.fs_path})]),
+        ("", [_call("done", "complete_task", _completion(deliverables=[
+            {"title": "Launch note", "reference": file.fs_path},
+        ]))]),
+    ])
+
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "completed", "task_id": task.id}
+    task = await _fresh(db_session, Task, task.id)
+    announce.assert_awaited_once()
+    kwargs = announce.await_args.kwargs
+    assert kwargs["workspace_id"] == task.workspace_id and kwargs["task_id"] == task.id
+    assert kwargs["task_title"] == "Write the launch note"
+    assert kwargs["summary"] == "Recorded the launch note."
+    assert kwargs["files"] == task.actual_output["files"]
+    assert kwargs["subscription_id"] == run.root_subscription_id
 
 
 @pytest.mark.asyncio
@@ -3571,13 +4032,16 @@ def test_wait_until_target_is_clamped_and_absolute(arguments, expected):
     assert error is None and target - now == expected
 
 
-def test_wait_until_is_read_only_and_task_loop_only():
+def test_wait_until_is_loop_control_and_task_loop_only():
     from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.human_gate import runtime_tool_requires_serial_execution
     from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
     from packages.core.ai.runtime.tool_registry import runtime_tool_schema
     from packages.core.ai.tool_pool import ToolPool
 
-    assert classify_runtime_tool("wait_until", {"seconds": 60}).effect is RuntimeToolEffect.READ_ONLY
+    # Loop control: it never crosses the consent gate, and it still batches.
+    assert classify_runtime_tool("wait_until", {"seconds": 60}).effect is RuntimeToolEffect.CONTROL
+    assert runtime_tool_requires_serial_execution("wait_until", {"seconds": 60}) is False
     pool = ToolPool()
     pool.initialize()
     # Chat never sees it: it is not a registered tool, only this loop's handler.
@@ -3589,7 +4053,7 @@ def test_wait_until_is_read_only_and_task_loop_only():
 @pytest.mark.parametrize("root", ["editor", "manor"])
 async def test_real_harness_authorizes_and_parks_wait_until(client, db_session, monkeypatch, root):
     env = await _real_workspace(client, db_session, f"agent_loop_wait_{root}")
-    _flag(monkeypatch, True)
+    _requester(monkeypatch)
     monkeypatch.setattr(
         task_requester_identity, "resolve_task_execution_user_id",
         AsyncMock(return_value=env.user_id),
@@ -3613,7 +4077,7 @@ async def test_real_harness_authorizes_and_parks_wait_until(client, db_session, 
 
     assert outcome["status"] == "waiting_timer", outcome
     assert len(seen) == 1
-    assert ("wait_until", "workspace_member", "read", True) in authorizations
+    assert ("wait_until", "workspace_member", "control", True) in authorizations
     row = await _fresh(db_session, TaskCoordinatorRun, run.id)
     assert row.phase == TaskCoordinatorPhase.WAITING_TIMER.value
     assert row.checkpoint["task_loop_wait"]["tool_call_id"] == "wait"
@@ -3678,7 +4142,7 @@ def _media_result(messages):
 async def test_pending_video_parks_on_its_job_and_the_job_wakes_the_task(db_session, monkeypatch):
     task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
     job = await _video_job(db_session, task)
-    host = _media_host(monkeypatch, db_session, selection, job.id)
+    _media_host(monkeypatch, db_session, selection, job.id)
 
     def after_job(messages, _tools):
         result = _media_result(messages)
@@ -3866,38 +4330,6 @@ def test_chat_keeps_the_registered_wait_media_jobs():
     assert handler is media_tools._wait_media_jobs_handler
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("finished", ["succeeded", "failed"])
-async def test_suno_job_terminal_paths_wake_the_parked_task(db_session, monkeypatch, finished):
-    from packages.core import database
-    from packages.core.models.media_job import MediaJob
-    from packages.core.tasks import media_tasks
-
-    task, run, selection, _event_id, _generation = await _agent_loop_run(db_session, monkeypatch)
-    host = _install_host(monkeypatch, db_session, selection)
-    monkeypatch.setattr(database, "async_session", host.session_factory)
-    monkeypatch.setattr(media_tasks, "_project_group_media_if_ready", AsyncMock())
-    job = MediaJob(
-        id=generate_ulid(), entity_id=task.entity_id, kind="audio", status="processing",
-        prompt="theme", byok=True, params={"task_id": task.id, "provider": "suno"},
-    )
-    db_session.add(job)
-    row = await _fresh(db_session, TaskCoordinatorRun, run.id)
-    row.phase = TaskCoordinatorPhase.WAITING_JOB.value
-    row.checkpoint = {"task_loop_wait": {"version": 1, "kind": "waiting_job", "job_ids": [job.id]}}
-    await db_session.commit()
-
-    if finished == "succeeded":
-        await media_tasks._finalize_suno_audio_success(job.id, {"result_url": "https://cdn.test/a.mp3"})
-    else:
-        await media_tasks._finalize_suno_audio_failure(job.id, "provider failed", release_reservation=False)
-
-    assert (await _event(db_session, task.id)).payload["reason"] == "media_jobs_settled"
-    assert (await _fresh(db_session, MediaJob, job.id)).status == (
-        "completed" if finished == "succeeded" else "failed"
-    )
-
-
 async def _lose_wake(db_session, task_id):
     event = await _event(db_session, task_id)
     event.delivered_at = datetime.now(timezone.utc)
@@ -4047,21 +4479,6 @@ async def test_pause_and_resume_of_a_running_loop_keeps_its_transcript(db_sessio
     assert _resumed(resumed)["initial_messages"] == [m for m in running["messages"] if m["role"] != "system"]
     assert resumed["user_message"].startswith("Task resumed at ")
     assert "re-check external state before continuing" in resumed["user_message"]
-
-
-@pytest.mark.asyncio
-async def test_plan_dag_runs_are_not_rebound_while_running(db_session, monkeypatch):
-    _flag(monkeypatch, False)
-    task = await _task(db_session)
-    selection = _selection()
-    run = await ensure_task_coordinator_run(db_session, task=task, selection=selection)
-    run.phase = TaskCoordinatorPhase.RUNNING.value
-    await db_session.commit()
-    task.status = "in_progress"
-    task.status_changed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
-    with pytest.raises(ValueError, match="not stopped for retry"):
-        await ensure_task_coordinator_run(db_session, task=task, selection=selection)
-    await db_session.rollback()
 
 
 @pytest.mark.asyncio

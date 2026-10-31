@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -52,6 +53,7 @@ from packages.core.integrations.registry import (
 )
 from packages.core.database_runtime import release_read_transaction
 from packages.core.services import smtp_transport
+from packages.core.services.account_incidents import apply_health_result
 
 # Convenience: every Meta Graph URL in this module pulls its version
 # from the central pin so a bump in external_api_versions.py
@@ -197,6 +199,23 @@ def is_credential_rejection(detail: str | None) -> bool:
     return any(marker in text for marker in _CREDENTIAL_REJECTION_MARKERS)
 
 
+# classify_nango_health codes that mean the account itself must be reconnected
+# (or re-granted), as opposed to an unreachable provider or deployment setup.
+_CREDENTIAL_REASON_CODES = frozenset({"credentials_rejected", "permission_denied"})
+
+
+def is_credential_failure(result: dict) -> bool:
+    """True when a failed health check needs the account reconnected.
+
+    Only these open an account incident; a transient failure never does.
+    """
+    return (
+        bool(result.get("needs_reconnect"))
+        or is_credential_rejection(result.get("detail"))
+        or result.get("reason_code") in _CREDENTIAL_REASON_CODES
+    )
+
+
 def classify_nango_health(
     *,
     ok: bool | None = None,
@@ -306,7 +325,7 @@ async def test_email_login(creds: dict) -> HealthResult:
                 if not use_ssl_smtp:
                     s.ehlo()
                     if use_tls_smtp:
-                        s.starttls()
+                        s.starttls(context=ssl.create_default_context())
                         s.ehlo()
                 s.login(username, password)
 
@@ -1033,28 +1052,6 @@ async def test_elevenlabs(creds: dict) -> HealthResult:
     return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
 
-async def test_suno(creds: dict) -> HealthResult:
-    """Validate Suno auth with a read-only account-usage request."""
-    t0 = time.monotonic()
-    raw_api_key = creds.get("api_key", "")
-    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
-    if not api_key:
-        return _fail("No Suno API key on record.", t0)
-    try:
-        resp = await _http_get(
-            "https://api.suno.com/v0/account/usage",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        )
-    except Exception as exc:
-        return _fail(f"Network error: {exc}", t0)
-    if resp.status_code == 200:
-        return _ok("Suno key valid", t0)
-    if resp.status_code in (401, 403):
-        return _fail(f"{resp.status_code} — key rejected.", t0)
-    return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
-
-
 async def test_tavily(creds: dict) -> HealthResult:
     """Validate Tavily credentials without consuming search credits."""
     t0 = time.monotonic()
@@ -1204,7 +1201,6 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "webhook":          test_webhook,
     "replicate":        test_replicate,
     "elevenlabs":       test_elevenlabs,
-    "suno":             test_suno,
     "tavily":           test_tavily,
     "apify":            test_apify,
     "jimeng":           test_jimeng,
@@ -1790,6 +1786,10 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
             whatsapp["subscription_error"] = str(result.get("detail") or "")
         cfg["whatsapp"] = whatsapp
     cfg["last_health_check"] = result
+    cfg = apply_health_result(
+        cfg, result, now=datetime.now(timezone.utc),
+        credential_failure=is_credential_failure(result),
+    )
     row.config = cfg
     await db.flush()
     return result
@@ -1931,6 +1931,20 @@ async def _wiring_ctx_for_integration(db, integration_row) -> dict | None:
     return context
 
 
+def _persist_oauth_health(row, result: HealthResult, *, credential_failure: bool | None = None) -> None:
+    """Record an OAuthAccount's check and open or close its incident from it.
+
+    ``credential_failure`` overrides the classification when the caller knows
+    more than the result text (an identity rejected with 401/403).
+    """
+    if credential_failure is None:
+        credential_failure = is_credential_failure(result)
+    row.profile = apply_health_result(
+        {**(row.profile or {}), "last_health_check": result}, result,
+        now=datetime.now(timezone.utc), credential_failure=credential_failure,
+    )
+
+
 async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     """Run the health check for an ``OAuthAccount`` row and stash into
     its ``profile.last_health_check``."""
@@ -1969,7 +1983,7 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
             db, user_id=row.user_id, entity_id=manor_oauth_binding(row).get("entity_id", ""),
         ):
             result = {"ok": False, "detail": "This OAuth connection is unavailable in its current owner/Entity/deployment; reconnect.", "latency_ms": 0.0, "checked_at": _now_iso(), "needs_reconnect": True}
-            row.profile = {**(row.profile or {}), "last_health_check": result}
+            _persist_oauth_health(row, result)
             await db.flush()
             return result
 
@@ -1980,7 +1994,7 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
         if not await lark_oauth_account_matches(db, row):
             result = _fail("Lark app configuration changed; reconnect this account.", time.monotonic())
             result["reason_code"] = "credentials_rejected"
-            row.profile = {**(row.profile or {}), "last_health_check": result}
+            _persist_oauth_health(row, result)
             await db.flush()
             return {**result, "needs_reconnect": True}
     released = await release_read_transaction(db)
@@ -2026,14 +2040,16 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
         from packages.core.services.oauth_flow import OAuthFlowError
 
         t0 = time.monotonic()
+        identity_rejected = False
         try:
             await verify_manor_oauth_account(row, str((creds or {}).get("access_token") or ""))
             result = _ok("OAuth account identity and Entity verified.", t0)
         except OAuthFlowError as exc:
             result = _fail(exc.message, t0)
             if exc.status in {401, 403}:
+                identity_rejected = True
                 row.profile = {**(row.profile or {}), "oauth_refresh": {"reauth_required": True, "error": "identity_rejected"}}
-        row.profile = {**(row.profile or {}), "last_health_check": result}
+        _persist_oauth_health(row, result, credential_failure=identity_rejected or None)
         await db.flush()
         return result
     if provider_key == "quickbooks":
@@ -2077,9 +2093,7 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
         )).scalar_one_or_none()
         if row is None or row.updated_at != observed_revision:
             return _changed_during_health_check()
-    profile = dict(row.profile or {})
-    profile["last_health_check"] = result
-    row.profile = profile
+    _persist_oauth_health(row, result)
     await db.flush()
     return result
 

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from time import perf_counter
 from typing import Literal
 
@@ -11,6 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.workflow_failure import user_facing_run_error
 from packages.core.ai.workflow_import import UnknownWorkflowFormat, import_workflow
 from packages.core.ai.workflow_runner import (
     WorkflowRunner,
@@ -26,7 +29,7 @@ from packages.core.models.workspace import Workspace
 from packages.core.services import workflow_service as svc
 from packages.core.services.workflow_service import ScheduledWorkflowInputsError
 from packages.core.services.workspace_workflow_router import WorkflowRunInputError
-from packages.core.services.workflow_run_trace import visible_workflow_tags
+from packages.core.services.workflow_run_trace import step_waits_in_background, visible_workflow_tags, workflow_result_outcome
 from packages.core.services.document_access import user_can_read_document
 from packages.core.services.resource_access import (
     ResourceDescriptor,
@@ -44,7 +47,13 @@ from packages.core.services.workspace_access import (
     user_can_write_workspace_id,
     user_writable_workspace_ids,
 )
+from apps.api.collaborator_boundary import collaborator_scope
 from apps.api.deps import get_current_user
+from packages.core.services.collaborator_scope import (
+    require_collaborator_references,
+    require_collaborator_workflow_steps,
+    workflow_workspace_ids_batch,
+)
 from apps.api.routers.workspace_chat import WORKSPACE_WORKFLOW_RUN_ACTION_KINDS
 from packages.core.constants.pending_actions import PendingActionKind
 
@@ -283,7 +292,9 @@ class WorkflowTriggerRequest(BaseModel):
 class RunStartRequest(BaseModel):
     variables: dict | None = None
     trigger_data: dict | None = None
-    execute: bool = True  # run inline to completion; false = create only (manual /step)
+    # /{workflow_id}/run: true = run inline to completion, false = create only
+    # (manual /step). /bindings/{id}/run always queues the run on a worker.
+    execute: bool = True
 
 
 class RunResponse(BaseModel):
@@ -335,12 +346,35 @@ class ResumeRequest(BaseModel):
 
 class RuntimeApprovalDecisionRequest(BaseModel):
     choice: Literal["approve", "reject"]
+    review: dict | None = None
+
+
+class WorkflowEffectReviewRequest(BaseModel):
+    step_id: str
+    effect_fingerprint: str = Field(min_length=64, max_length=64)
+    decision: Literal["not_applied", "applied"]
+    confirmed: Literal[True]
+    note: str = Field(min_length=20, max_length=2000)
+    result: dict | None = None
+    project_revisions: dict[str, int] = Field(default_factory=dict)
 
 
 class RetryRunRequest(BaseModel):
     from_step_id: str | None = None
     variables: dict | None = None
     execute: bool = True
+    effect_review: WorkflowEffectReviewRequest | None = None
+    # A person retrying a run they fixed wants the fix: resume at the
+    # checkpoint on the Workflow as it is now. "original" replays the
+    # definition the failed attempt ran.
+    definition: Literal["current", "original"] = "current"
+
+
+class ReviseRunRequest(BaseModel):
+    """A change the person wants in a finished run's result (see production.revise)."""
+    notes: str = Field(default="", max_length=2000)
+    # The version (MediaJob id) picked for each unit, by unit id.
+    unit_versions: dict[str, str] = Field(default_factory=dict, max_length=200)
 
 
 class WorkflowProjectCandidateResponse(BaseModel):
@@ -351,6 +385,12 @@ class WorkflowProjectCandidateResponse(BaseModel):
     youtube_video_id: str | None = None
     created_at: datetime
     updated_at: datetime | None = None
+
+
+class WorkflowRecordChoiceResponse(BaseModel):
+    value: str
+    label: str
+    description: str | None = None
 
 
 # ── Helpers ──
@@ -426,7 +466,7 @@ def _run_to_dict(
         "trigger_source": run.trigger_source,
         "status": run.status,
         "current_step_id": run.current_step_id,
-        "error": summary_error if summary else run.error,
+        "error": summary_error if summary else user_facing_run_error(run),
         "started_by": run.started_by,
         "started_at": run.started_at,
         "completed_at": run.completed_at,
@@ -462,7 +502,7 @@ def _run_to_dict(
             "workflow_definition_fingerprint": trigger_data.get(
                 "_workflow_definition_fingerprint"
             ),
-            "business_outcome": state.get("business_outcome"),
+            "business_outcome": state.get("business_outcome") or workflow_result_outcome(variables) or None,
             "publication_receipts": publication_receipts_from_step_results(
                 run.step_results
             ),
@@ -472,7 +512,9 @@ def _run_to_dict(
     if can_control and include_detail and not summary:
         from packages.core.services.workflow_run_control import run_resume_action
 
-        response_data["resume_action"] = run_resume_action(run)
+        from packages.core.i18n import get_locale
+
+        response_data["resume_action"] = run_resume_action(run, locale=get_locale())
     if summary:
         response_data.update(compact_state or {})
     if include_detail:
@@ -480,6 +522,7 @@ def _run_to_dict(
             "definition_snapshot": getattr(run, "definition_snapshot", None) or {},
             "execution_trace": getattr(run, "execution_trace", None) or [],
         })
+    response_data = _in_viewer_language(run, response_data)
     return RunResponse(**response_data).model_dump(
         mode="json",
         exclude=(
@@ -499,6 +542,22 @@ def _run_to_dict(
             }
         ),
     )
+
+
+def _in_viewer_language(run, payload: dict) -> dict:
+    """Name the Flow and its steps in the requesting person's language."""
+    from packages.core.i18n import get_locale
+    from packages.core.services.viewer_language import (
+        RUN_DISPLAY_I18N_KEY,
+        localize_run_names,
+        run_names_for,
+    )
+
+    translations = getattr(run, "summary_display_i18n", None)
+    if not isinstance(translations, dict):
+        trigger_data = run.__dict__.get("trigger_data")
+        translations = trigger_data.get(RUN_DISPLAY_I18N_KEY) if isinstance(trigger_data, dict) else None
+    return localize_run_names(payload, run_names_for(translations, get_locale()))
 
 
 def _persisted_workflow_history_state(run) -> dict:
@@ -541,7 +600,7 @@ def _run_business_outcome(run) -> str:
     variables = run.variables if isinstance(run.variables, dict) else {}
     project = variables.get("project") if isinstance(variables.get("project"), dict) else {}
     state = project.get("state") if isinstance(project.get("state"), dict) else {}
-    return str(state.get("business_outcome") or "").strip().lower()
+    return str(state.get("business_outcome") or workflow_result_outcome(variables)).strip().lower()
 
 
 def _response_artifact_refs(response_data: dict) -> list[dict]:
@@ -608,18 +667,38 @@ async def _enrich_visible_artifact_names(
     return response_data
 
 
-def _compact_workflow_run_state(run) -> dict:
+async def _attach_step_activity(response_data: dict, run) -> None:
+    """Put what each step's long work reported (phases, counts, warnings) on its row."""
+
+    steps = response_data.get("workflow_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+    from packages.core.services.runtime_activity import read_activity
+
+    activity = await read_activity(str(run.id))
+    if not activity:
+        return
+    for step in steps:
+        if isinstance(step, dict) and (entry := activity.get(str(step.get("id") or ""))):
+            step["activity"] = entry
+
+
+def _compact_workflow_run_state(run, *, restartable: bool = False) -> dict:
+    from packages.core.services.workflow_run_control import run_resume_action
     from packages.core.services.workflow_chat_projection import (
         _workflow_business_state,
         _workflow_error_payload,
         _workflow_retry_input_schema,
         _workflow_retry_values,
+        default_retry_change,
         workflow_progress_steps,
         workflow_retry_from_step_id,
+        workflow_step_display_name,
     )
     from packages.core.services.workflow_run_trace import (
         summarize_trace_value,
-        workflow_execution_progress,
+        workflow_execution_steps,
+        workflow_run_stage_counts,
     )
 
     persisted_state = _persisted_workflow_history_state(run)
@@ -628,7 +707,9 @@ def _compact_workflow_run_state(run) -> dict:
         activity_status=str(run.status or ""),
         existing_steps=persisted_state.get("workflow_steps"),
     )
-    progress = workflow_execution_progress(workflow_steps)
+    # Stages done against the longest route through the Flow: the same figures the
+    # history summary keeps. The displayed steps are only the path reached so far.
+    progress = workflow_run_stage_counts(run, workflow_execution_steps(run))
     business_outcome, retry_state = _workflow_business_state(run)
     raw_error = _workflow_error_payload(run)
     error = summarize_trace_value(raw_error) if raw_error is not None else None
@@ -637,13 +718,26 @@ def _compact_workflow_run_state(run) -> dict:
         current_step_result if isinstance(current_step_result, dict) else {}
     )
     retry_from_step_id = workflow_retry_from_step_id(run, retry_state)
-    retryable = run.status == "failed" or (
+    from packages.core.services.workflow_run_trace import STALLED_PROBLEM, STALLED_RESTART_CHANGE, workflow_run_stalled
+
+    stalled = workflow_run_stalled(run)
+    # A stalled run is retried by starting over on the current Flow, and only once it has changed.
+    retryable = restartable if stalled else (run.status in {"failed", "cancelled"} or (
         run.status == "completed"
         and business_outcome in {"needs_input", "revision_required"}
-    )
+    ))
+    if stalled and restartable:
+        retry_from_step_id = next((
+            str(node.get("id")) for node in (run.definition_snapshot or {}).get("nodes") or []
+            if isinstance(node, dict) and node.get("type") == "trigger"
+        ), retry_from_step_id)
+        retry_state = {**retry_state, "required_change": STALLED_RESTART_CHANGE, "observed_problem": STALLED_PROBLEM}
+    from packages.core.i18n import get_locale
+
+    native_action = run_resume_action(run, locale=get_locale())
     intervention = None
     if retryable and retry_from_step_id:
-        editable_input_schema = _workflow_retry_input_schema(run, retry_state)
+        editable_input_schema = {} if stalled else _workflow_retry_input_schema(run, retry_state)
         observed_problem = retry_state.get("observed_problem")
         intervention = {
             "kind": "workflow_retry",
@@ -653,6 +747,7 @@ def _compact_workflow_run_state(run) -> dict:
             "phase": retry_state.get("phase") or "execution",
             "step_id": retry_state.get("step_id") or run.current_step_id,
             "retry_from_step_id": retry_from_step_id,
+            "retry_from_step_name": workflow_step_display_name(run, retry_from_step_id),
             "retry_segment_ids": summarize_trace_value(
                 retry_state.get("segment_ids") or []
             ),
@@ -661,7 +756,7 @@ def _compact_workflow_run_state(run) -> dict:
             ),
             "required_change": summarize_trace_value(
                 retry_state.get("required_change")
-                or "Correct the failed input or external state, then retry this step."
+                or default_retry_change(error if observed_problem is None else observed_problem)
             ),
             "editable_input_schema": summarize_trace_value(editable_input_schema),
             "preserved_receipts": summarize_trace_value(
@@ -672,9 +767,27 @@ def _compact_workflow_run_state(run) -> dict:
             ),
             "options": ["retry", "cancel"],
         }
+    elif run.status in {"failed", "cancelled"}:
+        from packages.core.services.workflow_agent_recovery import workflow_effect_review
+
+        review = workflow_effect_review(run)
+        if review:
+            intervention = {
+                "kind": "workflow_effect_review",
+                "workflow_run_id": run.id,
+                "workflow_binding_id": run.binding_id,
+                "options": ["review"],
+                **review,
+            }
+    elif native_action and native_action.get("kind") in {"workflow_input", "workflow_approval"}:
+        # Native input and approval waits need the same App entry as their
+        # chat-backed forms. The dialog rechecks the frozen request on opening.
+        intervention = summarize_trace_value(native_action)
     elif (
         run.status == "paused"
         and run.current_step_id
+        # An automatic retry, a render or a timer continues on its own.
+        and not step_waits_in_background(current_step_result)
         and (
             str(current_step_result.get("wait_type") or "").lower() == "event"
             or current_step_result.get("resume_strategy") == "reexecute"
@@ -847,6 +960,9 @@ async def _native_workflow_approval_intervention(db: AsyncSession, run) -> dict 
         key: card[key] for key in ("tool", "action", "paths", "args_preview", "content", "review")
         if key in card and card[key] is not None
     })
+    tool = str(review.get("tool") or "") if isinstance(review, dict) else ""
+    tiktok_publish_review = tool in {"mcp__tiktok__post_video", "mcp__tiktok__post_photo"}
+    public_review = review.get("review") if tiktok_publish_review else review
     return {
         "kind": PendingActionKind.WORKFLOW_APPROVAL.value,
         "action_id": request.id,
@@ -856,12 +972,28 @@ async def _native_workflow_approval_intervention(db: AsyncSession, run) -> dict 
         "message_id": message.id,
         "message_workspace_id": conversation.workspace_id,
         "source": "workflow_runtime_approval",
-        "title": "Approval required",
+        "title": _runtime_approval_title(card),
         "prompt": sanitize_sensitive_payload(card.get("prompt") or result.get("output")),
         "options": ["approve", "reject"],
-        "review_read_only": True,
-        "review": review,
+        "tool": tool or None,
+        "review_read_only": not tiktok_publish_review,
+        "review": public_review,
     }
+
+
+def _runtime_approval_title(card: dict) -> str:
+    """Name the requested action and its files, e.g. ``Edit workspace file · CANVAS.md``."""
+    action = str(card.get("action") or "").strip()
+    paths = [path for path in card.get("paths") or [] if isinstance(path, str) and path.strip()]
+    names = ", ".join(PurePosixPath(path).name for path in paths[:2])
+    if len(paths) > 2:
+        names += f" +{len(paths) - 2}"
+    if re.fullmatch(r"[a-z_]+(\.[a-z_]+)+", action):
+        # An action key such as workspace.file.modify reads as its verb.
+        verb = action.rsplit(".", 1)[-1].replace("_", " ")
+        return f"{verb[:1].upper()}{verb[1:]} {names}".strip()
+    label = action[:1].upper() + action[1:] if action else "Approval required"
+    return f"{label} · {names}" if names else label
 
 
 async def _message_backed_workflow_intervention(
@@ -947,6 +1079,11 @@ async def _message_backed_workflow_intervention(
         sanitized["kind"] = action_kind
     sanitized["message_id"] = message.id
     sanitized["source"] = "workspace_chat"
+    if sanitized.get("retry_from_step_id") and not sanitized.get("retry_from_step_name"):
+        # Cards saved before the name was recorded.
+        from packages.core.services.workflow_chat_projection import workflow_step_display_name
+
+        sanitized["retry_from_step_name"] = workflow_step_display_name(run, str(sanitized["retry_from_step_id"]))
     return sanitized
 
 
@@ -1064,6 +1201,11 @@ async def list_workflows(
             )),
         ).order_by(WorkflowDefinition.created_at.desc())
     )).scalars().all()
+    collaborator_ids = collaborator_scope(user)
+    if collaborator_ids is not None:
+        # An external collaborator sees only Workflows of the Workspaces they were granted.
+        workspaces = await workflow_workspace_ids_batch(db, [w.id for w in items], entity_id=user.entity_id)
+        items = [w for w in items if collaborator_ids & workspaces.get(w.id, set())]
     visible = [
         w for w in items
         if await user_can_access_resource(
@@ -1125,7 +1267,11 @@ async def list_workflow_project_candidates(
         )
         if not title and isinstance(topic, dict):
             title = str(topic.get("selected_topic") or "").strip()
-        title = title or str(project.project_key or "").strip() or project.id
+        title = title or str(state.get("title") or "").strip() or str(project.project_key or "").strip() or project.id
+        # A numbered project (a series episode) reads as "E01 · title".
+        code = str(state.get("code") or "").strip()
+        if code and not title.startswith(code):
+            title = f"{code} · {title}"
         youtube_video_id = (
             str(youtube.get("video_id") or "").strip()
             if isinstance(youtube, dict)
@@ -1157,6 +1303,10 @@ async def create_workflow(
         role=getattr(user, "role", None),
     ):
         raise HTTPException(403, "Cannot create a workflow in this workspace")
+    # A collaborator's Workflow names only its Workspace's resources.
+    await require_collaborator_workflow_steps(
+        db, user_id=user.id, entity_id=user.entity_id, workspace_id=body.workspace_id, steps=body.steps, user=user,
+    )
     wf = await svc.create_workflow(
         db,
         entity_id=user.entity_id,
@@ -1401,6 +1551,18 @@ async def create_binding(
     A ``schedule`` trigger is an automation, not a binding — it creates a
     ScheduledJob (the workflow stays independent) and returns the automation.
     """
+    # A collaborator deploys only a Workflow that already belongs to their Workspace.
+    await require_collaborator_references(
+        db,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        workspace_id=body.workspace_id,
+        refs={
+            "workflow": {body.workflow_id},
+            "workflow_binding": {(body.config or {}).get("workspace_workflow_binding_id")},
+        },
+        user=user,
+    )
     workspace_scoped = await _require_binding_workspace_write(
         db, user, body.workspace_id
     )
@@ -1484,6 +1646,8 @@ async def create_binding(
     except ValueError as exc:
         if str(exc) == "Workspace not found":
             raise HTTPException(404, "Workspace not found") from exc
+        if str(exc) == "Workflow belongs to another workspace":
+            raise HTTPException(409, str(exc)) from exc
         raise
     await db.commit()
     return {
@@ -1609,6 +1773,24 @@ async def update_binding(
         workflow_id=current.workflow_id,
         workspace_id=current.workspace_id,
     )
+    if collaborator_scope(user) is not None:
+        # A collaborator's binding stays in its Workspace and runs that Workspace's Workflows.
+        if any(
+            key in body.model_fields_set and getattr(body, key) != getattr(current, key)
+            for key in ("workspace_id", "business_line")
+        ):
+            raise HTTPException(403, "External collaborators cannot move a binding out of its Workspace")
+        await require_collaborator_references(
+            db,
+            user_id=user.id,
+            entity_id=user.entity_id,
+            workspace_id=current.workspace_id,
+            refs={
+                "workflow": {body.workflow_id},
+                "workflow_binding": {(body.config or {}).get("workspace_workflow_binding_id")},
+            },
+            user=user,
+        )
     target_workspace_id = (
         body.workspace_id
         if "workspace_id" in body.model_fields_set
@@ -1648,6 +1830,8 @@ async def update_binding(
     except ValueError as exc:
         if str(exc) == "Workspace not found":
             raise HTTPException(404, "Workspace not found") from exc
+        if str(exc) == "Workflow belongs to another workspace":
+            raise HTTPException(409, str(exc)) from exc
         raise
     if not binding:
         raise HTTPException(404, "Binding not found")
@@ -1671,139 +1855,28 @@ async def run_binding(
     )
     if not workspace_scoped:
         await _require_workflow(db, user, binding.workflow_id, Capability.VIEW)
-    try:
-        execution_binding = await svc.execution_binding_for_automation(db, binding)
-        trigger_data = dict(body.trigger_data if body and body.trigger_data else {"manual_test": True})
-        trigger_data.pop("_workspace_user_request", None)
-        if execution_binding.id != binding.id:
-            trigger_data.setdefault("automation_binding_id", binding.id)
-        launched = None
-        if workspace_scoped and trigger_data.get("workspace_manual") is True:
-            from packages.core.services.conversation_messages import add_message
-            from packages.core.services.workspace_flow_launcher import (
-                launch_workspace_flow,
-            )
-            from packages.core.services.workspace_workflow_router import (
-                normalize_chat_entrypoint,
-            )
-            from packages.core.workspace_chat.service import ensure_main_conversation
+    from packages.core.services.workspace_flow_launcher import enqueue_binding_run, start_binding_run
 
-            workflow = await svc.get_workflow(
-                db,
-                execution_binding.workflow_id,
-                user.entity_id,
-            )
-            entrypoint = (
-                normalize_chat_entrypoint(execution_binding, workflow)
-                if workflow is not None
-                else None
-            )
-            if entrypoint is not None:
-                conversation = await ensure_main_conversation(
-                    db,
-                    entity_id=user.entity_id,
-                    workspace_id=str(execution_binding.workspace_id),
-                )
-                origin_message = await add_message(
-                    db,
-                    conversation.id,
-                    role="system",
-                    content=f"Started {entrypoint.title} from Workspace Flows.",
-                    message_kind="system",
-                    refs=[
-                        {
-                            "type": "workflow",
-                            "id": entrypoint.workflow_id,
-                            "title": entrypoint.title,
-                        },
-                        {
-                            "type": "workspace",
-                            "id": execution_binding.workspace_id,
-                        },
-                    ],
-                    meta={
-                        "author_user_id": user.id,
-                        "workflow_route_source": "workspace_manual",
-                        "workflow_binding_id": execution_binding.id,
-                    },
-                )
-                input_values = dict(body.variables or {}) if body else {}
-                input_values.update(trigger_data)
-                launched = await launch_workspace_flow(
-                    db,
-                    source="manual",
-                    entrypoint=entrypoint,
-                    binding=execution_binding,
-                    entity_id=user.entity_id,
-                    user_id=user.id,
-                    workspace_id=str(execution_binding.workspace_id),
-                    conversation_id=conversation.id,
-                    origin_message_id=origin_message.id,
-                    source_brief="",
-                    input_values=input_values,
-                    starter_policy="only_missing",
-                    origin_metadata={
-                        "route_source": "workspace_manual",
-                        "surface": "workspace_flows",
-                    },
-                    transaction_owner="caller",
-                )
-                run = launched.run
-                run.trigger_data = {
-                    **trigger_data,
-                    **dict(run.trigger_data or {}),
-                }
-                declared_input_roots = {
-                    str(item.get("key") or "")
-                    for item in entrypoint.run_inputs
-                } | {
-                    str(item.get("target") or item.get("key") or "").split(".", 1)[0]
-                    for item in entrypoint.run_inputs
-                }
-                extra_variables = {
-                    str(key): value
-                    for source in (
-                        body.variables if body and body.variables else {},
-                        trigger_data,
-                    )
-                    for key, value in source.items()
-                    if str(key) not in declared_input_roots
-                    and not str(key).startswith("_")
-                }
-                run.variables = {
-                    **dict(run.variables or {}),
-                    **extra_variables,
-                    "trigger": dict(run.trigger_data),
-                }
-        if launched is None:
-            run = await svc.start_workflow_from_binding(
-                db,
-                execution_binding,
-                variables=body.variables if body else None,
-                trigger_data=trigger_data,
-                trigger_source="manual",
-                started_by=user.id,
-            )
+    try:
+        run, launched = await start_binding_run(
+            db,
+            binding=binding,
+            user=user,
+            variables=body.variables if body else None,
+            trigger_data=body.trigger_data if body and body.trigger_data else None,
+            workspace_scoped=workspace_scoped,
+        )
+    except WorkflowRunInputError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
 
-    if launched is not None and launched.starter_message is not None:
-        pass
-    elif body is None or body.execute:
-        try:
-            await WorkflowRunner().run(run.id)
-        except Exception:
-            logger.exception("inline workflow binding run failed: %s", run.id)
-        await db.refresh(run)
-    elif launched is not None:
-        from packages.core.services.workspace_flow_launcher import (
-            enqueue_workspace_flow_launch,
-        )
-
-        await enqueue_workspace_flow_launch(db, launched)
-    else:
-        WorkflowRunner.enqueue(run.id)
+    # Execution always goes to the worker queue, whatever ``execute`` says:
+    # a node can run for many minutes, and a request handler can neither
+    # outlive its process nor be resumed by the claim-loss recovery sweep.
+    # The response is the created run; callers poll /runs/{id} for progress.
+    await enqueue_binding_run(db, run, launched)
     return _run_to_dict(run)
 
 
@@ -1907,12 +1980,30 @@ async def inbound_webhook(
 async def list_runs(
     workspace_id: str | None = Query(None),
     binding_id: str | None = Query(None),
+    workflow_id: str | None = Query(None),
+    include_unbound: bool = Query(False),
+    app_action: str | None = Query(None, max_length=200),
+    include_unlabelled: bool = Query(False),
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List workflow runs for Workspace and binding-level history surfaces."""
+    """List workflow runs for Workspace and binding-level history surfaces.
+
+    ``app_action`` narrows to runs started from that App entry;
+    ``include_unlabelled`` also keeps runs no entry claims (Chat, older runs).
+    """
+    if include_unbound:
+        if not workspace_id or not binding_id or not workflow_id:
+            raise HTTPException(422, "Unbound history requires a workspace, binding and workflow")
+        binding = await svc.get_binding(db, binding_id, user.entity_id)
+        if (
+            binding is None
+            or binding.workspace_id != workspace_id
+            or binding.workflow_id != workflow_id
+        ):
+            raise HTTPException(422, "Binding does not match the requested Workspace workflow")
     readable_workspace_ids = await user_readable_workspace_ids(
         db,
         entity_id=user.entity_id,
@@ -1927,6 +2018,10 @@ async def list_runs(
         user.entity_id,
         workspace_id=workspace_id,
         binding_id=binding_id,
+        workflow_id=workflow_id,
+        include_unbound=include_unbound,
+        app_action=app_action,
+        include_unlabelled=include_unlabelled,
         status=status,
         limit=limit,
         readable_workspace_ids=readable_workspace_ids,
@@ -1975,7 +2070,12 @@ async def get_run(
         raise HTTPException(404, "Run not found")
     await _require_run_read(db, run, user)
     compact_state = None
+    # A newer run has made this run's project since: going on would write it
+    # back over that version, so the run is closed, not offered again.
+    superseded = await svc.workflow_run_superseded_project(db, run) is not None
     if not detail:
+        from packages.core.services.workflow_run_trace import workflow_run_stalled
+
         from packages.core.services.workflow_chat_projection import (
             workflow_chat_context,
         )
@@ -1996,7 +2096,9 @@ async def get_run(
                 select(WorkflowRun.execution_trace).where(WorkflowRun.id == run.id)
             )
             set_committed_value(run, "execution_trace", legacy_trace or [])
-        compact_state = _compact_workflow_run_state(run)
+        compact_state = _compact_workflow_run_state(
+            run, restartable=await svc.stalled_run_restart(db, run) is not None,
+        )
         intervention_run = run
         nested_retry_run = await _deepest_retryable_subworkflow_run(db, run)
         if nested_retry_run.id != run.id:
@@ -2123,6 +2225,9 @@ async def get_run(
             )
             and workflow_chat_context(intervention_run) is not None
             and message_intervention is None
+            # Starting a stalled run over does not resume its chat card's frozen state; the card
+            # was drawn when it failed, before the Flow changed and made the restart possible.
+            and not workflow_run_stalled(intervention_run)
         )
         if retry_message_is_unavailable:
             compact_state["intervention"] = None
@@ -2153,6 +2258,29 @@ async def get_run(
             }
             projected_intervention.pop("message_id", None)
             compact_state["intervention"] = projected_intervention
+        if superseded and isinstance(compact_state.get("intervention"), dict) and compact_state["intervention"].get("kind") in {
+            PendingActionKind.WORKFLOW_RETRY, "workflow_effect_review",
+        }:
+            compact_state["intervention"] = None
+        review_action = compact_state.get("intervention")
+        if isinstance(review_action, dict) and review_action.get("kind") == "workflow_effect_review":
+            from packages.core.services.workflow_agent_recovery import (
+                workflow_effect_review_blocker, workflow_effect_result_schema, workflow_released_project_reviews,
+            )
+
+            blocker = await workflow_effect_review_blocker(db, intervention_run)
+            options = [] if blocker else ["review"]
+            result_schema = workflow_effect_result_schema(intervention_run)
+            if result_schema and not await workflow_effect_review_blocker(db, intervention_run, applied=True):
+                options.append("review_applied")
+            compact_state["intervention"] = {
+                **review_action, "options": options,
+                **({"blocked_reason": blocker} if blocker else {}),
+                **({"result_schema": result_schema} if "review_applied" in options else {}),
+                **({"project_revisions": {pid: item["revision"] for pid, item in
+                    (await workflow_released_project_reviews(db, intervention_run)).items()}}
+                   if "review_applied" in options else {}),
+            }
     response_data = _run_to_dict(
         run,
         include_detail=detail,
@@ -2160,6 +2288,13 @@ async def get_run(
         can_control=await _run_can_control(db, run, user),
         compact_state=compact_state,
     )
+    await _attach_step_activity(response_data, run)
+    if superseded:
+        response_data["superseded"] = True
+        if isinstance(response_data.get("intervention"), dict) and response_data["intervention"].get("kind") in {
+            PendingActionKind.WORKFLOW_RETRY, "workflow_effect_review",
+        }:
+            response_data["intervention"] = None
     if detail:
         if response_data.get("capabilities", {}).get("can_control") and run.status == "paused":
             from sqlalchemy import select
@@ -2168,7 +2303,17 @@ async def get_run(
             action = await _message_backed_workflow_intervention(db, run, full=True)
             if action and action.get("runtime_approval_id"):
                 response_data["resume_action"] = action
-            elif action and action.get("kind") == PendingActionKind.WORKFLOW_APPROVAL and action.get("step_id") == run.current_step_id:
+            elif (
+                action
+                and action.get("step_id") == run.current_step_id
+                and (
+                    action.get("kind") == PendingActionKind.WORKFLOW_APPROVAL
+                    or (
+                        action.get("kind") == PendingActionKind.WORKFLOW_INPUT
+                        and isinstance(action.get("inputs"), list)
+                    )
+                )
+            ):
                 result = (run.step_results or {}).get(run.current_step_id) or {}
                 response_data["resume_action"] = {
                     **action,
@@ -2181,12 +2326,33 @@ async def get_run(
                     "review": result.get("review"),
                     "review_title": result.get("review_title"),
                 }
+        from packages.core.services.workflow_review_files import attach_review_document_ids
+
+        # Reviews recorded before files were linked still open their Documents.
+        step_results = response_data.get("step_results")
+        await attach_review_document_ids(db, entity_id=user.entity_id, reviews=[
+            *((result or {}).get("review") for result in (step_results or {}).values() if isinstance(result, dict)),
+            (response_data.get("resume_action") or {}).get("review"),
+        ])
         await _enrich_visible_artifact_names(
             db,
             response_data,
             run=run,
             user=user,
         )
+    # A Workflow that declares its production shows its stages and units.
+    from sqlalchemy import select
+
+    from packages.core.i18n import get_locale
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.services.workflow_production import workflow_run_production
+
+    workflow_steps = await db.scalar(select(WorkflowDefinition.steps).where(
+        WorkflowDefinition.id == run.workflow_id, WorkflowDefinition.entity_id == run.entity_id,
+    ))
+    production = workflow_run_production(workflow_steps, run.variables, locale=get_locale())
+    if production is not None:
+        response_data["production"] = production
     return response_data
 
 
@@ -2278,6 +2444,7 @@ async def cancel_run(
         return response
     if run.status == "completed" and not actionable_completed:
         raise HTTPException(400, "Run already completed")
+    from packages.core.constants.task import CancelSource
     from packages.core.services.workflow_run_control import (
         active_subworkflow_descendant_ids,
         cancel_active_subworkflow_descendants,
@@ -2300,6 +2467,7 @@ async def cancel_run(
         cancel_workflow_run(
             run,
             actor_id=user.id,
+            source=CancelSource.USER,
             allow_problem_terminal=(run.status == "failed" or actionable_completed),
         )
     except ValueError as exc:
@@ -2371,6 +2539,7 @@ async def resolve_run_runtime_approval(
     try:
         resolution = await resolve_workflow_approval(
             db, run=run, request_id=request_id, user_id=user.id, choice=body.choice,
+            submitted_review=body.review,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -2434,6 +2603,21 @@ async def resume_run(
     return _run_to_dict(run)
 
 
+async def _restart_stalled_run(db: AsyncSession, stalled, body: "RetryRunRequest | None", user: User) -> dict:
+    """Retry of a run its frozen Flow could not advance: start over on the current Flow."""
+    from packages.core.services.workspace_flow_launcher import enqueue_binding_run
+
+    try:
+        run, launched = await svc.restart_stalled_run(
+            db, stalled, user=user, variables=body.variables if body else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc).lower() else 409, str(exc)) from exc
+    await db.commit()
+    await enqueue_binding_run(db, run, launched)
+    return _run_to_dict(run)
+
+
 @router.post("/runs/{run_id}/retry", status_code=201)
 async def retry_run(
     run_id: str,
@@ -2458,6 +2642,10 @@ async def retry_run(
         and retry_target.status in {"pending", "running", "paused", "completed"}
     ):
         raise HTTPException(409, "Nested workflow recovery is already in progress")
+    from packages.core.services.workflow_run_trace import workflow_run_stalled
+
+    if retry_target.id == existing_run.id and workflow_run_stalled(existing_run):
+        return await _restart_stalled_run(db, existing_run, body, user)
     try:
         run = await svc.retry_workflow_run(
             db,
@@ -2469,6 +2657,8 @@ async def retry_run(
             owner_run_id=existing_run.id,
             expected_owner_run_id=latest_visible_attempt.id,
             expected_owner_status=latest_visible_attempt.status,
+            effect_review=body.effect_review.model_dump() if body and body.effect_review else None,
+            definition=body.definition if body else "current",
         )
     except ValueError as exc:
         message = str(exc)
@@ -2481,8 +2671,10 @@ async def retry_run(
                 "changed since" in normalized
                 or "newer workflow attempt" in normalized
                 or "retry is blocked" in normalized
+                or "can't be retried" in normalized
                 or "workflow preflight" in normalized
                 or "requires an active workspace" in normalized
+                or "no longer part of the workflow" in normalized
             )
             else 400
         )
@@ -2508,6 +2700,75 @@ async def retry_run(
     return _run_to_dict(run)
 
 
+@router.post("/runs/{run_id}/revise", status_code=201)
+async def revise_run(
+    run_id: str,
+    body: ReviseRunRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Make the next version of a finished run's result: from the step its
+    Workflow's ``production.revise`` names, with the person's notes and the unit
+    versions they picked. The earlier version stays in the run's history."""
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.services.workflow_production import workflow_production_config
+
+    run = await svc.get_run(db, run_id, user.entity_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    await _require_run_control(db, run, user)
+    if run.status != "completed":
+        raise HTTPException(409, "Only a finished run can be revised")
+    # A later attempt that was cancelled made nothing, so this is still the latest version.
+    latest = await svc.latest_workflow_run_family_attempt(db, run)
+    if latest.id != run.id and latest.status != "cancelled":
+        raise HTTPException(409, "A newer version of this run already exists")
+    steps = await db.scalar(select(WorkflowDefinition.steps).where(
+        WorkflowDefinition.id == run.workflow_id, WorkflowDefinition.entity_id == run.entity_id,
+    ))
+    revise = (workflow_production_config(steps) or {}).get("revise")
+    if not revise:
+        raise HTTPException(400, "This Workflow does not declare how its result is revised")
+    notes = body.notes.strip()
+    versions = {str(unit)[:128]: str(job)[:64] for unit, job in body.unit_versions.items() if str(job).strip()}
+    if not notes and not versions:
+        raise HTTPException(400, "Say what should change, or pick new versions of its units")
+    # The first of the declared steps this run reached; a later version reuses
+    # what came before it on the path the run actually took.
+    reached = run.step_results or {}
+    from_step = next((step for step in revise["from_step"] if step in reached), None)
+    if from_step is None:
+        raise HTTPException(409, "This run did not reach the step its revisions start from")
+    variables = {revise["notes_input"]: notes}
+    if revise.get("versions_input"):
+        variables[revise["versions_input"]] = versions
+    try:
+        revised = await svc.retry_workflow_run(
+            db, run_id=run.id, entity_id=user.entity_id, started_by=user.id,
+            from_step_id=from_step, variables=variables,
+            owner_run_id=run.id, expected_owner_run_id=latest.id, expected_owner_status=latest.status,
+            definition="current", revision=True,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        raise HTTPException(409 if "newer" in message.lower() or "blocked" in message.lower() else 400, message) from exc
+    await db.commit()
+    if WorkflowRunner.enqueue(revised.id) is False:
+        revised.status = "failed"
+        revised.error = "Workflow could not be queued. Please retry this run."
+        revised.completed_at = datetime.now(timezone.utc)
+        mark_workflow_terminal_effects_pending(revised)
+        from packages.core.services.workflow_chat_projection import project_workflow_run_status
+        from packages.core.services.workflow_run_trace import update_workflow_history_summary
+
+        update_workflow_history_summary(revised)
+        await project_workflow_run_status(db, run=revised)
+        await db.commit()
+    return _run_to_dict(revised)
+
+
 # ── Workflow Definition — single-item endpoints ──
 
 @router.get("/{workflow_id}/metadata")
@@ -2521,6 +2782,48 @@ async def get_workflow_metadata(
     if not metadata:
         raise HTTPException(404, "Workflow not found")
     return metadata
+
+
+@router.get(
+    "/{workflow_id}/run-inputs/{input_key}/choices",
+    response_model=list[WorkflowRecordChoiceResponse],
+)
+async def list_workflow_record_choices(
+    workflow_id: str,
+    input_key: str,
+    workspace_id: str = Query(..., min_length=1),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Options of a ``record_select`` run input, read from its Workspace Ledger.
+
+    The source comes from the saved Workflow, never from the caller. A Ledger
+    that is not installed or has no matching rows yields no options.
+    """
+    from packages.core.services.workflow_record_source import (
+        RecordSourceUnavailable,
+        load_record_choices,
+        record_select_source,
+    )
+    from packages.core.services.workspace_workflow_router import workflow_run_inputs
+
+    wf = await _require_workflow(db, user, workflow_id, Capability.VIEW)
+    await _require_binding_workspace_read(db, user, workspace_id)
+    workspaces = await workflow_workspace_ids_batch(db, [wf.id], entity_id=user.entity_id)
+    if wf.workspace_id != workspace_id and workspace_id not in workspaces.get(wf.id, set()):
+        raise HTTPException(404, "Workflow not found in this Workspace")
+    item = next((row for row in workflow_run_inputs(wf) if row["key"] == input_key), None)
+    source = record_select_source(item.get("schema")) if item else None
+    if source is None:
+        raise HTTPException(404, "Run input has no record choices")
+    try:
+        return await load_record_choices(
+            db, source, entity_id=user.entity_id, workspace_id=workspace_id,
+        )
+    except RecordSourceUnavailable as exc:
+        raise HTTPException(
+            503, {"code": "record_source_unavailable", "message": str(exc)},
+        ) from None
 
 
 @router.get("/{workflow_id}")
@@ -2540,9 +2843,14 @@ async def update_workflow(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _require_workflow(db, user, workflow_id, Capability.EDIT)
+    current = await _require_workflow(db, user, workflow_id, Capability.EDIT)
     changes = body.model_dump(exclude_none=True)
     require_valid_steps = bool(changes.pop("validate_steps", False))
+    if "steps" in changes:
+        await require_collaborator_workflow_steps(
+            db, user_id=user.id, entity_id=user.entity_id, workspace_id=current.workspace_id,
+            steps=changes["steps"], user=user,
+        )
     try:
         wf = await svc.update_workflow(
             db,

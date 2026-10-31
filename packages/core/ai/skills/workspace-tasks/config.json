@@ -24,6 +24,8 @@
       "search",
       "create_task",
       "update_task_runtime",
+      "start_task",
+      "hold_for_approval",
       "delegate_service",
       "read_delegation_result",
       "answer_task_blocker",

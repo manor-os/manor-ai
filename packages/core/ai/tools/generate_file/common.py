@@ -36,6 +36,10 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
         "input_image_urls",
         "input_fidelity",
         "save_to_knowledge",
+        # A named asset given beside params is still that name, never dropped.
+        "workspace_asset_key",
+        "reuse_if_exists",
+        "reference_assets",
         "expected_sha256",
         "seed",
         "generate_audio",
@@ -50,6 +54,7 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
         "voice",
         "language",
         "narration_voice_mode",
+        "voice_role",
         "voice_instructions",
         "response_format",
         "format",

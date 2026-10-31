@@ -31,14 +31,20 @@ class FrozenSoloCompanyBlueprint:
     payload: dict[str, Any]
 
 
-def _load_payload(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    validate_payload(payload)
+def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """What loading adds to a config file's JSON before it is published."""
     recipe = payload["recipe"]
     recipe.setdefault(
         "simulation_experience",
         resolve_simulation_experience(payload),
     )
+    return payload
+
+
+def _load_payload(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    validate_payload(payload)
+    normalize_payload(payload)
     validate_payload(payload)
     return payload
 
@@ -89,5 +95,6 @@ __all__ = [
     "SOLO_COMPANY_BLUEPRINTS",
     "get_solo_company_blueprint",
     "get_solo_company_blueprints",
+    "normalize_payload",
     "validate_solo_company_blueprints",
 ]

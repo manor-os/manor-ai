@@ -91,7 +91,6 @@ async def test_every_task_creating_call_records_the_run_that_created_it(db_sessi
         "packages.core.database.async_session",
         async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False),
     )
-    monkeypatch.setattr("packages.core.tasks.ai_tasks.plan_and_run_task.delay", lambda *a, **k: None)
     pool = ToolPool()
     pool.initialize()
     envelope = SimpleNamespace(

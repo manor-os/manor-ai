@@ -31,6 +31,7 @@ from packages.core.services.tool_cache_version import bump_tool_cache_version
 from packages.core.services.workspace_artifacts import ensure_workspace_artifact_directory
 from packages.core.services.workspace_artifacts import resolve_workspace_artifact_directory
 from packages.core.services.workspace_ledger import (
+    LEDGER_PROVENANCE_FIELDS,
     LedgerStorage,
     WorkspaceLedgerError,
     ensure_ledger_location,
@@ -185,7 +186,7 @@ def _required_text(value: Any, field: str) -> str:
 
 
 def _idempotency_payload(entry: FinanceLedgerEntry, *, exclude_occurred_at: bool) -> dict[str, Any]:
-    excluded = {"entry_id", "recorded_at"}
+    excluded = {"entry_id", "recorded_at", *LEDGER_PROVENANCE_FIELDS}
     if exclude_occurred_at:
         excluded.add("occurred_at")
     payload = entry.model_dump(mode="json", exclude=excluded)

@@ -260,3 +260,46 @@ def test_validation_error_without_paths_keeps_its_plain_message():
     assert str(operations.OperationValidationError({"errors": []})) == (
         "workspace operation draft has validation errors"
     )
+
+
+# The 2026-10-28 benchmark shape: a per-person discount limit drafted as a block
+# on words no runtime call carries. It was shown as enforced and gated nothing.
+_LIMIT_AS_BLOCK = {
+    "rule_key": "discount_cap", "rule_type": "block",
+    "description": "单人优惠金额不超过 6 元", "action_patterns": ["promote", "discount", "coupon"],
+}
+
+
+@pytest.mark.asyncio
+async def test_rule_on_actions_no_call_carries_is_rejected_and_never_marked_enforced():
+    current = _state_with_undeclared_services()
+    validation = await _validate(current, {"op": "rule.add", "payload": dict(_LIMIT_AS_BLOCK)})
+
+    assert validation["valid"] is False
+    [error] = [e for e in validation["errors"] if e.get("code") == "rule_action_not_gateable"]
+    assert "promote, discount, coupon" in error["message"]
+    added = _draft(current, {"op": "rule.add", "payload": dict(_LIMIT_AS_BLOCK)}).current_state["rules"][-1]
+    assert "runtime_enforced" not in added
+
+
+@pytest.mark.asyncio
+async def test_rule_on_a_declared_action_is_enforced_and_valid():
+    current = _state_with_undeclared_services()
+    rule = {"rule_key": "review_posts", "rule_type": "approval_required",
+            "description": "发布前审批", "action_patterns": ["social_post.publish"]}
+    validation = await _validate(current, {"op": "rule.add", "payload": rule})
+
+    assert not [e for e in validation["errors"] if e.get("code") == "rule_action_not_gateable"]
+    added = _draft(current, {"op": "rule.add", "payload": rule}).current_state["rules"][-1]
+    assert added["runtime_enforced"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_stored_rule_that_gates_nothing_does_not_block_unrelated_changes():
+    current = _state_with_undeclared_services()
+    current["rules"] = [dict(_LIMIT_AS_BLOCK)]
+    validation = await _validate(
+        current, {"op": "budget.update", "payload": {"monthly_budget_credits": 200}},
+    )
+    assert validation["valid"] is True
+    assert "rules[0].action_patterns" in {issue["path"] for issue in validation["pre_existing_issues"]}

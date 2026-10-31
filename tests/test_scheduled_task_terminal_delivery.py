@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from packages.core.constants.task import TaskStatus
-from packages.core.models.runtime_run import RuntimeOutboxEvent
+from packages.core.models.runtime_run import RuntimeOutboxEvent, RuntimeRun
 from packages.core.services.task_runtime_approvals import TASK_RUNTIME_RESUME_EVENT
 
 
@@ -128,6 +128,7 @@ async def test_status_transition_stages_delivery_for_terminal_status(monkeypatch
         completed_at=None,
         status_changed_at=None,
         updated_at=None,
+        cancel_source=None,
         details={"scheduled_run_id": "run-1", "scheduled_job_id": "job-1"},
     )
 
@@ -145,7 +146,10 @@ async def test_staged_delivery_is_published_as_the_gateway_envelope(
     )
     from packages.core.tasks.runtime_tasks import dispatch_runtime_outbox_once
 
+    # The global publisher first recovers expired runs (an earlier test's run
+    # gains a terminal notice): reset the queue and its recovery source.
     await db_session.execute(delete(RuntimeOutboxEvent))
+    await db_session.execute(delete(RuntimeRun))
     await stage_scheduled_task_terminal_delivery(
         db_session, _scheduled_task(), "completed",
     )

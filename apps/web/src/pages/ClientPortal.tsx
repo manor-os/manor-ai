@@ -9,6 +9,7 @@ import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import { IconPlus } from "../components/icons";
 import { PermissionBanner } from "../components/permissions";
+import { getPreferredTimeZone } from "../lib/format";
 
 type PortalView = "login" | "tickets";
 
@@ -247,7 +248,7 @@ function PortalTickets({ token }: { token: string }) {
                         {ticket.status?.replace("_", " ") || t("page.client_portal.open")}
                       </span>
                       <span style={{ fontSize: 12, color: "#a8a29e" }}>
-                        {ticket.created_at ? new Date(ticket.created_at).toLocaleDateString() : ""}
+                        {ticket.created_at ? new Date(ticket.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) : ""}
                       </span>
                     </div>
                   </button>
@@ -294,7 +295,7 @@ function PortalTickets({ token }: { token: string }) {
                 <div>
                   <span style={{ fontSize: 12, color: "#a8a29e", display: "block" }}>{t("page.client_portal.field_created")}</span>
                   <span style={{ fontSize: 14, color: "#57534e" }}>
-                    {selectedTicket.created_at ? new Date(selectedTicket.created_at).toLocaleString() : t("page.client_portal.na")}
+                    {selectedTicket.created_at ? new Date(selectedTicket.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.client_portal.na")}
                   </span>
                 </div>
               </div>

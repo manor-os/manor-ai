@@ -16,6 +16,7 @@ _BILLING_CONTEXT_KEYS = {
     "conversation_id",
     "suppress",
     "byok",
+    "payer_entity_id",
 }
 
 _SYSTEM_TASK_USER_IDS = {"ai-agent"}
@@ -37,6 +38,8 @@ class RuntimeResolvedBillingScope:
     workspace_id: str | None = None
     user_id: str | None = None
     byok: bool = False
+    payer_entity_id: str | None = None
+    """Who pays, when already resolved; ``entity_id`` stays the data owner."""
 
 
 def _normalized_billable_user_id(value: Any) -> str | None:
@@ -118,6 +121,7 @@ def runtime_llm_billing_context(
     conversation_id: str | None = None,
     source: str = RUNTIME_SYSTEM_SOURCE,
     byok: bool = False,
+    payer_entity_id: str | None = None,
 ):
     """Return the async LLM billing context manager through the Runtime boundary."""
 
@@ -131,6 +135,7 @@ def runtime_llm_billing_context(
         conversation_id=conversation_id,
         source=source,
         byok=byok,
+        payer_entity_id=payer_entity_id,
     )
 
 
@@ -143,8 +148,13 @@ def runtime_set_suppressed_billing_context(
     conversation_id: str | None = None,
     source: str = RUNTIME_CHAT_SOURCE,
     durable_per_call: bool = False,
+    payer_entity_id: str | None = None,
 ) -> RuntimeBillingContextHandle:
-    """Bind a suppressing billing context for callers with custom billing."""
+    """Bind a suppressing billing context for callers with custom billing.
+
+    Pass the payer the custom billing charges so the credit preflight gates
+    the same entity.
+    """
 
     from packages.core.ai.llm_client import LLMBillingContext, _billing_ctx_var
 
@@ -157,6 +167,7 @@ def runtime_set_suppressed_billing_context(
         source=source,
         suppress=True,
         durable_per_call=durable_per_call,
+        payer_entity_id=payer_entity_id,
     )
     return RuntimeBillingContextHandle(
         context=context,
@@ -174,6 +185,17 @@ def runtime_release_billing_context(handle: RuntimeBillingContextHandle | None) 
 
     release_billing_in_flight(handle.context)
     _billing_ctx_var.reset(handle.token)
+
+
+def runtime_bound_billing_payer(entity_id: str | None, workspace_id: str | None) -> str | None:
+    """The payer pinned on the bound billing context for this scope, if any."""
+
+    from packages.core.ai.llm_client import _billing_ctx_var
+
+    bound = _billing_ctx_var.get()
+    if bound is None or bound.entity_id != entity_id or bound.workspace_id != workspace_id:
+        return None
+    return bound.payer_entity_id
 
 
 def runtime_current_billing_context() -> Any | None:
@@ -279,6 +301,8 @@ def _bind_resolved_billing_scope(scope: RuntimeResolvedBillingScope, *, source: 
         kwargs["user_id"] = scope.user_id
     if scope.byok:
         kwargs["byok"] = True
+    if scope.payer_entity_id:
+        kwargs["payer_entity_id"] = scope.payer_entity_id
     runtime_ensure_billing_context(
         scope.entity_id,
         source=source,
@@ -294,13 +318,28 @@ async def _resolve_scope_byok(
 ) -> RuntimeResolvedBillingScope:
     if not model_role or not scope.entity_id:
         return scope
+    from packages.core.services.billing_payer import TrialSponsorUnavailable, payer_entity_id
+
+    try:
+        payer = await payer_entity_id(db, scope.entity_id, scope.workspace_id)
+    except TrialSponsorUnavailable:
+        # No BYOK either: the credit preflight refuses the run as a trial.
+        return scope
+    scope = RuntimeResolvedBillingScope(
+        entity_id=scope.entity_id,
+        workspace_id=scope.workspace_id,
+        user_id=scope.user_id,
+        payer_entity_id=payer if payer != scope.entity_id else None,
+    )
     try:
         from packages.core.services.model_resolver import resolve_llm_metadata_for_user
 
+        # The payer's keys decide BYOK: in a trial the provider pays.
         metadata = await resolve_llm_metadata_for_user(
             model_role,
             user_id=scope.user_id,
             entity_id=scope.entity_id,
+            workspace_id=scope.workspace_id,
             db=db,
         )
     except Exception:
@@ -312,6 +351,7 @@ async def _resolve_scope_byok(
         workspace_id=scope.workspace_id,
         user_id=scope.user_id,
         byok=True,
+        payer_entity_id=scope.payer_entity_id,
     )
 
 

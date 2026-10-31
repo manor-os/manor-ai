@@ -23,6 +23,7 @@
       "update_goal_value",
       "get_stat_status",
       "record_stat_assessment",
+      "add_assessed_metrics",
       "request_strategist_review",
       "resolve_hitl",
       "answer_task_blocker",

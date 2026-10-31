@@ -36,7 +36,22 @@ DEFAULT_RESERVATION_TTL_SECONDS = int(
 
 
 class CreditReservationError(ValueError):
-    pass
+    kind = "credit"
+
+
+TRIAL_CREDIT_MESSAGE = (
+    "The provider's credits for this trial are used up. Ask the provider to add "
+    "credits, or accept the delivery to continue on your own plan."
+)
+
+
+class TrialCreditReservationError(CreditReservationError):
+    """The provider paying for a client delivery trial cannot cover the spend."""
+
+    kind = "trial_credit"
+
+    def __init__(self, message: str = TRIAL_CREDIT_MESSAGE):
+        super().__init__(message)
 
 
 def _now() -> datetime:
@@ -77,6 +92,63 @@ async def _lock_entity(db: AsyncSession, entity_id: str) -> None:
     )).scalar_one_or_none()
     if not entity_row:
         raise CreditReservationError(f"entity {entity_id!r} not found")
+
+
+async def _reservation_payer(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: Optional[str],
+    payer_entity_id: Optional[str],
+) -> str:
+    """Return the entity charged for a reservation by ``entity_id``.
+
+    ``payer_entity_id`` is a payer pinned by the caller; without one the
+    Workspace's current payer is resolved.
+    """
+    from packages.core.services.billing_payer import (
+        TrialSponsorUnavailable,
+        payer_entity_id as resolve_payer,
+        validate_payer,
+    )
+
+    if payer_entity_id is None:
+        try:
+            return await resolve_payer(db, entity_id, workspace_id)
+        except TrialSponsorUnavailable as exc:
+            raise TrialCreditReservationError() from exc
+    if payer_entity_id == entity_id:
+        return payer_entity_id
+    try:
+        await validate_payer(
+            db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=payer_entity_id,
+        )
+    except ValueError as exc:
+        raise CreditReservationError(str(exc)) from exc
+    payer = await db.get(Entity, payer_entity_id)
+    if payer is None or payer.deleted_at is not None:
+        raise TrialCreditReservationError()
+    return payer_entity_id
+
+
+def _insufficient_credits(meta: dict, required: int, available: int) -> CreditReservationError:
+    # A reservation held for another entity's data is a sponsored trial's.
+    if meta.get("data_owner_entity_id"):
+        return TrialCreditReservationError()
+    return CreditReservationError(
+        f"insufficient credits: required {required}, available {available}"
+    )
+
+
+async def reservation_payer_by_source(
+    db: AsyncSession,
+    *,
+    source_kind: str,
+    source_id: str,
+) -> str | None:
+    """Return the entity a source's reservation charges (plain read, no lock)."""
+    row = await _reservation_by_source(db, source_kind=source_kind, source_id=source_id)
+    return row.entity_id if row is not None else None
 
 
 async def _reservation_by_id(
@@ -129,11 +201,15 @@ async def reserve_credits(
     conversation_id: Optional[str] = None,
     user_id: Optional[str] = None,
     metadata: Optional[dict] = None,
+    payer_entity_id: Optional[str] = None,
 ) -> CreditReservation:
     """Reserve credits for pending async work.
 
-    Caller must commit. The entity row is locked so concurrent reservations for
-    the same entity see a serialized available balance.
+    Caller must commit. ``entity_id`` owns the work's data; the reservation
+    is held against the payer (``payer_entity_id``, or the Workspace's
+    current payer when omitted), whose Entity row is locked so concurrent
+    reservations see a serialized available balance. When the payer differs,
+    ``meta.data_owner_entity_id`` records the data owner.
     """
     amount = int(amount_credits or 0)
     if amount <= 0:
@@ -141,7 +217,13 @@ async def reserve_credits(
     if not source_kind or not source_id:
         raise CreditReservationError("source_kind and source_id are required")
 
-    await _lock_entity(db, entity_id)
+    payer = await _reservation_payer(
+        db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=payer_entity_id,
+    )
+    meta = dict(metadata or {})
+    if payer != entity_id:
+        meta["data_owner_entity_id"] = entity_id
+    await _lock_entity(db, payer)
 
     existing = await _reservation_by_source(
         db,
@@ -149,6 +231,10 @@ async def reserve_credits(
         source_id=source_id,
         lock=True,
     )
+    if existing and (existing.meta or {}).get("cancelled_before_reserve"):
+        if existing.entity_id != payer or existing.user_id != user_id:
+            raise CreditReservationError("reservation owner mismatch")
+        return existing
     if existing and existing.status == RESERVATION_STATUS_ACTIVE:
         if int(existing.amount_credits or 0) == amount:
             return existing
@@ -162,7 +248,7 @@ async def reserve_credits(
     now = _now()
     row = CreditReservation(
         id=generate_ulid(),
-        entity_id=entity_id,
+        entity_id=payer,
         workspace_id=workspace_id,
         agent_id=agent_id,
         conversation_id=conversation_id,
@@ -173,7 +259,7 @@ async def reserve_credits(
         source_id=source_id,
         status=RESERVATION_STATUS_ACTIVE,
         reason=reason,
-        meta=dict(metadata or {}),
+        meta=meta,
         expires_at=expires_at or _default_expires_at(now),
     )
     db.add(row)
@@ -191,6 +277,44 @@ async def consume_reservation(
     if row is None:
         raise CreditReservationError(f"reservation {reservation_id!r} not found")
     return await _consume_row(row, consumed_credits=consumed_credits)
+
+
+async def cancel_reservation_by_source(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    source_kind: str,
+    source_id: str,
+    workspace_id: Optional[str],
+    user_id: Optional[str] = None,
+    payer_entity_id: Optional[str] = None,
+) -> CreditReservation:
+    """Cancel a durable request, including one whose reserve has not arrived.
+
+    The caller commits and must treat a returned released row as terminal.
+    This records a zero-credit tombstone, never a charge or a temporary hold.
+    Resolve/pin the same payer as reservation creation before serializing it.
+    """
+    payer = await _reservation_payer(
+        db, entity_id=entity_id, workspace_id=workspace_id, payer_entity_id=payer_entity_id,
+    )
+    await _lock_entity(db, payer)
+    row = await _reservation_by_source(db, source_kind=source_kind, source_id=source_id, lock=True)
+    if row is not None:
+        if row.entity_id != payer or row.user_id != user_id:
+            raise CreditReservationError("reservation owner mismatch")
+        return await _release_row(row, reason="provider_did_not_complete")
+    meta = {"cancelled_before_reserve": True}
+    if payer != entity_id:
+        meta["data_owner_entity_id"] = entity_id
+    row = CreditReservation(
+        id=generate_ulid(), entity_id=payer, workspace_id=workspace_id, user_id=user_id,
+        source_kind=source_kind, source_id=source_id, amount_credits=0, consumed_credits=0,
+        status=RESERVATION_STATUS_RELEASED, released_at=_now(), meta=meta,
+    )
+    db.add(row)
+    await db.flush()
+    return row
 
 
 async def consume_reservation_by_source(

@@ -27,7 +27,6 @@ from packages.core.models.goal import Goal, GoalTaskLink
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.skill import AgentSkillBinding, Skill
 from packages.core.models.task import Task
-from packages.core.models.worker import SubscriptionWorker
 from packages.core.models.workspace import (
     AgentSubscription,
     AgentToolBinding,
@@ -964,19 +963,6 @@ async def _assert_custom_agent_subscriptions(db_session, workspace_id: str, scen
 
     expected_service_keys = {service["service_key"] for service in scenario["services"]}
     assert set(subscriptions_by_service) == expected_service_keys
-
-    workers = (
-        (
-            await db_session.execute(
-                select(SubscriptionWorker).where(
-                    SubscriptionWorker.subscription_id.in_([subscription.id for subscription in subscriptions])
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert {worker.subscription_id for worker in workers} == {subscription.id for subscription in subscriptions}
 
     for mapping in scenario["agent_mappings"]:
         service_key = mapping["service_key"]

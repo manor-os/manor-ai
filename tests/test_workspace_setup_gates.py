@@ -1,16 +1,13 @@
 """Regression tests for Blueprint-owned Workspace setup gates."""
 
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from packages.core.constants.blueprints import installed_blueprint_job_id
 from packages.core.models.base import generate_ulid
-from packages.core.models.execution import ExecutionPlan
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.workspace import Workspace
-from packages.core.plans.executor import PlanExecutor
 from packages.core.services.entity_service import (
     ProtectedWorkspaceSettingsError,
     update_workspace,
@@ -398,90 +395,3 @@ async def test_nonblocking_check_does_not_hide_durable_integration_blocker(
     [missing] = status.details["incomplete_checks"]
     assert missing["todo_kind"] == "missing_integration"
     assert missing["provider"] == "slack"
-
-
-@pytest.mark.asyncio
-async def test_plan_executor_does_not_advance_materialized_plan_while_setup_blocks(
-    db_session,
-) -> None:
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    workspace = Workspace(
-        id=workspace_id,
-        entity_id=entity_id,
-        name="Blocked plan",
-        status="active",
-        settings={
-            "_blueprint": {
-                "blueprint_id": "builtin:blocked",
-                "live_setup_requirements": [{
-                    "kind": "note",
-                    "detail": "Complete setup first.",
-                    "payload": {},
-                    "blocking": True,
-                }],
-            },
-        },
-    )
-    plan = ExecutionPlan(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        status="draft",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    )
-    db_session.add_all([workspace, plan])
-    await db_session.flush()
-
-    @asynccontextmanager
-    async def session_factory():
-        yield db_session
-
-    result = await PlanExecutor(session_factory=session_factory).run_cycle(plan.id)
-
-    assert result["status"] == "blocked_setup"
-    assert result["next_action"] == "schedule_self"
-    assert plan.status == "draft"
-
-
-@pytest.mark.asyncio
-async def test_plan_executor_defers_automatic_work_when_workspace_is_paused(
-    db_session,
-) -> None:
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    workspace = Workspace(
-        id=workspace_id,
-        entity_id=entity_id,
-        name="Paused workspace",
-        status="paused",
-        settings={},
-    )
-    plan = ExecutionPlan(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        status="draft",
-        execution_mode="live",
-        approval_required=False,
-        plan_dag={"steps": []},
-    )
-    db_session.add_all([workspace, plan])
-    await db_session.flush()
-
-    @asynccontextmanager
-    async def session_factory():
-        yield db_session
-
-    result = await PlanExecutor(session_factory=session_factory).run_cycle(plan.id)
-
-    assert result == {
-        "plan_id": plan.id,
-        "status": "workspace_autonomy_paused",
-        "next_action": "schedule_self",
-        "delay_seconds": 60,
-        "continuation_staged": True,
-    }
-    assert plan.status == "draft"

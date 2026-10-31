@@ -7,8 +7,6 @@ mint side cannot silently fall through the chat bridge.
 """
 from __future__ import annotations
 
-import json
-
 import pytest
 from sqlalchemy import select
 
@@ -407,65 +405,3 @@ async def test_list_open_task_blockers_scopes_and_shapes(db_session):
     assert entry["answerable_via_tool"] is True
     assert entry["reason"].startswith("Which screenshot")
 
-
-async def test_runtime_blocker_hints_durable_wake_after_commit_even_if_broker_fails(
-    monkeypatch,
-):
-    from packages.core.ai.runtime.workspace_blocker_actions import (
-        runtime_workspace_answer_task_blocker_action,
-    )
-    from packages.core.plans import wakeup
-    from packages.core.services import task_blockers
-    import packages.core.database as database
-
-    events: list[str] = []
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def commit(self):
-            events.append("commit")
-
-        async def rollback(self):
-            events.append("rollback")
-
-    async def fake_answer(_db, **_kwargs):
-        events.append("resolve")
-        return {
-            "resolved": True,
-            "decision": "answered",
-            "_plan_to_run": "plan-1",
-        }
-
-    async def pending_wake(_db, plan_id: str):
-        assert plan_id == "plan-1"
-        events.append("read_wake")
-        return object()
-
-    def fail_hint(_wake, *, reason: str):
-        assert reason == "task_blocker_post_commit_hint"
-        events.append("hint_failed")
-        return False
-
-    monkeypatch.setattr(database, "async_session", lambda: FakeSession())
-    monkeypatch.setattr(task_blockers, "answer_task_blocker", fake_answer)
-    monkeypatch.setattr(wakeup, "pending_plan_cycle_wake", pending_wake)
-    monkeypatch.setattr(wakeup, "dispatch_plan_cycle_wake_hint", fail_hint)
-
-    payload = json.loads(await runtime_workspace_answer_task_blocker_action(
-        entity_id="entity-1",
-        user_id="user-1",
-        workspace_id="workspace-1",
-        params={"request_id": "request-1", "answer": "continue"},
-    ))
-
-    assert payload == {
-        "resolved": True,
-        "decision": "answered",
-        "dispatched": True,
-    }
-    assert events == ["resolve", "commit", "read_wake", "hint_failed"]

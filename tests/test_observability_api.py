@@ -164,6 +164,7 @@ async def _seed(client: AsyncClient, username: str) -> dict:
             enabled=True, consecutive_errors=2, last_status="error",
             last_run_at=now - timedelta(hours=2),
             revision=3,
+            execution_type="workflow",
             execution_target={
                 "_experiment_overlay": {
                     "experiment_id": experiment.id, "patch": {"x": 1},
@@ -175,13 +176,19 @@ async def _seed(client: AsyncClient, username: str) -> dict:
             entity_id=entity_id, workspace_id=ws.id,
             name="Disabled", enabled=False,
         )
+        strategist_job = ScheduledJob(
+            job_id=f"strategist-{generate_ulid()}",
+            entity_id=entity_id, workspace_id=ws.id,
+            name="Strategist review", enabled=True,
+            execution_type="strategist_review",
+        )
         binding = WorkflowBinding(
             entity_id=entity_id, workflow_id=generate_ulid(),
             workspace_id=ws.id, name="Weekly report flow",
             trigger_type="schedule", trigger_config={"cron": "0 9 * * 1"},
             enabled=True, revision=2,
         )
-        db.add_all([job, disabled_job, binding])
+        db.add_all([job, disabled_job, strategist_job, binding])
         await db.flush()
 
         for i, (etype, status) in enumerate((
@@ -285,6 +292,7 @@ async def _seed(client: AsyncClient, username: str) -> dict:
             "item_approved_id": item_approved.id,
             "root_id": root_id,
             "job_id": job.id,
+            "strategist_job_id": strategist_job.id,
             "binding_id": binding.id,
             "experiment_id": experiment.id,
         }
@@ -442,8 +450,8 @@ async def test_automation_health_aggregates(client: AsyncClient):
     assert resp.status_code == 200
     automations = {a["id"]: a for a in resp.json()["automations"]}
 
-    # Disabled job excluded; enabled job + binding present.
-    assert set(automations) == {seed["job_id"], seed["binding_id"]}
+    # Disabled job excluded; every enabled automation remains observable.
+    assert set(automations) == {seed["job_id"], seed["strategist_job_id"], seed["binding_id"]}
 
     job = automations[seed["job_id"]]
     assert job["kind"] == "scheduled_job"
@@ -471,8 +479,12 @@ async def test_automation_health_aggregates(client: AsyncClient):
     }
     assert binding["active_experiment"] is None
 
+    strategist = automations[seed["strategist_job_id"]]
+    assert strategist["kind"] == "scheduled_job"
+    assert strategist["name"] == "Strategist review"
 
-async def test_automation_health_excludes_paused_workspace(client: AsyncClient):
+
+async def test_automation_health_keeps_enabled_automations_visible_when_strategist_paused(client: AsyncClient):
     seed = await _seed(client, "obs_health_paused")
     import packages.core.database as dbmod
 
@@ -487,7 +499,9 @@ async def test_automation_health_excludes_paused_workspace(client: AsyncClient):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"automations": []}
+    assert {entry["id"] for entry in resp.json()["automations"]} == {
+        seed["job_id"], seed["binding_id"],
+    }
 
 
 # ── task provenance ───────────────────────────────────────────────────

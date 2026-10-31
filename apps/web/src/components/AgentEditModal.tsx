@@ -43,6 +43,7 @@ import {
 } from "../lib/agentDisplay";
 import { PROMPT_VARIABLES, improvePrompt, runTest, insertVariable } from "../lib/agentPromptHelpers";
 import { useAgentEditModalStore, closeAgentEditModal } from "../stores/agentEditModal";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 
 // CATEGORIES is small and only used by the modal's category <Select> — kept
 // as a local copy rather than importing from Agents.tsx (a page file), since
@@ -300,35 +301,49 @@ export default function AgentEditModal() {
   const [toolSearch, setToolSearch] = useState("");
   const [mcpSearch, setMcpSearch] = useState("");
   const [capabilityTab, setCapabilityTab] = useState<"skills" | "tools" | "mcp">("skills");
+  // A section whose bindings could not be read is shown as unavailable and
+  // never sends attach/detach operations, so a save cannot drop bindings.
+  const [skillsLoadFailed, setSkillsLoadFailed] = useState(false);
+  const [toolsLoadFailed, setToolsLoadFailed] = useState(false);
+  const [agentSkillOptions, setAgentSkillOptions] = useState<any[]>([]);
+  // An external collaborator picks Skills from the Agent's Workspace; the
+  // company's skill library, tool catalog and MCP servers stay closed to them.
+  const collaborator = useIsCollaborator();
 
   const avatarFileInputRef = useRef<HTMLInputElement>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { data: entitySkills } = useQuery({
     ...skillListQueryOptions(catalogScope, { include_platform: true }),
-    enabled: privateApiEnabled && !!catalogScope && showModal,
+    enabled: privateApiEnabled && !!catalogScope && showModal && !collaborator,
   });
 
-  const { data: toolCatalog } = useQuery({
+  const { data: toolCatalog, isError: toolCatalogFailed } = useQuery({
     queryKey: ["agents", "tools", "all-for-create"],
     queryFn: () => api.agents.allToolsForCreate(),
-    enabled: privateApiEnabled && showModal,
+    enabled: privateApiEnabled && showModal && !collaborator,
   });
 
   const { data: mcpServerStatus } = useQuery({
     queryKey: ["mcp-servers", "agent-settings"],
     queryFn: () => api.integrations.mcpServers(),
-    enabled: privateApiEnabled && showModal,
+    enabled: privateApiEnabled && showModal && !collaborator,
   });
 
   const { data: modelCatalog } = useQuery({
     queryKey: ["model-catalog"],
     queryFn: () => api.auth.getModelCatalog(),
-    enabled: privateApiEnabled && showModal,
+    enabled: privateApiEnabled && showModal && !collaborator,
     staleTime: 60_000,
   });
 
-  const filteredSkills = ((entitySkills as any[]) || []).filter((skill: any) => {
+  const skillsUnavailable = skillsLoadFailed || (collaborator && !isEditing);
+  const toolsUnavailable = collaborator || toolsLoadFailed || toolCatalogFailed;
+  const unavailableSectionText = t(
+    collaborator ? "page.agents.section_unavailable_collaborator" : "page.agents.section_load_failed",
+  );
+  const skillOptions = collaborator ? agentSkillOptions : (entitySkills as any[]) || [];
+  const filteredSkills = skillOptions.filter((skill: any) => {
     if (!skillSearch.trim()) return true;
     const q = skillSearch.toLowerCase();
     const description = getSkillDescription(skill);
@@ -435,6 +450,9 @@ export default function AgentEditModal() {
     setAttachToolIds([]);
     setEditToolIds([]);
     setOrigToolIds([]);
+    setSkillsLoadFailed(false);
+    setToolsLoadFailed(false);
+    setAgentSkillOptions([]);
     setSkillSearch("");
     setToolSearch("");
     setMcpSearch("");
@@ -486,26 +504,37 @@ export default function AgentEditModal() {
         setFormTestMsg("");
         setFormTestResp("");
         setBindingsLoading(true);
-        const [boundSkills, availableSkills, boundTools] = await Promise.all([
+        setSkillsLoadFailed(false);
+        setToolsLoadFailed(false);
+        // Each section loads on its own: one refused or failed list leaves the
+        // agent and the other sections editable.
+        const [boundSkills, availableSkills, boundTools] = await Promise.allSettled([
           api.skills.listAgentBindings(agent.id),
           api.skills.listAgentAvailable(agent.id),
           api.agents.getTools(agent.id),
         ]);
         if (cancelled) return;
-        const boundSkillIds = (boundSkills || []).map((s: any) => s.id);
-        setOrigSkillIds(boundSkillIds);
-        setEditSkillIds([...boundSkillIds]);
-        const boundToolIds = (boundTools || []).map((t: any) => t.id);
-        setOrigToolIds(boundToolIds);
-        setEditToolIds([...boundToolIds]);
+        if (boundSkills.status === "fulfilled" && availableSkills.status === "fulfilled") {
+          const boundSkillIds = (boundSkills.value || []).map((s: any) => s.id);
+          setOrigSkillIds(boundSkillIds);
+          setEditSkillIds([...boundSkillIds]);
+          setAgentSkillOptions([...(boundSkills.value || []), ...(availableSkills.value || [])]);
+        } else {
+          setSkillsLoadFailed(true);
+        }
+        if (boundTools.status === "fulfilled") {
+          const boundToolIds = (boundTools.value || []).map((t: any) => t.id);
+          setOrigToolIds(boundToolIds);
+          setEditToolIds([...boundToolIds]);
+        } else {
+          setToolsLoadFailed(true);
+        }
         setBindingsLoading(false);
       } catch {
         if (cancelled) return;
         setBindingsLoading(false);
-        setOrigSkillIds([]);
-        setEditSkillIds([]);
-        setOrigToolIds([]);
-        setEditToolIds([]);
+        setSkillsLoadFailed(true);
+        setToolsLoadFailed(true);
         toast.error(t("page.agents.failed_to_load_agent"));
       }
     })();
@@ -521,8 +550,8 @@ export default function AgentEditModal() {
       let hasBindingFailures = false;
       if (agent?.id) {
         const bindingTasks: Promise<unknown>[] = [];
-        const uniqueToolIds = Array.from(new Set(attachToolIds));
-        const uniqueSkillIds = Array.from(new Set(attachSkillIds));
+        const uniqueToolIds = toolsUnavailable ? [] : Array.from(new Set(attachToolIds));
+        const uniqueSkillIds = skillsUnavailable ? [] : Array.from(new Set(attachSkillIds));
         if (uniqueToolIds.length > 0) {
           bindingTasks.push(api.agents.bindTools(agent.id, uniqueToolIds));
         }
@@ -553,16 +582,17 @@ export default function AgentEditModal() {
       const agentId2 = editingAgent?.id as string;
       let hasBindingFailures = false;
       if (agentId2) {
-        const toAttachSkills = editSkillIds.filter(
+        // A section that is unavailable was never loaded: leave its bindings alone.
+        const toAttachSkills = skillsUnavailable ? [] : editSkillIds.filter(
           (id: string) => !origSkillIds.includes(id),
         );
-        const toDetachSkills = origSkillIds.filter(
+        const toDetachSkills = skillsUnavailable ? [] : origSkillIds.filter(
           (id: string) => !editSkillIds.includes(id),
         );
-        const toAttachTools = editToolIds.filter(
+        const toAttachTools = toolsUnavailable ? [] : editToolIds.filter(
           (id: string) => !origToolIds.includes(id),
         );
-        const toDetachTools = origToolIds.filter(
+        const toDetachTools = toolsUnavailable ? [] : origToolIds.filter(
           (id: string) => !editToolIds.includes(id),
         );
 
@@ -1156,7 +1186,12 @@ export default function AgentEditModal() {
               ))}
             </div>
 
-            {capabilityTab === "skills" && (
+            {capabilityTab === "skills" && skillsUnavailable && (
+              <div role="status" className="rounded-xl border border-stone-200 bg-white p-3 text-xs text-stone-500">
+                {unavailableSectionText}
+              </div>
+            )}
+            {capabilityTab === "skills" && !skillsUnavailable && (
               <div>
                 <Input
                   value={skillSearch}
@@ -1225,7 +1260,12 @@ export default function AgentEditModal() {
               </div>
             )}
 
-            {capabilityTab === "tools" && (
+            {(capabilityTab === "tools" || capabilityTab === "mcp") && toolsUnavailable && (
+              <div role="status" className="rounded-xl border border-stone-200 bg-white p-3 text-xs text-stone-500">
+                {unavailableSectionText}
+              </div>
+            )}
+            {capabilityTab === "tools" && !toolsUnavailable && (
               <div>
               <Input
                 value={toolSearch}
@@ -1320,7 +1360,7 @@ export default function AgentEditModal() {
               </div>
             )}
 
-            {capabilityTab === "mcp" && (
+            {capabilityTab === "mcp" && !toolsUnavailable && (
               <div>
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">

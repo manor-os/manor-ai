@@ -1,5 +1,24 @@
 import { generatedFileLabel, generatedFileOpenReference, isOpenableFileReference } from "./fileReferences";
 
+const EXECUTION_ONLY_LOG_TYPES = new Set(["ai_execution_started", "ai_agent_turn", "ai_supervisor_verdict"]);
+const COORDINATOR_SUMMARY_LOG_TYPES = new Set(["ai_agent_turn", "ai_supervisor_verdict"]);
+const COMMENT_EXECUTION_LOG_TYPES = new Set([
+  "ai_hitl_requested", "ai_hitl_resumed", "ai_needs_replan", "ai_execution_completed", "ai_execution_failed",
+]);
+
+type CommentLog = { log_type?: string; meta?: Record<string, unknown> };
+
+/** Only persisted, bounded coordinator summaries join the conversation.
+ * Internal model rounds and supervisor traces remain in the execution log. */
+export function taskLogVisibleInComments(log: CommentLog): boolean {
+  return !EXECUTION_ONLY_LOG_TYPES.has(log.log_type || "")
+    || (COORDINATOR_SUMMARY_LOG_TYPES.has(log.log_type || "") && log.meta?.coordinator_progress === true);
+}
+
+export function taskLogVisibleInExecution(log: CommentLog): boolean {
+  return EXECUTION_ONLY_LOG_TYPES.has(log.log_type || "") || COMMENT_EXECUTION_LOG_TYPES.has(log.log_type || "");
+}
+
 export type CommentResultSection = {
   title: string;
   text: string;

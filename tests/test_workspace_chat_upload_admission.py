@@ -189,9 +189,15 @@ async def test_public_media_stays_available_without_knowledge_registration(monke
     monkeypatch.setattr(file_context, "extract_text", extract)
     monkeypatch.setattr(file_context, "runtime_assert_credit_available", credit)
     monkeypatch.setattr(whisper, "transcribe_blob", transcribe)
+    # Images must decode to be stored (metadata is stripped first); other types stay opaque.
+    from PIL import Image
+
+    png = io.BytesIO()
+    Image.new("RGB", (1, 1)).save(png, format="PNG")
+    payload = png.getvalue() if mime.startswith("image/") else b"attachment bytes"
     # A DB sentinel proves these surfaces cannot reach Knowledge persistence.
     attachments = await file_context.build_file_context(
-        [UploadFile(filename=name, file=io.BytesIO(b"attachment bytes"))], [], "entity", object(),
+        [UploadFile(filename=name, file=io.BytesIO(payload))], [], "entity", object(),
         workspace_id="workspace", user_id="internal-user", surface=surface,
     )
     assert attachments.attachment_refs[0]["url"] == url

@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import type { WorkspaceAppAction, WorkspaceAppFormField } from "../../lib/api";
 import { viewerPathForDocumentId } from "../../lib/fileReferences";
 import { t } from "../../lib/i18n";
+import type { WorkflowDocumentRef } from "../../lib/workflowRunInputs";
+import WorkflowWaitDocumentField from "../workflows/WorkflowWaitDocumentField";
 import { IconArrowLeft, IconArrowRight, IconChatBubble } from "../icons";
 import ChatMarkdown from "../ChatMarkdown";
 import Button from "../ui/Button";
@@ -14,16 +16,18 @@ export type WorkspaceAppChatResult = {
 };
 
 export default function WorkspaceAppActionChat({
-  action, canStart, onBack, onRun,
+  action, workspaceId, canStart, onBack, onRun,
 }: {
   action: WorkspaceAppAction;
+  workspaceId: string;
   canStart: boolean;
   onBack: () => void;
-  onRun: (request: string, files: File[]) => Promise<WorkspaceAppChatResult>;
+  onRun: (request: string, documents: WorkflowDocumentRef[]) => Promise<WorkspaceAppChatResult>;
 }) {
   const configured = (action.inputs || []) as WorkspaceAppFormField[];
   const fields: WorkspaceAppFormField[] = configured.length ? configured : [{ key: "request", label: t("component.workspace_app_view.tell_us"), type: "long_text", required: false, placeholder: action.description || action.title, options: [] }];
-  const [values, setValues] = useState<Record<string, string | File | null>>({});
+  // A file field holds Knowledge documents, picked or uploaded like every other App form.
+  const [values, setValues] = useState<Record<string, string | WorkflowDocumentRef[]>>({});
   const [step, setStep] = useState(0);
   const [stage, setStage] = useState<"input" | "review" | "running" | "result">("input");
   const [result, setResult] = useState<WorkspaceAppChatResult | null>(null);
@@ -32,7 +36,7 @@ export default function WorkspaceAppActionChat({
   const value = current ? values[current.key] : null;
   const display = (field: WorkspaceAppFormField) => {
     const item = values[field.key];
-    return item instanceof File ? item.name : String(item || "").trim();
+    return Array.isArray(item) ? item.map((document) => document.name || document.document_id).join(", ") : String(item || "").trim();
   };
   const next = () => {
     if (current.required && !display(current)) { setError(t("component.workspace_app_view.required_hint")); return; }
@@ -46,8 +50,8 @@ export default function WorkspaceAppActionChat({
     setStage("running");
     try {
       const answers = fields.filter((field) => display(field)).map((field) => `${field.label}: ${display(field)}`);
-      const files = fields.flatMap((field) => values[field.key] instanceof File ? [values[field.key] as File] : []);
-      setResult(await onRun(answers.join("\n"), files));
+      const documents = fields.flatMap((field) => { const item = values[field.key]; return Array.isArray(item) ? item : []; });
+      setResult(await onRun(answers.join("\n"), documents));
       setStage("result");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : t("component.workspace_app_view.start_error"));
@@ -71,7 +75,7 @@ export default function WorkspaceAppActionChat({
     {stage === "input" && <div className="workspace-app-flow__panel">
       <span className="workspace-app-flow__kicker">{step + 1} / {fields.length}</span>
       <label className="workspace-app-flow__request">{current.label}{current.required ? " *" : ""}
-        {current.type === "file" ? <input type="file" onChange={(event) => setValues((previous) => ({ ...previous, [current.key]: event.target.files?.[0] || null }))} disabled={!canStart} />
+        {current.type === "file" ? <WorkflowWaitDocumentField id={`app-action-${current.key}`} value={value} workspaceId={workspaceId} disabled={!canStart} onChange={(documents) => { setValues((previous) => ({ ...previous, [current.key]: documents })); setError(""); }} />
           : current.type === "long_text" ? <textarea className="manor-input" value={typeof value === "string" ? value : ""} onChange={(event) => setValues((previous) => ({ ...previous, [current.key]: event.target.value }))} rows={5} placeholder={current.placeholder} disabled={!canStart} />
           : current.type === "select" ? <Select
             role="combobox"
@@ -86,7 +90,6 @@ export default function WorkspaceAppActionChat({
           />
           : <input className="manor-input" type={current.type === "number" ? "number" : "text"} value={typeof value === "string" ? value : ""} onChange={(event) => setValues((previous) => ({ ...previous, [current.key]: event.target.value }))} placeholder={current.placeholder} disabled={!canStart} />}
       </label>
-      {current.type === "file" && value instanceof File && <p>{value.name}</p>}
       {error && <p role="alert" className="workspace-app-flow__error">{error}</p>}
       <div className="workspace-app-flow__buttons">
         {step > 0 && <Button variant="ghost" onClick={() => { setStep(step - 1); setError(""); }}>{t("component.workspace_app_view.back")}</Button>}

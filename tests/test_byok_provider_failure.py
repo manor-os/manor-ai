@@ -14,12 +14,14 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from packages.core.ai import llm_client
+from packages.core.ai import llm_client, provider_retry
 from packages.core.ai.agentic_loop import agentic_loop
 from packages.core.ai.runtime import ChatSurface
 from packages.core.ai.runtime.output_policy import (
     BYOK_PROVIDER_ERROR_CODE,
+    LLM_PROVIDER_UNAVAILABLE_ERROR_CODE,
     PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE,
+    PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE,
     PUBLIC_REQUEST_FAILURE_MESSAGE,
     runtime_assistant_result_meta,
     runtime_assistant_stream_error_content,
@@ -59,21 +61,30 @@ def _byok_usage() -> dict:
     }
 
 
+RETRIED = " after 6 attempts over 0s"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_tools", [False, True])
 @pytest.mark.parametrize("source", ["byok", "official"])
-@pytest.mark.parametrize("failure, expected_detail", [
-    (_http_error(503), PUBLIC_DETAIL),
-    (_http_error(401), "HTTP 401 from apitokengate.com (model openai/gpt-6-astra)"),
-    (httpx.ConnectError("dns"), "no response from apitokengate.com (model openai/gpt-6-astra)"),
+@pytest.mark.parametrize("failure, expected_detail, transient", [
+    (_http_error(503), PUBLIC_DETAIL + RETRIED, True),
+    (_http_error(401), "HTTP 401 from apitokengate.com (model openai/gpt-6-astra)", False),
+    (httpx.ConnectError("dns"), "no response from apitokengate.com (model openai/gpt-6-astra)" + RETRIED, True),
 ])
 async def test_provider_failure_is_typed_only_on_byok_routes(
-    monkeypatch, with_tools, source, failure, expected_detail,
+    monkeypatch, with_tools, source, failure, expected_detail, transient,
 ):
+    monkeypatch.setenv("LLM_STREAM_TRANSPORT", "0")
+    monkeypatch.setattr(llm_client.asyncio, "sleep", AsyncMock(return_value=None))
+    # Backoff sleeps are skipped, so the reported duration must not come from
+    # the runner's real time spent on six attempts ("over 2s" on a slow host).
+    monkeypatch.setattr(provider_retry, "_clock", lambda: 0.0)
     monkeypatch.setattr(llm_client, "resolve_llm_routing_for_model", AsyncMock(return_value=_route(source)))
     monkeypatch.setattr(llm_client, "_preflight_credit_check", AsyncMock(return_value=None))
     monkeypatch.setattr(llm_client, "_validate_llm_key_model_compatibility", lambda *_args: None)
-    monkeypatch.setattr(llm_client, "_post_with_retry", AsyncMock(side_effect=failure))
+    post = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(llm_client, "_post_with_retry", post)
     messages = [{"role": "user", "content": "现在有哪些每日任务"}]
     if with_tools:
         result = await llm_client.chat_completion_with_tools(messages, [], model=MODEL)
@@ -81,13 +92,45 @@ async def test_provider_failure_is_typed_only_on_byok_routes(
         result = await llm_client.chat_completion(messages, model=MODEL)
     usage = result[-1]
     assert usage["error"], usage
+    # Only a transient failure is sent again; a rejected key is not.
+    assert post.await_count == (6 if transient else 1)
+    assert bool(usage.get("error_transient")) is transient
     if source == "byok":
         assert usage["error_code"] == BYOK_PROVIDER_ERROR_CODE
         assert usage["error_public_detail"] == expected_detail
         assert RAW_BODY not in usage["error_public_detail"]
+    elif transient:
+        # A Manor-managed route never names the gateway host.
+        assert usage["error_code"] == LLM_PROVIDER_UNAVAILABLE_ERROR_CODE
+        assert usage["error_public_detail"] == expected_detail.split(" from ", 1)[0] + RETRIED
     else:
         assert usage.get("error_code") != BYOK_PROVIDER_ERROR_CODE
         assert "error_public_detail" not in usage
+
+
+@pytest.mark.asyncio
+async def test_byok_outage_tells_the_owner_it_is_not_their_settings(monkeypatch):
+    """2026-10-14: a dropped BYOK stream ("no response") failed a workflow and
+    told the owner to check a key, model and base URL that were all fine."""
+    detail = "no response from apitokengate.com (model gpt-6.1-sol) after 4 attempts over 150s"
+    usage = {**_byok_usage(), "error_public_detail": detail, "error_transient": True}
+    completion = AsyncMock(return_value=("", usage))
+    monkeypatch.setattr(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_text_completion", completion,
+    )
+    result = await agentic_loop(
+        system_prompt="system", user_message="plan the canvas", tools=[],
+        tool_executor=AsyncMock(side_effect=AssertionError("no tool without a model response")),
+    )
+    expected = f"{PUBLIC_BYOK_PROVIDER_UNAVAILABLE_MESSAGE}\n\nError detail: {detail}"
+    assert result.error == BYOK_PROVIDER_ERROR_CODE
+    assert result.content == expected
+    assert result.error_detail["transient"] is True
+    assert "API key" not in result.content
+    meta = runtime_assistant_result_meta(result)
+    assert runtime_public_assistant_message_content(result.content, meta) == expected
+    assert runtime_assistant_stream_error_content(expected) == expected
+    assert runtime_visitor_assistant_message_content(result.content, meta) == PUBLIC_REQUEST_FAILURE_MESSAGE
 
 
 @pytest.mark.asyncio

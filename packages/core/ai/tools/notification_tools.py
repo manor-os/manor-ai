@@ -96,6 +96,11 @@ NOTIFY_USER_SCHEMA: dict[str, Any] = {
                         "in their notification preferences."
                     ),
                 },
+                "idempotency_key": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "Stable key for retrying the same notification with identical content. Returns the existing delivery receipt on replay.",
+                },
             },
         },
     },
@@ -226,9 +231,12 @@ async def _notify_user(entity_id: str, **kwargs: Any) -> str:
             "link": link,
             "severity": severity,
             "kind": kind,
+            "idempotency_key": kwargs.get("idempotency_key"),
         },
         workspace_id=runtime_context.workspace_id,
         agent_id=runtime_context.agent_id or kwargs.get("agent_id"),
+        workflow_run_id=runtime_context.workflow_run_id,
+        actor_user_id=runtime_context.user_id,
     )
 
 

@@ -155,12 +155,21 @@ class RuntimeTurnAborted(ValueError):
         self.allow_alternate_path = allow_alternate_path
 
 
+class RuntimeContextWriterFenced(RuntimeTurnAborted, RuntimeError):
+    """This worker no longer holds the run's lease; another owner continues it.
+
+    Not a failure of the turn: the stale writer stops without writing. Still a
+    ``RuntimeError`` for callers that caught the untyped error it replaces.
+    """
+
+
 #: ``RuntimeToolSuspension.kind`` for a turn parked on a human answer.
 HUMAN_INPUT_SUSPENSION_KIND = "waiting_human"
 #: ``RuntimeToolSuspension.reason`` / ``RuntimeRun.status_reason`` while parked.
 HUMAN_INPUT_SUSPENSION_REASON = "awaiting_human_input"
 #: ``RuntimeRun.status_reason`` once the answer is written and resume is queued.
 HUMAN_INPUT_ANSWERED_REASON = "human_input_answered"
+
 
 
 @dataclass(frozen=True)
@@ -272,6 +281,19 @@ class RuntimeAgentCheckpoint:
     pending_tool_result: dict[str, Any] | None = None
     final_response_evidence: dict[str, Any] = field(default_factory=dict)
     tool_evidence: dict[str, Any] = field(default_factory=dict)
+    #: ``{tool name: guide source_sha256}`` the parked loop's model had read
+    #: (RuntimeToolGuidance). Host-owned, so a resume need not find the guide
+    #: text again in a system message compaction may have rewritten.
+    tool_guidance: dict[str, str] = field(default_factory=dict)
+    #: The round budget as this turn left it (a sandbox handoff extends it) and
+    #: the Skills whose handoff already did, so a resume neither shrinks the
+    #: budget back to the caller's nor extends it twice.
+    max_rounds: int | None = None
+    sandbox_budget_extended_for: list[str] = field(default_factory=list)
+    #: Tool-surface narrowings this turn applied, in order (``read_only``,
+    #: ``none``, ``allowlist`` + names). A resume replays them on the host's
+    #: rebuilt tool list, which can only narrow it.
+    tool_narrowing: list[dict[str, Any]] = field(default_factory=list)
     web_source_slices: list[dict[str, Any]] = field(default_factory=list)
     #: Tools discovery loaded before the park (names only); the resume
     #: re-authorizes them by exact discovery (RuntimeRunState).
@@ -301,6 +323,10 @@ class RuntimeAgentCheckpoint:
             ),
             "final_response_evidence": dict(self.final_response_evidence),
             "tool_evidence": dict(self.tool_evidence),
+            "tool_guidance": {str(name): str(sha) for name, sha in self.tool_guidance.items()},
+            "max_rounds": self.max_rounds,
+            "sandbox_budget_extended_for": [str(name) for name in self.sandbox_budget_extended_for],
+            "tool_narrowing": [dict(step) for step in self.tool_narrowing],
             "web_source_slices": [dict(item) for item in self.web_source_slices],
             "loaded_gateway_tools": [str(name) for name in self.loaded_gateway_tools],
         }
@@ -359,6 +385,21 @@ class RuntimeAgentCheckpoint:
                 if isinstance(value.get("final_response_evidence"), dict) else {}
             ),
             tool_evidence=(dict(value["tool_evidence"]) if isinstance(value.get("tool_evidence"), dict) else {}),
+            tool_guidance=(
+                {str(name): str(sha) for name, sha in value["tool_guidance"].items()}
+                if isinstance(value.get("tool_guidance"), dict) else {}
+            ),
+            max_rounds=(
+                int(value["max_rounds"])
+                if isinstance(value.get("max_rounds"), int) and value["max_rounds"] > 0 else None
+            ),
+            sandbox_budget_extended_for=[
+                str(name) for name in value.get("sandbox_budget_extended_for") or [] if name
+            ],
+            tool_narrowing=[
+                dict(step) for step in value.get("tool_narrowing") or []
+                if isinstance(step, dict) and step.get("mode") in {"read_only", "none", "allowlist"}
+            ],
             web_source_slices=[dict(item) for item in web_source_slices],
             # A checkpoint parked before the field existed: its discovery
             # loads from the ledger (RuntimeRunState.restore does the same).
@@ -385,6 +426,7 @@ __all__ = [
     "RuntimeAgentCheckpoint",
     "RuntimeToolSuspension",
     "is_human_input_suspension_control",
+    "RuntimeContextWriterFenced",
     "RuntimeTurnAborted",
     "is_runtime_tool_suspension",
     "runtime_owned_sequence_child_result",

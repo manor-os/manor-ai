@@ -324,14 +324,6 @@ async def test_scheduler_recognizes_only_exact_waiting_agent_task_suspension() -
 
     task.details["scheduled_run_id"] = run.id
     task.status = "pending"
-    task.details["_runtime_tool_hitl_v1"] = {"state": "waiting"}
-    assert await scheduler_tasks._scheduled_agent_execution_recovery_is_suspended(
-        Session(),
-        run,
-        recovery,
-    ) is True
-
-    task.details["_runtime_tool_hitl_v1"] = {"state": "resume_queued"}
     assert await scheduler_tasks._scheduled_agent_execution_recovery_is_suspended(
         Session(),
         run,
@@ -607,17 +599,8 @@ def test_run_agent_task_preserves_recovery_suspension_result(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("task_status", "marker_state"),
-    [
-        ("waiting_on_customer", "waiting"),
-        ("pending", "resume_queued"),
-    ],
-)
 async def test_stale_claim_loss_settlement_cannot_close_scheduled_hitl_task(
     monkeypatch,
-    task_status: str,
-    marker_state: str,
 ) -> None:
     from packages.core.services import task_state_machine
     from packages.core.services import workflow_run_execution_claim as claim_service
@@ -634,12 +617,11 @@ async def test_stale_claim_loss_settlement_cannot_close_scheduled_hitl_task(
         entity_id="entity-1",
         workspace_id=None,
         title="Scheduled approval",
-        status=task_status,
+        status="waiting_on_customer",
         actual_output={"sentinel": "preserved"},
         details={
             "scheduled_run_id": "run-waiting",
             "scheduled_job_id": "job-waiting",
-            "_runtime_tool_hitl_v1": {"state": marker_state},
             ai_tasks._AGENT_CLAIM_LOSS_RECOVERY_KEY: {
                 "version": 2,
                 "next_attempt_at": 0,
@@ -696,52 +678,11 @@ async def test_stale_claim_loss_settlement_cannot_close_scheduled_hitl_task(
 
     assert result["recovery_suspended"] is True
     assert result["status"] == "waiting_on_customer"
-    assert task.status == task_status
+    assert task.status == "waiting_on_customer"
     assert task.actual_output == {"sentinel": "preserved"}
     assert ai_tasks._AGENT_CLAIM_LOSS_RECOVERY_KEY not in task.details
     assert session.commits == 1
     assert claim.terminal_committed.is_set() is True
-
-
-@pytest.mark.asyncio
-async def test_claim_loss_sweep_retires_approved_scheduled_resume_intent(
-    db_session,
-) -> None:
-    from packages.core.models.task import Task
-
-    now = datetime.now(timezone.utc)
-    task = Task(
-        id=generate_ulid(),
-        entity_id=generate_ulid(),
-        title="Approved scheduled continuation",
-        status="pending",
-        details={
-            "scheduled_run_id": generate_ulid(),
-            "scheduled_job_id": f"scheduled-agent:{generate_ulid()}",
-            "_runtime_tool_hitl_v1": {"state": "resume_queued"},
-            ai_tasks._AGENT_CLAIM_LOSS_RECOVERY_KEY: {
-                "version": 2,
-                "requested_at": now.isoformat(),
-                "next_attempt_at": 0,
-                "sweep_attempts": 0,
-            },
-        },
-    )
-    db_session.add(task)
-    await db_session.commit()
-
-    @asynccontextmanager
-    async def session_factory():
-        yield db_session
-
-    assert await ai_tasks._load_agent_claim_loss_recovery_intents(
-        session_factory,
-        now=now,
-    ) == []
-
-    await db_session.refresh(task)
-    assert ai_tasks._AGENT_CLAIM_LOSS_RECOVERY_KEY not in task.details
-    assert task.status == "pending"
 
 
 def test_claim_loss_worker_does_not_settle_suspended_scheduled_task(
@@ -905,21 +846,20 @@ async def test_recovery_suspension_result_reports_the_blocked_task_status(
     execute.assert_not_awaited()
 
 
-def _terminal_task_with_stale_marker(marker_state: str = "waiting"):
+def _terminal_task():
     return SimpleNamespace(
         id="task-1",
         status="completed",
         details={
             "scheduled_run_id": "run-1",
             "scheduled_job_id": "job-1",
-            "_runtime_tool_hitl_v1": {"state": marker_state},
         },
     )
 
 
 @pytest.mark.asyncio
 async def test_recovery_delivery_never_treats_terminal_task_as_suspended():
-    task = _terminal_task_with_stale_marker("waiting")
+    task = _terminal_task()
 
     @asynccontextmanager
     async def session_factory():
@@ -945,7 +885,7 @@ async def test_scheduler_sweep_never_treats_terminal_task_as_suspended():
     )
     from packages.core.tasks import scheduler_tasks
 
-    task = _terminal_task_with_stale_marker("waiting")
+    task = _terminal_task()
     dispatch = scheduler_tasks._prepared_scheduled_dispatch(
         ScheduledDispatchKind.AGENT_TASK,
         args=["task-1", "agent-1"],
@@ -968,8 +908,8 @@ async def test_scheduler_sweep_never_treats_terminal_task_as_suspended():
         "dispatch": dispatch,
     }
 
-    # Sanity: the same marker on a live Task does suspend.
-    task.status = "in_progress"
+    # Sanity: the same Task waiting on a person does suspend.
+    task.status = "waiting_on_customer"
     assert await scheduler_tasks._scheduled_agent_execution_recovery_is_suspended(
         _OneTaskSession(task), run, recovery,
     ) is True
@@ -979,36 +919,3 @@ async def test_scheduler_sweep_never_treats_terminal_task_as_suspended():
         assert await scheduler_tasks._scheduled_agent_execution_recovery_is_suspended(
             _OneTaskSession(task), run, recovery,
         ) is False
-
-
-@pytest.mark.asyncio
-async def test_generic_delivery_fence_lets_terminal_task_through(monkeypatch):
-    execute = AsyncMock(return_value=(True, {"status": "completed"}))
-    monkeypatch.setattr(ai_tasks, "_run_agent_task_with_execution_claim", execute)
-
-    for marker_state in ("resume_queued", "resuming"):
-        task = _terminal_task_with_stale_marker(marker_state)
-
-        @asynccontextmanager
-        async def session_factory():
-            yield _OneTaskSession(task)
-
-        # Live Task: the fence suppresses a generic delivery.
-        task.status = "in_progress"
-        claimed, fenced = await ai_tasks._run_scheduled_agent_task_if_open(
-            session_factory, "task-1", "agent-1",
-            scheduled_run_id=None, scheduled_job_id=None,
-        )
-        assert claimed is False
-        assert fenced["reason"] == "runtime_approval_resume_identity_required"
-
-        # Terminal Task: the gateway's terminal early-return must be reachable.
-        for status in ("completed", "failed", "cancelled"):
-            execute.reset_mock()
-            task.status = status
-            claimed, result = await ai_tasks._run_scheduled_agent_task_if_open(
-                session_factory, "task-1", "agent-1",
-                scheduled_run_id=None, scheduled_job_id=None,
-            )
-            assert claimed is True
-            execute.assert_awaited_once()

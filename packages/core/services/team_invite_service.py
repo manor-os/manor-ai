@@ -18,6 +18,7 @@ from packages.core.services.auth_service import (
     hash_password,
     verify_password,
 )
+from packages.core.services.workspace_access import set_link_columns
 
 
 _SYSTEM_ROLE_NAMES = {"owner", "admin", "member", "viewer"}
@@ -145,24 +146,28 @@ async def _activate_staff_membership(
                 existing_rows[0],
             )
             role_rank = {"viewer": 0, "contributor": 1, "editor": 2, "owner": 3}
+            # A seat derived from a collaboration grant never contributes its
+            # role: the invite makes the seat customer-managed from here on.
             existing.role = max(
                 (
                     str(row.role)
                     for row in existing_rows
-                    if str(row.role) in role_rank
+                    if str(row.role) in role_rank and row.collaboration_id is None
                 ),
                 key=role_rank.__getitem__,
                 default="viewer",
             )
-            existing.staff_id = staff.id
             existing.user_id = user.id
             existing.status = "active"
+            existing.collaboration_id = None
             # Accepting a fresh invite creates an indefinite membership. Do not
             # carry an expired lease forward from a historical duplicate row.
             existing.expires_at = None
             for duplicate in existing_rows:
                 if duplicate is not existing:
                     await db.delete(duplicate)
+            # The Staff link alone is not an authority change (see set_link_columns).
+            await set_link_columns(db, existing, staff_id=staff.id)
             continue
         db.add(WorkspaceStaff(
             id=generate_ulid(),

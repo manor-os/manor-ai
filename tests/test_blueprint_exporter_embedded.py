@@ -25,6 +25,7 @@ Covers:
 from __future__ import annotations
 
 from typing import Any
+from datetime import UTC, datetime
 
 from packages.core.models.user import Entity
 from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
@@ -43,6 +44,7 @@ from packages.core.blueprints.installer import InstallMode, install_blueprint
 from packages.core.blueprints.payload import validate_payload
 from packages.core.constants.blueprints import BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES
 from packages.core.models.base import generate_ulid
+from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
@@ -335,6 +337,163 @@ async def test_mcp_allowlist_drops_secret_shaped_keys(
     assert mcp_binding["config_override_allowlist"] == ["team_id"]
     # No raw values anywhere in the payload.
     assert "sk_LEAK" not in str(payload)
+
+
+async def test_mcp_requirements_retain_applied_optional_policy_and_default_to_required(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workspace = seeded["workspace"]
+    optional_server = MCPServer(
+        id=generate_ulid(),
+        server_key=f"optional-mcp-{entity_id}",
+        name="Optional MCP",
+        transport="http",
+        endpoint="https://optional.example.com",
+        auth_type="api_key",
+        status="active",
+    )
+    required_server = MCPServer(
+        id=generate_ulid(),
+        server_key=f"required-mcp-{entity_id}",
+        name="Required MCP",
+        transport="http",
+        endpoint="https://required.example.com",
+        auth_type="api_key",
+        status="active",
+    )
+    second_agent = Agent(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        name="Second Embedded Agent",
+        slug=f"second-agent-{entity_id}",
+        system_prompt="Use the configured MCP servers.",
+        config={},
+        is_public=False,
+        status="active",
+        version="1.0.0",
+    )
+    db_session.add_all([optional_server, required_server, second_agent])
+    await db_session.flush()
+    db_session.add_all([
+        AgentSubscription(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            agent_id=second_agent.id,
+            workspace_id=workspace.id,
+            service_key=f"second.service.{entity_id}",
+            config={},
+            status="active",
+        ),
+        AgentMCPBinding(
+            id=generate_ulid(),
+            agent_id=seeded["agent_a"].id,
+            mcp_server_id=optional_server.id,
+            allowed_tools=None,
+            config_override={},
+            status="active",
+        ),
+        AgentMCPBinding(
+            id=generate_ulid(),
+            agent_id=second_agent.id,
+            mcp_server_id=optional_server.id,
+            allowed_tools=None,
+            config_override={},
+            status="active",
+        ),
+        AgentMCPBinding(
+            id=generate_ulid(),
+            agent_id=second_agent.id,
+            mcp_server_id=required_server.id,
+            allowed_tools=None,
+            config_override={},
+            status="active",
+        ),
+    ])
+    workspace.settings = {
+        **(workspace.settings or {}),
+        "_blueprint": {
+            "upgrade_runtime_contract": {"contract": {"requires": {
+                "mcp_servers": [
+                    {
+                        "slug": optional_server.server_key,
+                        "required": False,
+                        "install_blocking": False,
+                    },
+                    {
+                        "slug": required_server.server_key,
+                        "required": True,
+                        "install_blocking": True,
+                    },
+                ],
+            }}},
+        },
+    }
+    await db_session.flush()
+
+    payload = await export_workspace(db_session, workspace.id, title="MCP policy")
+    requirements = {
+        item["slug"]: item
+        for item in payload["contract"]["requires"]["mcp_servers"]
+    }
+
+    assert requirements[optional_server.server_key] == {
+        "slug": optional_server.server_key,
+        "purpose": None,
+        "config_fields_to_set": [],
+        "required": False,
+        "install_blocking": False,
+    }
+    assert requirements[required_server.server_key]["required"] is True
+    assert requirements[required_server.server_key]["install_blocking"] is True
+    # The original Linear binding has no applied policy declaration, so it
+    # keeps the installer's established required/blocking default.
+    assert requirements[seeded["mcp_slug"]]["required"] is True
+    assert requirements[seeded["mcp_slug"]]["install_blocking"] is True
+    validate_payload(payload)
+
+
+async def test_mcp_requirement_export_uses_applied_receipt_after_source_changes_or_deletion(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workspace = seeded["workspace"]
+    source = WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=entity_id, slug=f"source-{entity_id}",
+        title="Mutable source", status="published",
+        payload={"contract": {"requires": {"mcp_servers": [{
+            "slug": "source-policy", "required": True, "install_blocking": True,
+        }]}}},
+    )
+    db_session.add(source)
+    workspace.settings = {
+        "_blueprint": {
+            "blueprint_id": source.id,
+            "upgrade_runtime_contract": {"contract": {"requires": {
+                "mcp_servers": [{
+                    "slug": "applied-policy", "required": False,
+                    "install_blocking": False,
+                }],
+            }}},
+        },
+    }
+    await db_session.flush()
+
+    source.payload = {"contract": {"requires": {"mcp_servers": [{
+        "slug": "updated-source-policy", "required": True, "install_blocking": True,
+    }]}}}
+    exported = await export_workspace(db_session, workspace.id, title="Applied receipt")
+    assert any(item["slug"] == "applied-policy" and item["required"] is False
+               for item in exported["contract"]["requires"]["mcp_servers"])
+
+    await db_session.delete(source)
+    await db_session.flush()
+    exported = await export_workspace(db_session, workspace.id, title="Deleted source")
+    assert any(item["slug"] == "applied-policy" and item["install_blocking"] is False
+               for item in exported["contract"]["requires"]["mcp_servers"])
 
 
 async def test_mcp_empty_allowlist_round_trips_without_becoming_inherited(
@@ -962,11 +1121,17 @@ async def test_knowledge_pack_modes_use_canonical_membership_and_real_text(
         quarantine_status="clean",
         is_trashed=False,
     )
-    db_session.add_all([group, public_doc, private_doc])
+    runtime_doc = Document(
+        id=generate_ulid(), entity_id=entity_id, name="runtime-report.md",
+        mime_type="text/markdown", classification="public", visibility="workspace",
+        metadata_={"content_text": "This run's private results", "artifact": {"storage_scope": "artifact"}},
+    )
+    db_session.add_all([group, public_doc, private_doc, runtime_doc])
     await db_session.flush()
     db_session.add_all([
         DocumentGroupMember(document_id=public_doc.id, group_id=group.id),
         DocumentGroupMember(document_id=private_doc.id, group_id=group.id),
+        DocumentGroupMember(document_id=runtime_doc.id, group_id=group.id),
     ])
     await db_session.commit()
 
@@ -992,6 +1157,28 @@ async def test_knowledge_pack_modes_use_canonical_membership_and_real_text(
     assert starter["key"].startswith("voice-md-")
     assert public_doc.id not in starter["key"]
     assert "Never export me" not in str(inline_pack)
+    assert "runtime-report" not in str(inline_pack)
+    candidates = await list_exportable_knowledge_documents(
+        db_session, entity_id=entity_id, workspace_id=seeded["workspace"].id,
+    )
+    assert runtime_doc.id not in {item["id"] for item in candidates}
+
+
+async def test_knowledge_pack_generated_slug_does_not_collide_with_installed_handle(db_session, entity_id):
+    seeded = await _seed(db_session, entity_id)
+    db_session.add_all([
+        DocumentGroup(entity_id=entity_id, workspace_id=seeded["workspace"].id,
+                      name="Artist Resources", settings={"installed_from_blueprint_slug": "workspace-knowledge"}),
+        DocumentGroup(entity_id=entity_id, workspace_id=seeded["workspace"].id,
+                      name="Workspace Knowledge", settings={"kind": "workspace_collection"}),
+    ])
+    await db_session.flush()
+    exported = await export_workspace(db_session, seeded["workspace"].id, title="Collection collision")
+    packs = exported["embedded"]["knowledge_packs"]
+    assert {pack["slug"] for pack in packs} == {"workspace-knowledge", "workspace-knowledge-2"}
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=exported, mode=InstallMode.LIVE)
+    again = await export_workspace(db_session, installed.workspace_id, title="Collection collision")
+    assert again["embedded"]["knowledge_packs"] == packs
 
 
 async def test_knowledge_pack_inline_text_can_select_exact_safe_documents(
@@ -1249,6 +1436,18 @@ async def test_export_uses_live_workspace_framing_and_omits_derived_jobs(
             execution_type="strategist_review",
             schedule_kind="cron",
             cron_expr="0 9 * * 1",
+            stop_after=datetime(2099, 1, 1, tzinfo=UTC),
+            enabled=True,
+        ),
+        ScheduledJob(
+            job_id=f"maintenance-plan-{entity_id}",
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+            owner_project_id=generate_ulid(),
+            idempotency_key="maintenance:weekly",
+            execution_type="strategist_review",
+            schedule_kind="cron",
+            cron_expr="0 9 * * 1",
             enabled=True,
         ),
     ])
@@ -1262,6 +1461,7 @@ async def test_export_uses_live_workspace_framing_and_omits_derived_jobs(
     assert [job["job_id"] for job in payload["recipe"]["scheduled_jobs"]] == [
         f"weekly-review-{entity_id}",
     ]
+    assert payload["recipe"]["scheduled_jobs"][0]["stop_after"] == "2099-01-01T00:00:00+00:00"
 
 
 async def test_session_requirements_are_limited_to_workspace_references(

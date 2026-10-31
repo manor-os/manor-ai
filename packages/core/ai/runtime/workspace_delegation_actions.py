@@ -1058,30 +1058,14 @@ async def _persist_delegation_resume(
     remaining_tool_calls: list[dict[str, Any]] | None = None,
     disable_followup_tools: bool = False,
     tool_continuations: dict[str, dict[str, Any]] | None = None,
-    parent_step_id: str | None = None,
-    parent_lease_id: str | None = None,
-    parent_execution_claim_id: str | None = None,
 ) -> bool:
     from packages.core.ai.runtime.approval_messages import (
         RuntimeApprovalContinuationError,
         runtime_approval_continuation,
     )
     from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
-    from packages.core.constants.execution import (
-        COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY,
-        COORDINATOR_CHILD_ITEM_PARAM_KEY,
-        COORDINATOR_CHILD_PARAM_KEY,
-        COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-        COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY,
-        COORDINATOR_PARAM_KEY,
-        COORDINATOR_PARENT_STEP_PARAM_KEY,
-        ExecutionStepStatus,
-        WorkLeaseStatus,
-    )
     from packages.core.database import async_session
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.hitl_request import HitlRequest
-    from packages.core.models.worker import WorkLease
 
     approval_token = _clean(hitl.get("approval_token"))
     hitl_request = hitl.get("hitl")
@@ -1103,153 +1087,6 @@ async def _persist_delegation_resume(
         return False
 
     async with async_session() as db:
-        # A coordinator child creates its Runtime approval before the parent
-        # dispatcher can mint the canonical lease card.  Mark that request as
-        # coordinator-owned in this earlier transaction, so every generic
-        # Runtime/Human Queue surface fails closed throughout the gap.  The
-        # outer request id is deliberately empty until lease_needs_human fills
-        # it while holding the nested row lock.
-        # A Task-linked interactive Chat may carry ``task_id`` without being a
-        # materialized coordinator child.  Only the server-supplied child step
-        # or stable child idempotency key opts into this bridge.
-        coordinator_scope = step_id is not None or delegation_idempotency_key is not None
-        reverse_placeholder: dict[str, Any] | None = None
-        if coordinator_scope:
-            child_id = _clean(step_id)
-            expected_task_id = _clean(task_id)
-            expected_idempotency_key = _clean(delegation_idempotency_key)
-            expected_parent_step_id = _clean(parent_step_id)
-            expected_parent_lease_id = _clean(parent_lease_id)
-            expected_parent_execution_claim_id = _clean(
-                parent_execution_claim_id
-            )
-            if not all((
-                child_id,
-                expected_task_id,
-                expected_idempotency_key,
-                expected_parent_step_id,
-                expected_parent_lease_id,
-                expected_parent_execution_claim_id,
-            )):
-                return False
-
-            # Discover ids without taking locks, then reacquire in the shared
-            # lease -> parent -> child order and revalidate every value.  The
-            # discovery reads grant no authority and are never used after the
-            # locked checks below.
-            child_hint = await db.get(ExecutionStep, child_id)
-            child_hint_params = (
-                child_hint.params
-                if child_hint is not None and isinstance(child_hint.params, dict)
-                else {}
-            )
-            parent_key = _clean(
-                child_hint_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY)
-            )
-            if child_hint is None or not parent_key:
-                return False
-            parent_hint = (await db.execute(
-                select(ExecutionStep).where(
-                    ExecutionStep.plan_id == child_hint.plan_id,
-                    ExecutionStep.step_key == parent_key,
-                )
-            )).scalar_one_or_none()
-            if (
-                parent_hint is None
-                or parent_hint.id != expected_parent_step_id
-                or _clean(parent_hint.current_lease_id) != expected_parent_lease_id
-            ):
-                return False
-
-            lease = (await db.execute(
-                select(WorkLease)
-                .where(WorkLease.id == expected_parent_lease_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )).scalar_one_or_none()
-            parent = (await db.execute(
-                select(ExecutionStep)
-                .where(ExecutionStep.id == parent_hint.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )).scalar_one_or_none()
-            child = (await db.execute(
-                select(ExecutionStep)
-                .where(ExecutionStep.id == child_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )).scalar_one_or_none()
-            plan = (
-                await db.execute(
-                    select(ExecutionPlan).where(
-                        ExecutionPlan.id == child_hint.plan_id,
-                    )
-                )
-            ).scalar_one_or_none()
-            child_params = (
-                child.params
-                if child is not None and isinstance(child.params, dict)
-                else {}
-            )
-            parent_params = (
-                parent.params
-                if parent is not None and isinstance(parent.params, dict)
-                else {}
-            )
-            now = datetime.now(timezone.utc)
-            if (
-                lease is None
-                or parent is None
-                or child is None
-                or plan is None
-                or lease.status != WorkLeaseStatus.ACTIVE.value
-                or not _clean(lease.execution_claim_id)
-                or _clean(lease.execution_claim_id)
-                != expected_parent_execution_claim_id
-                or lease.lease_until is None
-                or lease.lease_until <= now
-                or lease.step_id != parent.id
-                or lease.plan_id != parent.plan_id
-                or lease.entity_id != entity_id
-                or lease.workspace_id != workspace_id
-                or parent.current_lease_id != lease.id
-                or parent.step_status != ExecutionStepStatus.RUNNING.value
-                or parent.entity_id != entity_id
-                or parent.workspace_id != workspace_id
-                or parent.plan_id != plan.id
-                or parent.params is None
-                or parent_params.get(COORDINATOR_PARAM_KEY) is not True
-                or child.step_status != ExecutionStepStatus.RUNNING.value
-                or child.entity_id != entity_id
-                or child.workspace_id != workspace_id
-                or child.plan_id != plan.id
-                or child.service_key != sub.service_key
-                or child_params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
-                or child_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY)
-                != parent.step_key
-                or not _clean(child_params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY))
-                or _clean(
-                    child_params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY)
-                )
-                != expected_idempotency_key
-                or _clean(plan.task_id) != expected_task_id
-            ):
-                return False
-            reverse_placeholder = {
-                "version": COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
-                "request_id": None,
-                "nested_request_id": approval_token,
-                "child_step_id": child.id,
-                "parent_step_id": parent.id,
-                "parent_lease_id": lease.id,
-                "parent_execution_claim_id": expected_parent_execution_claim_id,
-                "plan_id": plan.id,
-                "task_id": expected_task_id,
-                "child_step_key": child.step_key,
-                "service_key": child.service_key,
-                "idempotency_key": expected_idempotency_key,
-            }
-
         request = (await db.execute(
             select(HitlRequest).where(
                 HitlRequest.id == approval_token,
@@ -1300,21 +1137,7 @@ async def _persist_delegation_resume(
                 if isinstance(value, dict)
             },
         }
-        if reverse_placeholder is not None:
-            existing_reverse = context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY)
-            if existing_reverse not in (None, reverse_placeholder):
-                return False
-            context[COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY] = reverse_placeholder
         request.context = context
-        if reverse_placeholder is not None:
-            # Persist the child's waiting state in the same transaction as the
-            # hidden reverse placeholder. A crash can now leave either neither
-            # object or both objects, never an invisible pending approval
-            # attached to a RUNNING child that a successor would replay.
-            child.step_status = ExecutionStepStatus.WAITING_HUMAN.value
-            child.result = dict(hitl)
-            child.error = None
-            child.finished_at = None
         await db.commit()
     return True
 
@@ -1493,6 +1316,20 @@ PARALLEL_DELEGATION_STAGGER_SECONDS = 0.2
 _delegation_depth: "ContextVar[int]" = ContextVar("workspace_delegation_depth", default=0)
 
 
+@contextmanager
+def runtime_delegation_depth_scope(depth: int) -> Iterator[None]:
+    """Run a delegated agent at ``depth`` (a durable child run's own depth).
+
+    The registered delegation refuses at MAX_DELEGATION_DEPTH, so an agent
+    already that deep cannot delegate through it, whichever host runs it.
+    """
+    token = _delegation_depth.set(max(_delegation_depth.get(), int(depth)))
+    try:
+        yield
+    finally:
+        _delegation_depth.reset(token)
+
+
 def _target_label(sub: Any, agent: Any) -> str:
     return _clean(getattr(sub, "name", None)) or _clean(getattr(agent, "name", None)) or "Agent"
 
@@ -1545,6 +1382,9 @@ async def runtime_workspace_delegation_targets(
             "service_key": sub.service_key,
             "summary": summary[:200],
         })
+    # By the label people see: same-named agents created together have no stable
+    # creation order, and the tool schema must not change between turns.
+    targets.sort(key=lambda target: (target["label"].casefold(), target["agent_subscription_id"]))
     return targets
 
 
@@ -2050,6 +1890,36 @@ def runtime_delegation_tool_result(raw: str) -> str:
     return _fit_delegation_payload(out, [out])
 
 
+async def _durable_child_result(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    conversation_id: str,
+    run_id: str,
+) -> Any:
+    """A settled durable Task child run readable from this chat (its Task's thread)."""
+    from packages.core.models.task import Task
+    from packages.core.models.task_agent_child import (
+        TASK_AGENT_CHILD_TERMINAL_PHASES,
+        TaskAgentChildRun,
+    )
+
+    return (await db.execute(
+        select(TaskAgentChildRun)
+        .join(Task, Task.id == TaskAgentChildRun.task_id)
+        .where(
+            TaskAgentChildRun.id == run_id,
+            TaskAgentChildRun.entity_id == entity_id,
+            TaskAgentChildRun.workspace_id == workspace_id,
+            TaskAgentChildRun.phase.in_(tuple(TASK_AGENT_CHILD_TERMINAL_PHASES)),
+            Task.entity_id == entity_id,
+            Task.workspace_id == workspace_id,
+            Task.conversation_id == conversation_id,
+        )
+    )).scalar_one_or_none()
+
+
 async def runtime_read_delegation_result_action(
     *,
     entity_id: str,
@@ -2084,6 +1954,28 @@ async def runtime_read_delegation_result_action(
             db, entity_id=entity_id, workspace_id=workspace_id,
             conversation_id=conversation_id, user_id=user_id, run_id=run_id,
         )
+        child = None if found is not None else await _durable_child_result(
+            db, entity_id=entity_id, workspace_id=workspace_id,
+            conversation_id=conversation_id, run_id=run_id,
+        )
+    if child is not None:
+        # A durable Task child run keeps its full answer with the run itself.
+        result = child.result if isinstance(child.result, dict) else {}
+        content = str(result.get("content") or "")
+        page = content[offset:offset + limit]
+        end = offset + len(page)
+        return _dumps({
+            "run_id": run_id,
+            "session_id": None,
+            "agent": child.agent_label,
+            "status": child.outcome_status or result.get("status"),
+            "error": result.get("error"),
+            "content": page,
+            "offset": offset,
+            "returned_chars": len(page),
+            "total_chars": len(content),
+            "next_offset": end if end < len(content) else None,
+        })
     if found is None:
         return _dumps({
             "error": "delegation_result_not_found",
@@ -2447,6 +2339,7 @@ def runtime_delegated_child_billing(
     conversation_id: str | None,
     fallback_model: str | None,
     byok: bool,
+    payer_entity_id: str | None = None,
 ) -> Iterator[tuple[Callable[..., Any], Callable[..., Any]]]:
     """Per-call durable billing for one invocation of a delegated child.
 
@@ -2456,7 +2349,8 @@ def runtime_delegated_child_billing(
     keeps attribution stable across a resumed child; ``invocation_id`` is a
     fresh nonce per invocation so that real provider work repeated after a
     crash is not hidden by the settlement idempotency fence of an earlier
-    process.
+    process. ``payer_entity_id`` (``resolve_run_payer``) pins who pays for
+    the invocation in both the callbacks and the bound context.
     """
     from packages.core.ai.runtime.billing import (
         runtime_release_billing_context,
@@ -2475,6 +2369,7 @@ def runtime_delegated_child_billing(
         conversation_id=conversation_id,
         fallback_model=fallback_model,
         byok=byok,
+        payer_entity_id=payer_entity_id,
     )
     billing_handle = runtime_set_suppressed_billing_context(
         entity_id=entity_id,
@@ -2483,6 +2378,7 @@ def runtime_delegated_child_billing(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         durable_per_call=True,
+        payer_entity_id=payer_entity_id,
     )
     try:
         yield reserve_llm_call, settle_llm_call
@@ -2830,9 +2726,6 @@ async def _runtime_workspace_delegate_service_action(
         Callable[[str, str], Awaitable[None] | None] | None
     ) = None,
     record_nested_usage: bool = True,
-    parent_step_id: str | None = None,
-    parent_lease_id: str | None = None,
-    parent_execution_claim_id: str | None = None,
 ) -> str:
     """Delegate a workspace chat request to a service-bound sub-agent."""
 
@@ -3115,6 +3008,8 @@ async def _runtime_workspace_delegate_service_action(
             runtime_tool_effect_intent_scope,
         )
 
+        from packages.core.services.billing_payer import resolve_run_payer
+
         with runtime_delegated_child_billing(
             run_id=run_id,
             invocation_id=billing_invocation_id,
@@ -3125,6 +3020,9 @@ async def _runtime_workspace_delegate_service_action(
             conversation_id=conversation_id,
             fallback_model=ctx.model,
             byok=bool(getattr(ctx, "byok", False)),
+            payer_entity_id=await resolve_run_payer(
+                None, entity_id=entity_id, workspace_id=workspace_id,
+            ),
         ) as (reserve_llm_call, settle_llm_call):
             with runtime_tool_effect_intent_scope(on_tool_effect_intent):
                 result = await runtime_execute_chat_agent_loop(
@@ -3251,7 +3149,9 @@ async def _runtime_workspace_delegate_service_action(
             system_prompt=next((m["content"] for m in transcript if m.get("role") == "system"), ctx.system_prompt),
             tools=ctx.tools,
             messages=[m for m in transcript if m.get("role") != "system"],
-            context_window_tokens=effective_context_window_tokens(getattr(ctx, "model", None)),
+            context_window_tokens=effective_context_window_tokens(
+                getattr(ctx, "model", None), getattr(ctx, "llm_metadata", None),
+            ),
             output_reserve_tokens=int(getattr(ctx, "max_tokens", None) or RUNTIME_AGENTIC_MAX_TOKENS),
             compaction_ratio=LOOP_COMPACT_RATIO,
         )
@@ -3299,9 +3199,6 @@ async def _runtime_workspace_delegate_service_action(
                     if isinstance(result.control, dict)
                     else {}
                 ),
-                parent_step_id=parent_step_id,
-                parent_lease_id=parent_lease_id,
-                parent_execution_claim_id=parent_execution_claim_id,
             )
             if persisted:
                 # Files the child wrote before the approval stop stay in the parent ledger.

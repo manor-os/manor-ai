@@ -444,7 +444,8 @@ def test_workflow_run_guidance_prevents_duplicate_active_work():
     assert "pending, running" in guidance
     assert "Never propose a fresh run" in guidance
     assert "completed scheduled Flow" in guidance
-    assert "failed, blocked, or needs_input" in guidance
+    assert "failed or blocked run" in guidance
+    assert "needs_input run is already asking a person" in guidance
 
 
 def test_format_template_business_model_block():

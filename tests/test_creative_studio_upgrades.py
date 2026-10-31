@@ -36,7 +36,12 @@ def _expected_installed_export(source):
     rules, policy, _ = normalize_default_workspace_governance(
         rules, apply_preset(policy, "follow_default"),
     )
-    expected["policy"]["governance"] = portable_governance(policy_to_dict(policy))
+    governance = portable_governance(policy_to_dict(policy))
+    approval = governance["approval"]
+    # The exporter omits a default policy, as it does for any Workspace.
+    is_default = (not approval["rules"] and approval["mode"] is None
+                  and not governance["budget_caps_per_kind"] and governance["max_risk_level"] == "high")
+    expected["policy"]["governance"] = {} if is_default else governance
     if "rules" in operating_model or rules:
         operating_model["rules"] = rules
     return expected
@@ -44,19 +49,12 @@ def _expected_installed_export(source):
 
 def _assert_runtime_parity(expected, actual):
     expected = _expected_installed_export(expected)
-    # These frozen legacy studios must import as review requirements, never as
-    # operator consent. Keep an independent assertion on the actual export.
-    # Reads are allowed by every mode, so the review never covers them.
-    approval = actual["policy"]["governance"]["approval"]
-    assert approval["mode"] is None
-    assert len(approval["rules"]) == 9
-    assert {rule["selector"]["category"] for rule in approval["rules"]} == {
-        "browser", "files", "communication", "publishing", "deletion", "purchases",
-        "automation", "workspace", "unknown",
-    }
-    assert all(rule["effect"] == "ask" and rule["selector"]["kind"] == "category"
-        and rule["source_kind"] == "user" and rule.get("source_id") is None
-        for rule in approval["rules"])
+    # These frozen legacy studios carry only historical automatic grants. They
+    # import as neither operator consent nor review gates, so the installer's
+    # chosen mode decides. Keep an independent assertion on the actual export.
+    approval = actual["policy"]["governance"].get("approval") or {}
+    assert approval.get("mode") is None
+    assert not approval.get("rules")
     assert "root_entity_id" not in approval
     checker = _checker("compare_roundtrip")
     left = checker._normalize(checker._runtime_projection(expected))
@@ -85,10 +83,14 @@ def test_creative_runtime_parity_still_rejects_governance_and_source_drift(chang
         "approval_selectors": [{"kind": "action", "action_key": "social_post.publish"}],
     }]
     actual = _expected_installed_export(source)
+    approval = actual["policy"]["governance"].setdefault("approval", {"mode": None, "rules": []})
     if change == "allow":
-        actual["policy"]["governance"]["approval"]["rules"][0]["effect"] = "allow"
+        approval["rules"].append({
+            "id": "granted", "effect": "allow", "selector": {"kind": "category", "category": "files"},
+            "source_kind": "user", "source_id": None,
+        })
     elif change == "automatic":
-        actual["policy"]["governance"]["approval"]["mode"] = "automatic"
+        approval["mode"] = "automatic"
     elif change == "budget":
         actual["policy"]["governance"]["budget_caps_per_kind"] = {"llm_tokens": 100}
     else:

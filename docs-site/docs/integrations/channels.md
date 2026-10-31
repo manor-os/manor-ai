@@ -99,14 +99,41 @@ GET/POST /api/v1/channels/whatsapp/webhook
 POST /api/v1/channels/twilio/sms | /twilio/voice | /twilio/status
 GET/POST /api/v1/channels/wechat/callback?config_id=...   # Official Account; plain-text mode
 GET/POST /api/v1/channels/facebook/webhook
-POST /api/v1/channels/{channel_type}/callback?config_id=...   # generic (Slack, Discord, …)
+POST /api/v1/channels/{channel_type}/callback?config_id=...   # generic: email inbound, WeChat Personal runner
 ```
 
 All of them require `PUBLIC_BASE_URL` to be reachable by the provider —
 HTTPS in production. Signature verification (Meta HMAC, Discord Ed25519,
-Twilio signatures) rejects unsigned traffic; a signature mismatch fails
+Twilio signatures) rejects unsigned traffic. The generic callback accepts a
+post only when the channel proves the sender, so a WeChat Personal runner
+needs `WECHAT_RUNNER_BEARER_TOKEN` and a Facebook Page needs its app secret;
+channels with their own endpoint above get `410` there. A signature mismatch fails
 silently from the provider's point of view, so double-check app secrets when
 messages don't arrive.
+
+### Signed email inbound
+
+The email channel accepts inbound mail only from a forwarder (an IMAP poller
+or an inbound-parse service) that signs each POST to
+`/api/v1/channels/email/callback?config_id=...`. The connection owner reads
+the callback URL and signing secret from
+`GET /api/v1/integrations/{integration_id}/email-inbound` (the first call
+creates the secret) and can replace it with `POST .../email-inbound/rotate`.
+Each request carries:
+
+```text
+X-Manor-Timestamp: <unix seconds>
+X-Manor-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>." + raw body)>
+```
+
+Requests without a valid signature, or with a timestamp more than five minutes
+from the server clock, are rejected with `403` before anything is logged or
+dispatched.
+
+Manor accepts each `message_id` once per channel. Retrying a message that was
+already received, or replaying a signed request inside the five-minute window,
+returns `200` with `{"ok": true, "noop": true, "reason": "duplicate_event"}`
+and does not start a second reply, so a forwarder can retry safely.
 
 ## Internal Direct Messages
 

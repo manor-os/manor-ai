@@ -14,6 +14,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/auth";
 import { useDisplayPreferences } from "../stores/displayPreferences";
 import { usePageViewTracking, useWebSocket, type ChatRoomChangeEvent } from "../lib/websocket";
+import { invalidateRealtimeQueries, useRealtimeResync } from "../lib/realtimeResync";
+import { invalidateChangedWorkspace } from "../lib/workspaceChangeInvalidation";
 import { useConfigStore } from "../stores/config";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
@@ -36,9 +38,6 @@ import type { Workspace, Agent, Conversation } from "../lib/types";
 import type { ChatRoom } from "../lib/chatRoomTypes";
 import FloatingChat from "../components/FloatingChat";
 import TextSelectionToolbar from "../components/TextSelectionToolbar";
-import SupportPanel, {
-  useSupportUnreadCount,
-} from "../components/SupportPanel";
 import UserAvatar from "../components/ui/UserAvatar";
 import GroupChatAvatar from "../components/ui/GroupChatAvatar";
 import FeatureDiscoveryHint, { FeatureDiscoveryBadge } from "../components/ui/FeatureDiscoveryHint";
@@ -54,6 +53,7 @@ import { IconChevronRight, IconMoreHorizontal } from "../components/icons";
 import Button from "../components/ui/Button";
 import EmptyState from "../components/ui/EmptyState";
 import WorkspaceAttentionBadge from "../components/WorkspaceAttentionBadge";
+import { workspaceChatActionCount } from "../lib/workspaceActionCount";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import Dropdown from "../components/ui/Dropdown";
 import Input from "../components/ui/Input";
@@ -65,6 +65,8 @@ import OnboardingTour, { isTourSuppressedPath, MAIN_TOUR_STORAGE_KEY } from "../
 import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
 import { getAgentDescription } from "../lib/localizedContent";
 import { parseAppLayoutChatTarget } from "./appLayoutChatQuery";
+import LegacyCollaboratorSession from "../components/LegacyCollaboratorSession";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 import { relativeTime } from "../lib/format";
 import { isChatRunActive } from "../lib/chatStream";
 import { latestMessageByRole } from "../lib/chatHistoryScan";
@@ -149,6 +151,9 @@ const ChatInviteAcceptance = lazy(() =>
     default: module.ChatInviteAcceptance,
   })),
 );
+const PublicGroupJoin = lazy(() =>
+  import("../components/GroupPublicInvite").then((module) => ({ default: module.PublicGroupJoin })),
+);
 
 function ChatSurfaceLoading() {
   return (
@@ -181,36 +186,6 @@ function groupChatSummary(room: ChatRoom): string {
 function positiveStat(value: unknown) {
   const count = Number(value || 0);
   return Number.isFinite(count) && count > 0 ? count : 0;
-}
-
-function workspaceLegacyActionCount(ws: Pick<Workspace, "stats">) {
-  const stats = ws.stats || {};
-  const value =
-    stats.pending_actions ??
-    stats.hitl_tasks ??
-    stats.chat_pending_actions ??
-    0;
-  return positiveStat(value);
-}
-
-function workspaceChatActionCount(ws: Pick<Workspace, "stats">) {
-  const stats = ws.stats || {};
-  if (stats.unseen_actions !== undefined && stats.unseen_actions !== null) return positiveStat(stats.unseen_actions);
-  const hasVisibleChatStats = [
-    stats.chat_pending_actions,
-    stats.proposal_actions,
-    stats.failed_actions,
-  ].some((value) => value !== undefined && value !== null);
-
-  if (!hasVisibleChatStats) {
-    return workspaceLegacyActionCount(ws);
-  }
-
-  return (
-    positiveStat(stats.chat_pending_actions) +
-    positiveStat(stats.proposal_actions) +
-    positiveStat(stats.failed_actions)
-  );
 }
 
 function formatWorkspaceCount(count: number) {
@@ -1048,6 +1023,12 @@ const ManorLogo = ({
 );
 
 export default function AppLayout() {
+  // Customer trials open in the embedded frame only (src/embed); a top-level
+  // collaborator session is a legacy one, sent back to the person's own company.
+  return useIsCollaborator() ? <LegacyCollaboratorSession /> : <CompanyLayout />;
+}
+
+function CompanyLayout() {
   useEffect(installAutoHideScrollbars, []);
   const location = useLocation();
   const navigate = useNavigate();
@@ -1106,8 +1087,6 @@ export default function AppLayout() {
     window.dispatchEvent(new Event("manor:start-tour"));
     setTourRequested(false);
   }, [tourRequested, user, interfaceModeDialogOpen, hasSelectedInterfaceMode, simpleMode, location.pathname]);
-  const [supportOpen, setSupportOpen] = useState(false);
-  const supportRestoreFocusRef = useRef<HTMLButtonElement>(null);
   const [searchQuery, setSearchQuery] = useState("");
 
   /* ── Chat Mode state ── */
@@ -1231,11 +1210,7 @@ export default function AppLayout() {
   const configLoadError = useConfigStore((s) => s.load_error);
   const workspaceAddReady = configLoaded || configLoadError;
   const { enabled: flowsAvailable } = usePreviewFeatureAccess("flows");
-  const supportTicketsEnabled = useConfigStore(
-    (s) => s.support_tickets_enabled,
-  );
-  const supportUnread =
-    useSupportUnreadCount(supportTicketsEnabled && startupSettled).data?.count || 0;
+  let supportTicketsEnabled = false;
   const configurationItems = useMemo(() => {
     const items = [...baseConfigurationItems];
     // Only unavailable accounts see the disabled "Soon" state for Workflows.
@@ -1455,8 +1430,8 @@ export default function AppLayout() {
   }, [queryClient]);
   useEffect(() => {
     setChatWorkspaces(workspaceList);
-    // Seed counts from personal unread reminder state. Chat rows include proposal
-    // cards because these actions are handled in workspace chat.
+    // Count outstanding decisions. Viewing a card records a personal read
+    // receipt but does not resolve the decision.
     const chatCounts: Record<string, number> = {};
     const workspaceIds = new Set<string>();
     for (const ws of workspaceList) {
@@ -1858,8 +1833,7 @@ export default function AppLayout() {
   const onTaskUpdate = useCallback(
     (data: Record<string, any>) => {
       const taskId = data.task_id || data.id;
-      const planId = data.plan_id;
-      taskUpdateInvalidationRef.current?.enqueue({ taskId, planId });
+      taskUpdateInvalidationRef.current?.enqueue({ taskId });
     },
     [],
   );
@@ -1901,6 +1875,9 @@ export default function AppLayout() {
     },
     [queryClient],
   );
+  const onMediaJobUpdate = useCallback((data: Record<string, any>) => {
+    window.dispatchEvent(new CustomEvent("manor:media-job-update", { detail: data }));
+  }, []);
   const onWorkspaceChatMessage = useCallback(
     (data: Record<string, any>) => {
       const wsId = data.workspace_id as string;
@@ -1969,14 +1946,17 @@ export default function AppLayout() {
       new CustomEvent("manor:chat-stream-snapshot", { detail: data }),
     );
   }, []);
-  const hasConnectedRef = useRef(false);
   const onConnect = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ["chat-rooms"] });
-    if (hasConnectedRef.current) {
-      window.dispatchEvent(new Event(CATALOG_REVALIDATE_EVENT));
-    }
-    hasConnectedRef.current = true;
   }, [queryClient]);
+  // After a delivery gap (reconnect, relay recovery, long-hidden tab) every
+  // realtime-driven projection reconciles with the API. Chat transcripts
+  // listen for the same signal and refetch their own messages.
+  useRealtimeResync(() => {
+    if (!catalogScope || catalogScopeForToken(getAuthToken()) !== catalogScope) return;
+    void invalidateRealtimeQueries(queryClient);
+    window.dispatchEvent(new Event(CATALOG_REVALIDATE_EVENT));
+  });
   const roomListRefreshTimerRef = useRef<number | null>(null);
   const seenRoomMessageIdsRef = useRef(new Set<string>());
   const onChatRoomChanged = useCallback(({ room_id, kind, message }: ChatRoomChangeEvent) => {
@@ -2010,13 +1990,18 @@ export default function AppLayout() {
   useEffect(() => () => {
     if (roomListRefreshTimerRef.current !== null) window.clearTimeout(roomListRefreshTimerRef.current);
   }, []);
+  const onWorkspaceChanged = useCallback((data: Record<string, any>) => {
+    invalidateChangedWorkspace(queryClient, String(data.workspace_id || ""));
+  }, [queryClient]);
   const { connectedRef: _connectedRef, unreadCount: wsUnread } = useWebSocket({
     onConnect,
     onNotification,
     onTaskUpdate,
     onJobUpdate,
     onVideoReady,
+    onMediaJobUpdate,
     onWorkspaceChatMessage,
+    onWorkspaceChanged,
     onConversationMessage,
     onChatRoomChanged,
     onChatStreamSnapshot,
@@ -2168,6 +2153,7 @@ export default function AppLayout() {
     || location.pathname === "/team/clients"
     || location.pathname.startsWith("/client-delivery/")
     || location.pathname === "/notifications"
+    || location.pathname.startsWith("/approvals/")
     || location.pathname === "/workspaces"
     || isSimpleSetupPage
     || location.pathname.startsWith("/viewer/")
@@ -3865,7 +3851,6 @@ export default function AppLayout() {
                 {!sidebarCollapsed && (
                   <div style={{ position: "relative", order: 4 }}>
                   <button
-                    ref={supportRestoreFocusRef}
                     data-tour="sidebar-more"
                     type="button"
                     onClick={() => {
@@ -4054,86 +4039,17 @@ export default function AppLayout() {
                           <IconChatSmall />
                           <span>{t("nav.chatHistory")}</span>
                         </Link>
-                        {supportTicketsEnabled && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMoreOpen(false);
-                              setSupportOpen(true);
-                            }}
-                            aria-haspopup="dialog"
-                            aria-controls="floating-support-panel"
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 10,
-                              width: "100%",
-                              padding: "9px 10px",
-                              borderRadius: 9,
-                              border: "none",
-                              background: "transparent",
-                              color: "var(--text-default)",
-                              fontSize: 13,
-                              fontWeight: 500,
-                              cursor: "pointer",
-                              textAlign: "left",
-                            }}
-                            onMouseEnter={(e) => {
-                              e.currentTarget.style.background = "var(--surface-muted)";
-                            }}
-                            onMouseLeave={(e) => {
-                              e.currentTarget.style.background = "transparent";
-                            }}
+                        {!supportTicketsEnabled && (
+                          <a
+                            href="https://github.com/manor-os/manor-ai/discussions"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => setMoreOpen(false)}
+                            style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 9, color: "var(--text-default)", fontSize: 13, fontWeight: 500, textDecoration: "none" }}
                           >
-                            <span
-                              style={{
-                                position: "relative",
-                                display: "inline-flex",
-                                alignItems: "center",
-                              }}
-                            >
-                              <svg
-                                width="14"
-                                height="14"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <path d="M4 13a8 8 0 0116 0" />
-                                <path d="M18 13v3a2 2 0 01-2 2h-1" />
-                                <path d="M6 13v3a2 2 0 002 2" />
-                                <path d="M18 13h1a2 2 0 012 2v1a2 2 0 01-2 2h-1v-5z" />
-                                <path d="M6 13H5a2 2 0 00-2 2v1a2 2 0 002 2h1v-5z" />
-                              </svg>
-                              {supportUnread > 0 && (
-                                <span
-                                  style={{
-                                    position: "absolute",
-                                    top: -4,
-                                    right: -5,
-                                    minWidth: 12,
-                                    height: 12,
-                                    padding: "0 3px",
-                                    borderRadius: 6,
-                                    background: "#5d7f77",
-                                    color: "#fff",
-                                    fontSize: 8,
-                                    fontWeight: 700,
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    lineHeight: 1,
-                                  }}
-                                >
-                                  {supportUnread > 9 ? "9+" : supportUnread}
-                                </span>
-                              )}
-                            </span>
-                            <span>{t("nav.support")}</span>
-                          </button>
+                            <IconChatSmall />
+                            <span>{t("nav.communitySupport")}</span>
+                          </a>
                         )}
                         <div
                           style={{
@@ -4502,7 +4418,24 @@ export default function AppLayout() {
         </main>
 
         {/* Toast notification */}
-        {location.pathname === "/chat" && new URLSearchParams(location.search).get("invite") && (
+        {location.pathname === "/chat" && new URLSearchParams(location.search).get("join") && (
+          <Suspense fallback={null}>
+            <PublicGroupJoin
+              key={new URLSearchParams(location.search).get("join")}
+              token={new URLSearchParams(location.search).get("join") || ""}
+              onClose={() => navigate("/chat", { replace: true })}
+              onJoined={(room) => {
+                setActiveConvId(room.id);
+                setActiveConvType("room");
+                setActiveDmAgentId(null);
+                setConvSearchQuery("");
+                setMobileOpen(false);
+                navigate(`/chat?room=${encodeURIComponent(room.id)}`, { replace: true });
+              }}
+            />
+          </Suspense>
+        )}
+        {location.pathname === "/chat" && !new URLSearchParams(location.search).get("join") && new URLSearchParams(location.search).get("invite") && (
           <Suspense fallback={null}>
             <ChatInviteAcceptance
               token={new URLSearchParams(location.search).get("invite") || ""}
@@ -4534,6 +4467,7 @@ export default function AppLayout() {
         )}
 
         <TextSelectionToolbar />
+
 
         {/* Global agent create/edit modal — opened via openAgentEditModal()
             from any page (Agents.tsx, WorkspaceDetail.tsx, WorkspaceChat).
@@ -4603,14 +4537,6 @@ export default function AppLayout() {
           <OnboardingTour enabled={false} />
         )}
 
-        {/* Support drawer — talks to the platform team */}
-        {supportTicketsEnabled && (
-          <SupportPanel
-            open={supportOpen}
-            onClose={() => setSupportOpen(false)}
-            restoreFocusRef={supportRestoreFocusRef}
-          />
-        )}
       </div>
     </div>
   );

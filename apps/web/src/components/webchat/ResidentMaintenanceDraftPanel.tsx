@@ -7,6 +7,7 @@ import Textarea from "../ui/Textarea";
 import { tForLocale } from "../../lib/i18n";
 import { maintenanceCategories, maintenancePriorities, residentDraftCanConfirm, residentDraftFieldsEqual, type ResidentDraft, type ResidentDraftCollection } from "../../lib/residentMaintenanceDrafts";
 import type { useResidentMaintenanceDrafts } from "../../lib/useResidentMaintenanceDrafts";
+import { getPreferredTimeZone } from "../../lib/format";
 
 type DraftController = ReturnType<typeof useResidentMaintenanceDrafts>;
 type Translate = (key: string) => string;
@@ -74,7 +75,7 @@ function DraftCard({ draft, locations, controller, text }: {
 export default function ResidentMaintenanceDraftPanel({ controller, language }: { controller: DraftController; language?: string | null }) {
   const text: Translate = key => tForLocale(`webchat_maintenance.${key}`, language || "en");
   const collection = controller.active ? controller.collection : null;
-  return <section aria-label={text("title")} style={{ marginTop: 12, padding: 12, borderRadius: "var(--radius-card)", background: "var(--surface-muted)", overflowWrap: "anywhere" }}>
+  return <section className="public-chat-panel" aria-label={text("title")} style={{ marginTop: 12, padding: 12, borderRadius: "var(--radius-card)", background: "var(--public-chat-soft, var(--surface-muted))", color: "var(--public-chat-text, inherit)", overflowWrap: "anywhere" }}>
     <strong style={{ fontSize: 13 }}>{text("title")}</strong>
     {controller.notice && <p role="alert" style={{ fontSize: 12 }}>{text(controller.notice)}</p>}
     {!collection ? <>
@@ -82,7 +83,7 @@ export default function ResidentMaintenanceDraftPanel({ controller, language }: 
       {!["checking", "redirecting"].includes(controller.phase) && <Button size="sm" onClick={() => void controller.start()}>{text("enable")}</Button>}
       {controller.phase === "unavailable" && <Button size="sm" variant="outline" onClick={() => void controller.load()}>{text("retry")}</Button>}
     </> : <>
-      <p style={{ fontSize: 12 }}>{text("enabled_until")} {new Date(collection.create_access.expires_at!).toLocaleTimeString(language || "en")}</p>
+      <p style={{ fontSize: 12 }}>{text("enabled_until")} {new Date(collection.create_access.expires_at!).toLocaleTimeString(language || "en", { timeZone: getPreferredTimeZone() })}</p>
       <Button size="sm" variant="outline" disabled={controller.loading || controller.busyDraftId !== null} onClick={() => void controller.load()}>{text("refresh")}</Button>
       {controller.loading && <p role="status" style={{ fontSize: 12 }}>{text("checking")}</p>}
       {collection.items.length === 0 && <p style={{ fontSize: 12 }}>{text("empty")}</p>}

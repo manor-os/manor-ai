@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from packages.core.ai.runtime.approvals import (
     RuntimeApprovalMiddleware,
+    RuntimeApprovalPreview,
     RuntimeApprovalRequest,
 )
 from packages.core.ai.runtime.capabilities import AGENT_INITIATIVE_TOOL_NAMES
@@ -68,7 +69,7 @@ from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     RuntimeToolCallContext,
     RuntimeToolContextConflictError,
-    runtime_authorization_conversation_id,
+    runtime_authorization_sandbox_binding_key,
     runtime_injected_tool_context_args,
     runtime_tool_call_context_from_kwargs,
 )
@@ -76,6 +77,7 @@ from packages.core.constants.integrations import (
     RUNTIME_MCP_ACCOUNT_REGISTRY_SNAPSHOT_ARGUMENT,
     RUNTIME_MCP_INTEGRATION_REGISTRY_ARGUMENT,
 )
+from packages.core.services.collaborator_steering import collaborator_steering_scoped
 from packages.core.services.generated_media_naming import WorkspaceArtifactScope, workspace_artifact_scope
 
 
@@ -118,6 +120,7 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = (
         {
             "mcp__chrome__run_sequence",
             "check_youtube_publication_setup",
+            "resolve_platform_routes",
             "search_tools",
             "resident_maintenance_status",
             "resident_maintenance_draft",
@@ -140,7 +143,6 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = (
             "delete_file",
             "generate_file",
             "generate_document_file",
-            "save_sandbox_file",
             "sandbox_save_result",
             "sandbox",
             "bash",
@@ -234,6 +236,43 @@ def _runtime_policy_arguments(
     if tool_name.startswith("mcp__chrome__") and active_user_message:
         policy_arguments.setdefault("active_user_message", active_user_message)
     return policy_arguments
+
+
+
+
+# File arguments the handlers accept as any file address (``/viewer/<id>``,
+# ``/api/v1/fs/...``, the sandbox mount). Resolved once here so the approval
+# receipt names the same path the handler then writes.
+_FILE_REFERENCE_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "patch_file": ("path",),
+    "delete_file": ("path",),
+    "replace_file": ("source_path", "target_path"),
+}
+
+
+async def _runtime_canonical_file_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    entity_id: str | None,
+) -> dict[str, Any]:
+    keys = _FILE_REFERENCE_ARGUMENTS.get(tool_name)
+    if not keys or not entity_id:
+        return arguments
+    from packages.core.ai.tools.file_tools import _file_reference_path
+    from packages.core.services.entity_fs import get_entity_root
+
+    root = get_entity_root(entity_id)
+    canonical = dict(arguments)
+    for key in keys:
+        value = canonical.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path, error = await _file_reference_path(entity_id, root, value)
+        # An unknown or foreign reference stays as given; the handler reports it.
+        if error is None and path:
+            canonical[key] = path
+    return canonical
 
 
 
@@ -429,6 +468,104 @@ def runtime_preflight_tool_resolution(
             )
 
     return RuntimeToolResolutionPreflight(context=context, harness=harness)
+
+
+def _runtime_tool_approval_request(
+    *,
+    tool_name: str,
+    policy_arguments: dict[str, Any],
+    context: RuntimeToolCallContext,
+    step_id: str | None,
+    envelope: Any | None,
+    account_id: str | None,
+    discovered_tool_grant: RuntimeDiscoveredToolGrant | None,
+) -> RuntimeApprovalRequest:
+    """The approval request the gate judges for one concrete call."""
+
+    call_id = str(context.runtime_tool_call_id or "").strip()
+    run_identity = str(context.runtime_run_id or context.performance_run_id or context.task_id or "").strip()
+    return RuntimeApprovalRequest(
+        tool_name=tool_name,
+        arguments=policy_arguments,
+        operation_id=f"runtime:{run_identity}:call:{call_id}" if run_identity and call_id else None,
+        account_id=account_id,
+        entity_id=context.entity_id or "",
+        user_id=context.user_id or "",
+        workspace_id=context.workspace_id,
+        conversation_id=context.conversation_id,
+        # Sandbox-bound tools are also authorized against their sandbox
+        # binding, so a conversation-less Task or Workflow run has a scope.
+        sandbox_binding_key=runtime_authorization_sandbox_binding_key(context, tool_name),
+        task_id=context.task_id,
+        step_id=step_id,
+        envelope=envelope,
+        declared_effect=(
+            discovered_tool_grant.effect
+            if discovered_tool_grant is not None
+            else None
+        ),
+    )
+
+
+async def runtime_preview_tool_gate(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    entity_id: str | None = None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    workspace_id: str | None = None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    step_id: str | None = None,
+    active_user_message: str | None = None,
+    runtime_envelope: Any | None = None,
+) -> "RuntimeApprovalPreview | None":
+    """Preview the approval gate of one native call before anything runs.
+
+    Builds the same approval request as ``runtime_prepare_tool_execution``
+    and asks the approval middleware for a write-free decision. ``None``
+    when the call cannot be previewed faithfully: an MCP call (its account
+    and policy facts come from the provider preflight), a context conflict,
+    or a call the Runtime tool policy refuses.
+    """
+
+    if tool_name.startswith("mcp__"):
+        return None
+    try:
+        context = runtime_tool_call_context_from_kwargs(
+            arguments,
+            entity_id=entity_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            runtime_envelope=runtime_envelope,
+        )
+    except RuntimeToolContextConflictError:
+        return None
+    if _runtime_workspace_task_scope_conflicts(tool_name, arguments, task_id=context.task_id):
+        return None
+    if runtime_envelope is not None:
+        from packages.core.ai.runtime.policies import check_runtime_tool_policy
+
+        if not check_runtime_tool_policy(
+            envelope=runtime_envelope, tool_name=tool_name, arguments=arguments,
+        ).allowed:
+            return None
+    request = _runtime_tool_approval_request(
+        tool_name=tool_name,
+        policy_arguments=_runtime_policy_arguments(
+            tool_name, arguments, active_user_message=active_user_message,
+        ),
+        context=context,
+        step_id=step_id,
+        envelope=runtime_envelope,
+        account_id=None,
+        discovered_tool_grant=None,
+    )
+    return await RuntimeApprovalMiddleware().preview_request(request)
 
 
 @dataclass(frozen=True)
@@ -817,6 +954,23 @@ async def runtime_execute_prepared_tool_handler(
                     ),
                 )
             return provider_preflight_result
+        from packages.core.ai.runtime.effect_deadline import workflow_effect_deadline_expired
+        if workflow_effect_deadline_expired(
+            deadline_at=context.workflow_effect_deadline_at,
+            action_keys=context.workflow_effect_deadline_action_keys,
+            classification=prepared.classification,
+        ):
+            blocked = json.dumps({"error": "workflow_effect_deadline_expired", "action_executed": False})
+            if harness is not None:
+                harness.record_tool_block_result(tool_name, blocked)
+            return await runtime_settle_provider_approval_preflight_failure(
+                harness=harness,
+                tool_name=tool_name,
+                arguments=arguments,
+                result=blocked,
+                entity_id=entity,
+                conversation_id=context.conversation_id,
+            )
         # This runs after authorization/approval preflight but before the
         # handler can cross external I/O.  Coordinator children install a
         # context-local observer that durably records mutating intent; all
@@ -965,6 +1119,7 @@ async def runtime_execute_prepared_tool_handler(
         runtime_end_tool_authorization_scope(authorization_token)
 
 
+@collaborator_steering_scoped
 async def runtime_execute_scoped_dynamic_tool_handler(
     *,
     tool_name: str,
@@ -1083,6 +1238,29 @@ async def runtime_execute_scoped_dynamic_tool_handler(
                     ),
                 )
             return provider_preflight_result
+        dynamic_context = runtime_tool_call_context_from_kwargs(
+            prepared_arguments,
+            entity_id=envelope_value("entity_id", entity_id),
+            user_id=envelope_value("user_id", user_id),
+            runtime_envelope=runtime_envelope,
+        )
+        from packages.core.ai.runtime.effect_deadline import workflow_effect_deadline_expired
+        if workflow_effect_deadline_expired(
+            deadline_at=dynamic_context.workflow_effect_deadline_at,
+            action_keys=dynamic_context.workflow_effect_deadline_action_keys,
+            classification=prepared.classification,
+        ):
+            blocked = json.dumps({"error": "workflow_effect_deadline_expired", "action_executed": False})
+            if harness is not None:
+                harness.record_tool_block_result(tool_name, blocked)
+            return await runtime_settle_provider_approval_preflight_failure(
+                harness=harness,
+                tool_name=tool_name,
+                arguments=prepared_arguments,
+                result=blocked,
+                entity_id=envelope_value("entity_id", entity_id) or "",
+                conversation_id=envelope_value("conversation_id", conversation_id),
+            )
         from packages.core.ai.runtime.tool_effect_intents import (
             runtime_record_tool_effect_intent,
             runtime_record_tool_effect_result,
@@ -1243,9 +1421,7 @@ async def runtime_prepare_tool_execution(
             arguments=arguments, harness=harness, blocked_result=blocked_result,
         )
 
-    from packages.core.contracts.step_execution import (
-        step_contract_tool_error, tool_operation_denied_error,
-    )
+    from packages.core.contracts.step_execution import tool_operation_denied_error
 
     denied_operation = tool_operation_denied_error(tool_name, arguments)
     if denied_operation is not None:
@@ -1253,28 +1429,6 @@ async def runtime_prepare_tool_execution(
 
         blocked_result = RuntimePreflightValidationError(json.dumps(tool_error_payload(
             tool_name=tool_name, code="tool_operation_denied", message=denied_operation,
-        )))
-        if harness is not None:
-            harness.record_tool_block_result(tool_name, blocked_result)
-        return RuntimePreparedToolExecution(
-            arguments=arguments, harness=harness, blocked_result=blocked_result,
-        )
-
-    step_declared_grant = discovered_tool_grant
-    if step_declared_grant is None and tool_name.startswith("mcp__"):
-        step_grants = getattr(runtime_envelope, "discovered_tool_grants", None)
-        if step_grants is not None:
-            step_declared_grant = step_grants.metadata(tool_name)
-    step_error = step_contract_tool_error(
-        tool_name, arguments, entity_id=entity,
-        workspace_id=context.workspace_id, task_id=context.task_id,
-        declared_effect=getattr(step_declared_grant, "effect", None),
-    )
-    if step_error is not None:
-        from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
-
-        blocked_result = RuntimePreflightValidationError(json.dumps(tool_error_payload(
-            tool_name=tool_name, code="step_execution_contract_violation", message=step_error,
         )))
         if harness is not None:
             harness.record_tool_block_result(tool_name, blocked_result)
@@ -1464,34 +1618,22 @@ async def runtime_prepare_tool_execution(
         workspace_id=context.workspace_id,
     )
 
+    resolved_arguments = await _runtime_canonical_file_arguments(
+        tool_name, resolved_arguments, entity_id=context.entity_id,
+    )
     policy_arguments = _runtime_policy_arguments(
         tool_name,
         resolved_arguments,
         active_user_message=active_user_message,
     )
-    call_id = str(context.runtime_tool_call_id or "").strip()
-    run_identity = str(context.runtime_run_id or context.performance_run_id or context.task_id or "").strip()
-    operation_id = f"runtime:{run_identity}:call:{call_id}" if run_identity and call_id else None
-    approval_request = RuntimeApprovalRequest(
+    approval_request = _runtime_tool_approval_request(
         tool_name=tool_name,
-        arguments=policy_arguments,
-        operation_id=operation_id,
-        account_id=(str(mcp_preflight.integration_account_id) if tool_name.startswith("mcp__") and mcp_preflight.integration_account_id else None),
-        entity_id=entity,
-        user_id=user,
-        workspace_id=context.workspace_id,
-        # Sandbox-bound tools are authorized against the sandbox binding, so a
-        # conversation-less task-worker run presents its binding key here and
-        # nowhere else; see runtime_authorization_conversation_id.
-        conversation_id=runtime_authorization_conversation_id(context, tool_name),
-        task_id=context.task_id,
+        policy_arguments=policy_arguments,
+        context=context,
         step_id=step_id,
         envelope=(harness.envelope if harness is not None else runtime_envelope),
-        declared_effect=(
-            discovered_tool_grant.effect
-            if discovered_tool_grant is not None
-            else None
-        ),
+        account_id=(str(mcp_preflight.integration_account_id) if tool_name.startswith("mcp__") and mcp_preflight.integration_account_id else None),
+        discovered_tool_grant=discovered_tool_grant,
     )
     output_scope = _output_scope(context, tool_name, resolved_arguments)
     from packages.core.ai.runtime.tool_effect_intents import (
@@ -1537,7 +1679,7 @@ async def runtime_prepare_tool_execution(
             authorization_receipt,
             consumed_approval_request_id=consumed_approval_request_id,
         )
-    if tool_name == "mcp__tiktok__post_video":
+    if tool_name in {"mcp__tiktok__post_video", "mcp__tiktok__post_photo"}:
         if authorization_receipt is None or len(publish_consents) != 1:
             return RuntimePreparedToolExecution(
                 arguments=arguments, harness=harness,
@@ -1593,6 +1735,8 @@ async def runtime_prepare_tool_execution(
                 chrome_sequence_child=chrome_sequence_child,
                 chrome_expected_connection_id=chrome_expected_connection_id or None,
                 runtime_validation_duration_ms=runtime_validation_duration_ms,
+                workflow_effect_deadline_at=context.workflow_effect_deadline_at,
+                workflow_effect_deadline_action_keys=context.workflow_effect_deadline_action_keys,
             )
         )
     return RuntimePreparedToolExecution(
@@ -1610,6 +1754,7 @@ async def runtime_prepare_tool_execution(
     )
 
 
+@collaborator_steering_scoped
 async def runtime_execute_registered_tool(
     *,
     tool_name: str,
@@ -1642,7 +1787,12 @@ async def runtime_execute_registered_tool(
 
     handler = handler_resolver(tool_name)
     if handler is None:
-        error_result = runtime_tool_error_result(f"unknown tool '{tool_name}'")
+        from packages.core.ai.runtime.tool_results import RuntimeSettledToolResult
+
+        # No handler: nothing ran.
+        error_result = RuntimeSettledToolResult.not_applied(
+            runtime_tool_error_result(f"unknown tool '{tool_name}'"), "tool_unavailable",
+        )
         return await runtime_settle_provider_approval_preflight_failure(
             harness=(RuntimeHarness(runtime_envelope) if runtime_envelope else None),
             tool_name=tool_name,

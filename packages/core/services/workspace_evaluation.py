@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -34,6 +35,15 @@ from packages.core.models.task import Task
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.workspace import Workspace
 from packages.core.services.credit_service import usd_to_credits
+from packages.core.services.workspace_health_metrics import (
+    CANCELLED,
+    FAILED,
+    IN_FLIGHT,
+    SUCCEEDED,
+    platform_stopped_task_ids,
+    step_outcome,
+    task_outcome,
+)
 
 
 DEFAULT_WINDOW_DAYS = 30
@@ -80,7 +90,10 @@ async def build_workspace_evaluation(
 
     budget = await get_budget_status(db, workspace.id)
     goal_impact = _build_goal_impact(goals, measurements, goal_links)
-    execution = _build_execution_health(tasks, plans, steps)
+    stopped = await platform_stopped_task_ids(
+        db, [t.id for t in tasks if task_outcome(t.status) == FAILED]
+    )
+    execution = _build_execution_health(tasks, plans, steps, platform_stopped=stopped)
     cost = _build_cost_efficiency(
         steps=steps,
         token_logs=token_logs,
@@ -90,7 +103,7 @@ async def build_workspace_evaluation(
         goal_progress_points=goal_impact["aggregate"]["progress_points"],
     )
     time_efficiency = _build_time_efficiency(tasks, plans, steps)
-    output_quality = _build_output_quality(tasks, steps, evidence)
+    output_quality = _build_output_quality(tasks, steps, evidence, platform_stopped=stopped)
     user_feedback = _build_user_feedback(evidence)
     governance = _build_governance_health(steps, evidence)
     learning = _build_learning_health(evidence, candidates)
@@ -459,20 +472,32 @@ def _build_goal_impact(
 
 
 def _build_execution_health(
-    tasks: list[Task], plans: list[ExecutionPlan], steps: list[ExecutionStep]
+    tasks: list[Task],
+    plans: list[ExecutionPlan],
+    steps: list[ExecutionStep],
+    *,
+    platform_stopped: Collection[str] = frozenset(),
 ) -> dict[str, Any]:
     task_status = Counter(t.status or "unknown" for t in tasks)
     plan_status = Counter(p.status or "unknown" for p in plans)
     step_status = Counter(s.step_status or "unknown" for s in steps)
     step_kind = Counter(s.kind or "unknown" for s in steps)
-    completed_tasks = task_status.get("completed", 0)
-    failed_tasks = task_status.get("failed", 0) + task_status.get("cancelled", 0)
-    open_tasks = len(tasks) - completed_tasks - failed_tasks
-    done_steps = step_status.get("done", 0)
-    failed_steps = step_status.get("failed", 0) + step_status.get("cancelled", 0)
+    task_outcomes = Counter(
+        task_outcome(t.status, platform_stopped=t.id in platform_stopped) for t in tasks
+    )
+    step_outcomes = Counter(step_outcome(s.step_status) for s in steps)
+    completed_tasks = task_outcomes[SUCCEEDED]
+    failed_tasks = task_outcomes[FAILED]
+    cancelled_tasks = task_outcomes[CANCELLED]
+    open_tasks = task_outcomes[IN_FLIGHT]
+    done_steps = step_outcomes[SUCCEEDED]
+    failed_steps = step_outcomes[FAILED]
     waiting_steps = step_status.get("waiting_human", 0)
 
-    task_completion_rate = completed_tasks / len(tasks) if tasks else None
+    # A proposed Task (outcome None) is not work: it is neither open nor
+    # part of the completion rate.
+    work_count = len(tasks) - task_outcomes[None]
+    task_completion_rate = completed_tasks / work_count if work_count else None
     step_done_rate = done_steps / len(steps) if steps else None
     dependency_errors = _dependency_errors(steps)
 
@@ -496,6 +521,8 @@ def _build_execution_health(
         "completed_task_count": completed_tasks,
         "open_task_count": open_tasks,
         "failed_task_count": failed_tasks,
+        "cancelled_task_count": cancelled_tasks,
+        "failed_step_count": failed_steps,
         "task_status_counts": dict(task_status),
         "plan_count": len(plans),
         "plan_status_counts": dict(plan_status),
@@ -614,7 +641,11 @@ def _build_time_efficiency(
 
 
 def _build_output_quality(
-    tasks: list[Task], steps: list[ExecutionStep], evidence: list[RuntimeEvidence]
+    tasks: list[Task],
+    steps: list[ExecutionStep],
+    evidence: list[RuntimeEvidence],
+    *,
+    platform_stopped: Collection[str] = frozenset(),
 ) -> dict[str, Any]:
     approval_like_types = {"approval_decision", "external_message_decision"}
     approvals = 0
@@ -641,8 +672,11 @@ def _build_output_quality(
         if "change" in choice or "revision" in choice or "reject" in choice:
             revision_requests += 1
 
-    completed = sum(1 for t in tasks if t.status == "completed")
-    failed = sum(1 for t in tasks if t.status in {"failed", "cancelled"})
+    outcomes = [
+        task_outcome(t.status, platform_stopped=t.id in platform_stopped) for t in tasks
+    ]
+    completed = outcomes.count(SUCCEEDED)
+    failed = outcomes.count(FAILED)
     schema_failures = sum(
         1 for s in steps
         if s.error and "schema" in str(s.error).lower()

@@ -27,7 +27,6 @@ from packages.core.services.task_chat_hitl import (
 from packages.core.services.task_input_resume import (
     TASK_INPUT_QUESTION_KEY,
     apply_task_input_answer,
-    legacy_task_can_resume_input,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -94,7 +93,6 @@ async def test_lease_pause_keeps_the_transcript_and_resume_preserves_it(db_sessi
     assert step.step_status == ExecutionStepStatus.WAITING_HUMAN.value
     assert step.runtime_checkpoint["pending_tool_call"]["id"] == "call-ask"
 
-    monkeypatch.setattr("packages.core.tasks.ai_tasks.run_plan", None, raising=False)
     await resume_step_for_retry(
         db_session,
         entity_id=fx["entity_id"], user_id=fx["entity_id"], step_id=fx["step_id"],
@@ -332,43 +330,6 @@ async def test_chat_blocker_cannot_reenter_legacy_loop_for_workspace_task(
     assert (await db_session.get(HitlRequest, request.id)).status == ApprovalStatus.PENDING.value
 
 
-async def test_standalone_legacy_input_resumes_exact_factory_agent(db_session) -> None:
-    task, user_id = await _legacy_task(db_session, with_workspace=False)
-
-    applied = await apply_task_input_answer(
-        db_session,
-        task=task,
-        user_id=user_id,
-        user_label="Amy",
-        response_text="4C",
-    )
-
-    assert applied["resumed"] is True
-    assert applied["dispatch_agent_id"] == task.agent_id
-    assert task.status == TaskStatus.PENDING.value
-
-
-async def test_legacy_input_resume_rejects_a_stale_target_agent(db_session) -> None:
-    task, _user_id = await _legacy_task(db_session, with_workspace=False)
-
-    assert await legacy_task_can_resume_input(
-        db_session,
-        task,
-        agent_id=generate_ulid(),
-    ) is False
-
-
-async def test_plan_owned_tasks_do_not_take_the_legacy_resume(db_session) -> None:
-    task, user_id = await _legacy_task(db_session, with_workspace=False)
-    db_session.add(ExecutionPlan(
-        id=generate_ulid(), entity_id=task.entity_id, task_id=task.id, plan_dag={}, status="paused",
-    ))
-    await db_session.flush()
-    applied = await apply_task_input_answer(
-        db_session, task=task, user_id=user_id, user_label="Amy", response_text="4C",
-    )
-    assert applied["resumed"] is False
-    assert (await db_session.get(Task, task.id)).status == TaskStatus.WAITING_ON_CUSTOMER.value
 
 
 async def test_ownerless_workspace_team_task_does_not_take_legacy_resume(

@@ -250,16 +250,19 @@ def format_content_version(parts: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in parts)
 
 
-def bump_content_version(value: Any) -> str:
-    """The next version after a content change.
+def bump_content_version(value: Any, level: str = "patch") -> str:
+    """The next version after a content change of ``level`` (patch, minor, major).
 
-    Publishing an edit is a patch release; the parts roll over at 99 so the
-    number stays readable rather than growing a 400-wide patch component. An
-    owner who wants to say "this is a major rewrite" edits the version
-    directly — the automatic bump exists so a release can never *forget* to
-    move, not to take the naming away.
+    The level comes from what changed (``release_diff.minimum_bump``), so a
+    release can never *forget* to move, nor call a removed component a patch.
+    A patch rolls over at 99 so the number stays readable rather than growing
+    a 400-wide patch component.
     """
     major, minor, patch = parse_content_version(value or FIRST_CONTENT_VERSION)
+    if level == "major":
+        return format_content_version((major + 1, 0, 0))
+    if level == "minor":
+        minor, patch = minor + 1, -1
     patch += 1
     if patch > _VERSION_PART_MAX:
         patch = 0
@@ -307,8 +310,13 @@ def blueprint_freshness(
     current_payload: dict[str, Any] | None,
     *,
     current_version: str | None = None,
+    current_fingerprint: str | None = None,
 ) -> BlueprintFreshness:
-    """Compare what a workspace was installed from against the blueprint now."""
+    """Compare what a workspace was installed from against the blueprint now.
+
+    ``current_fingerprint`` lets a caller comparing many installs against one
+    blueprint hash its payload once; it must be that payload's fingerprint.
+    """
     record = installed_blueprint_record(workspace_settings)
     # Identity is the id. The slug is a display name and a per-owner
     # uniqueness rule; it was never a stable identity, and leaning on it is
@@ -316,7 +324,8 @@ def blueprint_freshness(
     if not record.get(BLUEPRINT_ID_KEY):
         return BlueprintFreshness.NOT_FROM_BLUEPRINT
 
-    current_fingerprint = blueprint_content_fingerprint(current_payload)
+    if current_fingerprint is None:
+        current_fingerprint = blueprint_content_fingerprint(current_payload)
     partial_version = record.get(LAST_PARTIAL_UPGRADE_VERSION_KEY)
     partial_fingerprint = str(
         record.get(LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY) or ""
@@ -382,6 +391,7 @@ def blueprint_update_summary(
     current_payload: dict[str, Any] | None,
     *,
     current_version: str | None = None,
+    current_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """What to show a workspace about its blueprint, and what changed.
 
@@ -391,8 +401,11 @@ def blueprint_update_summary(
     they learn to dismiss.
     """
     record = installed_blueprint_record(workspace_settings)
+    if current_fingerprint is None:
+        current_fingerprint = blueprint_content_fingerprint(current_payload)
     status = blueprint_freshness(
         workspace_settings, current_payload, current_version=current_version,
+        current_fingerprint=current_fingerprint,
     )
     summary: dict[str, Any] = {
         "status": status.value,
@@ -403,7 +416,7 @@ def blueprint_update_summary(
         "synchronization_status": record.get("synchronization_status"),
         "installed_at": record.get("installed_at"),
         "installed_fingerprint": record.get(CONTENT_FINGERPRINT_KEY) or None,
-        "current_fingerprint": blueprint_content_fingerprint(current_payload) or None,
+        "current_fingerprint": current_fingerprint or None,
         "changed": [],
     }
     if status is BlueprintFreshness.UPDATE_AVAILABLE:

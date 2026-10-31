@@ -13,6 +13,7 @@
  * rendering the browser's broken-image icon.
  */
 import { useState } from "react";
+import { userAvatarImage } from "../../lib/userAvatar";
 import AgentAvatar from "./AgentAvatar";
 import ManorAvatar from "./ManorAvatar";
 import { IconUser, IconWorkspace, IconShield } from "../icons";
@@ -31,7 +32,7 @@ interface UserAvatarProps {
 const brokenAvatarUrls = new Set<string>();
 
 export default function UserAvatar({ name, avatarUrl, type = "user", seed, size = 26, style }: UserAvatarProps) {
-  const src = (avatarUrl || "").trim();
+  const src = type === "user" ? userAvatarImage(avatarUrl) : (avatarUrl || "").trim();
   const [brokenSrc, setBrokenSrc] = useState<string | null>(() => (src && brokenAvatarUrls.has(src) ? src : null));
   const isBroken = !!src && (brokenSrc === src || brokenAvatarUrls.has(src));
 

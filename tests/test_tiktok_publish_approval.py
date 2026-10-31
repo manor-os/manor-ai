@@ -106,9 +106,8 @@ def test_changed_post_cannot_activate_the_consumed_approval_receipt(changed):
         runtime_end_tool_authorization_scope(scope)
 
 
-def test_review_survives_live_and_durable_cards_without_private_evidence():
+def test_review_survives_live_card_without_private_evidence():
     from packages.core.services.hitl_requests import hitl_requests_from_data
-    from packages.core.workers.internal import _pending_action_from_tool_payload
 
     review = {"kind": "tiktok_publish", "review_id": "fresh-review", "title": "Reviewed"}
     payload = json.loads(
@@ -123,9 +122,6 @@ def test_review_survives_live_and_durable_cards_without_private_evidence():
     )
     assert payload["hitl"]["options"] == ["approve", "reject"]
     assert hitl_requests_from_data(payload)[0]["review"] == review
-    durable = _pending_action_from_tool_payload(payload)
-    assert durable["review"] == review
-    assert durable["options"] == ["approve", "reject"]
     assert "secret-hash" not in json.dumps(payload)
 
 

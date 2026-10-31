@@ -1,4 +1,6 @@
 import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
+import { getPreferredTimeZone } from "../lib/format";
+import ImagePreview from "./file-preview/ImagePreview";
 import {
   lazy,
   Suspense,
@@ -26,6 +28,8 @@ import {
   resolveDisplayMediaUrl,
 } from "../lib/api";
 import { getAuthToken } from "../lib/authToken";
+import { saveRoomFileSelection } from "../lib/roomFileSelectionDownload";
+import { ROOM_FILE_PREVIEW_MAX_BYTES } from "../lib/roomFileLimits";
 import { isMasterAgent } from "../lib/constants";
 import { workflowPath } from "../lib/workflowRoutes";
 import {
@@ -70,6 +74,7 @@ import {
   type ManorDocumentRender,
 } from "../lib/manorDocumentEngine";
 import { useIsolatedHtmlPreview } from "../lib/useIsolatedHtmlPreview";
+import { externalPreviewFrame } from "../lib/externalPreviewFrame";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   ChatStreamCompletionStatus,
@@ -187,6 +192,7 @@ import {
 import { latestMessageByRole, priorMatchingEntries } from "../lib/chatHistoryScan";
 import { isAbortError, loadServerSlidePreview, slidePriorityPicker } from "../lib/pptxServerPreview";
 import { createFilePreviewSource, filePreviewMediaBlob, withFilePreviewTimeout } from "../lib/filePreviewSource";
+import { fetchFileBlob } from "../lib/fileTransfer";
 import { getFilePreviewKind } from "../lib/filePreviewKind";
 import {
   manualSkillReferences,
@@ -231,6 +237,7 @@ import {
 import type { WorkflowTemplate } from "./workflows/WorkflowTemplates";
 import { t } from "../lib/i18n";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
+import { useRealtimeResync } from "../lib/realtimeResync";
 import { parseDelimitedText } from "../lib/delimitedText";
 import {
   spreadsheetCellVisualStyle,
@@ -1097,6 +1104,9 @@ type SideHustleSampleDefinition = {
   sampleSrc?: string;
   videoSrc?: string;
   detailPageCount?: number;
+  // Published /assets/ URLs are immutable: new preview images go to new
+  // `${id}-v${assetRevision}` paths instead of replacing the old files.
+  assetRevision?: number;
   chatModePayloadPatch?: ChatModePayload;
   copy?: {
     title: string;
@@ -1142,17 +1152,18 @@ const SIDE_HUSTLE_SAMPLE_DEFINITIONS: Record<
     {
       id: "null_signal_incident_manual",
       preview: "slides",
-      sampleSrc: "/assets/samples/artifacts/slides/null-signal-incident-manual.pptx",
-      detailPageCount: 3,
+      sampleSrc: "/assets/samples/artifacts/slides/null-signal-incident-manual-v2.pptx",
+      detailPageCount: 6,
+      assetRevision: 2,
       chatModePayloadPatch: { render: "editable" },
       copy: {
         title: "Null Signal Incident Manual",
-        outcome: "Build a black terminal-style cybersecurity field manual with operational diagrams, triage logic, and high-contrast technical hierarchy.",
-        prompt: "Remix the Null Signal Incident Manual into a new 10-slide operational playbook for a different technical topic and fictional organization. Preserve the black terminal aesthetic, cyan and amber signal colors, grid system, procedural diagrams, severity logic, and field-manual typography while replacing all content.",
+        outcome: "Build a black-and-signal-yellow security field manual: first-hour numbers, a five-step response, a severity table, roles and the golden rule.",
+        prompt: "Remix the Null Signal Incident Manual into a new 8-10 slide operational playbook for a different technical topic and fictional organization. Preserve the black background with the yellow-rimmed planet horizon, signal-yellow headlines, phone dashboard cover, step diagrams, severity table, role grid and full-yellow statement slide while replacing all content.",
         label: "Cybersecurity",
         preview_title: "Null Signal Incident Manual",
-        line_1: "Technical field manual with triage and response logic",
-        line_2: "Dark grid, signal colors, diagrams, and procedures",
+        line_1: "First-hour numbers, five steps, severity table and roles",
+        line_2: "Black space, signal yellow, phone dashboard cover",
         chip_1: "Security",
         chip_2: "Playbook",
       },
@@ -1268,17 +1279,18 @@ const SIDE_HUSTLE_SAMPLE_DEFINITIONS: Record<
     {
       id: "line_47_wayfinding",
       preview: "slides",
-      sampleSrc: "/assets/samples/artifacts/slides/line-47-wayfinding.pptx",
-      detailPageCount: 3,
+      sampleSrc: "/assets/samples/artifacts/slides/line-47-wayfinding-v2.pptx",
+      detailPageCount: 6,
+      assetRevision: 2,
       chatModePayloadPatch: { render: "editable" },
       copy: {
         title: "Line 47 Wayfinding System",
-        outcome: "Explain a public-space design system through bold numbered stages, signage rules, maps, and rigorous black-red-blue typography.",
-        prompt: "Remix the Line 47 Wayfinding System into a new 10-slide service, transit, or public-design proposal for a different fictional system. Preserve the bold numbered hierarchy, red-blue-black palette, signage logic, rollout timeline, diagram language, and rigorous modernist grid while replacing all content.",
+        outcome: "Propose a public-space design system with rider data, numbered rules, signage photography, a rollout table and a timeline on a Swiss grid.",
+        prompt: "Remix the Line 47 Wayfinding System into a new 8-10 slide service, transit, or public-design proposal for a different fictional system. Preserve the charcoal 12-column Swiss grid with registration marks, white modular number cards, orange-red accent, numbered rules, architectural photography, rollout table and timeline while replacing all content.",
         label: "Wayfinding system",
         preview_title: "Line 47 Wayfinding System",
-        line_1: "Modernist service system with signage and rollout logic",
-        line_2: "Bold numbers, maps, diagrams, and disciplined grid",
+        line_1: "Rider data, four rules, rollout table and 12-month timeline",
+        line_2: "Swiss grid, white number cards, orange-red accent",
         chip_1: "Wayfinding",
         chip_2: "System",
       },
@@ -2954,11 +2966,13 @@ function createSideHustleSample(
     sampleSrc,
     videoSrc: explicitVideoSrc,
     detailPageCount = 3,
+    assetRevision,
     chatModePayloadPatch,
     copy,
   }: SideHustleSampleDefinition,
 ): WorkspaceCapabilityConfig["samples"][number] {
   const key = `${capability}.${id}`;
+  const assetStem = assetRevision ? `${id}-v${assetRevision}` : id;
   const sampleText = (field: keyof NonNullable<SideHustleSampleDefinition["copy"]>) =>
     copy?.[field] ?? sideHustleText(`${key}.${field}`);
   const videoSrc =
@@ -2968,7 +2982,7 @@ function createSideHustleSample(
       : undefined);
   const detailImageSrcs = Array.from({ length: detailPageCount }, (_, index) => index + 1).map(
     (page) =>
-      `/assets/samples/details/${capability}/${id}-${String(page).padStart(2, "0")}.png`,
+      `/assets/samples/details/${capability}/${assetStem}-${String(page).padStart(2, "0")}.png`,
   );
   const previewContent: WorkspaceSamplePreviewContent = coverTemplate
     ? {
@@ -2994,7 +3008,7 @@ function createSideHustleSample(
         previewImageSrc:
           capability === "docs"
             ? detailImageSrcs[0]
-            : `/assets/samples/previews/${capability}/${id}.png`,
+            : `/assets/samples/previews/${capability}/${assetStem}.png`,
         previewImageAlt: sampleText("preview_title"),
         detailImageSrcs,
         detailImageAlt: sampleText("preview_title"),
@@ -7145,8 +7159,14 @@ async function loadArtifactDocumentThumbnail(
   return api.documents.thumbnail(doc.id, { cache: true, version });
 }
 
+function roomArtifactPreviewTooLarge(artifact: OutputArtifact) {
+  return Boolean(artifact.data?.room_id && artifact.data?.room_file_id
+    && Number(artifact.data.file_size ?? artifact.blob?.size ?? 0) > ROOM_FILE_PREVIEW_MAX_BYTES);
+}
+
 function ArtifactThumb({ artifact }: { artifact: OutputArtifact }) {
-  const directSrc = artifactThumbSrc(artifact);
+  const previewTooLarge = roomArtifactPreviewTooLarge(artifact);
+  const directSrc = previewTooLarge ? null : artifactThumbSrc(artifact);
   const [docThumb, setDocThumb] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [failedDirect, setFailedDirect] = useState(false);
@@ -7154,7 +7174,7 @@ function ArtifactThumb({ artifact }: { artifact: OutputArtifact }) {
   const wantsDocThumb = DOC_THUMB_KINDS.has(artifact.kind);
 
   useEffect(() => {
-    if (!wantsDocThumb) return;
+    if (!wantsDocThumb || previewTooLarge) return;
     let cancelled = false;
     (async () => {
       try {
@@ -7170,9 +7190,9 @@ function ArtifactThumb({ artifact }: { artifact: OutputArtifact }) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [artifact.id, wantsDocThumb]);
+  }, [artifact.id, wantsDocThumb, previewTooLarge]);
 
-  const src = directSrc && !failedDirect ? directSrc : docThumb;
+  const src = previewTooLarge ? null : directSrc && !failedDirect ? directSrc : docThumb;
   if (!src || failed) return <ArtifactIcon kind={artifact.kind} />;
   return (
     <img
@@ -7288,7 +7308,7 @@ async function findDocumentForArtifact(
   const inflight = artifactDocumentInflight.get(cacheKey);
   if (inflight) return inflight;
 
-  const lookup = api.documents.get(documentId).catch(() => null);
+  const lookup = api.documents.getForPreview(documentId).catch(() => null);
 
   artifactDocumentInflight.set(cacheKey, lookup);
   try {
@@ -7313,18 +7333,17 @@ async function findDocumentForArtifact(
 }
 
 async function downloadArtifact(artifact: OutputArtifact) {
+  if (artifact.data?.room_id && artifact.data?.room_file_id) {
+    await saveRoomFileSelection(artifact.title,
+      (signal) => api.chatRooms.prepareFileDownload(
+        String(artifact.data!.room_id), [String(artifact.data!.room_file_id)], false, signal,
+      ), { signal: new AbortController().signal });
+    return;
+  }
   if (artifact.blob) {
     const url = URL.createObjectURL(artifact.blob);
     const filename = artifact.blob instanceof File ? artifact.blob.name : artifact.title;
     triggerBrowserDownload(url, filename, () => URL.revokeObjectURL(url));
-    return;
-  }
-  if (artifact.data?.room_id && artifact.data?.room_file_id) {
-    const blob = await api.chatRooms.downloadFile(
-      String(artifact.data.room_id), String(artifact.data.room_file_id),
-    );
-    const url = URL.createObjectURL(blob);
-    triggerBrowserDownload(url, artifact.title, () => URL.revokeObjectURL(url));
     return;
   }
   const doc = await findDocumentForArtifact(artifact);
@@ -8181,7 +8200,8 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             fetchBinary: artifact.data?.room_id && artifact.data?.room_file_id
               ? (signal) => api.chatRooms.downloadFile(String(artifact.data!.room_id), String(artifact.data!.room_file_id), { signal })
               : isLocalFsUrl(directUrl)
-                ? async (signal) => (await fetchProtectedFsResponse(directUrl, { signal })).blob()
+                ? async (signal) => (await fetchFileBlob(directUrl, { signal }, (url, init) =>
+                  fetchProtectedFsResponse(url, { signal: init.signal ?? undefined }))).blob
                 : undefined,
           });
           if (fallbackCategory === "diagram") {
@@ -8415,7 +8435,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
         className={`chat-output-plain-media${isSlideImage ? " chat-output-plain-media--slide" : ""}`}
       >
         <div className="chat-output-plain-media-frame">
-          <img src={objectUrl || artifact.href} alt={artifact.title} onError={() => setError(t("page.shared_doc.preview_unavailable"))} />
+          <ImagePreview src={objectUrl || artifact.href!} alt={artifact.title} onError={() => setError(t("page.shared_doc.preview_unavailable"))} />
         </div>
       </div>
     );
@@ -8428,6 +8448,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     return (
       <video
         className="chat-output-video"
+        aria-label={artifact.title}
         src={objectUrl || artifact.href}
         controls
         onError={(event) => setError(event.currentTarget.error?.message || t("page.shared_doc.preview_unavailable"))}
@@ -8718,6 +8739,8 @@ export function ArtifactViewer({
   updating?: boolean;
 }) {
   const [viewMode, setViewMode] = useState<"preview" | "code">("preview");
+  const [largeFileDownloading, setLargeFileDownloading] = useState(false);
+  const [largeFileError, setLargeFileError] = useState("");
   const task = artifact.kind === "task" ? artifact.data || {} : null;
   const htmlSource = artifact.kind === "page" ? artifact.body || "" : "";
   const isFileBackedArtifact =
@@ -8742,6 +8765,21 @@ export function ArtifactViewer({
   const canToggleCode =
     artifact.kind === "page" && Boolean(htmlSource) && !isFileBackedArtifact;
   const htmlPreview = useIsolatedHtmlPreview(htmlSource, canToggleCode);
+  const previewFrame = artifact.kind === "page" ? externalPreviewFrame(artifact.href) : null;
+
+  if (roomArtifactPreviewTooLarge(artifact)) {
+    return <div className="chat-output-artifact space-y-3">
+      <p className="m-0 text-sm text-[var(--text-muted)]">{t("component.group_chat.large_file_preview")}</p>
+      <Button type="button" variant="outline" size="sm" loading={largeFileDownloading} onClick={async () => {
+        if (largeFileDownloading) return;
+        setLargeFileDownloading(true); setLargeFileError("");
+        try { await downloadArtifact(artifact); }
+        catch (cause) { setLargeFileError(cause instanceof Error ? cause.message : t("download.failed")); }
+        finally { setLargeFileDownloading(false); }
+      }}>{t("page.knowledge.download")}</Button>
+      {largeFileError && <p role="alert" className="m-0 text-sm text-red-700">{largeFileError}</p>}
+    </div>;
+  }
 
   if (artifact.kind === "workspace" && artifact.data?.draft_id) {
     return (
@@ -8799,8 +8837,9 @@ export function ArtifactViewer({
         artifact.kind === "page" &&
         viewMode === "preview" && (
           <div className="chat-output-render-frame">
-            {artifact.href ? (
-              <iframe title={artifact.title} src={artifact.href} />
+            {previewFrame ? (
+              // Sandboxed: an output's own page never runs with this app's origin.
+              <iframe title={artifact.title} src={previewFrame.src} sandbox={previewFrame.sandbox} referrerPolicy="no-referrer" />
             ) : (
               <IsolatedHtmlPreviewFrame
                 title={artifact.title}
@@ -8869,6 +8908,7 @@ export function ArtifactViewer({
       )}
 
       {artifact.href &&
+        /^(?:https?:\/\/|\/(?!\/))/i.test(artifact.href) &&
         !artifact.data?.room_file_id &&
         !isFileBackedArtifact &&
         artifact.kind !== "image" &&
@@ -10040,6 +10080,24 @@ export default function EmbeddedChat({
     return () => window.removeEventListener("manor:conversation-message", handler);
   }, [agentId, currentConvId, loadConversationMessages]);
 
+  /*
+   * Catch up after a realtime gap. A background producer (a Task run's approval
+   * card, an Agent Initiative) announces its row only through the socket; a
+   * push sent while the socket was down is never replayed, so the stored
+   * transcript is reloaded instead. Same guards as the push path: never while
+   * this tab streams, and never yanking the view to a conversation the user
+   * already left. The composer draft lives outside the transcript.
+   */
+  useRealtimeResync(() => {
+    if (!currentConvId || streamingRef.current) return;
+    if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId)) return;
+    loadConversationMessages(currentConvId, {
+      fallbackToAgent: Boolean(agentId),
+      backgroundRefresh: true,
+      onlyIfStillCurrent: true,
+    }).catch(() => {});
+  });
+
   const handleLoadOlderMessages = useCallback(async () => {
     if (
       !currentConvId ||
@@ -10874,6 +10932,7 @@ export default function EmbeddedChat({
       return new Date(ts).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
+        timeZone: getPreferredTimeZone(),
       });
     } catch {
       return "";
@@ -11364,6 +11423,7 @@ export default function EmbeddedChat({
                           <ApprovalSummary
                             action={inferApprovalAction(content)}
                             paths={extractApprovalPaths(content)}
+                            pathsFromText
                             content={content}
                           />
                           <ChatActionCard

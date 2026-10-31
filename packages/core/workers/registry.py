@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional
 
 import bcrypt
 from sqlalchemy import and_, desc, or_, select
@@ -21,14 +21,12 @@ from packages.core.constants.execution import (
     WorkerStatus,
 )
 from packages.core.models.base import generate_ulid
-from packages.core.models.workspace import AgentSubscription
 from packages.core.models.worker import (
     SubscriptionWorker,
     Worker,
     WorkerActivityLog,
 )
 from packages.core.workers.protocol import (
-    CURRENT_WORKER_PROTOCOL_VERSION,
     require_current_worker_protocol,
 )
 
@@ -36,108 +34,9 @@ logger = logging.getLogger(__name__)
 
 
 INTERNAL_WORKER_KIND = "internal"
-"""Reserved kind for the always-on, in-process worker."""
+"""Kind of the retired in-process Plan Step worker; its rows never authenticate externally."""
 
 STALE_EXTERNAL_WORKER_SECONDS = 300
-
-
-def _internal_supported_kinds() -> list[str]:
-    """Derive the advertised kind set from the worker's actual handlers.
-
-    Imported lazily: ``workers.internal`` pulls in the AI runtime, and
-    this module is imported from request paths that must stay light.
-    """
-    from packages.core.workers.internal import INTERNAL_WORKER_SUPPORTED_KINDS
-
-    return list(INTERNAL_WORKER_SUPPORTED_KINDS)
-
-
-DEFAULT_INTERNAL_CAPABILITIES: dict[str, Any] = {
-    "supported_kinds": ["llm", "action", "subagent", "sleep", "human"],
-    # Kept as a literal so importing this module stays cheap; the guard
-    # test in tests/test_worker_kind_coverage.py asserts it equals
-    # _internal_supported_kinds(), so it can never drift from the
-    # handlers again.
-    "supported_providers": None,  # null = "all" — internal can call anything
-    "max_concurrent_leases": 4,
-    "max_risk_level": "high",
-    "uses_manor_credentials": True,
-    "deployment": "local",
-    "protocol_version": int(CURRENT_WORKER_PROTOCOL_VERSION),
-}
-
-
-# ── Internal worker bootstrap ─────────────────────────────────────────
-
-async def ensure_internal_worker(
-    db: AsyncSession, entity_id: str,
-) -> Worker:
-    """Get-or-create the entity's always-on internal worker. Caller commits.
-
-    Idempotent. Bound to every active subscription on creation; later
-    subscriptions get auto-bound by ``bind_subscription`` when they're
-    introduced (the subscription_workers row is added on first dispatch
-    if missing — handled by the dispatcher's matchmaker)."""
-    existing = (await db.execute(
-        select(Worker).where(
-            Worker.entity_id == entity_id,
-            Worker.kind == INTERNAL_WORKER_KIND,
-        ).limit(1)
-    )).scalar_one_or_none()
-    if existing:
-        if existing.status != "active":
-            existing.status = WorkerStatus.ACTIVE.value
-        capabilities = dict(existing.capabilities or {})
-        capabilities["protocol_version"] = int(CURRENT_WORKER_PROTOCOL_VERSION)
-        existing.capabilities = capabilities
-        await _bind_active_subscriptions_to_worker(db, entity_id, existing.id)
-        return existing
-
-    worker = Worker(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        kind=INTERNAL_WORKER_KIND,
-        display_name="Manor Built-in",
-        description=(
-            "Always-on in-process worker. Wraps AgenticLoop + the "
-            "MCP integration adapters. Created automatically per "
-            "entity on first need; cannot be deleted."
-        ),
-        capabilities=dict(DEFAULT_INTERNAL_CAPABILITIES),
-        secret_hash=None,           # internal doesn't authenticate over HTTP
-        trust_level="high",
-        status=WorkerStatus.ACTIVE.value,
-    )
-    db.add(worker)
-    await db.flush()
-
-    # Auto-bind to every existing active subscription in the entity so
-    # the dispatcher has a default executor immediately.
-    await _bind_active_subscriptions_to_worker(db, entity_id, worker.id)
-
-    db.add(WorkerActivityLog(
-        worker_id=worker.id,
-        event="register",
-        payload_summary={"kind": INTERNAL_WORKER_KIND, "auto": True},
-    ))
-    await db.flush()
-    return worker
-
-
-async def _bind_active_subscriptions_to_worker(
-    db: AsyncSession,
-    entity_id: str,
-    worker_id: str,
-) -> None:
-    """Ensure the internal worker can execute every active subscription."""
-    subs = list((await db.execute(
-        select(AgentSubscription).where(
-            AgentSubscription.entity_id == entity_id,
-            AgentSubscription.status == "active",
-        )
-    )).scalars().all())
-    for sub in subs:
-        await bind_subscription(db, sub.id, worker_id, is_preferred=True)
 
 
 # ── External worker registration ──────────────────────────────────────
@@ -165,7 +64,7 @@ async def register_external_worker(
     only the bcrypt hash. Caller commits.
     """
     if kind == INTERNAL_WORKER_KIND:
-        raise ValueError("internal workers are bootstrapped via ensure_internal_worker")
+        raise ValueError("the internal worker kind is reserved")
     require_current_worker_protocol(capabilities)
 
     secret = secrets.token_urlsafe(32)

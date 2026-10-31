@@ -22,6 +22,12 @@ clicking Promote. Three sections:
   Goal pace        For each goal in the workspace, did the simulated
                    measurements move toward the target?
 
+  Operations       Task / Agent / Workflow / Automation run outcomes and
+  + Readiness      the launch checks built on them (``launch_review``).
+
+The window starts at the blueprint install (or Workspace creation when
+there is no blueprint metadata) and ends at promotion or now.
+
 Read-only — no side effects.
 """
 from __future__ import annotations
@@ -29,12 +35,25 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.blueprints.launch_review import (
+    ConnectionIssue,
+    GoalSnapshot,
+    LaunchReadiness,
+    OperationsSection,
+    ValueEvidence,
+    billed_credits_in_window,
+    build_launch_readiness,
+    build_operations,
+    build_value_evidence,
+    connection_issues,
+)
+from packages.core.blueprints.promote import preflight_promote
 from packages.core.constants.execution import without_rolled_up_coordinator_children
 from packages.core.constants.goals import GoalStatus
 from packages.core.governance import get_policy
@@ -77,6 +96,15 @@ class CostSection:
     projected_monthly_credits: int = 0
     """Naïve extrapolation: daily_avg × 30. Operator sees the number,
     decides if they can stomach it."""
+
+    billed_credits: int = 0
+    """Credits the billing ledger charged this Workspace in the window.
+    Step costs are estimates and miss work outside plans (chat, workflow
+    LLM nodes), so the projection extrapolates whichever is larger."""
+
+    credits_per_outcome: Optional[float] = None
+    """Spent credits per completed task or successful workflow run — the
+    unit cost of what the Workspace delivered. None when nothing did."""
 
 
 @dataclass
@@ -124,8 +152,8 @@ class SimulationReport:
     workspaces not installed from a blueprint."""
 
     window_start: Optional[datetime]
-    """When the simulation started (settings._blueprint.installed_at).
-    None if no blueprint metadata is present."""
+    """Start of the evaluated window: the simulation start, or later when
+    the caller asked for only the most recent days."""
     window_end: datetime
     """``now`` for in-flight sim, ``promoted_at`` for promoted ones."""
 
@@ -133,6 +161,16 @@ class SimulationReport:
     cost: CostSection
     counterfactuals: list[CounterfactualOutcome]
     goals: list[GoalPace]
+    operations: OperationsSection
+    readiness: LaunchReadiness
+    value: ValueEvidence
+
+    simulation_started_at: Optional[datetime] = None
+    """settings._blueprint.installed_at, falling back to the Workspace's
+    creation time. Equals window_start unless recent_days narrowed it."""
+    promoted_at: Optional[datetime] = None
+    """When a simulation was promoted to live; the window ends there. None
+    for a running simulation and for a Workspace that was never simulated."""
 
     notes: list[str] = field(default_factory=list)
 
@@ -140,9 +178,19 @@ class SimulationReport:
 # ── Public API ────────────────────────────────────────────────────────
 
 async def simulate_report(
-    db: AsyncSession, workspace_id: str,
+    db: AsyncSession,
+    workspace_id: str,
+    *,
+    viewer_user_id: Optional[str] = None,
+    recent_days: Optional[int] = None,
 ) -> SimulationReport:
-    """Build the report. Read-only."""
+    """Build the report. Read-only.
+
+    ``recent_days`` evaluates only the most recent days of the simulation,
+    so a fix can be judged without the failures it already resolved.
+    ``viewer_user_id`` resolves integration connections the way the
+    Workspace connection notice does; without it that check is skipped.
+    """
     ws = (await db.execute(
         select(Workspace).where(Workspace.id == workspace_id)
     )).scalar_one_or_none()
@@ -153,12 +201,18 @@ async def simulate_report(
     in_simulation = bool((ws.settings or {}).get("sandbox"))
     preset_key = bp_meta.get("governance_preset")
 
-    window_start = _parse_iso(bp_meta.get("installed_at"))
-    window_end = _parse_iso(bp_meta.get("promoted_at")) or datetime.now(timezone.utc)
+    simulation_started_at = _parse_iso(bp_meta.get("installed_at")) or _parse_iso(ws.created_at)
+    promoted_at = _parse_iso(bp_meta.get("promoted_at"))
+    window_end = promoted_at or datetime.now(timezone.utc)
+    window_start = simulation_started_at
+    if recent_days:
+        recent_start = window_end - timedelta(days=recent_days)
+        window_start = max(window_start, recent_start) if window_start else recent_start
 
     # ── Pull every step that ran in the window ──
     stmt = select(ExecutionStep).where(
         ExecutionStep.workspace_id == workspace_id,
+        ExecutionStep.started_at <= window_end,
     )
     if window_start is not None:
         # finished_at is None for in-flight; include those by checking
@@ -175,13 +229,43 @@ async def simulate_report(
     runtime_evidence = list((await db.execute(evidence_stmt)).scalars().all())
 
     activity = _build_activity(steps, runtime_evidence)
-    cost = _build_cost(steps, runtime_evidence, window_start, window_end)
+    billed_credits = (
+        await billed_credits_in_window(db, ws, window_start, window_end)
+        if window_start is not None else 0
+    )
+    cost = _build_cost(
+        steps, runtime_evidence, window_start, window_end,
+        billed_credits=billed_credits,
+    )
 
     counterfactuals = await _build_counterfactuals(db, workspace_id, steps)
 
     goals = await _build_goal_pace(db, workspace_id, window_start, window_end)
 
-    notes = _build_notes(ws, in_simulation, activity, cost, counterfactuals)
+    operations = await build_operations(
+        db, ws, steps, window_start or window_end, window_end,
+    )
+    if operations.successful_outcomes:
+        cost.credits_per_outcome = round(
+            max(cost.total_credits, cost.billed_credits) / operations.successful_outcomes, 1,
+        )
+    readiness = build_launch_readiness(
+        unmet_setup=[u.detail for u in await preflight_promote(db, workspace_id)],
+        operations=operations,
+        observation_days=cost.simulation_days,
+        projected_monthly_usd=credits_to_usd(cost.projected_monthly_credits),
+        monthly_budget_usd=(
+            float(ws.monthly_budget_usd) if ws.monthly_budget_usd is not None else None
+        ),
+        connections=await _connection_issues(db, ws, viewer_user_id),
+    )
+    value = build_value_evidence(await _goal_snapshots(db, ws), operations.human)
+
+    notes = _build_notes(
+        ws, in_simulation, activity, cost, counterfactuals,
+        finished_work=operations.finished_work,
+        promoted=promoted_at is not None,
+    )
 
     return SimulationReport(
         workspace_id=ws.id,
@@ -194,8 +278,61 @@ async def simulate_report(
         cost=cost,
         counterfactuals=counterfactuals,
         goals=goals,
+        operations=operations,
+        readiness=readiness,
+        value=value,
+        simulation_started_at=simulation_started_at,
+        promoted_at=promoted_at,
         notes=notes,
     )
+
+
+async def _goal_snapshots(db: AsyncSession, ws: Workspace) -> list[GoalSnapshot]:
+    """The Workspace's active Goals as the Goals page shows them now, with
+    the pace the platform already computed. Goals sharing a title are one
+    goal re-created by an install or upgrade; the measured copy wins."""
+    rows = (await db.execute(
+        select(Goal.title, Goal.pace_status, Goal.current_value).where(
+            Goal.entity_id == ws.entity_id,
+            Goal.workspace_id == ws.id,
+            Goal.status == GoalStatus.ACTIVE.value,
+        )
+    )).all()
+    by_title: dict[str, GoalSnapshot] = {}
+    for row in rows:
+        goal = GoalSnapshot(
+            title=row.title, pace_status=row.pace_status, measured=row.current_value is not None,
+        )
+        key = (row.title or "").strip().lower()
+        existing = by_title.get(key)
+        if existing is None or (goal.measured and not existing.measured):
+            by_title[key] = goal
+    return list(by_title.values())
+
+
+async def _connection_issues(
+    db: AsyncSession, ws: Workspace, viewer_user_id: Optional[str],
+) -> Optional[list[ConnectionIssue]]:
+    """Integration gaps resolved for the account the Workspace runs as —
+    its creator, falling back to the viewer — so a reviewer who did not
+    connect the accounts still sees the Workspace's real state. The report
+    stays available when this auxiliary lookup fails."""
+    user_id = str((ws.settings or {}).get("created_by_user_id") or "") or viewer_user_id
+    if not user_id:
+        return None
+    from packages.core.services.workspace_connection_status import (
+        WorkspaceConnectionStatusFactory,
+    )
+
+    try:
+        async with db.begin_nested():
+            status = await WorkspaceConnectionStatusFactory.create(
+                db, workspace=ws, user_id=user_id,
+            )
+    except Exception:
+        logger.exception("launch review connection status failed for workspace=%s", ws.id)
+        return None
+    return connection_issues(status)
 
 
 # ── Section builders ──────────────────────────────────────────────────
@@ -250,6 +387,8 @@ def _build_cost(
     runtime_evidence: list[RuntimeEvidence] | None,
     window_start: Optional[datetime],
     window_end: datetime,
+    *,
+    billed_credits: int = 0,
 ) -> CostSection:
     total_usd = 0.0
     by_kind_usd: dict[str, float] = {}
@@ -279,7 +418,8 @@ def _build_cost(
     else:
         sim_days = 0.0
 
-    daily_avg = total_credits / sim_days if sim_days > 0 else 0.0
+    spent_credits = max(total_credits, billed_credits)
+    daily_avg = spent_credits / sim_days if sim_days > 0 else 0.0
     projected_monthly = int(round(daily_avg * 30))
 
     return CostSection(
@@ -289,6 +429,7 @@ def _build_cost(
         simulation_days=round(sim_days, 2) if sim_days else 0.0,
         daily_avg_credits=round(daily_avg, 2),
         projected_monthly_credits=projected_monthly,
+        billed_credits=billed_credits,
     )
 
 
@@ -313,6 +454,18 @@ def _runtime_evidence_cost_usd(ev: RuntimeEvidence) -> float:
     return 0.0
 
 
+def _step_policy_facts(step: Any, *, entity_id: str, workspace_id: str) -> Any:
+    """The same subject facts the Dispatcher gate judges for this step."""
+    from packages.core.governance.approvals import ApprovalSubject, subject_policy_facts
+
+    return subject_policy_facts(ApprovalSubject(
+        entity_id=entity_id, workspace_id=workspace_id, action_key=step.action_key,
+        capability_id=getattr(step, "capability_id", None), kind=step.kind,
+        risk_level=step.risk_level or "low", provider=getattr(step, "provider", None),
+        arguments=dict(getattr(step, "params", None) or {}),
+    ))
+
+
 async def _build_counterfactuals(
     db: AsyncSession, workspace_id: str, steps: list[ExecutionStep],
 ) -> list[CounterfactualOutcome]:
@@ -320,7 +473,7 @@ async def _build_counterfactuals(
     workspace's current policy. Reports how the verdict would have
     differed."""
     base_policy = await get_policy(db, workspace_id)
-    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_facts import EXEMPT
     from packages.core.governance.approval_policy import evaluate_policy
     from packages.core.governance.approval_policy_service import load_policy_chain
     from packages.core.governance.approval_projection import policy_override
@@ -355,9 +508,13 @@ async def _build_counterfactuals(
             if not d.allowed:
                 denied += 1
                 continue
-            consent = evaluate_policy(variant_chain, action_facts(
-                action_key=s.action_key, risk_level=s.risk_level or "low",
-            ))
+            facts = _step_policy_facts(
+                s, entity_id=base_policy.approval.root_entity_id, workspace_id=workspace_id,
+            )
+            if facts is EXEMPT:
+                allowed += 1
+                continue
+            consent = evaluate_policy(variant_chain, facts)
             if consent.outcome == "allow":
                 allowed += 1
             elif consent.outcome == "ask":
@@ -462,18 +619,22 @@ def _build_notes(
     activity: ActivitySection,
     cost: CostSection,
     counterfactuals: list[CounterfactualOutcome],
+    finished_work: int = 0,
+    promoted: bool = True,
 ) -> list[str]:
     """Operator-readable callouts. Surfaces the things they probably
     care about without making them parse the raw numbers."""
     notes: list[str] = []
 
-    if not in_simulation:
+    if not in_simulation and promoted:
         notes.append(
             "Workspace is already promoted to live — this report covers "
             "the historic simulation window."
         )
 
-    if activity.total_steps == 0:
+    # Agent-loop Tasks write no plan steps, so steps alone cannot say the
+    # Workspace was idle; finished runs on any surface can.
+    if activity.total_steps == 0 and finished_work == 0:
         notes.append(
             "No steps ran during the simulation window. Either nothing "
             "was scheduled yet, or the workspace is too fresh to evaluate."
@@ -487,7 +648,7 @@ def _build_notes(
 
     if cost.projected_monthly_credits > 0:
         notes.append(
-            f"At the simulation's pace, this workspace would burn "
+            f"At this pace, this workspace would burn "
             f"~{cost.projected_monthly_credits} credits/month."
         )
 
@@ -495,7 +656,7 @@ def _build_notes(
     risk_based = next((c for c in counterfactuals if c.preset_key == "risk_based"), None)
     if safe and safe.delta_blocked_vs_actual > 0:
         notes.append(
-            f"Switching to 'Confirm changes' before promote would have paused "
+            f"Switching to 'Confirm changes' would have paused "
             f"{safe.delta_blocked_vs_actual} additional step(s) for HITL."
         )
     if risk_based and risk_based.delta_blocked_vs_actual < 0:

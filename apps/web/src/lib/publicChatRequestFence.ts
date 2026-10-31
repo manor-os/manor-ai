@@ -22,6 +22,14 @@ export function createPublicChatRequestFence() {
 }
 export type PublicChatRequestFence = ReturnType<typeof createPublicChatRequestFence>;
 
+// The server no longer has this session's conversation: nothing private can
+// be reloaded through it, so the page may start a fresh session instead.
+export function residentStatusSessionMissing(status: number, value: unknown): boolean {
+  if (status !== 404 || !value || typeof value !== "object" || !("detail" in value)) return false;
+  const detail = value.detail;
+  return Boolean(detail && typeof detail === "object" && "code" in detail && detail.code === "chat_session_not_found");
+}
+
 export function residentStatusAllowsHistory(value: unknown, now = Date.now()): boolean {
   if (!value || typeof value !== "object" || !("verified" in value)) return false;
   if (value.verified === false) return true; // Server confirmed this is not a private binding.

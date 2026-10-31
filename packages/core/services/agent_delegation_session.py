@@ -22,6 +22,15 @@ class DelegationSessionInterrupted(Exception):
     pass
 
 
+# Why a delegation to an agent whose last turn was interrupted is refused
+# until the caller passes continue_interrupted. Shared by the chat session and
+# the durable Task child runs (services.task_agent_delegation).
+DELEGATION_INTERRUPTED_MESSAGE = (
+    "The previous delegated turn ended without a verified receipt. "
+    "Check its effects before continuing; then pass continue_interrupted=true."
+)
+
+
 # Full answers of an Agent's latest delegated runs in one chat, readable by
 # run_id after the parent saw a shortened copy.
 DELEGATION_RESULTS_KEPT = 20
@@ -107,10 +116,7 @@ async def claim_delegation_session(
         session.active_run_id = None
         session.active_until = None
     if session.status == "interrupted" and not continue_interrupted:
-        raise DelegationSessionInterrupted(
-            "The previous delegated turn ended without a verified receipt. "
-            "Check its effects before continuing; then pass continue_interrupted=true."
-        )
+        raise DelegationSessionInterrupted(DELEGATION_INTERRUPTED_MESSAGE)
 
     prior_messages = [dict(message) for message in session.messages if isinstance(message, dict)]
     run_id = generate_ulid()

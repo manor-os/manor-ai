@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
 
 from celery import Task
@@ -15,7 +15,6 @@ from celery.result import EagerResult
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.constants.task import TaskStatus
 from packages.core.constants.execution import (
-    ExecutionPlanStatus,
     ScheduledChildAdmissionStatus,
     SCHEDULED_EXECUTION_RECOVERY_HEADER,
     SCHEDULED_JOB_SKILL_GENERATION_MAX_ATTEMPTS,
@@ -33,28 +32,16 @@ from packages.core.constants.execution import (
     ScheduledResultProjectionState,
     ScheduledRunStatus,
     ScheduledSettlementKind,
-    WORKFLOW_CONTINUATION_RETRY_SECONDS,
     WORKFLOW_TERMINAL_EFFECT_RETRY_SECONDS,
+    workflow_continuation_retry_seconds,
 )
 from packages.core.celery_app import celery_app
 from packages.core.tasks._runtime import run_in_worker as _run_async
 from packages.core.ai.llm_client import CreditExhaustedError, LLMRateLimited
-from packages.core.plans.service import (
-    ActiveTaskPlanError,
-    PlanContractError,
-    TaskEffectReplayBlockedError,
-)
 from packages.core.queues import CeleryQueue
-from packages.core.services.step_deadline import (
-    CELERY_LEASE_HARD_TIME_LIMIT_SECONDS,
-    CELERY_LEASE_SOFT_TIME_LIMIT_SECONDS,
-)
 from packages.core.services.task_requester_identity import TaskRequesterIdentityError
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from packages.core.plans.wakeup import PlanCycleWake
 
 
 class _PausedDocumentEmbeddingTask(Task):
@@ -323,6 +310,7 @@ async def _scheduled_job_skill_generation_byok(job, *, db=None) -> bool:
             user_id=getattr(job, "user_id", None),
             entity_id=getattr(job, "entity_id", None),
             db=db,
+            workspace_id=getattr(job, "workspace_id", None),
         )
         return metadata_has_native_byok(metadata)
     except Exception:
@@ -331,87 +319,21 @@ async def _scheduled_job_skill_generation_byok(job, *, db=None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — mark plan/task as failed when Celery retries are exhausted
+# Helpers — mark a task as failed when Celery retries are exhausted
 # ---------------------------------------------------------------------------
 
-def _mark_plan_failed(
-    plan_id: str,
-    error_msg: str,
-    *,
-    error_type: str = "PlanWorkerExhausted",
-) -> None:
-    """Mark an ExecutionPlan and its parent Task as failed after crashes."""
-    try:
-        async def _do():
-            from packages.core.database import create_worker_session
-            from packages.core.models.execution import ExecutionPlan
-            from packages.core.models.task import Task
-            from packages.core.services.task_runtime_approvals import (
-                fail_task_runtime_approval_task,
-            )
-            from sqlalchemy import select
-            from datetime import datetime, timezone
-            async with create_worker_session()() as db:
-                plan = (await db.execute(
-                    select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
-                )).scalar_one_or_none()
-                event_payload = None
-                if plan and plan.status not in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED, ExecutionPlanStatus.CANCELLED,):
-                    plan.status = ExecutionPlanStatus.FAILED.value
-                    plan.completed_at = datetime.now(timezone.utc)
-                    if plan.task_id:
-                        task = (await db.execute(
-                            select(Task).where(Task.id == plan.task_id)
-                        )).scalar_one_or_none()
-                        if task and task.status == TaskStatus.IN_PROGRESS:
-                            await fail_task_runtime_approval_task(
-                                db,
-                                task=task,
-                                reason=error_msg,
-                                error_type=error_type,
-                            )
-                            task.actual_output = {
-                                "plan_id": plan.id,
-                                "plan_status": "failed",
-                                "error_type": error_type,
-                                "error_message": error_msg,
-                            }
-                            event_payload = {
-                                "task_id": task.id,
-                                "title": task.title,
-                                "plan_id": plan.id,
-                                "plan_status": "failed",
-                                "task_status": "failed",
-                                "error_type": error_type,
-                                "error_message": error_msg,
-                            }
-                await db.commit()
-                if plan and event_payload:
-                    from packages.core.services import event_emitter
-                    event_emitter.emit(
-                        plan.entity_id,
-                        "task.failed",
-                        source="ai_tasks",
-                        payload=event_payload,
-                    )
-        _run_async(_do())
-    except Exception:
-        logger.exception("Failed to mark plan %s as failed", plan_id)
-
-
-async def _apply_task_planning_failure(
+async def _apply_task_execution_failure(
     db,
     task_id: str,
     error_msg: str,
     *,
     error_type: str,
 ) -> tuple[str, dict] | None:
-    """Fail an unplanned Task under the canonical Workspace -> Task locks."""
+    """Fail an in-progress Task under the canonical Workspace -> Task locks."""
 
     from sqlalchemy import select
 
     from packages.core.models.task import Task
-    from packages.core.plans.service import get_active_task_plan
     from packages.core.services.task_state_machine import apply_task_status_transition
     from packages.core.services.task_runtime_approvals import (
         expire_task_runtime_approval_for_terminal,
@@ -461,20 +383,6 @@ async def _apply_task_planning_failure(
     if task is None or task.status != TaskStatus.IN_PROGRESS:
         return None
 
-    active_plan = await get_active_task_plan(
-        db,
-        task_id=task_id,
-        entity_id=entity_id,
-    )
-    if active_plan is not None:
-        logger.info(
-            "Skipping planning failure for Task %s because Plan %s is %s",
-            task_id,
-            active_plan.id,
-            active_plan.status,
-        )
-        return None
-
     await expire_task_runtime_approval_for_terminal(
         db,
         task=task,
@@ -511,18 +419,20 @@ async def _apply_task_planning_failure(
     }
 
 
+
+
 def _mark_task_failed(
     task_id: str,
     error_msg: str,
     *,
     error_type: str = "TaskPlanningExhausted",
 ) -> None:
-    """Mark a Task as failed after planning crashes."""
+    """Mark a Task as failed after its runner crashes."""
     try:
         async def _do():
             from packages.core.database import create_worker_session
             async with create_worker_session()() as db:
-                failure = await _apply_task_planning_failure(
+                failure = await _apply_task_execution_failure(
                     db,
                     task_id,
                     error_msg,
@@ -541,85 +451,6 @@ def _mark_task_failed(
         _run_async(_do())
     except Exception:
         logger.exception("Failed to mark task %s as failed", task_id)
-
-
-async def _load_existing_plan_for_dispatch(
-    task_id: str,
-    plan_id: str,
-) -> tuple[str, str, PlanCycleWake | None]:
-    """Reload a committed Plan and repair its durable cycle intent."""
-    from sqlalchemy import select
-
-    from packages.core.database import create_worker_session
-    from packages.core.models.execution import ExecutionPlan
-    from packages.core.plans.wakeup import (
-        pending_plan_cycle_wake,
-        stage_plan_cycle_wake,
-    )
-
-    async with create_worker_session()() as db:
-        plan = (await db.execute(
-            select(ExecutionPlan).where(
-                ExecutionPlan.id == plan_id,
-                ExecutionPlan.task_id == task_id,
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-        if plan is None:
-            raise RuntimeError(
-                f"Committed Plan {plan_id} no longer belongs to Task {task_id}"
-            )
-        wake = await pending_plan_cycle_wake(db, plan.id)
-        if (
-            wake is None
-            and plan.status
-            not in {
-                ExecutionPlanStatus.PENDING_APPROVAL.value,
-                ExecutionPlanStatus.NEEDS_ATTENTION.value,
-                ExecutionPlanStatus.PAUSED.value,
-                ExecutionPlanStatus.COMPLETED.value,
-                ExecutionPlanStatus.FAILED.value,
-                ExecutionPlanStatus.CANCELLED.value,
-                ExecutionPlanStatus.REPLANNED.value,
-            }
-        ):
-            wake = await stage_plan_cycle_wake(
-                db,
-                plan.id,
-                reason="existing_plan_dispatch_recovery",
-            )
-        await db.commit()
-        return plan.id, plan.status, wake
-
-
-def _mark_initial_plan_dispatch_failed(plan_id: str, error_msg: str) -> bool:
-    """Persist a recoverable boundary when a committed Plan cannot be queued."""
-    try:
-        async def _do() -> bool:
-            from packages.core.database import create_worker_session
-            from packages.core.services.task_retry_service import (
-                mark_plan_continuation_dispatch_failed,
-            )
-
-            async with create_worker_session()() as db:
-                marked = await mark_plan_continuation_dispatch_failed(
-                    db,
-                    plan_id=plan_id,
-                    user_id="system",
-                    reason="plan_initial_dispatch_failed",
-                )
-                await db.commit()
-                return marked
-
-        return bool(_run_async(_do()))
-    except Exception:
-        logger.exception(
-            "Failed to persist initial dispatch recovery for Plan %s: %s",
-            plan_id,
-            error_msg,
-        )
-        return False
 
 
 def _retry_once_on_credit_exhausted(self, exc: CreditExhaustedError, *, countdown: int = 120) -> None:
@@ -1195,90 +1026,8 @@ async def _run_scheduled_agent_task_if_open(
     scheduled_run_id: str | None,
     scheduled_job_id: str | None,
     claim_recheck: bool = False,
-    runtime_hitl_delivery_identity: dict[str, Any] | None = None,
 ) -> tuple[bool, dict | None]:
     """Admit scheduled agent work only while its durable occurrence is open."""
-    if runtime_hitl_delivery_identity is not None:
-        from packages.core.services.task_runtime_approvals import (
-            validate_task_runtime_resume_delivery,
-        )
-
-        async with session_factory() as db:
-            valid_resume_delivery = await validate_task_runtime_resume_delivery(
-                db,
-                task_id=task_id,
-                agent_id=agent_id,
-                scheduled_run_id=scheduled_run_id,
-                scheduled_job_id=scheduled_job_id,
-                runtime_hitl_id=str(
-                    runtime_hitl_delivery_identity.get("runtime_hitl_id") or ""
-                ),
-                runtime_hitl_generation=runtime_hitl_delivery_identity.get(
-                    "runtime_hitl_generation"
-                ),
-                runtime_hitl_checkpoint_digest=str(
-                    runtime_hitl_delivery_identity.get(
-                        "runtime_hitl_checkpoint_digest"
-                    )
-                    or ""
-                ),
-                runtime_hitl_checkpoint_signature=str(
-                    runtime_hitl_delivery_identity.get(
-                        "runtime_hitl_checkpoint_signature"
-                    )
-                    or ""
-                ),
-                runtime_hitl_resolution_signature=str(
-                    runtime_hitl_delivery_identity.get(
-                        "runtime_hitl_resolution_signature"
-                    )
-                    or ""
-                ),
-                allow_resuming=True,
-            )
-            await db.rollback()
-        if not valid_resume_delivery:
-            return False, {
-                "task_id": task_id,
-                "status": "stale_resume_suppressed",
-                "duplicate_suppressed": True,
-                "reason": "runtime_approval_resume_identity_mismatch",
-            }
-    else:
-        # A generic delayed/recovery delivery must not consume a signed HITL
-        # generation merely because it targets the same Task id.
-        from sqlalchemy import select
-
-        from packages.core.models.task import Task
-        from packages.core.services.task_runtime_approvals import (
-            TASK_RUNTIME_HITL_DETAIL_KEY,
-        )
-        from packages.core.services.task_state_machine import TERMINAL_STATUSES
-
-        async with session_factory() as db:
-            task = (await db.execute(
-                select(Task).where(Task.id == task_id)
-            )).scalar_one_or_none()
-            task_details = (
-                task.details
-                if task is not None and isinstance(task.details, dict)
-                else {}
-            )
-            marker = task_details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-            # A terminal Task can still carry a stale marker; it must reach the
-            # gateway's terminal early-return so its occurrence can settle.
-            if (
-                task is not None
-                and task.status not in TERMINAL_STATUSES
-                and isinstance(marker, dict)
-                and marker.get("state") in {"resume_queued", "resuming"}
-            ):
-                return False, {
-                    "task_id": task_id,
-                    "status": getattr(task, "status", None),
-                    "duplicate_suppressed": True,
-                    "reason": "runtime_approval_resume_identity_required",
-                }
     admission = None
     if scheduled_run_id:
         admission = await _admit_scheduled_child(
@@ -1340,7 +1089,6 @@ async def _run_scheduled_agent_task_if_open(
         session_factory,
         task_id,
         agent_id,
-        runtime_hitl_delivery_identity=runtime_hitl_delivery_identity,
     )
 
 
@@ -1376,10 +1124,7 @@ async def _scheduled_agent_recovery_is_suspended(
         # recovery re-entry only yields another coordinator monitor result.
         # The Task terminal transition settles the occurrence instead.
         if task.status != TaskStatus.BLOCKED.value and not (
-            _scheduled_agent_task_has_runtime_human_gate(
-                task,
-                include_resume_queued=False,
-            )
+            _scheduled_agent_task_has_runtime_human_gate(task)
         ):
             return None
         details = task.details if isinstance(task.details, dict) else {}
@@ -1591,64 +1336,6 @@ def _run_scheduled(
                 except Exception:
                     logger.exception("Failed to post terminal failure card for %s %s", label, workspace_id)
         raise self.retry(exc=exc, countdown=countdown_on_retry)
-
-
-@celery_app.task(bind=True, max_retries=0)
-def internal_worker_tick(self):
-    """Heartbeat for the in-process InternalWorker(s).
-
-    Celery beat fires this every ``INTERNAL_WORKER_TICK_SECONDS``. For
-    each active internal worker (one per entity), the task does a
-    Dispatcher checkout and fans out per-lease execution to its own
-    Celery task — so a slow LLM call doesn't block the next tick.
-    """
-    try:
-        from packages.core.workers.internal import tick_all_internal_workers
-        leased = _run_async(tick_all_internal_workers())
-        if leased:
-            logger.info("internal_worker_tick: %d leases issued", leased)
-    except Exception:
-        logger.exception("internal_worker_tick failed")
-
-
-@celery_app.task(
-    bind=True,
-    max_retries=2,
-    # These decorator values override the app-level ``task_soft_time_limit=300``
-    # / ``task_time_limit=600`` in packages/core/celery_app.py (a task's own
-    # attributes win over the global config), so THESE are the limits that
-    # apply to a lease.
-    #
-    # They are a LAST-RESORT BACKSTOP for a wedged worker process, not the
-    # execution policy. The real policy is the per-step deadline
-    # (``max_runtime_seconds``, resolved in packages/core/services/step_deadline.py
-    # and enforced in execute_lease_inproc), which always expires first and
-    # produces a diagnosable StepDeadlineExceeded failure that flows through
-    # the retry policy. Keeping both numbers derived from the step-deadline
-    # ceiling makes the invariant "celery limit > step deadline" impossible to
-    # invert silently — tests/test_step_deadline.py guards it.
-    soft_time_limit=CELERY_LEASE_SOFT_TIME_LIMIT_SECONDS,
-    time_limit=CELERY_LEASE_HARD_TIME_LIMIT_SECONDS,
-)
-def execute_lease(self, lease_id: str):
-    """Execute one lease via the InternalWorker. Reports completion /
-    failure / needs_human back to the Dispatcher.
-
-    Per-lease task because LLM / browser steps can take seconds — we
-    don't want one slow lease blocking the tick or starving sibling
-    leases. Celery's per-task retry policy handles transient infra
-    blips (DB hiccup); business-level failures land in fail_lease via
-    the InternalWorker itself."""
-    logger.info("execute_lease %s (attempt %d)", lease_id, self.request.retries + 1)
-    try:
-        from packages.core.workers.internal import execute_lease_inproc
-        return _run_async(execute_lease_inproc(lease_id))
-    except CreditExhaustedError as exc:
-        _retry_once_on_credit_exhausted(self, exc, countdown=120)
-        logger.warning("execute_lease %s aborted: credits exhausted", lease_id)
-    except Exception as exc:
-        logger.error("execute_lease %s infrastructure failure: %s", lease_id, exc)
-        raise self.retry(exc=exc, countdown=30)
 
 
 @celery_app.task(bind=True, max_retries=0)
@@ -2228,18 +1915,35 @@ def run_workspace_stat_collection(
     run_id: str | None = None,
     job_id_str: str | None = None,
 ):
-    """Collect one deterministic Workspace Stat observation."""
+    """Collect one deterministic Workspace Stat observation.
+
+    The Stat must belong to the scheduling job's company and, when the job has
+    one, its Workspace; without a job to scope it nothing is collected. The
+    scope is read from the job so the task signature stays wire-compatible.
+    """
     logger.info("Collecting workspace stat %s (attempt %d)", stat_id, self.request.retries + 1)
 
     async def _go():
         from sqlalchemy import select
         from packages.core.database import create_worker_session
+        from packages.core.models.scheduler import ScheduledJob
         from packages.core.models.workspace_stat import WorkspaceStat
         from packages.core.stats.service import StatError, collect_stat
 
         async with create_worker_session()() as db:
+            job_scope = (await db.execute(
+                select(ScheduledJob.entity_id, ScheduledJob.workspace_id).where(
+                    ScheduledJob.job_id == job_id_str
+                )
+            )).first() if job_id_str else None
+            if job_scope is None or not job_scope.entity_id:
+                raise StatError(f"stat {stat_id} has no scheduling job to scope it")
+            scope_entity_id, scope_workspace_id = job_scope
+            stat_scope = [WorkspaceStat.id == stat_id, WorkspaceStat.entity_id == scope_entity_id]
+            if scope_workspace_id:
+                stat_scope.append(WorkspaceStat.workspace_id == scope_workspace_id)
             stat = (await db.execute(
-                select(WorkspaceStat).where(WorkspaceStat.id == stat_id)
+                select(WorkspaceStat).where(*stat_scope)
             )).scalar_one_or_none()
             if stat is None:
                 raise StatError(f"stat {stat_id} not found")
@@ -2260,508 +1964,6 @@ def run_workspace_stat_collection(
         job_id_str=job_id_str,
         countdown_on_retry=300,
     )
-
-
-def _settle_plan_cycle_delivery(
-    *,
-    event_id: str,
-    plan_id: str,
-    wake_generation: str,
-    claim_token: str,
-    result: dict | None,
-) -> bool:
-    async def _settle():
-        from packages.core.database import create_worker_session
-        from packages.core.plans.wakeup import settle_plan_cycle_wake
-
-        async with create_worker_session()() as db:
-            settled = await settle_plan_cycle_wake(
-                db,
-                event_id=event_id,
-                plan_id=plan_id,
-                wake_generation=wake_generation,
-                claim_token=claim_token,
-                next_action=(result or {}).get("next_action"),
-                result_status=(result or {}).get("status"),
-                delay_seconds=(result or {}).get("delay_seconds") or 0,
-            )
-            await db.commit()
-            return settled
-
-    return bool(_run_async(_settle()))
-
-
-def _claim_plan_cycle_delivery(
-    *,
-    plan_id: str,
-    claim_token: str,
-    event_id: str,
-    wake_generation: str,
-):
-    async def _claim():
-        from packages.core.database import create_worker_session
-        from packages.core.plans.wakeup import claim_plan_cycle_wake
-
-        async with create_worker_session()() as db:
-            claim, reason = await claim_plan_cycle_wake(
-                db,
-                plan_id=plan_id,
-                claim_token=claim_token,
-                event_id=event_id,
-                wake_generation=wake_generation,
-            )
-            await db.commit()
-            return claim, reason
-
-    return _run_async(_claim())
-
-
-def _release_plan_cycle_delivery(
-    cycle_claim,
-    *,
-    delay_seconds: float,
-) -> bool:
-    async def _release():
-        from packages.core.database import create_worker_session
-        from packages.core.plans.wakeup import release_plan_cycle_wake_claim
-
-        async with create_worker_session()() as db:
-            released = await release_plan_cycle_wake_claim(
-                db,
-                event_id=cycle_claim.event_id,
-                plan_id=cycle_claim.plan_id,
-                wake_generation=cycle_claim.wake_generation,
-                claim_token=cycle_claim.claim_token,
-                delay_seconds=delay_seconds,
-            )
-            await db.commit()
-            return released
-
-    return bool(_run_async(_release()))
-
-
-@celery_app.task(bind=True, max_retries=3)
-def run_plan(
-    self,
-    plan_id: str,
-    *,
-    outbox_event_id: str | None = None,
-    wake_generation: str | None = None,
-):
-    """Drive one durable orchestration cycle for an ExecutionPlan.
-
-    ``PlanExecutor`` advances Plan/Step state and Dispatcher leases. A durable
-    outbox delivery is acknowledged only after that cycle returns. Both the
-    exact outbox event and its generation are mandatory; old generationless
-    broker payloads fail closed before claiming or executing Plan work.
-    """
-    logger.info("Running plan %s (attempt %d)", plan_id, self.request.retries + 1)
-    durable_delivery = bool(outbox_event_id and wake_generation)
-    if not durable_delivery:
-        return {
-            "plan_id": plan_id,
-            "status": "invalid_plan_cycle_delivery",
-            "next_action": "stop",
-        }
-    claim_token = str(getattr(self.request, "id", None) or uuid4().hex)
-    try:
-        cycle_claim, claim_reason = _claim_plan_cycle_delivery(
-            plan_id=plan_id,
-            claim_token=claim_token,
-            event_id=str(outbox_event_id),
-            wake_generation=str(wake_generation),
-        )
-    except Exception as exc:
-        logger.warning(
-            "Plan %s durable execution claim failed; retrying before business work",
-            plan_id,
-            exc_info=True,
-        )
-        raise self.retry(exc=exc, countdown=5)
-    if cycle_claim is None:
-        status = (
-            "plan_cycle_execution_claim_held"
-            if claim_reason == "execution_claim_held"
-            else "stale_plan_cycle_delivery"
-        )
-        return {
-            "plan_id": plan_id,
-            "status": status,
-            "reason": claim_reason,
-            "next_action": "stop",
-        }
-
-    def _defer_claim(delay_seconds: float) -> None:
-        try:
-            _release_plan_cycle_delivery(
-                cycle_claim,
-                delay_seconds=delay_seconds,
-            )
-        except Exception:
-            # The bounded claim expiry remains the crash backstop.  Do not
-            # turn an infrastructure release failure into a second business
-            # failure or let it mask the provider/runtime exception.
-            logger.warning(
-                "Plan %s retry could not release its durable cycle claim",
-                plan_id,
-                exc_info=True,
-            )
-
-    try:
-        # Billing context is set inside PlanExecutor.run_cycle() after
-        # loading the plan's entity_id — same event loop as the LLM calls.
-        from packages.core.plans.executor import PlanExecutor
-        result = _run_async(PlanExecutor().run_cycle(plan_id))
-        try:
-            _settle_plan_cycle_delivery(
-                event_id=cycle_claim.event_id,
-                plan_id=cycle_claim.plan_id,
-                wake_generation=cycle_claim.wake_generation,
-                claim_token=cycle_claim.claim_token,
-                result=result,
-            )
-        except Exception:
-            # The Plan cycle already committed its business state. An ACK
-            # failure must leave the outbox generation pending for
-            # redelivery; retrying this Celery body through the generic
-            # exception path could eventually mark healthy work failed.
-            logger.warning(
-                "Plan %s cycle committed but durable wake ACK failed; "
-                "outbox recovery will redeliver",
-                plan_id,
-                exc_info=True,
-            )
-        return result
-    except LLMRateLimited as exc:
-        logger.warning(
-            "Plan %s rate limited; provider requested %.1fs backoff",
-            plan_id,
-            exc.retry_after,
-        )
-        if self.request.retries >= self.max_retries:
-            error = (
-                f"Provider remained rate limited after "
-                f"{self.max_retries + 1} attempts: {exc}"
-            )
-            _mark_plan_failed(plan_id, error, error_type=type(exc).__name__)
-            _defer_claim(0)
-            return {"plan_id": plan_id, "status": "failed", "error": error}
-        retry_delay = max(1, int(exc.retry_after))
-        _defer_claim(retry_delay)
-        raise self.retry(
-            exc=RuntimeError(str(exc)),
-            countdown=retry_delay,
-        )
-    except CreditExhaustedError as exc:
-        # Don't retry — credits won't refill between attempts
-        logger.warning("Plan %s halted: credits exhausted", plan_id)
-        _mark_plan_failed(plan_id, f"Credits exhausted: {exc}")
-        _defer_claim(0)
-    except TaskRequesterIdentityError as exc:
-        logger.error("Plan %s rejected invalid requester identity: %s", plan_id, exc)
-        _mark_plan_failed(
-            plan_id,
-            str(exc),
-            error_type=type(exc).__name__,
-        )
-        _defer_claim(0)
-        return {"plan_id": plan_id, "status": "failed", "error": str(exc)}
-    except Exception as exc:
-        logger.error("Plan %s failed: %s", plan_id, exc, exc_info=True)
-        if self.request.retries >= self.max_retries:
-            _mark_plan_failed(plan_id, f"Plan execution crashed after {self.max_retries + 1} attempts: {exc}")
-        retry_delay = 30 * (2 ** self.request.retries)
-        _defer_claim(retry_delay)
-        raise self.retry(exc=exc, countdown=retry_delay)
-
-
-@celery_app.task(bind=True, max_retries=2, soft_time_limit=900, time_limit=1080)
-def plan_and_run_task(
-    self,
-    task_id: str,
-    *,
-    existing_plan_id: str | None = None,
-    planning_claim_recheck: bool = False,
-):
-    """Plan a task → persist Plan plus durable first-cycle intent.
-
-    Triggered when a Task with ``owner_subscription_id`` transitions
-    to ``in_progress`` (see ``task_service.update_task``). Splits cleanly
-    in two so each can fail / retry without losing the other:
-
-      1. ``plan_task(task_id)`` → Plan, Steps, and cycle outbox in one commit
-      2. best-effort CONTROL hint → lower-latency executor cycle
-
-    If the plan needs approval (high-risk steps), step 2 is skipped —
-    the user approves via the API which then dispatches.
-    """
-    from packages.core.plans.planner import (
-        CapabilityError,
-        TaskPlanAdmissionError,
-        TaskPlanOwnedByCoordinatorError,
-        TaskPlanClaimHeldError,
-        WorkspaceAutonomyPausedError,
-    )
-
-    logger.info(
-        "%s task %s (attempt %d)",
-        "Redispatching committed Plan for" if existing_plan_id else "Planning",
-        task_id,
-        self.request.retries + 1,
-    )
-
-    async def _go():
-        from packages.core.database import create_worker_session
-        from packages.core.plans.planner import plan_task_and_commit
-        from packages.core.ai.runtime import runtime_ensure_plan_and_run_task_billing_context
-
-        async with create_worker_session()() as db:
-            async def _preflight():
-                return await runtime_ensure_plan_and_run_task_billing_context(
-                    db,
-                    task_id,
-                )
-
-            initial_wake = None
-
-            async def _capture_initial_cycle_wake(plan):
-                nonlocal initial_wake
-                from packages.core.plans.wakeup import pending_plan_cycle_wake
-
-                # ``create_plan_from_dag`` already staged the first runnable
-                # generation in this transaction. Capture that exact generation
-                # for the optional post-commit hint without replacing it.
-                initial_wake = await pending_plan_cycle_wake(db, plan.id)
-
-            plan = await plan_task_and_commit(
-                db,
-                task_id,
-                execution_mode="live",
-                before_provider=_preflight,
-                before_commit=_capture_initial_cycle_wake,
-            )
-            return plan.id, plan.status, initial_wake
-
-    try:
-        if existing_plan_id:
-            plan_id, status, plan_wake = _run_async(
-                _load_existing_plan_for_dispatch(task_id, existing_plan_id)
-            )
-        else:
-            plan_id, status, plan_wake = _run_async(_go())
-    except LLMRateLimited as exc:
-        logger.warning(
-            "Planning task %s rate limited; provider requested %.1fs backoff",
-            task_id,
-            exc.retry_after,
-        )
-        if self.request.retries >= self.max_retries:
-            error = (
-                f"Provider remained rate limited after "
-                f"{self.max_retries + 1} attempts: {exc}"
-            )
-            _mark_task_failed(task_id, error, error_type=type(exc).__name__)
-            return {"plan_id": None, "status": "failed", "error": error}
-        raise self.retry(
-            exc=RuntimeError(str(exc)),
-            countdown=max(1, int(exc.retry_after)),
-        )
-    except CreditExhaustedError as exc:
-        logger.warning("Planning task %s halted: credits exhausted", task_id)
-        error = f"Credits exhausted: {exc}"
-        _mark_task_failed(
-            task_id,
-            error,
-            error_type=type(exc).__name__,
-        )
-        return {"plan_id": None, "status": "failed", "error": error}
-    except TaskRequesterIdentityError as exc:
-        logger.error("Planning task %s rejected invalid requester identity: %s", task_id, exc)
-        _mark_task_failed(
-            task_id,
-            str(exc),
-            error_type=type(exc).__name__,
-        )
-        return {"plan_id": None, "status": "failed", "error": str(exc)}
-    except ActiveTaskPlanError as exc:
-        # The Plan commit is authoritative, but queue publication may have been
-        # interrupted. Fall through to the common idempotent dispatch path so
-        # a redelivery repairs that exact Plan instead of abandoning it.
-        logger.info(
-            "Planning task %s reused active Plan %s (%s)",
-            task_id,
-            exc.plan_id,
-            exc.status,
-        )
-        plan_id, status, plan_wake = _run_async(
-            _load_existing_plan_for_dispatch(task_id, exc.plan_id)
-        )
-    except TaskEffectReplayBlockedError as exc:
-        logger.warning(
-            "Planning Task %s stopped at an external-effect replay fence: %s",
-            task_id,
-            exc,
-        )
-        _mark_task_failed(
-            task_id,
-            str(exc),
-            error_type=type(exc).__name__,
-        )
-        return {"plan_id": None, "status": "failed", "error": str(exc)}
-    except TaskPlanClaimHeldError as exc:
-        from packages.core.services.workflow_run_execution_claim import (
-            TASK_PLAN_EXECUTION_RECHECK_SECONDS,
-        )
-
-        # A live owner normally publishes the Plan. Keep a delayed recovery
-        # delivery alive while the claim remains held so a renewable
-        # long-running owner is still covered if it later crashes. Once the
-        # claim expires, the delivery either plans once or rediscovers and
-        # dispatches the committed Plan.
-        try:
-            self.apply_async(
-                args=[task_id],
-                kwargs={"planning_claim_recheck": True},
-                countdown=TASK_PLAN_EXECUTION_RECHECK_SECONDS,
-            )
-        except Exception as publish_error:
-            logger.warning(
-                "Could not publish planning-claim recovery for Task %s",
-                task_id,
-                exc_info=True,
-            )
-            raise self.retry(
-                exc=publish_error,
-                countdown=30 * (2 ** self.request.retries),
-                kwargs={"planning_claim_recheck": False},
-            )
-        logger.info("Planning task %s deferred: %s", task_id, exc)
-        return {
-            "plan_id": None,
-            "status": TaskStatus.IN_PROGRESS.value,
-            "duplicate_suppressed": True,
-            "recheck_scheduled": True,
-        }
-    except WorkspaceAutonomyPausedError:
-        # This is an operator pause, not a failed planning attempt. Retain the
-        # same Task and check again without consuming the provider retry budget.
-        self.apply_async(args=[task_id], countdown=60)
-        return {"plan_id": None, "status": "workspace_autonomy_paused", "recheck_scheduled": True}
-    except TaskPlanOwnedByCoordinatorError:
-        # A pre-upgrade direct V2 Celery message can arrive after the V3
-        # TaskRun was admitted. It must never retry into _mark_task_failed:
-        # the durable Task owner and its wake already hold the work.
-        return {
-            "plan_id": None,
-            "status": TaskStatus.IN_PROGRESS.value,
-            "duplicate_suppressed": True,
-            "task_coordinator_owned": True,
-        }
-    except TaskPlanAdmissionError as exc:
-        if planning_claim_recheck:
-            logger.info(
-                "Planning-claim recovery for Task %s closed at status %s",
-                task_id,
-                exc.status,
-            )
-            return {
-                "plan_id": None,
-                "status": exc.status or "not_runnable",
-                "duplicate_suppressed": True,
-                "recheck_scheduled": False,
-            }
-        if self.request.retries >= self.max_retries:
-            _mark_task_failed(
-                task_id,
-                (
-                    "Planning admission failed after "
-                    f"{self.max_retries + 1} attempts: {exc}"
-                ),
-                error_type=type(exc).__name__,
-            )
-        raise self.retry(
-            exc=exc,
-            countdown=60 * (2 ** self.request.retries),
-            kwargs={"planning_claim_recheck": False},
-        )
-    except CapabilityError as exc:
-        # The persisted Workspace allowlist rejected the generated Plan. A
-        # blind retry repeats provider spend without changing authorization.
-        logger.error("Planning task %s failed capability validation: %s", task_id, exc)
-        _mark_task_failed(
-            task_id,
-            f"Plan capability validation failed: {exc}",
-            error_type=type(exc).__name__,
-        )
-        return {"plan_id": None, "status": "failed", "error": str(exc)}
-    except PlanContractError as exc:
-        # Contract gaps are deterministic — a blind retry would just reproduce
-        # the same unresolvable plan. Fail the task immediately with the gap
-        # reason so it surfaces to the operator instead of churning retries.
-        logger.error("Planning task %s failed contract enforcement: %s", task_id, exc)
-        _mark_task_failed(task_id, f"Plan contract gaps: {exc}")
-        return {"plan_id": None, "status": "failed"}
-    except Exception as exc:
-        logger.error("Planning task %s failed: %s", task_id, exc, exc_info=True)
-        if self.request.retries >= self.max_retries:
-            if existing_plan_id:
-                _mark_plan_failed(
-                    existing_plan_id,
-                    (
-                        "Could not reload the committed Plan after "
-                        f"{self.max_retries + 1} attempts: {exc}"
-                    ),
-                    error_type="PlanRedispatchRecoveryFailed",
-                )
-            else:
-                _mark_task_failed(
-                    task_id,
-                    f"Planning failed after {self.max_retries + 1} attempts: {exc}",
-                )
-        retry_kwargs = (
-            {
-                "existing_plan_id": existing_plan_id,
-                "planning_claim_recheck": planning_claim_recheck,
-            }
-            if existing_plan_id
-            else {"planning_claim_recheck": planning_claim_recheck}
-        )
-        raise self.retry(
-            exc=exc,
-            countdown=60 * (2 ** self.request.retries),
-            kwargs=retry_kwargs,
-        )
-
-    non_dispatchable_statuses = {
-        ExecutionPlanStatus.PENDING_APPROVAL.value,
-        ExecutionPlanStatus.NEEDS_ATTENTION.value,
-        ExecutionPlanStatus.PAUSED.value,
-        ExecutionPlanStatus.COMPLETED.value,
-        ExecutionPlanStatus.FAILED.value,
-        ExecutionPlanStatus.CANCELLED.value,
-        ExecutionPlanStatus.REPLANNED.value,
-    }
-    if status in non_dispatchable_statuses:
-        return {"plan_id": plan_id, "status": status}
-
-    from packages.core.plans.wakeup import dispatch_plan_cycle_wake_hint
-
-    if plan_wake is None:
-        # A runnable Plan must leave its commit with a durable generation. This
-        # is a persistence invariant, not a broker error; the indexed state
-        # backstop still reconstructs historical rows that predate the outbox.
-        logger.warning(
-            "Runnable Plan %s for Task %s has no pending cycle wake; recovery sweep will reconstruct it",
-            plan_id,
-            task_id,
-        )
-    else:
-        dispatch_plan_cycle_wake_hint(
-            plan_wake,
-            reason="initial_plan_post_commit_hint",
-        )
-
-    return {"plan_id": plan_id, "status": status}
 
 
 def _task_terminal_result(task) -> dict[str, Any]:
@@ -2805,9 +2007,15 @@ def _task_terminal_result(task) -> dict[str, Any]:
         "status": task.status,
         "response": str(response or ""),
         "turns_used": actual_output.get("turns_used", 0),
-        "runtime_kind": "coordinated_plan" if task.workspace_id else "legacy_agent",
+        "runtime_kind": "coordinated_plan",
     }
-    for key in ("error_type", "error", "error_message", "supervisor_verdict"):
+    # acceptance_exceptions / unconfirmed_effects: a delivered agent-loop Task's
+    # criteria left unmet or unverified, and its calls whose effect stayed
+    # unconfirmed; the occurrence settles completed and still shows them.
+    for key in (
+        "error_type", "error", "error_message", "supervisor_verdict",
+        "acceptance_exceptions", "unconfirmed_effects",
+    ):
         value = actual_output.get(key)
         if value is not None:
             result[key] = value
@@ -2828,25 +2036,59 @@ def _task_terminal_result(task) -> dict[str, Any]:
     return result
 
 
+async def _reject_inadmissible_initiative_start(db, task) -> str | None:
+    """Re-check an Agent Initiative's authority as its Task starts.
+
+    The scheduler admitted the occurrence earlier; the Initiative, its
+    subscription or its conversation may have changed since. A Task without
+    an Initiative marker passes. A rejected one is failed here (the caller
+    commits) and the reason is returned.
+    """
+
+    from packages.core.services.agent_initiative_decision import (
+        InitiativeAdmissionRejected,
+        has_initiative_task_marker,
+        initiative_task_marker,
+        mark_initiative_run_started,
+    )
+    from packages.core.services.task_runtime_approvals import (
+        fail_task_runtime_approval_task,
+    )
+
+    if not has_initiative_task_marker(task.details):
+        return None
+    if initiative_task_marker(task.details) is None:
+        reason = "initiative_task_marker_invalid"
+    else:
+        try:
+            await mark_initiative_run_started(db, task)
+            return None
+        except InitiativeAdmissionRejected as exc:
+            reason = exc.reason_code
+    await fail_task_runtime_approval_task(
+        db, task=task, reason=reason, error_type="InitiativeAdmissionRejected",
+    )
+    return reason
+
+
 async def _prepare_agent_task_runtime(
     session_factory,
     task_id: str,
     *,
     execution_claim=None,
 ):
-    """Resolve the closed Task runtime before the legacy provider loop.
+    """Resolve the closed Task runtime and hand the Task to its run.
 
     ``ScheduledDispatchKind.AGENT_TASK`` is a durable transport name retained
-    for rolling compatibility.  It does not select ``TaskRunner``.  The Task
-    factory is authoritative: coordinated Workspace work is handed to the Plan
-    runtime, while only ``LEGACY_AGENT`` returns an admission for the old loop.
+    for rolling compatibility. The Task factory is authoritative: an
+    executable Task's start intent is staged for its durable run (the agent
+    loop), a terminal Task reports its result, and a Task with no runner
+    fails. The result is always the gateway's terminal or monitor result.
     """
 
     from sqlalchemy import select
 
-    from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
     from packages.core.constants.task import TaskRuntimeKind
-    from packages.core.models.execution import ExecutionPlan
     from packages.core.models.task import Task
     from packages.core.services.task_execution import (
         resolve_task_execution,
@@ -2928,38 +2170,7 @@ async def _prepare_agent_task_runtime(
             return None, terminal_result
 
         dispatch = await resolve_task_execution(db, task)
-        if dispatch.runtime_kind is TaskRuntimeKind.LEGACY_AGENT:
-            await db.rollback()
-            return dispatch, None
-
         if dispatch.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN:
-            active_plan_id = (
-                await db.execute(
-                    select(ExecutionPlan.id)
-                    .where(
-                        ExecutionPlan.task_id == task.id,
-                        ExecutionPlan.entity_id == task.entity_id,
-                        ExecutionPlan.status.notin_(
-                            [status.value for status in PLAN_TERMINAL_STATUSES]
-                        ),
-                    )
-                    .order_by(ExecutionPlan.created_at.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if active_plan_id is not None:
-                monitor_result = {
-                    "task_id": locked_task_id,
-                    "status": locked_task_status,
-                    "runtime_kind": dispatch.runtime_kind.value,
-                    "coordinator_monitor": True,
-                    "duplicate_suppressed": True,
-                    "reason": "active_plan_owns_task_execution",
-                    "plan_id": active_plan_id,
-                }
-                await db.rollback()
-                return None, monitor_result
-
             if task.status in {
                 TaskStatus.CREATED.value,
                 TaskStatus.PENDING.value,
@@ -2970,6 +2181,25 @@ async def _prepare_agent_task_runtime(
                     TaskStatus.IN_PROGRESS.value,
                     db=db,
                 )
+                rejected = await _reject_inadmissible_initiative_start(db, task)
+                if rejected is not None:
+                    terminal_result = _task_terminal_result(task)
+                    await commit_fenced_execution_boundary(
+                        db.commit,
+                        before_commit=(
+                            execution_claim.raise_if_lost
+                            if execution_claim is not None
+                            else None
+                        ),
+                        after_commit=(
+                            execution_claim.mark_terminal_committed
+                            if execution_claim is not None
+                            else None
+                        ),
+                        execution_claim=execution_claim,
+                        session=db,
+                    )
+                    return None, terminal_result
             elif task.status != TaskStatus.IN_PROGRESS.value:
                 if task.status in {
                     TaskStatus.WAITING_ON_CUSTOMER.value,
@@ -3027,7 +2257,7 @@ async def _prepare_agent_task_runtime(
             }
         else:
             error = (
-                "Legacy TaskRunner delivery rejected by TaskExecution factory: "
+                "Agent Task delivery rejected by TaskExecution factory: "
                 f"runtime={dispatch.runtime_kind.value}"
             )
             if dispatch.runtime_kind is TaskRuntimeKind.MANUAL:
@@ -3087,16 +2317,17 @@ async def _run_agent_task_with_execution_claim(
     session_factory,
     task_id: str,
     agent_id: str | None,
-    *,
-    runtime_hitl_delivery_identity: dict[str, Any] | None = None,
 ) -> tuple[bool, dict | None]:
-    """Run one Task only while this delivery owns its execution lease."""
+    """Hand one Task to its run only while this delivery owns its execution lease.
 
-    from packages.core.ai.task_runner import TaskRunner
+    The run itself (the Task agent loop) owns every later approval and answer.
+    """
+
     from packages.core.services.workflow_run_execution_claim import (
         agent_task_execution_claim,
     )
 
+    del agent_id
     async with agent_task_execution_claim(task_id) as claim:
         if not claim:
             logger.info(
@@ -3105,63 +2336,25 @@ async def _run_agent_task_with_execution_claim(
                 claim.reason,
             )
             return False, None
-        runtime_dispatch, early_result = await _prepare_agent_task_runtime(
+        _, result = await _prepare_agent_task_runtime(
             session_factory,
             task_id,
             execution_claim=claim,
         )
-        if early_result is not None:
-            return True, early_result
-        if runtime_dispatch is None:
-            raise RuntimeError("Task runtime factory returned no legacy admission")
-        result = await TaskRunner(
-            session_factory=session_factory,
-            before_terminal_commit=claim.raise_if_lost,
-            after_terminal_commit=claim.mark_terminal_committed,
-            execution_claim=claim,
-        ).run(
-            task_id,
-            runtime_dispatch.target_id or agent_id,
-            runtime_hitl_delivery_identity=runtime_hitl_delivery_identity,
-        )
-        if result.get("runtime_factory_recheck"):
-            runtime_dispatch, rerouted_result = await _prepare_agent_task_runtime(
-                session_factory,
-                task_id,
-                execution_claim=claim,
-            )
-            if rerouted_result is not None:
-                return True, rerouted_result
+        if result is None:
+            raise RuntimeError("Task runtime factory returned no gateway result")
         return True, result
 
 
-def _scheduled_agent_task_has_runtime_human_gate(
-    task,
-    *,
-    include_resume_queued: bool,
-) -> bool:
-    """Recognize a scheduled Task whose runtime is owned by HITL state."""
+def _scheduled_agent_task_has_runtime_human_gate(task) -> bool:
+    """Recognize a scheduled Task whose runtime waits on a person."""
 
     details = task.details if isinstance(getattr(task, "details", None), dict) else {}
-    if not (
+    return bool(
         str(details.get("scheduled_run_id") or "").strip()
         and str(details.get("scheduled_job_id") or "").strip()
-    ):
-        return False
-    if task.status == TaskStatus.WAITING_ON_CUSTOMER.value:
-        return True
-
-    from packages.core.services.task_runtime_approvals import (
-        TASK_RUNTIME_HITL_DETAIL_KEY,
+        and task.status == TaskStatus.WAITING_ON_CUSTOMER.value
     )
-
-    marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-    if not isinstance(marker, dict):
-        return False
-    allowed_states = {"waiting"}
-    if include_resume_queued:
-        allowed_states.add("resume_queued")
-    return str(marker.get("state") or "") in allowed_states
 
 
 def _agent_claim_loss_suspension_result(task_id: str) -> dict[str, Any]:
@@ -3192,10 +2385,8 @@ async def _settle_lost_agent_task_execution_claim(
         apply_task_status_transition,
     )
     from packages.core.services.task_runtime_approvals import (
-        TASK_RUNTIME_HITL_DETAIL_KEY,
         expire_task_runtime_approval_for_terminal,
         lock_task_runtime_approval_boundary,
-        mark_task_runtime_approval_execution_ambiguous,
     )
     from packages.core.services.workspace_access import (
         lock_workspace_access_boundary,
@@ -3298,10 +2489,7 @@ async def _settle_lost_agent_task_execution_claim(
                     "error_type": actual_output.get("error_type"),
                 }
 
-            if _scheduled_agent_task_has_runtime_human_gate(
-                task,
-                include_resume_queued=True,
-            ):
+            if _scheduled_agent_task_has_runtime_human_gate(task):
                 # An old claim-loss delivery has no authority to close a newer
                 # human-gated generation.  Retire its durable intent while the
                 # Task row is locked; already-published copies hit this same
@@ -3337,33 +2525,8 @@ async def _settle_lost_agent_task_execution_claim(
                 reason="agent_task_execution_claim_lost",
             )
 
-            task_details = (
-                dict(task.details)
-                if isinstance(getattr(task, "details", None), dict)
-                else {}
-            )
-            runtime_marker = task_details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
-            runtime_action_ambiguous = bool(
-                isinstance(runtime_marker, dict)
-                and runtime_marker.get("state") == "resuming"
-            )
-            terminal_error_type = (
-                "RuntimeApprovalExecutionAmbiguous"
-                if runtime_action_ambiguous
-                else "AgentTaskExecutionClaimLost"
-            )
-            terminal_error = (
-                "The approved action may have crossed its side-effect boundary "
-                "before the worker stopped. It was not replayed automatically."
-                if runtime_action_ambiguous
-                else error
-            )
-            if runtime_action_ambiguous:
-                await mark_task_runtime_approval_execution_ambiguous(
-                    db,
-                    task=task,
-                    reason=terminal_error,
-                )
+            terminal_error_type = "AgentTaskExecutionClaimLost"
+            terminal_error = error
 
             try:
                 await apply_task_status_transition(task, "failed", db=db)
@@ -3500,10 +2663,7 @@ async def _persist_agent_claim_loss_recovery_intent(
             await db.rollback()
             return AgentClaimLossRecoveryIntentState.TASK_TERMINAL
 
-        if _scheduled_agent_task_has_runtime_human_gate(
-            task,
-            include_resume_queued=True,
-        ):
+        if _scheduled_agent_task_has_runtime_human_gate(task):
             details = dict(task.details) if isinstance(task.details, dict) else {}
             had_intent = details.pop(_AGENT_CLAIM_LOSS_RECOVERY_KEY, None) is not None
             if had_intent:
@@ -3642,10 +2802,7 @@ async def _load_agent_claim_loss_recovery_intents(
         candidates: list[dict] = []
         for task in tasks:
             details = dict(task.details) if isinstance(task.details, dict) else {}
-            if _scheduled_agent_task_has_runtime_human_gate(
-                task,
-                include_resume_queued=True,
-            ):
+            if _scheduled_agent_task_has_runtime_human_gate(task):
                 details.pop(_AGENT_CLAIM_LOSS_RECOVERY_KEY, None)
                 task.details = details
                 continue
@@ -3803,17 +2960,12 @@ def run_agent_task(
     scheduled_run_id: str | None = None,
     scheduled_job_id: str | None = None,
     claim_recheck: bool = False,
-    runtime_hitl_id: str | None = None,
-    runtime_hitl_generation: int | None = None,
-    runtime_hitl_checkpoint_digest: str | None = None,
-    runtime_hitl_checkpoint_signature: str | None = None,
-    runtime_hitl_resolution_signature: str | None = None,
 ):
     """Admit a durable Task transport delivery through its runtime factory.
 
     The Celery name and signature remain compatible with scheduled/legacy
-    envelopes. Workspace background work stages the coordinated Plan outbox;
-    only a factory-selected ``LEGACY_AGENT`` enters ``TaskRunner``.
+    envelopes. Executable Tasks stage their durable run's start intent (the
+    Task agent loop); this gateway then settles scheduled occurrences.
     """
     logger.info(
         "Running agent task: task=%s agent=%s (attempt %d)",
@@ -3825,26 +2977,6 @@ def run_agent_task(
     from packages.core.services.workflow_run_execution_claim import (
         AgentTaskExecutionClaimLost,
     )
-    raw_runtime_hitl_identity = {
-        "runtime_hitl_id": runtime_hitl_id,
-        "runtime_hitl_generation": runtime_hitl_generation,
-        "runtime_hitl_checkpoint_digest": runtime_hitl_checkpoint_digest,
-        "runtime_hitl_checkpoint_signature": runtime_hitl_checkpoint_signature,
-        "runtime_hitl_resolution_signature": runtime_hitl_resolution_signature,
-        "agent_id": agent_id,
-        "scheduled_run_id": scheduled_run_id,
-        "scheduled_job_id": scheduled_job_id,
-    }
-    runtime_hitl_delivery_identity = (
-        raw_runtime_hitl_identity
-        if any(
-            value is not None
-            for key, value in raw_runtime_hitl_identity.items()
-            if key.startswith("runtime_hitl_")
-        )
-        else None
-    )
-
     try:
         from packages.core.database import create_worker_session
         session_factory = create_worker_session()
@@ -3855,15 +2987,11 @@ def run_agent_task(
             scheduled_run_id=scheduled_run_id,
             scheduled_job_id=scheduled_job_id,
             claim_recheck=claim_recheck,
-            runtime_hitl_delivery_identity=runtime_hitl_delivery_identity,
         ))
         if not claimed:
             if result and (
                 result.get("scheduled_occurrence_closed")
                 or result.get("recovery_suspended")
-                or str(result.get("reason") or "").startswith(
-                    "runtime_approval_resume_"
-                )
             ):
                 return result
             if claim_recheck:
@@ -3888,17 +3016,6 @@ def run_agent_task(
                     "scheduled_run_id": scheduled_run_id,
                     "scheduled_job_id": scheduled_job_id,
                     "claim_recheck": True,
-                    "runtime_hitl_id": runtime_hitl_id,
-                    "runtime_hitl_generation": runtime_hitl_generation,
-                    "runtime_hitl_checkpoint_digest": (
-                        runtime_hitl_checkpoint_digest
-                    ),
-                    "runtime_hitl_checkpoint_signature": (
-                        runtime_hitl_checkpoint_signature
-                    ),
-                    "runtime_hitl_resolution_signature": (
-                        runtime_hitl_resolution_signature
-                    ),
                 },
                 countdown=AGENT_TASK_EXECUTION_RECHECK_SECONDS,
             )
@@ -5628,12 +4745,21 @@ def run_workflow(
     condition branching, and pauses on wait steps.  Each invocation runs
     the workflow to completion or pause.
     """
+    from packages.core.services.workflow_claim_recovery import (
+        WORKFLOW_CLAIM_HANDOFF_HEADER,
+    )
+
     request_headers = getattr(self.request, "headers", None)
     if (
         isinstance(request_headers, dict)
         and request_headers.get(SCHEDULED_EXECUTION_RECOVERY_HEADER) is True
     ):
         claim_recheck = True
+    claim_handoff_token = (
+        str(request_headers.get(WORKFLOW_CLAIM_HANDOFF_HEADER) or "").strip() or None
+        if isinstance(request_headers, dict)
+        else None
+    )
 
     logger.info("Running workflow %s (attempt %d)", workflow_run_id, self.request.retries + 1)
     try:
@@ -5690,7 +4816,7 @@ def run_workflow(
                 }
             execution_outcome = await WorkflowRunner(
                 session_factory=session_factory,
-            ).run(workflow_run_id)
+            ).run(workflow_run_id, claim_handoff_token=claim_handoff_token)
             async with session_factory() as db:
                 run = (await db.execute(
                     select(WorkflowRun).where(WorkflowRun.id == workflow_run_id)
@@ -5768,12 +4894,19 @@ async def _claim_due_workflow_continuations(*, limit: int = 100) -> list[tuple[s
 
     from datetime import datetime, timedelta, timezone
 
-    from sqlalchemy import select
+    from sqlalchemy import exists, select
 
     from packages.core.database import create_worker_session
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
     from packages.core.models.workflow import WorkflowRun
 
     now = datetime.now(timezone.utc)
+    # A run with a live execution owner is already continuing; republishing
+    # it only adds a heavy-queue delivery that ends as claim_held.
+    has_live_owner = exists().where(
+        RuntimeExecutionClaim.claim_key == "workflow-run:" + WorkflowRun.id,
+        RuntimeExecutionClaim.expires_at > now,
+    )
     async with create_worker_session()() as db:
         runs = list((await db.execute(
             select(WorkflowRun)
@@ -5781,6 +4914,7 @@ async def _claim_due_workflow_continuations(*, limit: int = 100) -> list[tuple[s
                 WorkflowRun.continuation_token.is_not(None),
                 WorkflowRun.continuation_due_at <= now,
                 WorkflowRun.continuation_next_attempt_at <= now,
+                ~has_live_owner,
             )
             .order_by(
                 WorkflowRun.continuation_next_attempt_at.asc(),
@@ -5795,7 +4929,7 @@ async def _claim_due_workflow_continuations(*, limit: int = 100) -> list[tuple[s
             if not token:
                 continue
             run.continuation_next_attempt_at = now + timedelta(
-                seconds=WORKFLOW_CONTINUATION_RETRY_SECONDS
+                seconds=workflow_continuation_retry_seconds(run.continuation_due_at, now)
             )
             claimed.append((run.id, token))
         await db.commit()
@@ -5916,7 +5050,12 @@ def workflow_terminal_effect_sweep():
 
 
 async def _recover_expired_workflow_claims(*, limit: int = 25) -> dict[str, int]:
-    """Settle interrupted executions without replaying their external effects."""
+    """Resume or settle runs whose execution owner disappeared.
+
+    A run resumes from its durable step boundary when its interrupted nodes
+    are replay-safe and fails with an explicit reason when they are not; the
+    decision lives in ``WorkflowRunner._recover_lost_execution_claim``.
+    """
     from sqlalchemy import func, select
 
     from packages.core.ai.workflow_runner import WorkflowRunner
@@ -5933,29 +5072,121 @@ async def _recover_expired_workflow_claims(*, limit: int = 25) -> dict[str, int]
                 RuntimeExecutionClaim.claim_key == "workflow-run:" + WorkflowRun.id,
             )
             .where(
-                WorkflowRun.status == "running",
+                # A pending run with an expired lease lost its owner before
+                # it recorded progress; it resumes like a running one.
+                WorkflowRun.status.in_(("pending", "running")),
                 RuntimeExecutionClaim.expires_at <= func.now(),
             )
             .order_by(RuntimeExecutionClaim.expires_at, WorkflowRun.id)
             .limit(max(1, min(int(limit), 100)))
         )).all())
     settled = 0
+    resumed = 0
     for run_id, expired_token in candidates:
         try:
-            status = await WorkflowRunner._fail_lost_execution_claim(
+            status = await WorkflowRunner._recover_lost_execution_claim(
                 run_id,
                 session_factory=factory,
                 expired_claim_token=expired_token,
             )
             settled += int(status in {"failed", "cancelled"})
+            resumed += int(status in {"pending", "running"})
         except Exception:
             logger.exception("Expired Workflow claim recovery failed run=%s", run_id)
-    return {"checked": len(candidates), "settled": settled}
+    return {"checked": len(candidates), "settled": settled, "resumed": resumed}
 
 
 @celery_app.task(name="workflow.recover_expired_claims")
 def recover_expired_workflow_claims():
     return _run_async(_recover_expired_workflow_claims())
+
+
+async def _redispatch_unclaimed_workflow_runs(*, limit: int = 25) -> dict[str, int]:
+    """Republish open runs whose dispatch no worker ever claimed.
+
+    Starting or retrying a run publishes one broker message. When that message
+    is lost (a broker or worker restart between publish and claim), the run
+    stays pending/running with no execution claim and nothing recovers it:
+    ``_recover_expired_workflow_claims`` only sees runs a worker once claimed.
+    A duplicate delivery is harmless, because the execution claim fences it
+    and a settled run is skipped, so republishing after a quiet period is safe.
+    Each republish waits twice as long as the previous one, so a run that is
+    merely queued behind long work gains a few cheap duplicates, not a stream.
+    Runs quiet for longer than the window predate execution claims or were
+    abandoned long ago; reviving them could replay stale work.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import exists, func, or_, select
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.constants.workflow import (
+        WORKFLOW_DISPATCH_GRACE_SECONDS,
+        WORKFLOW_DISPATCH_MAX_BACKOFF_SECONDS,
+        WORKFLOW_DISPATCH_RECOVERY_TRIGGER_FIELD,
+        WORKFLOW_DISPATCH_RECOVERY_WINDOW_SECONDS,
+    )
+    from packages.core.database import create_worker_session
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
+    from packages.core.models.workflow import WorkflowRun
+
+    now = datetime.now(timezone.utc)
+    last_activity = func.coalesce(
+        WorkflowRun.updated_at, WorkflowRun.started_at, WorkflowRun.created_at,
+    )
+    has_claim = exists().where(
+        RuntimeExecutionClaim.claim_key == "workflow-run:" + WorkflowRun.id,
+    )
+    published = 0
+    deferred = 0
+    async with create_worker_session()() as db:
+        runs = list((await db.execute(
+            select(WorkflowRun)
+            .where(
+                WorkflowRun.status.in_(("pending", "running")),
+                # Scheduled occurrences have their own dispatch recovery.
+                or_(WorkflowRun.trigger_source.is_(None), WorkflowRun.trigger_source != "schedule"),
+                WorkflowRun.continuation_token.is_(None),
+                ~has_claim,
+                last_activity <= now - timedelta(seconds=WORKFLOW_DISPATCH_GRACE_SECONDS),
+                last_activity > now - timedelta(seconds=WORKFLOW_DISPATCH_RECOVERY_WINDOW_SECONDS),
+            )
+            .order_by(last_activity, WorkflowRun.id)
+            .limit(max(1, min(int(limit), 100)))
+            .with_for_update(skip_locked=True, of=WorkflowRun)
+        )).scalars().all())
+        due: list[str] = []
+        for run in runs:
+            trigger_data = dict(run.trigger_data or {})
+            previous = trigger_data.get(WORKFLOW_DISPATCH_RECOVERY_TRIGGER_FIELD)
+            attempts = int(previous.get("attempts") or 0) if isinstance(previous, dict) else 0
+            quiet_for = min(
+                WORKFLOW_DISPATCH_GRACE_SECONDS * (2 ** attempts),
+                WORKFLOW_DISPATCH_MAX_BACKOFF_SECONDS,
+            )
+            active_at = run.updated_at or run.started_at or run.created_at
+            if active_at is not None and active_at > now - timedelta(seconds=quiet_for):
+                deferred += 1
+                continue
+            trigger_data[WORKFLOW_DISPATCH_RECOVERY_TRIGGER_FIELD] = {
+                "attempts": attempts + 1,
+                "last_dispatched_at": now.isoformat(),
+            }
+            run.trigger_data = trigger_data
+            flag_modified(run, "trigger_data")
+            due.append(run.id)
+        await db.commit()
+    for run_id in due:
+        if WorkflowRunner.enqueue(run_id):
+            published += 1
+            logger.warning("Republished unclaimed Workflow run=%s", run_id)
+    return {"checked": len(runs), "published": published, "deferred": deferred}
+
+
+@celery_app.task(name="workflow.redispatch_unclaimed_runs")
+def redispatch_unclaimed_workflow_runs():
+    return _run_async(_redispatch_unclaimed_workflow_runs())
 
 
 @celery_app.task(
@@ -6467,43 +5698,6 @@ def generate_knowledge_content(
                 # The excerpt only exists to ground this generation; drop it now.
                 settings["starter_document"].pop("source_excerpt", None)
                 group.settings = settings
-
-            try:
-                import os
-                import time as _time
-                from packages.core.config import get_settings
-                from packages.core.services.entity_fs import write_entity_file_atomic
-                from packages.core.services.knowledge_visibility import is_user_visible_path
-
-                settings = get_settings()
-                if settings.MANOR_FS_ENABLED:
-                    entity_root = os.path.join(settings.MANOR_FS_ROOT, entity_id)
-                    os.makedirs(entity_root, exist_ok=True)
-                    filename = os.path.basename(f"{group_name}.md") or "Knowledge Starter.md"
-                    if not is_user_visible_path(filename):
-                        filename = "Knowledge Starter.md"
-                    target = os.path.normpath(os.path.join(entity_root, filename))
-                    entity_root_norm = os.path.normpath(entity_root)
-                    if os.path.commonpath([entity_root_norm, target]) != entity_root_norm:
-                        raise ValueError("Generated knowledge filename escaped entity root")
-                    if os.path.exists(target):
-                        base, ext = os.path.splitext(filename)
-                        target = os.path.join(entity_root, f"{base}_{int(_time.time())}{ext}")
-                    content_bytes = content.strip().encode("utf-8")
-                    target = write_entity_file_atomic(
-                        entity_id,
-                        os.path.relpath(target, entity_root),
-                        content_bytes,
-                        expected_size=len(content_bytes),
-                        allow_empty=False,
-                    )
-                    doc.fs_path = os.path.relpath(target, entity_root)
-                    doc.file_size = len(content_bytes)
-                else:
-                    doc.metadata_ = {**(doc.metadata_ or {}), "content_text": content.strip()[:50000]}
-            except Exception:
-                logger.warning("Failed to write starter doc %s to filesystem", doc_id, exc_info=True)
-                doc.metadata_ = {**(doc.metadata_ or {}), "content_text": content.strip()[:50000]}
 
             await db.commit()
             logger.info("Generated starter doc %s for group %s", doc_id, group_id)

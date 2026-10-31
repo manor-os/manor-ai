@@ -23,9 +23,20 @@ GUARDED: dict[str, list[tuple[str, int]]] = {
         ("**replay_fields_from_result(result),", 1),
         ("failure.update(replay_fields_from_result(skill_result))", 2),
         ("**replay_fields_from_result(skill_result)}", 1),
+        # A step failing before any effectful call is proven effect-free only
+        # by the pre-I/O watcher seeing no call during that attempt.
+        ("effect_watcher.effect_intents == intents_before", 1),
     ],
-    "packages/core/workers/task_coordinator.py": [
-        ("not replay_forbidden", 1),
+    # Transient step re-execution: never past a replay-forbidding attempt, and
+    # for effectful node types only with a host-proven "none".
+    "packages/core/services/workflow_step_resilience.py": [
+        ('if attempt_forbids_replay(result) or result.get("retry_blocked") is True:', 1),
+        ('return result.get("effect_state") == "none"', 1),
+        # An interrupted attempt is effect-free only by its own bound journal.
+        ('and entry.get("effect_intent") is False', 1),
+    ],
+    "packages/core/services/workflow_claim_recovery.py": [
+        ("and not interrupted_step_proved_effect_free(run, step_id)", 1),
     ],
     "packages/core/services/agent_delegation_session.py": [
         ('run_result.get("do_not_replay") is True', 1),
@@ -44,11 +55,35 @@ GUARDED: dict[str, list[tuple[str, int]]] = {
         # The definition plus every attempt/settlement call site.
         ("_has_ambiguous_external_effect(", 5),
     ],
-    "packages/core/plans/executor.py": [
-        ('failure.get("retryable") is False', 1),
-        ("attempt_forbids_replay(failure)", 1),
-        # Every branch-repair / reconciliation call site.
-        ("has_ambiguous_external_effect(", 4),
+    # A durable delegated child run (W4a): a repeated wake crash fails the
+    # child with an unknown last round (effect floor, interrupted), never a
+    # silent fourth replay; a new delegation to an interrupted agent is
+    # refused until continue_interrupted.
+    "packages/core/workers/task_agent_child_loop.py": [
+        ("if failures < _MAX_WAKE_FAILURES:", 1),
+        ("code=CHILD_REPAIR_REQUIRED,", 1),
+        ("interrupted = child_effects_unknown(checkpoint, ledger_complete=ledger_complete)", 1),
+        ("ledger_complete = ledger_complete and not lost_work", 1),
+        ("took_over = child.phase == TaskCoordinatorPhase.RUNNING.value and child.claim_token is not None", 1),
+    ],
+    "packages/core/services/task_agent_child_settlement.py": [
+        # Host-ended children whose effects are unknown are interrupted
+        # (do_not_replay): an incomplete or unconfirmed ledger ...
+        ('{"do_not_replay": True, "effect_state": EffectState.UNCONFIRMED.value}', 1),
+        ("if not ledger_complete or took_over:", 1),
+        ('and failures.get("wake_generation") == wake_generation', 1),
+        ('return ledger_is_unconfirmed(checkpoint.get("tool_evidence"))', 1),
+        # ... and an incomplete ledger raises the parent's effect floor.
+        ("if not complete:", 1),
+    ],
+    "packages/core/services/task_agent_delegation.py": [
+        ('if latest.interrupted and item["params"].get("continue_interrupted") is not True:', 1),
+    ],
+    # A Task retry of a root that waited on children: the parked call keeps
+    # its settled (or cancelled) result and the children's ledgers carry over.
+    "packages/core/services/task_coordinator_wakeup.py": [
+        ("stored = runtime_stored_pending_result(checkpoint)", 1),
+        ('ledger.merge_child_observations(stored["id"], stored["child_evidence"], observe=False)', 1),
     ],
 }
 

@@ -56,7 +56,7 @@ import { workflowReferencePath } from "../../lib/workflowRoutes";
 import { currentApprovalOptions } from "../../lib/approvalOptions";
 import { chatMessageAnchorId } from "../../lib/chatMessageAnchor";
 import { preserveReturnToInHistory } from "../../lib/chatRouteReferences";
-import { looksLikeFileReference } from "../../lib/fileReferences";
+import { entityStoragePath, looksLikeFileReference } from "../../lib/fileReferences";
 import Button from "./Button";
 import CompactCard from "./CompactCard";
 import Textarea from "./Textarea";
@@ -266,6 +266,7 @@ export default function ApprovalActionBar({
                 reference={file.reference}
                 label={file.label}
                 returnTo={sourceReturnTo}
+                trustedReference={file.trusted}
                 display="card"
                 className="approval-action-bar__material-card approval-action-bar__material-card--document"
               />
@@ -377,18 +378,22 @@ function collectPendingApprovals(
 
 function approvalMaterialFiles(hitl: ApprovalHITLRequest) {
   const seen = new Set<string>();
-  const files: Array<{ key: string; reference: string; label?: string }> = [];
-  const add = (reference: unknown, label?: string) => {
+  const files: Array<{ key: string; reference: string; label?: string; trusted?: boolean }> = [];
+  const add = (reference: unknown, label?: string, trusted = false) => {
     const normalized = String(reference || "").trim();
     if (!normalized || seen.has(normalized)) return;
     const isDocumentId = /^[0-9A-HJKMNP-TV-Z]{26}$/i.test(normalized);
     const isDocumentRoute = /^\/(?:viewer|documents)\//.test(normalized);
     if (!looksLikeFileReference(normalized) && !isDocumentId && !isDocumentRoute) return;
     seen.add(normalized);
-    files.push({ key: normalized, reference: normalized, label });
+    files.push({ key: normalized, reference: normalized, label, trusted });
   };
 
-  hitl.paths?.forEach((path) => add(path));
+  // Approval paths are storage paths, which free-text file detection refuses.
+  hitl.paths?.forEach((path) => {
+    const storagePath = entityStoragePath(path);
+    add(storagePath || path, undefined, Boolean(storagePath));
+  });
   workflowReviewArtifacts(hitl.review).forEach((artifact) => {
     add(artifact.reference, artifact.label);
   });

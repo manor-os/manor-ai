@@ -1,14 +1,11 @@
-"""Server-rendered Strategist execution facts remain distinct from strategy."""
+"""Server-recorded Strategist execution facts remain distinct from strategy."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from packages.core.strategist import service
-from packages.core.strategist.execution_presentation import (
-    execution_review_metadata,
-    format_execution_notes,
-)
+from packages.core.strategist.execution_presentation import execution_review_metadata
 from packages.core.strategist.proposal import ExecutionReference, ExecutionReview, Proposal
 
 pytestmark = pytest.mark.oss_regression
@@ -39,63 +36,24 @@ def _fact(task_id: str, *, state: str = "blocked", blocker: dict | None = None) 
     }
 
 
-@pytest.mark.parametrize("scope,label", [
-    ("still_missing", "required capability still missing"),
-    ("configuration_changed", "tool scope now covers previous gap; retry/recheck needed"),
-    ("unavailable", "current capability scope unverified"),
-])
-def test_execution_notes_are_frozen_host_facts_not_acceptance_or_current_error(scope, label):
+def test_execution_metadata_keeps_exact_cited_facts_apart_from_strategy():
     blocker = {"ref": "capability:task-1:hash", "source_task_id": "task-1",
-               "scope_status": scope, "current_missing_capabilities": ["web.safe_search"],
+               "scope_status": "still_missing", "current_missing_capabilities": ["web.safe_search"],
                "affected_agents": [{"service_key": "research"}]}
     proposal = _proposal(ExecutionReference(
         task_id="task-1", plan_id="plan-1", observed_state="blocked",
         blocker_ref=blocker["ref"],
     ))
-    snapshot = _snapshot(_fact("task-1", blocker=blocker))
 
-    rendered = format_execution_notes(proposal, snapshot)
-    metadata = execution_review_metadata(proposal, snapshot)
+    metadata = execution_review_metadata(proposal, _snapshot(_fact("task-1", blocker=blocker)))
 
-    assert "observed at 2026-09-25T12:00:00+00:00; not live status" in rendered
-    assert "- Prepare evidence: blocked" in rendered
-    assert "2 step(s) done (not Task acceptance)" in rendered
-    assert label in rendered
-    if scope == "still_missing":
-        assert "web.safe_search for research" in rendered
-    assert "past error earlier_failure (not current cause)" in rendered
     assert proposal.notes == "Try a smaller batch."
     assert metadata["source"] == "server_observation"
+    assert metadata["observed_at"] == "2026-09-25T12:00:00+00:00"
     assert metadata["strategy_notes"] == proposal.notes
     assert metadata["facts"][0]["current_blocker"] == blocker
     assert metadata["facts"][0]["latest_error"]["message"] == "A prior attempt failed."
     assert metadata["facts"][0]["owner_service_key"] == "writer"
-
-
-def test_delivered_and_waiting_coordinator_do_not_confuse_step_progress_with_review():
-    delivered = _fact("task-delivered", state="delivered")
-    waiting = _fact("task-waiting", state="awaiting_coordinator")
-    proposal = _proposal(
-        ExecutionReference(task_id="task-delivered", plan_id="plan-1", observed_state="delivered"),
-        ExecutionReference(task_id="task-waiting", plan_id="plan-1", observed_state="awaiting_coordinator"),
-    )
-    rendered = format_execution_notes(proposal, _snapshot(delivered, waiting))
-    assert "- Prepare evidence: delivered" in rendered
-    assert "- Prepare evidence: steps recorded; waiting for next execution update" in rendered
-    assert rendered.count("not Task acceptance") == 1
-    assert "awaiting Task review" not in rendered
-
-
-def test_task_title_is_bounded_for_existing_plaintext_card():
-    fact = _fact("task-title")
-    fact["title"] = "[Untrusted] " + "X" * 100
-    proposal = _proposal(ExecutionReference(
-        task_id="task-title", plan_id="plan-1", observed_state="blocked",
-    ))
-    rendered = format_execution_notes(proposal, _snapshot(fact))
-    assert "- [Untrusted] " in rendered
-    assert "X" * 71 not in rendered
-    assert "task-title" not in rendered
 
 
 def test_execution_presentation_rejects_mismatched_or_missing_citations():
@@ -104,7 +62,6 @@ def test_execution_presentation_rejects_mismatched_or_missing_citations():
     ))
     snapshot = _snapshot(_fact("task-1"))
     assert execution_review_metadata(proposal, snapshot) is None
-    assert format_execution_notes(proposal, snapshot) is None
 
     proposal.execution_review.references[0].plan_id = "plan-1"
     proposal.execution_review.references[0].observed_state = "delivered"
@@ -116,24 +73,21 @@ def test_execution_presentation_rejects_mismatched_or_missing_citations():
 
     historical = Proposal(review_id="old", summary="Old proposal", tasks=[])
     assert execution_review_metadata(historical, snapshot) is None
-    assert format_execution_notes(historical, snapshot) is None
 
 
-def test_empty_citations_keep_revision_auditable_without_an_execution_note():
-    proposal = _proposal()
-    metadata = execution_review_metadata(proposal, _snapshot(_fact("task-1")))
+def test_empty_citations_keep_revision_auditable():
+    metadata = execution_review_metadata(_proposal(), _snapshot(_fact("task-1")))
     assert metadata["revision"] == "snapshot-1"
     assert metadata["references"] == [] and metadata["facts"] == []
-    assert format_execution_notes(proposal, _snapshot(_fact("task-1"))) is None
 
 
 @pytest.mark.asyncio
-async def test_proposal_chat_receipt_keeps_execution_metadata_and_strategy_notes(monkeypatch):
+async def test_owner_card_shows_manor_ai_summary_not_execution_facts_or_private_notes(monkeypatch):
     proposal = _proposal(ExecutionReference(
         task_id="task-1", plan_id="plan-1", observed_state="blocked",
     ))
+    proposal.summary = "Everything is on track; nothing needs you right now."
     metadata = execution_review_metadata(proposal, _snapshot(_fact("task-1")))
-    proposal.notes = format_execution_notes(proposal, _snapshot(_fact("task-1"))) + "\n\nStrategy notes:\nTry a smaller batch."
     post = AsyncMock(return_value=SimpleNamespace(id="message-1"))
     monkeypatch.setattr(service.chat_service, "post_message", post)
     monkeypatch.setattr(service, "_proposal_basis_reports", AsyncMock(return_value=[]))
@@ -144,9 +98,10 @@ async def test_proposal_chat_receipt_keeps_execution_metadata_and_strategy_notes
     )
 
     payload = post.await_args.kwargs
+    card = payload["meta"]["proposal"]
     assert payload["message_kind"] == "proposal"
-    assert payload["meta"]["proposal"]["execution_review"] == metadata
-    assert payload["meta"]["proposal"]["notes"] == proposal.notes
-    assert "Execution facts" in payload["body"]
-    assert "Strategy notes" in payload["body"]
-    assert payload["meta"]["proposal"]["summary"] == "Next steps"
+    assert payload["body"] == proposal.summary
+    assert card["summary"] == proposal.summary
+    assert "notes" not in card and card["approval"] is None
+    # Facts and reasoning stay in the review record, off the owner's card.
+    assert card["execution_review"] == metadata

@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.sandbox_exec_fakes import CURRENT_RUNNER_HEALTH, ExecViaStart  # noqa: E402
+
 from tests.test_sandbox_session_service import (  # noqa: F401 - fixtures
     FakeCache,
     ScriptedSandboxClient,
@@ -31,7 +33,21 @@ USER = "user_1"
 REGISTRY_KEY = f"sandbox:owner:{ENTITY}:{USER}:conversation:{CONVERSATION}"
 
 
-class ExecScriptedClient(ScriptedSandboxClient):
+def _skill_scope():
+    from packages.core.ai.runtime.sandbox import RuntimeSandboxScope
+
+    return RuntimeSandboxScope(ENTITY, USER, CONVERSATION)
+
+
+def _ctx_key(sandbox_id: str) -> str:
+    # A human user's sandboxes are bound to the user (``*``), not to the conversation.
+    return "sandbox:bind:" + ":".join(("*", ENTITY, USER)) + f":sbx:{sandbox_id}"
+
+
+CTX_KEY = _ctx_key("998b86cf3c11")
+
+
+class ExecScriptedClient(ExecViaStart, ScriptedSandboxClient):
     """Scripted client whose containers can vanish between calls."""
 
     gone: set[str] = set()
@@ -40,6 +56,9 @@ class ExecScriptedClient(ScriptedSandboxClient):
     def reset(cls) -> None:
         super().reset()
         cls.gone = set()
+        # A current runner (work areas, per-command Skill views); the
+        # old-runner cases are in test_sandbox_runner_compat.py.
+        cls.health_payload = dict(CURRENT_RUNNER_HEALTH)
 
     async def status(self, sandbox_id):
         if sandbox_id in type(self).gone:
@@ -49,10 +68,12 @@ class ExecScriptedClient(ScriptedSandboxClient):
             raise SandboxNotFoundError(f"Sandbox not found: {sandbox_id}", status_code=404)
         return await super().status(sandbox_id)
 
-    async def exec(self, *, sandbox_id, command, timeout, execution_id=None):
+    async def exec(self, *, sandbox_id, command, timeout, execution_id=None, **placement):
         from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
 
-        type(self).calls.append({"handler": "exec", "sandbox_id": sandbox_id, "command": command})
+        type(self).calls.append(
+            {"handler": "exec", "sandbox_id": sandbox_id, "command": command, "placement": placement}
+        )
         if sandbox_id in type(self).gone:
             raise SandboxNotFoundError(f"Sandbox not found: {sandbox_id}", status_code=404)
         return SimpleNamespace(stdout="ok", stderr="", exit_code=0)
@@ -68,16 +89,11 @@ def exec_client(monkeypatch):
 
 
 async def _bind_warm_pptx_sandbox(fake_cache, sandbox_id: str = "998b86cf3c11") -> None:
-    from packages.core.ai.runtime import runtime_init_sandbox_context
+    from packages.core.ai.runtime import runtime_init_sandbox_binding
 
-    await runtime_init_sandbox_context(
-        CONVERSATION,
-        sandbox_id,
-        "skill_pptx",
-        entity_id=ENTITY,
-        user_id=USER,
-        agent_id="",
-    )
+    scope = _skill_scope()
+    assert scope.key("sbx", sandbox_id) == _ctx_key(sandbox_id)
+    await runtime_init_sandbox_binding(scope, sandbox_id, "skill_pptx", skill_key="pptx")
     fake_cache.store[REGISTRY_KEY] = {
         "sandbox_id": sandbox_id,
         "base_url": "http://sandbox-service",
@@ -120,7 +136,7 @@ async def test_exec_on_reclaimed_sandbox_reports_expired_and_drops_the_binding(
     assert "998b86cf3c11" in message
     assert "invoke_skill" in message and "pptx" in message
     # The stale binding is gone everywhere it could be found again.
-    ctx = fake_cache.store[f"sandbox:ctx:{CONVERSATION}"]
+    ctx = fake_cache.store[CTX_KEY]
     assert "sandbox_id" not in ctx
     assert ctx["expired_sandbox_id"] == "998b86cf3c11"
     assert REGISTRY_KEY not in fake_cache.store
@@ -161,7 +177,7 @@ async def test_not_found_for_a_live_sandbox_keeps_the_binding(
     payload = await _exec("998b86cf3c11")
 
     assert payload["error"]["code"] == "sandbox_execution_failed"
-    assert fake_cache.store[f"sandbox:ctx:{CONVERSATION}"]["sandbox_id"] == "998b86cf3c11"
+    assert fake_cache.store[CTX_KEY]["sandbox_id"] == "998b86cf3c11"
     assert REGISTRY_KEY in fake_cache.store
 
 
@@ -190,12 +206,12 @@ async def test_reopening_after_expiry_allocates_a_fresh_sandbox_that_exec_accept
 
     assert session.sandbox_id == "sb_fresh"
     assert session.reused is False
-    ctx = fake_cache.store[f"sandbox:ctx:{CONVERSATION}"]
+    ctx = fake_cache.store[_ctx_key("sb_fresh")]
     assert ctx["sandbox_id"] == "sb_fresh"
     assert "expired_sandbox_id" not in ctx
     assert await _exec("sb_fresh") == "ok\n[exit_code: 0]"
-    # The old id stays refused: it belongs to nobody now.
-    assert (await _exec("998b86cf3c11"))["error"]["code"] == "sandbox_access_denied"
+    # The old id keeps answering as expired, never reaching a runner.
+    assert (await _exec("998b86cf3c11"))["error"]["code"] == "sandbox_expired"
 
 
 @pytest.mark.asyncio
@@ -215,7 +231,7 @@ async def test_unroutable_sandbox_counts_as_expired(fake_cache, exec_client, loc
     payload = await _exec("998b86cf3c11")
 
     assert payload["error"]["code"] == "sandbox_expired"
-    assert "sandbox_id" not in fake_cache.store[f"sandbox:ctx:{CONVERSATION}"]
+    assert "sandbox_id" not in fake_cache.store[CTX_KEY]
 
 
 @pytest.mark.asyncio
@@ -257,5 +273,10 @@ def test_every_runner_facing_action_maps_a_vanished_sandbox_to_expiry() -> None:
             runner_facing[action.value] = source
     # Sanity: the derivation still finds the actions this incident hit.
     assert {"exec", "status", "read_file", "write_file", "save_result"} <= set(runner_facing)
-    missing = sorted(name for name, source in runner_facing.items() if "_vanished_sandbox_error(" not in source)
+    # ``_runner_failure_error`` is the vanished-sandbox check plus the
+    # outdated-runner answer (test_sandbox_runner_compat.py).
+    missing = sorted(
+        name for name, source in runner_facing.items()
+        if "_vanished_sandbox_error(" not in source and "_runner_failure_error(" not in source
+    )
     assert missing == []

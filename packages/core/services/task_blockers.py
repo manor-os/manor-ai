@@ -149,7 +149,9 @@ async def _answer_task_input_request(
                 "The user declined to answer this question. Continue without it "
                 "if you can, otherwise finish by stating exactly what is blocked."
             ),
-            payload={"choice": "refuse", "source": "chat_bridge"},
+            payload={"choice": "refuse", "source": "chat_bridge", "request_id": request.id},
+            # Exactly the run that asked (a delegated agent's own card).
+            request_id=request.id,
         )
         return {
             "resolved": True,
@@ -177,7 +179,9 @@ async def _answer_task_input_request(
             "response": text,
             "fields": dict(answers or {}),
             "source": "chat_bridge",
+            "request_id": request.id,
         },
+        request_id=request.id,
     )
     if not applied["resumed"]:
         return {"resolved": False, "reason": "task_not_waiting", "request_id": request.id}
@@ -221,11 +225,18 @@ async def answer_task_blocker(
     )
     from packages.core.services.step_resume import cancel_step, resume_step_for_retry
 
+    preview = (await db.execute(select(HitlRequest).where(
+        HitlRequest.id == request_id, HitlRequest.entity_id == entity_id,
+    ))).scalar_one_or_none()
+    if preview is not None and preview.origin_kind == ApprovalOriginKind.TASK.value and preview.action_key == TASK_INPUT_ACTION_KEY:
+        from packages.core.services.task_runtime_approvals import lock_task_runtime_approval_boundary
+
+        await lock_task_runtime_approval_boundary(db, task_id=preview.origin_task_id)
     request = (await db.execute(
         select(HitlRequest).where(
             HitlRequest.id == request_id,
             HitlRequest.entity_id == entity_id,
-        ).with_for_update()
+        ).with_for_update().execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if request is None:
         return {"resolved": False, "reason": "request_not_found"}
@@ -443,7 +454,7 @@ async def _mark_blocker_card_resolved(
                 "note": (note or "")[:1000],
                 "via": "chat_bridge",
             },
-            emit_followup=False,
+            publish_resolution=False,
         )
     except Exception:
         logger.warning(

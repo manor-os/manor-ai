@@ -550,3 +550,115 @@ async def test_vercel_video_request_shares_one_inline_budget_across_images(monke
     # The start frame goes inline; what no longer fits travels as a signed URL.
     assert images[0]["type"] == "file"
     assert any(image["type"] == "url" for image in images[1:])
+
+
+@pytest.mark.asyncio
+async def test_vercel_seedance_audio_reference_rides_provider_options(monkeypatch):
+    """Regression: audio references were dropped on the gateway route, so a
+    voice-driven (lip-sync) Seedance request silently lost its voice."""
+    from packages.core.services import vercel_ai_gateway
+    from packages.core.tasks import video_adapters
+
+    calls = []
+
+    async def gateway_post(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("endpoint_suffix") == "start":
+            return {"operation": {"id": "operation-1"}}
+        return {"status": "completed", "videos": [{"type": "url", "url": "https://cdn.example.test/v.mp4", "mediaType": "video/mp4"}]}
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def remember(*_args, **_kwargs):
+        return None
+
+    async def download(*_args, **_kwargs):
+        return {"result_url": "/api/v1/fs/entity/videos/result.mp4"}
+
+    async def ensure_public_url(value, *_args, **_kwargs):
+        return f"https://signed.example.test/{value}"
+
+    monkeypatch.setattr(vercel_ai_gateway, "vercel_gateway_post", gateway_post)
+    monkeypatch.setattr(video_adapters.asyncio, "sleep", no_sleep)
+    runtime = video_adapters.VideoAdapterRuntime(
+        http_client_cls=None, media_api_timeout=None, ensure_public_url=ensure_public_url,
+        public_url_kwargs=lambda _url: {}, remember_provider_poll=remember,
+        poll_openrouter_generation=None, poll_volcengine_task=None, poll_generic_video_task=None,
+        download_and_save=download, extract_video_url=lambda _value: "", extract_task_id=lambda _value: "",
+        provider_error_message=lambda _value: "", openrouter_api_url=lambda value: value,
+        normalize_duration=lambda value: int(value), normalize_resolution=lambda _model, value: str(value),
+    )
+    job = SimpleNamespace(
+        id="job-1", entity_id="entity", prompt="The host speaks to camera", model="bytedance/seedance-2.0",
+        params={
+            "duration": 12, "resolution": "720p", "aspect_ratio": "9:16", "generate_audio": True,
+            "reference_urls": ["hosts/presenter.png"], "audio_reference_urls": ["vo/presenter.mp3"],
+        },
+    )
+
+    await video_adapters.VercelGatewayVideoAdapter().submit(job, "vck_test", None, runtime)
+
+    options = calls[0]["payload"]["providerOptions"]["bytedance"]
+    assert options["referenceAudio"] == ["https://signed.example.test/vo/presenter.mp3"]
+    assert options["generateAudio"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model, first_frame, generate_audio, wire_model, options",
+    [
+        # Pro with a first frame: image-to-video, pro mode, native sound on.
+        ("kwaivgi/kling-v3.0-pro", "hosts/presenter.png", True, "klingai/kling-v3.0-i2v", {"mode": "pro", "sound": "on"}),
+        # Std without a frame: text-to-video; sound exists only in pro mode.
+        ("kwaivgi/kling-v3.0-std", "", True, "klingai/kling-v3.0-t2v", {"mode": "std"}),
+    ],
+)
+async def test_vercel_kling_routes_image_to_video_and_sends_klingai_options(
+    monkeypatch, model, first_frame, generate_audio, wire_model, options,
+):
+    """Regression: Kling always went to the t2v gateway model (the first frame
+    was ignored) and its options were filed under ``kwaivgi``, which the
+    gateway does not read — so Pro mode and native sound never applied."""
+    from packages.core.services import vercel_ai_gateway
+    from packages.core.tasks import video_adapters
+
+    calls = []
+
+    async def gateway_post(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("endpoint_suffix") == "start":
+            return {"operation": {"id": "operation-1"}}
+        return {"status": "completed", "videos": [{"type": "url", "url": "https://cdn.example.test/v.mp4", "mediaType": "video/mp4"}]}
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def remember(*_args, **_kwargs):
+        return None
+
+    async def download(*_args, **_kwargs):
+        return {"result_url": "/api/v1/fs/entity/videos/result.mp4"}
+
+    async def ensure_public_url(value, *_args, **_kwargs):
+        return f"https://signed.example.test/{value}"
+
+    monkeypatch.setattr(vercel_ai_gateway, "vercel_gateway_post", gateway_post)
+    monkeypatch.setattr(video_adapters.asyncio, "sleep", no_sleep)
+    runtime = video_adapters.VideoAdapterRuntime(
+        http_client_cls=None, media_api_timeout=None, ensure_public_url=ensure_public_url,
+        public_url_kwargs=lambda _url: {}, remember_provider_poll=remember,
+        poll_openrouter_generation=None, poll_volcengine_task=None, poll_generic_video_task=None,
+        download_and_save=download, extract_video_url=lambda _value: "", extract_task_id=lambda _value: "",
+        provider_error_message=lambda _value: "", openrouter_api_url=lambda value: value,
+        normalize_duration=lambda value: int(value), normalize_resolution=lambda _model, value: str(value),
+    )
+    params = {"duration": 10, "resolution": "720p", "aspect_ratio": "9:16", "generate_audio": generate_audio}
+    if first_frame:
+        params["first_frame_url"] = first_frame
+    job = SimpleNamespace(id="job-1", entity_id="entity", prompt="The host speaks to camera", model=model, params=params)
+
+    await video_adapters.VercelGatewayVideoAdapter().submit(job, "vck_test", None, runtime)
+
+    assert {call["model"] for call in calls} == {wire_model}
+    assert calls[0]["payload"]["providerOptions"] == {"klingai": options}

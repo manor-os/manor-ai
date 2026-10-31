@@ -24,21 +24,25 @@ import { useToastStore } from "../stores/toast";
 import type { AgentLearningCandidate, RuntimeEvidence, Workspace, WorkspaceStaff, WorkspaceActivity } from "../lib/types";
 import { canManageWorkspace, canWriteWorkspace } from "../lib/permissions";
 import { useAuthStore } from "../stores/auth";
+import { useIsCollaborator } from "../lib/collaboratorSession";
 import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useDisplayPreferences } from "../stores/displayPreferences";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { openAgentEditModal } from "../stores/agentEditModal";
-import { formatDate, relativeTime } from "../lib/format";
+import { formatDate, getPreferredTimeZone, relativeTime } from "../lib/format";
 import PageHeader from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import { FeatureDiscoveryBadge } from "../components/ui/FeatureDiscoveryHint";
 import useFeatureDiscovery from "../components/useFeatureDiscovery";
 import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
 import StatusBadge from "../components/ui/StatusBadge";
+import StatusPill from "../components/ui/StatusPill";
 import Chip from "../components/ui/Chip";
 import Card from "../components/ui/Card";
 import { WorkspaceCollaborationManagement } from "./WorkspaceCollaboration";
 import ClientDeliveryDialog from "./clients/ClientDeliveryDialog";
+import ClientTrialsTab, { useClientTrials } from "../components/clientTrials/ClientTrialsTab";
+import { EMBED } from "../embed/embedContext";
 import GlassCard from "../components/ui/GlassCard";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
@@ -252,8 +256,8 @@ const KPI_CARD: React.CSSProperties = {
   padding: "20px 24px",
 };
 
-type Tab = "overview" | "app" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings" | "collaboration";
-type PrimaryTab = "overview" | "configure" | "activity" | "settings" | "collaboration";
+type Tab = "overview" | "app" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings" | "collaboration" | "client-trials";
+type PrimaryTab = "overview" | "configure" | "activity" | "settings" | "collaboration" | "client-trials";
 
 function blueprintSetupDestination(check: { todo_kind?: string; kind?: string }): Tab | "/integrations" {
   const kind = check.todo_kind || check.kind || "";
@@ -292,6 +296,7 @@ function _isWorkspaceDetailTab(value: string | null): value is Tab {
     "activity",
     "settings",
     "collaboration",
+    "client-trials",
   ].includes(value));
 }
 
@@ -325,12 +330,27 @@ function _primaryTabFor(value: Tab): PrimaryTab {
   if (value === "activity") return "activity";
   if (value === "settings") return "settings";
   if (value === "collaboration") return "collaboration";
+  if (value === "client-trials") return "client-trials";
   return "overview";
 }
 
 function _staffLabel(s: { id?: string; name?: string; display_name?: string; email?: string } | null | undefined): string {
   if (!s) return "";
   return s.display_name || s.name || s.email || s.id || t("page.workspace_detail.unknown");
+}
+
+// A seat derived from a provider's collaboration grant. The grant decides it
+// (Collaboration tab, or keep/remove at acceptance), so it has no remove control.
+/** What DELETE /workspaces/{id}/staff/{x} names: the Staff row, or the seat itself when it has none. */
+function _seatRemovalId(s: WorkspaceStaff): string {
+  return s.staff_id || s.id;
+}
+
+function _CollaborationSeatPill({ role, team }: { role: NonNullable<WorkspaceStaff["collaboration_role"]>; team?: boolean }) {
+  const label = team
+    ? t("collaboration.seat_provider_team", { access: t(role === "provider_trial" ? "page.client_trials.access_trial" : "page.client_trials.access_maintainer") })
+    : t(role === "provider_trial" ? "collaboration.seat_provider_trial" : "collaboration.seat_maintainer");
+  return <StatusPill size="sm" status="active" label={label} />;
 }
 
 function _agentLabel(a: { id?: string; name?: string; slug?: string; category?: string } | null | undefined): string {
@@ -987,6 +1007,7 @@ const PRIMARY_TABS: { key: PrimaryTab; label: string }[] = [
   { key: "configure", label: t("page.workspace_detail.configure") },
   { key: "activity", label: t("nav.activity") },
   { key: "collaboration", label: t("page.collaboration.tab") },
+  { key: "client-trials", label: t("page.client_trials.tab") },
   { key: "settings", label: t("nav.settings") },
 ];
 
@@ -1359,6 +1380,9 @@ export default function WorkspaceDetail() {
   const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const currentUser = useAuthStore((s) => s.user);
+  // An external collaborator works in the Workspace but never decides who is
+  // in it or its delivery; those routes and the company directory refuse them.
+  const collaborator = useIsCollaborator();
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
@@ -1404,6 +1428,8 @@ export default function WorkspaceDetail() {
     } else {
       nextParams.set("tab", nextTab);
     }
+    // An open customer trial belongs to the Customer trials tab only.
+    if (nextTab !== "client-trials") nextParams.delete("trial");
     setSearchParams(nextParams, { replace: options?.replace ?? true });
   }, [searchParams, setSearchParams]);
 
@@ -1620,18 +1646,47 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId && (tab === "overview" || tab === "settings"),
   });
 
-  const { data: staffList } = useQuery({
+  const { data: staffList, isFetched: staffFetched } = useQuery({
     queryKey: ["workspace-staff", workspaceId],
     queryFn: () => api.workspaces.staff.list(workspaceId!),
     enabled: !!workspaceId,
     staleTime: 30_000,
   });
   const canManageWs = canManageWorkspace(currentUser, staffList || []);
+  // Membership, collaboration, delivery and Blueprint export stay the customer's.
+  const canAdministerWs = canManageWs && !collaborator;
+  const identity = `${currentUser?.id}:${currentUser?.entity_id}`;
+  // Every manager of a source Workspace can open its customer trials.
+  const clientTrials = useClientTrials(workspaceId || "", identity, !!workspaceId && canAdministerWs);
+  const showClientTrials = canAdministerWs && (!!clientTrials.data?.length || tab === "client-trials");
   let openSimulationReport = () => setSimulationPromotionOpen(true);
   let openPromotion = () => setSimulationPromotionOpen(true);
+  // The full report page (launch review) also judges live Workspaces; the
+  // OSS promotion panel only makes sense while simulating.
+  let launchReviewPage = false;
   const canWriteWs = canWriteWorkspace(currentUser, staffList || []);
-  const canDeleteWs = workspace?.can_delete === true;
+  // The server never offers deletion on a collaboration-derived seat; this keeps
+  // the danger zone hidden for collaborators even from a stale response.
+  const canDeleteWs = workspace?.can_delete === true && !collaborator;
   const [showBlueprintUpgrade, setShowBlueprintUpgrade] = useState(false);
+  // The update-notice email links here with ?blueprint_upgrade=1: open the
+  // existing upgrade dialog once, then drop the param so a refresh doesn't reopen it.
+  // Once the workspace and staff have loaded the param is always consumed, even
+  // when there is nothing to upgrade or the viewer can't manage the workspace.
+  const blueprintUpdateStatus = workspace?.blueprint_update?.status;
+  const blueprintUpgradeReady = !!workspace && staffFetched;
+  useEffect(() => {
+    if (searchParams.get("blueprint_upgrade") !== "1" || !blueprintUpgradeReady) return;
+    if (
+      canManageWs
+      && (blueprintUpdateStatus === "update_available" || blueprintUpdateStatus === "reconfigure_required")
+    ) {
+      setShowBlueprintUpgrade(true);
+    }
+    const next = new URLSearchParams(searchParams);
+    next.delete("blueprint_upgrade");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, blueprintUpgradeReady, blueprintUpdateStatus, canManageWs]);
 
   useEffect(() => {
     if (canManageWs) return;
@@ -1649,7 +1704,7 @@ export default function WorkspaceDetail() {
   const { data: entityStaff } = useQuery({
     queryKey: ["entity-staff"],
     queryFn: () => api.staff.list(),
-    enabled: showStaffModal || showWorkspaceShareModal || (!!workspaceId && tab === "staff"),
+    enabled: !collaborator && (showStaffModal || showWorkspaceShareModal || (!!workspaceId && tab === "staff")),
   });
 
   const { data: agentMappings } = useQuery({
@@ -1743,7 +1798,8 @@ export default function WorkspaceDetail() {
   const { data: capabilityIntegrationStatus } = useQuery({
     queryKey: ["workspace-capability-integration-status"],
     queryFn: () => api.integrations.mcpServers(),
-    enabled: privateApiEnabled && !!workspaceId && tab === "capabilities",
+    // The company's MCP servers are not part of a collaborator's session.
+    enabled: privateApiEnabled && !collaborator && !!workspaceId && tab === "capabilities",
   });
 
   const { data: documents } = useQuery({
@@ -1847,7 +1903,8 @@ export default function WorkspaceDetail() {
   } = useQuery({
     queryKey: ["workspace-credit-usage-summary", workspaceId],
     queryFn: () => api.workspaces.creditUsageSummary(workspaceId!),
-    enabled: !!workspaceId && tab === "settings",
+    // The overview's credit tile reads paid_by_provider too.
+    enabled: !!workspaceId && (tab === "settings" || tab === "overview"),
     staleTime: 30_000,
   });
 
@@ -1907,17 +1964,6 @@ export default function WorkspaceDetail() {
       toast.success(t("page.workspace_detail.heartbeat_enabled"));
     },
     onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_enable_heartbeat"), err.message),
-  });
-
-  const heartbeatDisable = useMutation({
-    mutationFn: () => api.workspaces.heartbeat.disable(workspaceId!),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["workspace-heartbeat", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
-      toast.success(t("page.workspace_detail.heartbeat_disabled"));
-    },
-    onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_disable_heartbeat"), err.message),
   });
 
   const assignStaff = useMutation({
@@ -2016,7 +2062,7 @@ export default function WorkspaceDetail() {
       };
       const created = data.agent_id
         ? await api.agents.update(data.agent_id, agentPayload)
-        : await api.agents.create(agentPayload);
+        : await api.agents.create({ ...agentPayload, workspace_id: workspaceId });
       // A failed mapping retry reconnects the Agent already created here.
       setAgentForm((current) => ({ ...current, agent_id: created.id }));
 
@@ -2141,6 +2187,9 @@ export default function WorkspaceDetail() {
               system_prompt: promptParts.join("\n\n"),
               category: ws.category || ws.kind || undefined,
               tags: [service_key],
+              // The Workspace owns its service Agents; an external collaborator
+              // may only create Agents inside the Workspace they were granted.
+              workspace_id: workspaceId,
             });
             agent_id = created.id;
             knownAgents.add(created.id);
@@ -2523,7 +2572,7 @@ export default function WorkspaceDetail() {
           }
           title={t("page.workspace_detail.not_found")}
           description={t("page.workspace_detail.not_found_desc")}
-          action={<Button variant="outline" onClick={() => navigate("/workspaces")}>{t("page.workspace_detail.back_to_workspaces")}</Button>}
+          action={EMBED ? undefined : <Button variant="outline" onClick={() => navigate("/workspaces")}>{t("page.workspace_detail.back_to_workspaces")}</Button>}
         />
       </div>
     );
@@ -2771,6 +2820,7 @@ export default function WorkspaceDetail() {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 16 }}>
             <div
               style={{ ...KPI_CARD, cursor: "pointer" }}
+              // In the customer-trial frame /tasks is this Workspace's task list.
               onClick={() => navigate(`/tasks?workspaceId=${ws.id}`)}
               title={t("page.workspace_detail.all_tasks_scheduled_in_this_workspace_click_to_v")}
             >
@@ -2834,9 +2884,10 @@ export default function WorkspaceDetail() {
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 24, fontWeight: 800, color: "#292524" }}>{budgetStatus.monthly_spent_credits.toLocaleString()}</div>
-                  <div style={LABEL}>{t("page.workspace_detail.credits_used")}</div>
+                  {/* During a sponsored trial the provider is charged for this usage. */}
+                  <div style={{ ...LABEL, overflowWrap: "anywhere", lineHeight: 1.35 }}>{t(creditUsageSummary?.paid_by_provider ? "page.workspace_detail.trial_credits_paid_by_provider" : "page.workspace_detail.credits_used")}</div>
                   <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 2, lineHeight: 1.3 }}>
-                    {budgetStatus.monthly_budget_credits != null
+                    {creditUsageSummary?.paid_by_provider ? null : budgetStatus.monthly_budget_credits != null
                       ? t("page.workspace_detail.of_credit_cap", { cap: budgetStatus.monthly_budget_credits.toLocaleString() })
                       : t("page.workspace_detail.no_monthly_credit_cap")}
                   </div>
@@ -3029,15 +3080,21 @@ export default function WorkspaceDetail() {
                   size="sm"
                   onClick={() => {
                     if (heartbeatStatus?.enabled ?? ws.heartbeat_enabled) {
-                      heartbeatDisable.mutate();
+                      togglePause.mutate();
+                    } else if (ws.status === "paused") {
+                      togglePause.mutate();
                     } else {
                       heartbeatEnable.mutate();
                     }
                   }}
-                  disabled={heartbeatEnable.isPending || heartbeatDisable.isPending}
+                  disabled={heartbeatEnable.isPending || togglePause.isPending}
                   className="ml-auto"
                 >
-                  {heartbeatStatus?.enabled ?? ws.heartbeat_enabled ? t("page.workspace_detail.disable") : t("page.workspace_detail.enable")}
+                  {heartbeatStatus?.enabled ?? ws.heartbeat_enabled
+                    ? t("page.workspace_detail.disable")
+                    : ws.status === "paused"
+                      ? t("page.workspace_detail.resume")
+                      : t("page.workspace_detail.enable")}
                 </Button>
               </div>
               {ws.last_heartbeat_at && (
@@ -3342,7 +3399,7 @@ export default function WorkspaceDetail() {
                 {accessCopy.body}
               </p>
             </div>
-            {canManageWs && (
+            {canAdministerWs && (
               <Button variant="outline" size="sm" onClick={() => setShowWorkspaceShareModal(true)}>
                 Share workspace
               </Button>
@@ -3352,7 +3409,7 @@ export default function WorkspaceDetail() {
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={SECTION_TITLE}>{t("page.workspace_detail.staff_assignments")}</div>
-          {canManageWs && (
+          {canAdministerWs && (
             <Button variant="primary" size="sm" onClick={() => setShowStaffModal(true)}>
               {t("page.workspace_detail.add_staff")}
             </Button>
@@ -3372,7 +3429,7 @@ export default function WorkspaceDetail() {
                   <th style={TABLE_HEADER}>Status</th>
                   <th style={TABLE_HEADER}>Expires</th>
                   <th style={TABLE_HEADER}>{t("page.workspace_detail.assigned")}</th>
-                  {canManageWs && <th style={{ ...TABLE_HEADER, width: 80 }}>{t("page.custom_fields.actions")}</th>}
+                  {canAdministerWs && <th style={{ ...TABLE_HEADER, width: 80 }}>{t("page.custom_fields.actions")}</th>}
                 </tr>
               </thead>
               <tbody>
@@ -3381,7 +3438,10 @@ export default function WorkspaceDetail() {
                   const expired = !!s.expires_at && new Date(s.expires_at) < new Date();
                   return (
                   <tr key={s.id}>
-                    <td style={TABLE_CELL}>{matched ? _staffLabel(matched) : (s.staff_id || s.user_id || "—")}</td>
+                    <td style={TABLE_CELL}>
+                      {matched ? _staffLabel(matched) : (s.display_name || s.email || s.staff_id || s.user_id || "—")}
+                      {s.collaboration_role && <span style={{ marginLeft: 6 }}><_CollaborationSeatPill role={s.collaboration_role} team={s.collaboration_team} /></span>}
+                    </td>
                     <td style={TABLE_CELL}>{s.role || "—"}</td>
                     <td style={TABLE_CELL}>
                       <span style={{
@@ -3393,19 +3453,21 @@ export default function WorkspaceDetail() {
                     </td>
                     <td style={TABLE_CELL}>
                       {s.expires_at
-                        ? <span style={{ color: expired ? "#a23e38" : undefined }}>{new Date(s.expires_at).toLocaleDateString()}</span>
+                        ? <span style={{ color: expired ? "#a23e38" : undefined }}>{new Date(s.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}</span>
                         : <span style={{ color: "#d6d3d1" }}>permanent</span>}
                     </td>
                     <td style={TABLE_CELL}>{formatDate(s.added_at || s.created_at)}</td>
-                    {canManageWs && (
+                    {canAdministerWs && (
                       <td style={TABLE_CELL}>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setConfirmRemoveStaff(s.staff_id || s.user_id || "")}
-                        >
-                          <span style={{ color: "#ef4444", fontWeight: 700 }}>{t("page.task_detail.runtime.remove_rule")}</span>
-                        </Button>
+                        {!s.collaboration_role && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setConfirmRemoveStaff(_seatRemovalId(s))}
+                          >
+                            <span style={{ color: "#ef4444", fontWeight: 700 }}>{t("page.task_detail.runtime.remove_rule")}</span>
+                          </Button>
+                        )}
                       </td>
                     )}
                   </tr>
@@ -3418,7 +3480,7 @@ export default function WorkspaceDetail() {
         )}
 
         <Modal
-          open={canManageWs && showWorkspaceShareModal}
+          open={canAdministerWs && showWorkspaceShareModal}
           onClose={() => { setShowWorkspaceShareModal(false); setPickedStaff(null); }}
           title="Share workspace"
           footer={
@@ -3561,8 +3623,8 @@ export default function WorkspaceDetail() {
                   </div>
                 ) : items.map((s: WorkspaceStaff) => {
                   const matched = staffById.get(s.staff_id || "");
-                  const displayName = matched ? _staffLabel(matched) : (s.staff_id || s.user_id || "Unknown member");
-                  const email = matched?.email || s.user_id || "Workspace member";
+                  const displayName = matched ? _staffLabel(matched) : (s.display_name || s.email || s.staff_id || s.user_id || "Unknown member");
+                  const email = matched?.email || s.email || s.user_id || "Workspace member";
                   const expired = !!s.expires_at && new Date(s.expires_at) < new Date();
                   return (
                     <div
@@ -3585,42 +3647,53 @@ export default function WorkspaceDetail() {
                         </div>
                         <div style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {email}
-                          {s.expires_at && !expired && ` · Expires ${new Date(s.expires_at).toLocaleDateString()}`}
+                          {s.expires_at && !expired && ` · Expires ${new Date(s.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}`}
                         </div>
                       </div>
-                      <Select
-                        value={s.role || "viewer"}
-                        onChange={(role) => assignStaff.mutate({
-                          staff_id: s.staff_id || "",
-                          role,
-                          expires_at: s.expires_at || undefined,
-                        })}
-                        options={roleOptions}
-                        disabled={!s.staff_id || assignStaff.isPending}
-                      />
-                      <button
-                        type="button"
-                        disabled={!s.staff_id || removeStaff.isPending}
-                        onClick={() => s.staff_id && removeStaff.mutate(s.staff_id)}
-                        aria-label="Remove access"
-                        title="Remove access"
-                        style={{
-                          width: 26,
-                          height: 26,
-                          borderRadius: 6,
-                          border: "none",
-                          background: "transparent",
-                          color: "var(--text-faint)",
-                          cursor: !s.staff_id || removeStaff.isPending ? "not-allowed" : "pointer",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          fontSize: 18,
-                          lineHeight: 1,
-                        }}
-                      >
-                        ×
-                      </button>
+                      {s.collaboration_role ? (
+                        <>
+                          <_CollaborationSeatPill role={s.collaboration_role} team={s.collaboration_team} />
+                          <span />
+                        </>
+                      ) : (
+                        <>
+                          <Select
+                            value={s.role || "viewer"}
+                            onChange={(role) => assignStaff.mutate({
+                              staff_id: s.staff_id || "",
+                              role,
+                              expires_at: s.expires_at || undefined,
+                            })}
+                            options={roleOptions}
+                            disabled={!s.staff_id || assignStaff.isPending}
+                          />
+                          <button
+                            type="button"
+                            // A seat without a Staff row is removed by its own id; a
+                            // collaboration seat (above) follows its grant instead.
+                            disabled={removeStaff.isPending}
+                            onClick={() => removeStaff.mutate(_seatRemovalId(s))}
+                            aria-label="Remove access"
+                            title="Remove access"
+                            style={{
+                              width: 26,
+                              height: 26,
+                              borderRadius: 6,
+                              border: "none",
+                              background: "transparent",
+                              color: "var(--text-faint)",
+                              cursor: removeStaff.isPending ? "not-allowed" : "pointer",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              fontSize: 18,
+                              lineHeight: 1,
+                            }}
+                          >
+                            ×
+                          </button>
+                        </>
+                      )}
                     </div>
                   );
                 })}
@@ -3686,7 +3759,7 @@ export default function WorkspaceDetail() {
         </Modal>
 
         <Modal
-          open={canManageWs && showStaffModal}
+          open={canAdministerWs && showStaffModal}
           onClose={() => { setShowStaffModal(false); setPickedStaff(null); }}
           title={t("page.workspace_detail.assign_staff")}
           footer={
@@ -4224,9 +4297,11 @@ export default function WorkspaceDetail() {
             </p>
           </div>
           <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-            <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-              {t("page.workspace_detail.open_integrations_2")}
-            </Button>
+            {!collaborator && (
+              <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                {t("page.workspace_detail.open_integrations_2")}
+              </Button>
+            )}
             <Button variant="outline" size="sm" onClick={() => handleTabChange("agents")}>
               {t("page.workspace_detail.manage_agents")}
             </Button>
@@ -4282,9 +4357,11 @@ export default function WorkspaceDetail() {
                       {t("page.workspace_detail.these_are_capability_integrations_referenced_by")}
                     </p>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                    {t("page.apps.connect")}
-                  </Button>
+                  {!collaborator && (
+                    <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                      {t("page.apps.connect")}
+                    </Button>
+                  )}
                 </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
                   {workspaceMissing.map((flag: any, idx: number) => (
@@ -4737,11 +4814,13 @@ export default function WorkspaceDetail() {
                 </StatusBadge>
               )}
             </div>
-            <div className="workspace-integrations-toolbar__manage">
-              <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                {t("page.workspace_detail.add_or_manage_integrations")}
-              </Button>
-            </div>
+            {!collaborator && (
+              <div className="workspace-integrations-toolbar__manage">
+                <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                  {t("page.workspace_detail.add_or_manage_integrations")}
+                </Button>
+              </div>
+            )}
           </div>
         </GlassCard>
 
@@ -7491,10 +7570,18 @@ export default function WorkspaceDetail() {
               <Button
                 variant={heartbeatOn ? "outline" : "primary"}
                 size="sm"
-                onClick={() => (heartbeatOn ? heartbeatDisable.mutate() : heartbeatEnable.mutate())}
-                loading={heartbeatEnable.isPending || heartbeatDisable.isPending}
+                onClick={() => {
+                  if (heartbeatOn) togglePause.mutate();
+                  else if (ws.status === "paused") togglePause.mutate();
+                  else heartbeatEnable.mutate();
+                }}
+                loading={heartbeatEnable.isPending || togglePause.isPending}
               >
-                {heartbeatOn ? t("page.workspace_detail.disable") : t("page.workspace_detail.enable")}
+                {heartbeatOn
+                  ? t("page.workspace_detail.disable")
+                  : ws.status === "paused"
+                    ? t("page.workspace_detail.resume")
+                    : t("page.workspace_detail.enable")}
               </Button>
             )}
           </div>
@@ -7600,6 +7687,11 @@ export default function WorkspaceDetail() {
                     <IconRefresh size={14} aria-hidden="true" />
                   </button>
                 </Tooltip>
+              </div>
+            ) : creditUsageSummary?.paid_by_provider ? (
+              // The trial's provider is charged, so this company's ledger reads 0.
+              <div className="workspace-credit-usage-note" role="status">
+                {t("page.workspace_detail.trial_usage_paid_by_provider")}
               </div>
             ) : creditUsageSummary ? (
               <div className="workspace-credit-metric-grid">
@@ -7992,15 +8084,32 @@ export default function WorkspaceDetail() {
     learning: renderLearning,
     activity: renderActivity,
     settings: renderSettings,
-    collaboration: () => canManageWs ? <div className="space-y-4">
-      <Card minHeight={0} hoverable={false} title={t("page.clients.deliver")} description={t("page.clients.delivery_policy")}
-        headerAction={<Button onClick={() => setDeliveryOpen(true)}>{t("page.clients.deliver")}</Button>}>
-        <p className="mt-2 text-sm text-stone-500">{t("page.clients.materials_policy")}</p>
-      </Card>
-      <WorkspaceCollaborationManagement key={`${currentUser?.id}:${workspaceId}`} workspaceId={workspaceId!} identity={`${currentUser?.id}:${currentUser?.entity_id}`} />
-    </div> : <EmptyState title={t("page.collaboration.manager_required")} />,
+    collaboration: () => canAdministerWs ? (
+      <WorkspaceCollaborationManagement key={`${currentUser?.id}:${workspaceId}`} workspaceId={workspaceId!} identity={`${currentUser?.id}:${currentUser?.entity_id}`}
+        deliverCard={<Card minHeight={0} hoverable={false} title={t("page.clients.deliver")} description={t("page.clients.delivery_policy")}
+          headerAction={<Button onClick={() => setDeliveryOpen(true)}>{t("page.clients.deliver")}</Button>} />} />
+    ) : <EmptyState title={t("page.collaboration.manager_required")} />,
+    "client-trials": () => canAdministerWs ? (
+      <ClientTrialsTab
+        workspaceId={workspaceId!}
+        identity={identity}
+        trialId={searchParams.get("trial")}
+        onOpen={(deliveryId) => {
+          const next = new URLSearchParams(searchParams);
+          next.set("tab", "client-trials");
+          next.set("trial", deliveryId);
+          setSearchParams(next);
+        }}
+        onClose={() => {
+          const next = new URLSearchParams(searchParams);
+          next.delete("trial");
+          setSearchParams(next);
+        }}
+      />
+    ) : <EmptyState title={t("page.collaboration.manager_required")} />,
   };
   const primaryTab = _primaryTabFor(tab);
+  const trialFrameOpen = tab === "client-trials" && !!searchParams.get("trial");
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "clamp(0.5rem, 2.5vw, 1rem)", overflow: "hidden", position: "relative", zIndex: 10 }}>
@@ -8039,7 +8148,8 @@ export default function WorkspaceDetail() {
             {ws.status === "active" ? t("page.workspace_detail.pause") : t("page.workspace_detail.resume")}
           </Button>
         )}
-        <Button
+        {/* The customer-trial frame has one Workspace: no list to go back to. */}
+        {(simpleSetupMode || !EMBED) && <Button
           variant="outline"
           size="sm"
           onClick={() => navigate(simpleSetupMode
@@ -8049,8 +8159,8 @@ export default function WorkspaceDetail() {
           {t(simpleSetupMode
             ? "page.workspace_detail.open_workspace_chat"
             : "page.workspace_detail.back_to_workspaces")}
-        </Button>
-        {!simpleSetupMode && canManageWs && (
+        </Button>}
+        {!simpleSetupMode && canAdministerWs && (
           <Button
             variant="outline"
             size="sm"
@@ -8059,7 +8169,7 @@ export default function WorkspaceDetail() {
             {t("page.workspace_detail.export_as_blueprint")}
           </Button>
         )}
-        {!simpleSetupMode && canManageWs && tab !== "collaboration" && (
+        {!simpleSetupMode && canAdministerWs && tab !== "collaboration" && (
           <Button variant="ghost" size="sm" onClick={() => setDeliveryOpen(true)}>
             {t("page.clients.deliver")}
           </Button>
@@ -8073,16 +8183,16 @@ export default function WorkspaceDetail() {
             {t("page.workspaces.blueprint_check_updates")}
           </Button>
         )}
-        {!simpleSetupMode && (ws.settings as any)?.sandbox ? (
+        {!simpleSetupMode && ((ws.settings as any)?.sandbox || launchReviewPage) ? (
           <>
             <Button
               variant="outline"
               size="sm"
               onClick={openSimulationReport}
             >
-              {t("page.simulation_report.title")}
+              {launchReviewPage ? t("page.simulation_report.launch_review") : t("page.simulation_report.title")}
             </Button>
-            {canManageWs && (
+            {canManageWs && (ws.settings as any)?.sandbox && (
               <Button
                 variant="primary"
                 size="sm"
@@ -8097,7 +8207,7 @@ export default function WorkspaceDetail() {
       >
       </PageHeader>
 
-      {canManageWs && <ClientDeliveryDialog key={ws.id} open={deliveryOpen} onClose={() => setDeliveryOpen(false)} workspace={{ id: ws.id, name: ws.name }} />}
+      {canAdministerWs && <ClientDeliveryDialog key={ws.id} open={deliveryOpen} onClose={() => setDeliveryOpen(false)} workspace={{ id: ws.id, name: ws.name }} />}
       <WorkspaceConnectionNotice workspaceId={ws.id} />
 
       <BlueprintGuideDialog
@@ -8335,7 +8445,7 @@ export default function WorkspaceDetail() {
       {!simpleSetupMode && <div className="workspace-detail-tab-navigation">
         <div className="workspace-detail-primary-tabs">
           <TabSwitcher
-            tabs={PRIMARY_TABS.filter(item => item.key !== "collaboration" || canManageWs)}
+            tabs={PRIMARY_TABS.filter(item => item.key === "client-trials" ? showClientTrials : item.key !== "collaboration" || canAdministerWs)}
             value={primaryTab}
             onChange={handlePrimaryTabChange}
             ariaLabel={ws.name}
@@ -8366,15 +8476,17 @@ export default function WorkspaceDetail() {
         )}
       </div>}
 
-      {/* Tab content */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "4px 4px 20px" }}>
+      {/* Tab content; an open customer trial fills it (its frame scrolls inside). */}
+      <div style={trialFrameOpen
+        ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", padding: "4px 4px 8px" }
+        : { flex: 1, overflowY: "auto", padding: "4px 4px 20px" }}>
         {tabContent[simpleSetupTab || tab]()}
       </div>
 
       <ConfirmDialog
         open={!!confirmRemoveStaff}
         onClose={() => setConfirmRemoveStaff(null)}
-        onConfirm={() => { if (canManageWs && confirmRemoveStaff) removeStaff.mutate(confirmRemoveStaff); }}
+        onConfirm={() => { if (canAdministerWs && confirmRemoveStaff) removeStaff.mutate(confirmRemoveStaff); }}
         title={t("page.workspace_detail.remove_staff")}
         message={t("page.workspace_detail.remove_this_staff_member_from_the_workspace_they")}
         confirmLabel={t("page.task_detail.runtime.remove_rule")}

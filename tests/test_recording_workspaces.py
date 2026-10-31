@@ -142,11 +142,23 @@ def test_invalid_transcript_never_becomes_cut_evidence(raw):
     [{"title": "bad", "first_segment": 0, "last_segment": 99}],
     [PLAN["cuts"][1], PLAN["cuts"][0]],
     [PLAN["cuts"][0], PLAN["cuts"][0]],
-    [{"title": "too short", "first_segment": 0, "last_segment": 0}],
 ])
-def test_out_of_bounds_duplicate_reordered_or_short_cuts_fail(cuts):
+def test_out_of_bounds_duplicate_or_reordered_cuts_fail(cuts):
     with pytest.raises(ValueError):
         recording._cuts({"cuts": cuts}, SEGMENTS, "shorts")
+
+
+def test_cut_length_follows_the_format_not_a_fixed_window():
+    # Any length of material is usable: a 6-second clip, or a tutorial longer than ten minutes.
+    one_cue = {"cuts": [{"title": "Brief", "first_segment": 0, "last_segment": 0}]}
+    assert recording._cuts(one_cue, SEGMENTS, "shorts")[0]["end_seconds"] == 6.0
+    long_talk = [{"id": index, "start": index * 60.0, "end": (index + 1) * 60.0, "text": f"Step {index}"}
+                 for index in range(40)]
+    whole = {"cuts": [{"title": "Everything", "first_segment": 0, "last_segment": 39}]}
+    assert recording._cuts(whole, long_talk, "tutorial")[0]["end_seconds"] == 2400.0
+    # Only a short has a ceiling, because it is a short.
+    with pytest.raises(ValueError, match="at most 90 seconds"):
+        recording._cuts(whole, long_talk, "shorts")
 
 
 def test_tutorial_subtitle_offsets_follow_the_selected_source_not_model_text():
@@ -164,6 +176,27 @@ def test_portrait_cjk_captions_use_a_full_width_glyph_budget():
     cues, _ = recording._subtitle_cues(cuts, segments, line_width=18)
     assert all(len(line) <= 18 for cue in cues for line in recording.media._wrap_subtitle_text(cue.text, 18).splitlines())
     assert "".join(c.text.replace(" ", "") for c in cues) == text
+
+
+def test_ai_voice_follows_its_cues_and_never_spills_into_the_next_chapter():
+    cuts = recording._cuts(PLAN, SEGMENTS, "tutorial")
+    # A long line pushes the next one later; captions move with the voice.
+    timing, tempos = recording._place_voice(cuts, SEGMENTS, {0: 7.0, 1: 4.0, 2: 3.0, 3: 3.0})
+    assert timing[1] == (7.08, 11.08) and timing[2] == (12.0, 15.0)
+    assert set(tempos.values()) == {1.0}
+    cues, _ = recording._subtitle_cues(cuts, SEGMENTS, timing=timing)
+    second = [cue for cue in cues if 7.08 <= cue.start < 12]
+    assert (second[0].start, second[-1].end) == (7.08, 11.08)
+    # A chapter that would overrun is read a little faster, and only that chapter.
+    timing, tempos = recording._place_voice(cuts, SEGMENTS, {0: 7.0, 1: 6.0, 2: 3.0, 3: 3.0})
+    assert 1.09 < tempos[0] == tempos[1] < 1.1 and tempos[2] == tempos[3] == 1.0
+    assert timing[1][1] <= 12.0 and timing[2] == (12.0, 15.0)
+    with pytest.raises(ValueError, match='"Prepare a request" runs 2.1s past its footage even when read faster'):
+        recording._place_voice(cuts, SEGMENTS, {0: 9.0, 1: 8.5, 2: 3.0, 3: 3.0})
+    assert recording._voice_language(["检查字幕"]) == "zh"
+    assert recording._voice_language(["Check the draft"]) == ""
+    with pytest.raises(ValueError, match="voice must be"):
+        recording._voice("narrator")
 
 
 def test_chat_prioritizes_all_five_finished_videos_over_sidecar_files():
@@ -206,12 +239,20 @@ def test_tools_are_registered_and_have_scoped_write_authorization():
 async def test_missing_input_and_fake_delivery_cannot_complete(spec):
     runner = WorkflowRunner()
     steps = {s["id"]: s for s in workflow_steps(spec)}
-    run = WorkflowRun(id="run", entity_id="entity", workflow_id="flow", variables={"source_path": " "}, step_results={})
+    run = WorkflowRun(id="run", entity_id="entity", workflow_id="flow", variables={"recording": []}, step_results={})
     result = await runner._execute_step_safe(steps["start"], run, None)
     assert result["code"] == "input_schema_validation_failed"
     run.variables = {"edit_plan": {"status": "needs_input", "cuts": [], "reason": "No spoken explanation"}}
     route = await runner._execute_step_safe(steps["has_plan"], run, None)
     assert route["next_override"] == ["needs_input"]
+    # The run ends asking for input, with the editor's reason as what the person reads.
+    from packages.core.services.workflow_run_trace import workflow_result_outcome
+    ending = await runner._execute_step_safe(steps["needs_input"], run, None)
+    result = ending.get("output", ending)
+    result = result.get("input", result) if isinstance(result, dict) else result
+    assert result["status"] == "needs_input" and result["summary"] == "No spoken explanation"
+    assert workflow_result_outcome({"__result": result}) == "needs_input"
+    assert workflow_result_outcome({"__result": {"status": "completed"}}) == ""
 
 
 @pytest.mark.media_integration
@@ -224,7 +265,6 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
     from packages.core.config import get_settings
     from packages.core.models.document import Document
     from packages.core.services.workflow_service import start_workflow_from_binding
-    from packages.core.services.generated_media_naming import resolve_workspace_artifact_base_dir
 
     assert shutil.which("ffmpeg") and shutil.which("ffprobe"), "Real FFmpeg is required for the production gate"
     # The gate burns subtitles through libass. The Docker image and CI install
@@ -245,6 +285,28 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
         monkeypatch.setattr(os.path, "ismount", lambda path: os.path.abspath(path) == str(tmp_path) or original_ismount(path))
         (tmp_path / ".accesschk").touch()
     monkeypatch.setattr(file_actions, "runtime_trigger_document_embeddings", lambda _id: None)
+    # The tutorial is narrated by the AI voice; shorts keep the source audio.
+    voice = "ai" if spec.key == "tutorial" else "original"
+    spoken = []
+    if voice == "ai":
+        from packages.core.ai.tools import extended_tools
+
+        async def speak(**kwargs):
+            # Stand-in provider bytes; the real Knowledge save path places and registers each line.
+            spoken.append(kwargs["prompt"])
+            tone = subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                                   "sine=frequency=330:duration=2.5", "-f", "mp3", "-"],
+                                  capture_output=True, check=True, timeout=30).stdout
+            url = await extended_tools._save_generated_audio_bytes(
+                entity_id=kwargs["entity_id"], user_id=kwargs["user_id"], prompt=kwargs["prompt"],
+                model="test/tts", purpose=kwargs["purpose"], audio_bytes=tone, audio_format="mp3",
+                is_byok=False, output_name=kwargs["name"], workspace_id=kwargs.get("workspace_id"),
+                task_id=kwargs.get("task_id"), bill_media=False,
+            )
+            return json.dumps({"status": "completed", "model": "test/tts", "voice": "test",
+                               "fs_path": extended_tools._fs_path_from_result_url(url, kwargs["entity_id"])})
+
+        monkeypatch.setattr(extended_tools, "_generate_live_audio", speak)
     account = (await register_user_and_get_token(client, {
         "username": "recording-test", "email": "recording@example.test", "password": "TestPassword123!",
         "entity_name": "Recording test",
@@ -260,8 +322,9 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
         workspace_id=installed.workspace_id, actor_id=user_id,
         user_rules=[action_rule("workspace.file.create")])
     await db_session.commit()
-    base = await resolve_workspace_artifact_base_dir(entity_id=entity_id, workspace_id=installed.workspace_id)
-    source = tmp_path / entity_id / base / "source.mp4"
+    # Picked Knowledge uploads live outside the Workspace folder; every media
+    # step must still read them there.
+    source = tmp_path / entity_id / "source.mp4"
     source.parent.mkdir(parents=True, exist_ok=True)
     # Synthetic picture + tone is an engineering fixture, not product proof or a speech test.
     # A slightly shorter audio track reproduces the browser-discovered AAC-tail
@@ -274,10 +337,13 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
     srt.write_text("\n\n".join(f"{i+1}\n00:00:{i*6:02d},000 --> 00:00:{(i+1)*6:02d},000\n{s['text']}"
                              for i, s in enumerate(SEGMENTS)))
 
+    plans = []
+
     async def model_output(**kwargs):
         assert kwargs["tools"] == []
         assert SEGMENTS[0]["text"] in kwargs["user_message"]
         assert spec.editorial_rules in kwargs["system_prompt"]
+        plans.append(kwargs["user_message"])
         return SimpleNamespace(content=json.dumps({"status": "ready", **PLAN, "reason": "Two complete steps"}),
                                error=None, stop_reason="end_turn", usage={}, tool_calls_made=[], rounds=1)
 
@@ -285,10 +351,15 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
         monkeypatch.setattr(runner_module, "runtime_execute_workflow_agent_loop", model_output)
     binding = await db_session.get(WorkflowBinding, installed.workflow_binding_ids[0])
     workflow = await db_session.get(WorkflowDefinition, binding.workflow_id)
+    picked = [Document(entity_id=entity_id, name=name, fs_path=name, owner_id=user_id)
+              for name in ("source.mp4", "source.srt")]
+    db_session.add_all(picked)
+    await db_session.flush()
     run = await start_workflow_from_binding(db_session, binding,
-        variables={"source_path": base + "/source.mp4", "subtitle_path": base + "/source.srt",
+        variables={"recording": [{"document_id": picked[0].id}], "subtitles": [{"document_id": picked[1].id}],
                    "focus": "Make two standalone clips about preparing and reviewing a request." if spec.key == "shorts"
-                            else "Make one tutorial with separate preparation and review chapters."},
+                            else "Make one tutorial with separate preparation and review chapters.",
+                   "voiceover": voice},
         trigger_source="manual", started_by=user_id, user_requested=True)
     await db_session.commit()
     await WorkflowRunner()._run_loop(workflow, run, db_session)
@@ -306,7 +377,17 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
         assert output["qa"]["full_decode"] is True
         assert output["qa"]["probe"]["has_audio"]
         assert output["qa"]["subtitles"]["verdict"] == "pass"
-        assert output["video"]["include_source_audio"] is True
+        assert output["video"]["include_source_audio"] is (voice == "original")
+        if voice == "ai":
+            # Every selected cue is voiced exactly as written, saved beside its video, and starts its caption.
+            assert spoken == [segment["text"] for segment in SEGMENTS]
+            folder = output["video"]["fs_path"].rsplit("/", 1)[0] + "/voice/"
+            assert [line["fs_path"].startswith(folder) for line in output["voice"]] == [True] * len(SEGMENTS)
+            timeline = json.loads((tmp_path / entity_id / output["timeline"]["fs_path"]).read_text())
+            assert [track["start"] for track in timeline["audio_tracks"]] == [0.0, 6.0, 12.0, 18.0]
+            assert [round(c["end"] - c["start"], 1) for c in timeline["captions"]][:1] == [2.5]
+        else:
+            assert output["voice"] == []
         assert output["video"]["burn_subtitles"] is True
         assert output["video"]["subtitle_path"].endswith(".ass")
         ass = (tmp_path / entity_id / output["burned_subtitles"]["fs_path"]).read_text()
@@ -323,13 +404,24 @@ async def test_installed_graph_renders_real_media_and_waits_for_review(client, d
     # to a real worker connected to another database.
     monkeypatch.setattr(WorkflowRunner, "enqueue_resume", staticmethod(lambda *args, **kwargs: False))
     await db_session.commit()
-    choice = "accept" if spec.key == "shorts" else "revise"
-    assert await WorkflowRunner.resume(run.id, {"acceptance": {"choice": choice}}, entity_id=entity_id,
+    if spec.key == "tutorial":
+        # A change request replans with the note and renders a new version; the reviewed one stays.
+        first = delivery["receipt"]["fs_path"]
+        assert await WorkflowRunner.resume(
+            run.id, {"acceptance": {"choice": "revise", "note": "Shorten the review chapter."}},
+            entity_id=entity_id, resumed_by=user_id, execute=False) == "resumed"
+        await db_session.refresh(run)
+        await WorkflowRunner()._run_loop(workflow, run, db_session)
+        assert run.status == "paused" and run.current_step_id == "review", (run.error, run.step_results)
+        assert "Shorten the review chapter." in plans[-1]
+        assert run.variables["delivery"]["receipt"]["fs_path"] != first
+        assert (tmp_path / entity_id / first).exists()
+    assert await WorkflowRunner.resume(run.id, {"acceptance": {"choice": "accept"}}, entity_id=entity_id,
                                         resumed_by=user_id, execute=False) == "resumed"
     await db_session.refresh(run)
     await WorkflowRunner()._run_loop(workflow, run, db_session)
     assert run.status == "completed", (run.error, run.step_results)
-    assert run.variables["__result"]["status"] == ("accepted" if choice == "accept" else "revision_required")
+    assert run.variables["__result"]["status"] == "accepted"
     # Changed input cannot render using old planning evidence.
     snapshot = run.variables["source"]["snapshot"]
     source.write_bytes(source.read_bytes() + b"changed")
@@ -369,6 +461,65 @@ async def test_runtime_acl_blocks_cross_workspace_and_unreadable_sources(monkeyp
         assert result.get("error")
 
 
+async def test_picked_recording_uses_its_document_path_and_the_same_acl(db_session, monkeypatch, tmp_path):
+    from packages.core.ai.runtime.media import runtime_document_ref_paths
+    from packages.core.models.document import Document
+    from packages.core.services import entity_fs
+
+    entity = Entity(id=generate_ulid(), name="Picker", plan_id="plan_enterprise")
+    db_session.add(entity)
+    await db_session.flush()
+    private, srt, trashed = (Document(entity_id=entity.id, name=name, fs_path=f"Workspaces/one/{name}", is_trashed=gone)
+                             for name, gone in (("private.mp4", False), ("private.srt", False), ("old.mp4", True)))
+    unstored = Document(entity_id=entity.id, name="notes.md", fs_path=None)
+    db_session.add_all([private, srt, trashed, unstored])
+    await db_session.commit()
+    # The browser's fs_path is not trusted; the Document row decides the path.
+    assert await runtime_document_ref_paths(
+        [{"document_id": private.id, "fs_path": "Workspaces/one/public.mp4"}, {"document_id": private.id},
+         {"document_id": srt.id}], entity.id, limit=2,
+    ) == ["Workspaces/one/private.mp4", "Workspaces/one/private.srt"]
+    assert await runtime_document_ref_paths([], entity.id, limit=1) == []
+    for refs, limit in (([{"document_id": trashed.id}], 1), ([{"document_id": unstored.id}], 1),
+                        ([{"document_id": private.id}], 0),
+                        ([{"name": "private.mp4"}], 1), ("Workspaces/one/private.mp4", 1)):
+        with pytest.raises(ValueError):
+            await runtime_document_ref_paths(refs, entity.id, limit=limit)
+    with pytest.raises(ValueError):
+        await runtime_document_ref_paths([{"document_id": private.id}], generate_ulid(), limit=1)
+
+    async def base(**_):
+        return "Workspaces/one"
+
+    async def preflight():
+        return "ffmpeg", "ffprobe"
+
+    async def deny(**kwargs):
+        assert kwargs["paths"] == ["Workspaces/one/private.mp4"]
+        return {"error": "denied"}
+
+    monkeypatch.setattr(recording.media, "_workspace_media_base_dir", base)
+    monkeypatch.setattr(recording, "_runtime_preflight", preflight)
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _: str(tmp_path))
+    monkeypatch.setattr(recording.media, "runtime_guard_file_read_access", deny)
+    (tmp_path / "Workspaces/one").mkdir(parents=True)
+    (tmp_path / "Workspaces/one/private.mp4").write_bytes(b"not visible")
+    result = json.loads(await recording._prepare_recording_handler(
+        entity_id=entity.id, user_id="user", workspace_id="one", output_directory="production/sources",
+        source=[{"document_id": private.id, "fs_path": "Workspaces/one/public.mp4"}], _user_id_from_context="user",
+    ))
+    # deny() saw the Document's path, and the same read check refused it.
+    assert result.get("error")
+
+    # An upload outside the Workspace folder resolves to its own path, while a
+    # Workspace file of the same name still wins.
+    (tmp_path / "talk.mp4").write_bytes(b"upload")
+    ctx = {"entity_id": entity.id, "workspace_id": "one", "task_id": None}
+    assert (await recording._source_path("talk.mp4", ctx))[0] == "talk.mp4"
+    (tmp_path / "Workspaces/one/talk.mp4").write_bytes(b"workspace")
+    assert (await recording._source_path("talk.mp4", ctx))[0] == "Workspaces/one/talk.mp4"
+
+
 async def test_missing_subtitle_renderer_blocks_before_billable_transcription(monkeypatch):
     async def filters(*args, **kwargs):
         return " ... scale V->V Scale video", ""
@@ -379,7 +530,7 @@ async def test_missing_subtitle_renderer_blocks_before_billable_transcription(mo
         await recording._runtime_preflight()
 
 
-@pytest.mark.parametrize("failure", ["credit blocked", "text-only STT"])
+@pytest.mark.parametrize("failure", ["credit blocked", "text-only STT", "no timings"])
 async def test_transcription_blocker_never_saves_a_prepared_snapshot(monkeypatch, tmp_path, failure):
     """Exercise the no-SRT branch with provider boundaries stubbed, not bypassed."""
     source = tmp_path / "recording.mp4"
@@ -405,6 +556,9 @@ async def test_transcription_blocker_never_saves_a_prepared_snapshot(monkeypatch
         assert kwargs["entity_id"] == "entity"
         if failure == "credit blocked":
             raise ValueError("credit blocked")
+        if failure == "no timings":
+            from packages.core.services.voice.whisper import WhisperTimestampError
+            raise WhisperTimestampError("The configured OpenRouter STT route does not provide measured timestamps.")
         return SimpleNamespace(segments=[])
 
     async def save(*args):
@@ -422,4 +576,90 @@ async def test_transcription_blocker_never_saves_a_prepared_snapshot(monkeypatch
         output_directory="production/sources",
     ))
     assert result["code"] == "recording_preparation_failed"
-    assert ("credit blocked" if failure == "credit blocked" else "timestamped transcript") in result["error"]
+    assert {"credit blocked": "credit blocked", "text-only STT": "No speech was found",
+            "no timings": "Add the recording's SRT, or add an OpenAI or Groq key"}[failure] in result["error"]
+    assert "OpenRouter" not in result["error"]
+
+
+@pytest.mark.parametrize("probe_report,expected", [
+    ({"duration_seconds": 24, "has_video": False, "has_audio": True}, "This file has no picture."),
+    ({"duration_seconds": 0, "has_video": True, "has_audio": True}, "This recording could not be played."),
+])
+async def test_an_unusable_recording_says_what_is_wrong_with_it(monkeypatch, tmp_path, probe_report, expected):
+    source = tmp_path / "recording.mov"
+    source.write_bytes(b"fixture")
+
+    async def scope(*args):
+        return str(tmp_path), "production/sources/test"
+
+    async def source_path(*args):
+        return "recording.mov", str(source)
+
+    async def preflight():
+        return "ffmpeg", "ffprobe"
+
+    async def probe(*args):
+        return probe_report
+
+    monkeypatch.setattr(recording, "_scope", scope)
+    monkeypatch.setattr(recording, "_source_path", source_path)
+    monkeypatch.setattr(recording, "_runtime_preflight", preflight)
+    monkeypatch.setattr(recording.media, "_probe_media_report", probe)
+    result = json.loads(await recording._prepare_recording_handler(
+        entity_id="entity", user_id="actor", workspace_id="workspace", source_path="recording.mov",
+        output_directory="production/sources",
+    ))
+    assert result["code"] == "recording_preparation_failed"
+    assert result["error"].startswith(expected)
+
+
+async def test_a_long_recording_is_transcribed_in_pieces_cut_at_pauses(monkeypatch, tmp_path):
+    """No length limit: 25 minutes of speech goes to STT in three pieces, timed back onto the recording."""
+    source = tmp_path / "recording.mov"
+    source.write_bytes(b"fixture")
+    pieces, saved = [], {}
+
+    async def scope(*args):
+        return str(tmp_path), "production/sources/test"
+
+    async def source_path(*args):
+        return "recording.mov", str(source)
+
+    async def preflight():
+        return "ffmpeg", "ffprobe"
+
+    async def probe(*args):
+        return {"duration_seconds": 1500, "has_video": True, "has_audio": True}
+
+    async def process(args, **kwargs):
+        if any("silencedetect" in str(arg) for arg in args):
+            # Pauses near each ten-minute mark, where the pieces should be cut.
+            return "", ("silence_start: 597.5\nsilence_end: 598.5\n"
+                        "silence_start: 1202.6\nsilence_end: 1203.4\n")
+        if "-ss" in args:
+            pieces.append((float(args[args.index("-ss") + 1]), float(args[args.index("-t") + 1])))
+        return "", ""
+
+    async def transcribe(**kwargs):
+        return SimpleNamespace(segments=[{"start": 1.0, "end": 5.0, "text": f"Piece {len(pieces)}"}])
+
+    async def save(ctx, rel, content, role):
+        saved.update(json.loads(content))
+        return {"document_id": "doc", "fs_path": rel, "file_size": 1, "sha256": "0" * 64}
+
+    monkeypatch.setattr(recording, "_scope", scope)
+    monkeypatch.setattr(recording, "_source_path", source_path)
+    monkeypatch.setattr(recording, "_runtime_preflight", preflight)
+    monkeypatch.setattr(recording, "_save", save)
+    monkeypatch.setattr(recording.media, "_probe_media_report", probe)
+    monkeypatch.setattr(recording.media, "_run_process", process)
+    monkeypatch.setattr(recording.media, "_transcribe_narration_audio", transcribe)
+    result = json.loads(await recording._prepare_recording_handler(
+        entity_id="entity", user_id="actor", workspace_id="workspace", source_path="recording.mov",
+        output_directory="production/sources",
+    ))
+    assert result["status"] == "completed", result
+    assert pieces == [(0.0, 598.0), (598.0, 605.0), (1203.0, 297.0)]
+    assert [(cue["start"], cue["end"], cue["text"]) for cue in saved["segments"]] == [
+        (1.0, 5.0, "Piece 1"), (599.0, 603.0, "Piece 2"), (1204.0, 1208.0, "Piece 3"),
+    ]

@@ -81,7 +81,6 @@ from packages.core.services.workspace_operation_service import (
     check_work_batch_completion,
 )
 from packages.core.strategist import service as strategist_service
-from packages.core.tasks import ai_tasks
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 FLAG_KEY = "strategist_review_v2"
@@ -261,7 +260,6 @@ def _quiet_side_surfaces(monkeypatch):
     async def _noop_post(*args, **kwargs):
         return None
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop_post)
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
 
 
 async def _reviews(db, workspace_id: str) -> list[ReviewRun]:

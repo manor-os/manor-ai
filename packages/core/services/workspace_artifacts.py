@@ -571,3 +571,70 @@ def _display_folder_name(value: str | None) -> str:
 
 def _truncate_folder_name(value: str, max_length: int = 255) -> str:
     return value[:max_length].rstrip(" .") or "Workspace"
+
+
+_ARCHIVE_ID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+_TASK_ARCHIVE_SEGMENTS = frozenset({"tasks"})
+_WORKFLOW_ARCHIVE_SEGMENTS = frozenset({"workflow", "runs"})
+
+
+async def workspace_archive_folder_labels(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    folders: list[tuple[str, str, str | None]],
+) -> dict[str, str]:
+    """Readable labels for Workspace execution archive folders.
+
+    ``folders`` are ``(id, name, parent_id)``. A Task or Workflow archive is
+    stored and filed under its ID (``Workspaces/<name>/tasks/<task id>``);
+    its folder name stays that ID because physical paths are resolved from
+    the folder chain. Callers show the returned ``"<title> (<last 6>)"``
+    instead, the same short tag Workspace and Chat folders use.
+    """
+    from packages.core.models.task import Task
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+
+    candidates = {
+        folder_id: (name, parent_id)
+        for folder_id, name, parent_id in folders
+        if parent_id and _ARCHIVE_ID_RE.match(name or "")
+    }
+    if not candidates:
+        return {}
+    parents = {
+        parent.id: parent
+        for parent in (await db.execute(select(DocumentFolder).where(
+            DocumentFolder.entity_id == entity_id,
+            DocumentFolder.id.in_({parent_id for _, parent_id in candidates.values()}),
+            DocumentFolder.name.in_(_TASK_ARCHIVE_SEGMENTS | _WORKFLOW_ARCHIVE_SEGMENTS),
+        ))).scalars()
+    }
+    workspace_roots = set((await db.execute(select(Workspace.artifact_folder_id).where(
+        Workspace.entity_id == entity_id,
+        Workspace.artifact_folder_id.in_({p.parent_id for p in parents.values() if p.parent_id}),
+    ))).scalars()) if parents else set()
+    task_ids: set[str] = set()
+    run_ids: set[str] = set()
+    for name, parent_id in candidates.values():
+        parent = parents.get(parent_id)
+        if parent is None or parent.parent_id not in workspace_roots:
+            continue
+        (task_ids if parent.name in _TASK_ARCHIVE_SEGMENTS else run_ids).add(name)
+    titles: dict[str, str] = {}
+    if task_ids:
+        titles.update((await db.execute(select(Task.id, Task.title).where(
+            Task.entity_id == entity_id, Task.id.in_(task_ids),
+        ))).tuples().all())
+    if run_ids:
+        titles.update((await db.execute(
+            select(WorkflowRun.id, WorkflowDefinition.name)
+            .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowRun.workflow_id)
+            .where(WorkflowRun.entity_id == entity_id, WorkflowRun.id.in_(run_ids))
+        )).tuples().all())
+    labels: dict[str, str] = {}
+    for folder_id, (name, _parent_id) in candidates.items():
+        title = re.sub(r"\s+", " ", str(titles.get(name) or "")).strip()
+        if title:
+            labels[folder_id] = f"{_display_folder_name(title[:200])} ({name[-6:]})"
+    return labels

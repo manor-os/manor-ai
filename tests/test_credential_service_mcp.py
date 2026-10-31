@@ -22,6 +22,20 @@ def _service() -> tuple[CredentialService, DevKeyProvider]:
     return CredentialService(key_provider, audit_sink=NullAuditSink()), key_provider
 
 
+def test_ephemeral_credential_key_is_not_logged(monkeypatch, caplog) -> None:
+    generated_key = Fernet.generate_key()
+    monkeypatch.setattr(Fernet, "generate_key", staticmethod(lambda: generated_key))
+    with caplog.at_level(logging.WARNING):
+        provider = DevKeyProvider(audit_sink=NullAuditSink())
+    assert "ephemeral key" in caplog.text
+    assert generated_key.decode("ascii") not in caplog.text
+    context = {"kind": "test", "id": "ephemeral-key"}
+    encrypted = provider.encrypt(b"test-only-value", context)
+    assert provider.decrypt(
+        encrypted, context, reason="test", requester=Requester(kind="test", id="test")
+    ) == b"test-only-value"
+
+
 def test_mcp_server_secret_uses_stable_server_key_context() -> None:
     service, _ = _service()
     server = SimpleNamespace(

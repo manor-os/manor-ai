@@ -19,6 +19,7 @@ Exercises:
 from __future__ import annotations
 
 import copy
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
@@ -803,8 +804,6 @@ async def test_missing_agent_todo_requires_the_exact_callable_agent(
     db_session: AsyncSession,
     entity_id: str,
 ):
-    from packages.core.workers.registry import ensure_internal_worker
-
     slug = f"required-agent-{entity_id}"
     result = await install_blueprint(
         db_session,
@@ -845,7 +844,6 @@ async def test_missing_agent_todo_requires_the_exact_callable_agent(
     )
     db_session.add_all([wrong_agent, wrong_subscription])
     await db_session.flush()
-    await ensure_internal_worker(db_session, entity_id)
 
     wrong_identity = await evaluate_workspace_blocking_setup(db_session, workspace)
     assert wrong_identity is not None and wrong_identity.blocks_work
@@ -861,7 +859,6 @@ async def test_missing_agent_todo_requires_the_exact_callable_agent(
     )
     db_session.add(exact_subscription)
     await db_session.flush()
-    await ensure_internal_worker(db_session, entity_id)
 
     exact_identity = await evaluate_workspace_blocking_setup(db_session, workspace)
     assert exact_identity is not None
@@ -1370,6 +1367,7 @@ async def test_scheduled_workflow_resolves_portable_slug_to_installed_binding(
             "execution_target": {"workflow_slug": slug},
             "schedule_kind": "cron",
             "cron_expr": "0 9 * * *",
+            "stop_after": "2099-01-01T00:00:00+00:00",
             "enabled": False,
         }],
     })
@@ -1391,6 +1389,12 @@ async def test_scheduled_workflow_resolves_portable_slug_to_installed_binding(
     )
 
     assert job.enabled is False
+    assert job.stop_after == datetime(2099, 1, 1, tzinfo=UTC)
+    exported = await export_workspace(db_session, result.workspace_id, title="Finite workflow")
+    [exported_job] = exported["recipe"]["scheduled_jobs"]
+    assert exported_job["stop_after"] == "2099-01-01T00:00:00+00:00"
+    assert "owner_project_id" not in exported_job
+    assert "idempotency_key" not in exported_job
     assert binding is not None
     assert binding.enabled is False
     assert binding.status == "inactive"
@@ -2247,8 +2251,13 @@ async def test_check_cron_scheduled_pass(
     )).scalar_one()
     job.enabled = False
     await db_session.flush()
-    disabled = await evaluate_workspace_blocking_setup(db_session, workspace)
-    assert disabled is not None and disabled.blocks_work
+    paused = await evaluate_workspace_blocking_setup(db_session, workspace)
+    assert paused is not None and not paused.blocks_work
+    # Only a schedule that is no longer installed blocks work.
+    await db_session.delete(job)
+    await db_session.flush()
+    removed = await evaluate_workspace_blocking_setup(db_session, workspace)
+    assert removed is not None and removed.blocks_work
 
 
 async def test_scheduled_agent_install_fails_when_service_is_not_deployed(
@@ -2301,17 +2310,11 @@ async def test_check_cron_scheduled_fail(
         enabled=False,
     ))
     await db_session.flush()
-    disabled = await evaluate_workspace_blocking_setup(db_session, workspace)
-    assert disabled is not None and disabled.blocks_work
-
-    job = (await db_session.execute(
-        select(ScheduledJob).where(ScheduledJob.workspace_id == workspace.id)
-    )).scalar_one()
-    job.enabled = True
-    await db_session.flush()
-    enabled = await evaluate_workspace_blocking_setup(db_session, workspace)
-    assert enabled is not None
-    assert enabled.blocks_work is False
+    # A paused schedule is still installed: pausing it (or a run of failures
+    # pausing it) must not block every other action in the Workspace.
+    paused = await evaluate_workspace_blocking_setup(db_session, workspace)
+    assert paused is not None
+    assert paused.blocks_work is False
 
 
 async def test_check_workflow_present_pass(

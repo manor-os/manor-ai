@@ -56,7 +56,8 @@ async def _context(db, token, request, session_id):
         db, entity_id=cc.entity_id, channel_config_id=cc.id, session_id=session_id,
     )
     if conv is None:
-        raise HTTPException(404, "Chat session not found")
+        # The widget starts a fresh session on this code instead of retrying.
+        raise HTTPException(404, {"code": "chat_session_not_found", "message": "Chat session not found"}, headers=_HEADERS)
     contact = await public_chat._ensure_session_contact_for_user(
         db, cc=cc, session_id=session_id, user=user, conversation=conv,
         request=request, resident_check=False,
